@@ -2211,8 +2211,50 @@ namespace D365MetadataBridge.Services
         {
             switch (prop.ToLowerInvariant())
             {
-                case "label": tbl.Label = value; break;
-                case "developerdocumentation": tbl.DeveloperDocumentation = value; break;
+                // ── String properties ──────────────────────────────────────────────
+                case "label":                       tbl.Label = value; break;
+                case "singularlabel":               tbl.SingularLabel = value; break;
+                case "developerdocumentation":      tbl.DeveloperDocumentation = value; break;
+                case "clusteredindex":              tbl.ClusteredIndex = value; break;
+                case "primaryindex":                tbl.PrimaryIndex = value; break;
+                case "extends":                     tbl.Extends = value; break;
+                case "titlefield1":                 tbl.TitleField1 = value; break;
+                case "titlefield2":                 tbl.TitleField2 = value; break;
+                case "replacementkey":              tbl.ReplacementKey = value; break;
+                case "formref":                     tbl.FormRef = value; break;
+                case "listpageref":                 tbl.ListPageRef = value; break;
+                case "reportref":                   tbl.ReportRef = value; break;
+                case "previewpartref":              tbl.PreviewPartRef = value; break;
+                case "configurationkey":            tbl.ConfigurationKey = value; break;
+                case "countryregioncodes":          tbl.CountryRegionCodes = value; break;
+                case "countryregioncontextfield":   tbl.CountryRegionContextField = value; break;
+                case "tags":                        tbl.Tags = value; break;
+
+                // ── NoYes properties ───────────────────────────────────────────────
+                case "allowrowversionchangetracking":   tbl.AllowRowVersionChangeTracking = ParseNoYes(value); break;
+                case "allowchangetracking":             tbl.AllowChangeTracking = ParseNoYes(value); break;
+                case "allowarchival":                   tbl.AllowArchival = ParseNoYes(value); break;
+                case "allowretention":                  tbl.AllowRetention = ParseNoYes(value); break;
+                case "allowoverride":                   tbl.AllowOverride = ParseNoYes(value); break;
+                case "abstract":                        tbl.Abstract = ParseNoYes(value); break;
+                case "supportinheritance":              tbl.SupportInheritance = ParseNoYes(value); break;
+                case "savedatapercompany":              tbl.SaveDataPerCompany = ParseNoYes(value); break;
+                case "savedataperpartition":            tbl.SaveDataPerPartition = ParseNoYes(value); break;
+                case "systemtable":                     tbl.SystemTable = ParseNoYes(value); break;
+                case "createrecidindex":                tbl.CreateRecIdIndex = ParseNoYes(value); break;
+                case "createddatetime":                 tbl.CreatedDateTime = ParseNoYes(value); break;
+                case "createdby":                       tbl.CreatedBy = ParseNoYes(value); break;
+                case "createdtransactionid":            tbl.CreatedTransactionId = ParseNoYes(value); break;
+                case "modifieddatetime":                tbl.ModifiedDateTime = ParseNoYes(value); break;
+                case "modifiedby":                      tbl.ModifiedBy = ParseNoYes(value); break;
+                case "modifiedtransactionid":           tbl.ModifiedTransactionId = ParseNoYes(value); break;
+                case "occentabled":                     tbl.OccEnabled = ParseNoYes(value); break;
+                case "disabledatabaselogging":          tbl.DisableDatabaseLogging = ParseNoYes(value); break;
+                case "disablelockescalation":           tbl.DisableLockEscalation = ParseNoYes(value); break;
+                case "isobsolete":                      tbl.IsObsolete = ParseNoYes(value); break;
+                case "visible":                         tbl.Visible = ParseNoYes(value); break;
+
+                // ── Enum properties ────────────────────────────────────────────────
                 case "tablegroup":
                     if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableGroup>(value, true, out var tg))
                         tbl.TableGroup = tg;
@@ -2221,21 +2263,43 @@ namespace D365MetadataBridge.Services
                     if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.RecordCacheLevel>(value, true, out var cl))
                         tbl.CacheLookup = cl;
                     break;
-                case "clusteredindex": tbl.ClusteredIndex = value; break;
-                case "primaryindex": tbl.PrimaryIndex = value; break;
-                case "savedatapercompany":
-                    tbl.SaveDataPerCompany = ParseNoYes(value);
-                    break;
                 case "tabletype":
                     if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableType>(value, true, out var tt))
                         tbl.TableType = tt;
                     break;
-                case "supportinheritance":
-                    tbl.SupportInheritance = ParseNoYes(value);
+                case "aosauthorization":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.AosAuthorization>(value, true, out var aa))
+                        tbl.AosAuthorization = aa;
                     break;
-                case "extends": tbl.Extends = value; break;
-                case "titlefield1": tbl.TitleField1 = value; break;
-                case "titlefield2": tbl.TitleField2 = value; break;
+                case "entityrelationshiptype":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.EntityRelationshipType>(value, true, out var ert))
+                        tbl.EntityRelationshipType = ert;
+                    break;
+                case "validtimestatefieldtype":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.ValidTimeStateFieldType>(value, true, out var vts))
+                        tbl.ValidTimeStateFieldType = vts;
+                    break;
+                case "tablecontents":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableContents>(value, true, out var tc))
+                        tbl.TableContents = tc;
+                    break;
+                case "datasharingtype":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.SysDataSharingType>(value, true, out var dst))
+                        tbl.DataSharingType = dst;
+                    break;
+                case "durability":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.Durability>(value, true, out var dur))
+                        tbl.Durability = dur;
+                    break;
+                case "operationaldomain":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.OperationalDomain>(value, true, out var od))
+                        tbl.OperationalDomain = od;
+                    break;
+                case "storagemode":
+                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.StorageMode>(value, true, out var sm))
+                        tbl.StorageMode = sm;
+                    break;
+
                 default:
                     Console.Error.WriteLine($"[WriteService] Unknown AxTable property: {prop}");
                     break;
