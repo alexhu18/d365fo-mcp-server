@@ -2,6 +2,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { XppMetadataParser } from '../metadata/xmlParser.js';
+import { parseLabelFile } from '../metadata/labelParser.js';
 import type { XppServerContext } from '../types/context.js';
 import type { XppSymbol } from '../metadata/types.js';
 import { bridgeRefreshProvider } from '../bridge/index.js';
@@ -9,7 +10,7 @@ import { bridgeRefreshProvider } from '../bridge/index.js';
 export const updateSymbolIndexToolDefinition = {
   name: 'update_symbol_index',
   description:
-    'Index a newly generated or modified D365FO XML file immediately so references to it work without restarting the server. ' +
+    'Index a newly generated or modified D365FO XML/label file immediately so references to it work without restarting the server. ' +
     'Also handles file DELETIONS: if the file no longer exists on disk, stale symbols + labels + Redis cache entries are cleaned up.',
   parameters: z.object({
     filePath: z.string().describe('The absolute path to the modified, created, or DELETED XML file')
@@ -50,14 +51,51 @@ function extractModelFromPath(filePath: string): string | null {
   if (aotIdx >= 2) {
     return parts[aotIdx - 1]; // folder immediately before the AOT folder = model name
   }
+
+  // Label file path pattern: ...\{model}\AxLabelFile\LabelResources\{locale}\{LabelFileId}.{locale}.label.txt
+  const labelIdx = parts.findIndex(p => p.toLowerCase() === 'axlabelfile');
+  if (labelIdx >= 1) {
+    return parts[labelIdx - 1];
+  }
+
   return null;
+}
+
+function isLabelTextFile(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith('.label.txt');
+}
+
+function normalizeLocale(locale: string): string {
+  return locale
+    .split('-')
+    .map((part, idx) => (idx === 0 ? part.toLowerCase() : part.toUpperCase()))
+    .join('-');
+}
+
+function parseLabelFileName(filePath: string): { labelFileId: string; language: string } | null {
+  const parts = filePath.split(/[\\/]/);
+  const baseName = parts[parts.length - 1] ?? '';
+  const withoutSuffix = baseName.replace(/\.label\.txt$/i, '');
+  const dotIdx = withoutSuffix.lastIndexOf('.');
+  if (dotIdx < 0) return null;
+
+  const labelFileId = withoutSuffix.substring(0, dotIdx);
+  const language = withoutSuffix.substring(dotIdx + 1);
+  if (!labelFileId || !language) return null;
+
+  return {
+    labelFileId,
+    language: normalizeLocale(language),
+  };
 }
 
 export const updateSymbolIndexTool = async (params: any, context: XppServerContext) => {
   const { filePath } = params;
   try {
     const { symbolIndex, cache } = context;
-    const objectName = path.parse(filePath).name;
+    const pathParts = filePath.split(/[\\/]/);
+    const fileName = pathParts[pathParts.length - 1] ?? filePath;
+    const objectName = fileName.replace(/\.[^.]+$/, '');
     const parts = filePath.replace(/\//g, '\\').split('\\');
     const aotFolder = parts.find((p: string) => p.toLowerCase() in AOT_FOLDER_TYPE_MAP) ?? '';
     const objectType: XppSymbol['type'] = AOT_FOLDER_TYPE_MAP[aotFolder.toLowerCase()] ?? 'class';
@@ -80,6 +118,8 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
         await bridgeRefreshProvider(context.bridge);
       } catch { /* bridge not available */ }
 
+      symbolIndex.touchLastIndexed?.();
+
       const parts_cleaned: string[] = [];
       if (deletedCount > 0) parts_cleaned.push(`${deletedCount} symbol(s)`);
       if (labelCount > 0) parts_cleaned.push(`${labelCount} label(s)`);
@@ -95,8 +135,62 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
     }
 
     // ── FILE EXISTS: re-index ───────────────────────────────────────────────
-    const parser = new XppMetadataParser();
     const model = extractModelFromPath(filePath) ?? 'Unknown';
+
+    // Label files are indexed in labels DB (not symbols DB).
+    if (isLabelTextFile(filePath)) {
+      const parsedFileName = parseLabelFileName(filePath);
+      if (!parsedFileName) {
+        return {
+          content: [{
+            type: 'text',
+            text: `❌ Error updating label index: invalid label filename format for ${path.basename(filePath)} (expected {LabelFileId}.{locale}.label.txt).`,
+          }],
+          isError: true,
+        };
+      }
+
+      const { labelFileId, language } = parsedFileName;
+      const removedCount = symbolIndex.removeLabelsByFile(filePath);
+
+      let insertedCount = 0;
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const labels = parseLabelFile(content, labelFileId, model, language, filePath);
+        if (labels.length > 0) {
+          symbolIndex.bulkAddLabels(labels.map(lbl => ({
+            labelId: lbl.labelId,
+            labelFileId: lbl.labelFileId,
+            model: lbl.model,
+            language: lbl.language,
+            text: lbl.text,
+            comment: lbl.comment,
+            filePath: lbl.filePath,
+          })));
+          insertedCount = labels.length;
+        }
+      } catch (e: any) {
+        return {
+          content: [{ type: 'text', text: `❌ Error updating label index: ${e.message}` }],
+          isError: true,
+        };
+      }
+
+      await invalidateCache(cache, labelFileId, 'label', [labelFileId]);
+      symbolIndex.touchLastIndexed?.();
+
+      return {
+        content: [{
+          type: 'text',
+          text: `✅ Label index updated for **${path.basename(filePath)}** (model: ${model}, language: ${language}).\n\n` +
+            `Removed: ${removedCount} stale entr${removedCount === 1 ? 'y' : 'ies'}\n` +
+            `Inserted: ${insertedCount} label${insertedCount !== 1 ? 's' : ''}\n` +
+            `Redis cache invalidated.`,
+        }],
+      };
+    }
+
+    const parser = new XppMetadataParser();
 
     console.error(`[update_symbol_index] Re-indexing ${objectType} "${objectName}" (model: ${model})`);
 
@@ -228,6 +322,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
 
     // ── Invalidate Redis cache for the re-indexed object ────────────────────
     await invalidateCache(cache, objectName, objectType, [objectName]);
+    symbolIndex.touchLastIndexed?.();
 
     return {
       content: [{

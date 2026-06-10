@@ -34,11 +34,13 @@ function Get-EnvPort([string]$envFile) {
 }
 
 # ── Helper: extract variable names from a .env file ─────────────────────────
+# Treats commented-out lines (e.g. "# KEY=value") as present-but-disabled so
+# that the missing-settings check doesn't flag vars the user has intentionally
+# left commented in their instance .env.
 function Get-EnvVarNames([string]$envFile) {
     $names = @()
     foreach ($line in (Get-Content $envFile)) {
-        # Match uncommented KEY=value lines (skip comments and blank lines)
-        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') {
+        if ($line -match '^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') {
             $names += $Matches[1]
         }
     }
@@ -74,7 +76,7 @@ function Show-MissingSettings([System.IO.DirectoryInfo]$inst) {
 # versioned file (e.g. "myenv-dev___10.0.2345.153") and rewrite the .env so
 # run-instance can later detect UDE upgrades with a plain file-exists check.
 function Normalize-XppConfigName([string]$envFile) {
-    $envType = Get-EnvValue $envFile 'DEV_ENVIRONMENT_TYPE'
+    $envType = Get-DevEnvType $envFile
     if ($envType -eq 'traditional') { return }
 
     $configName = Get-EnvValue $envFile 'XPP_CONFIG_NAME'
@@ -111,6 +113,44 @@ function Get-EnvValue([string]$envFile, [string]$key) {
     return $null
 }
 
+# ── Helper: read the dev-environment-type setting ───────────────────────────
+# Canonical name is the D365FO_-prefixed form; the plain name is a legacy
+# fallback so un-migrated instances keep behaving correctly during rebuild.
+function Get-DevEnvType([string]$envFile) {
+    $v = Get-EnvValue $envFile 'D365FO_DEV_ENVIRONMENT_TYPE'
+    if (-not $v) { $v = Get-EnvValue $envFile 'DEV_ENVIRONMENT_TYPE' }
+    return $v
+}
+
+# ── Helper: migrate the dev-env-type setting to its canonical prefixed name ──
+# The public setting was renamed DEV_ENVIRONMENT_TYPE -> D365FO_DEV_ENVIRONMENT_TYPE
+# (matching the D365FO_PACKAGE_PATH convention). If an instance .env still uses
+# only the old plain name, offer to rename it in place. Fires only on a genuine
+# migration case (prefixed missing AND plain present), so instances that omit
+# the setting entirely are never nagged. Declining is safe — the plain name is
+# still read as a legacy fallback by both these scripts and the server.
+function Migrate-DevEnvTypeName([string]$envFile) {
+    $prefixed = Get-EnvValue $envFile 'D365FO_DEV_ENVIRONMENT_TYPE'
+    $plain    = Get-EnvValue $envFile 'DEV_ENVIRONMENT_TYPE'
+    if ($prefixed -or (-not $plain)) { return }
+
+    Write-Host ''
+    Write-Host 'NOTE: the dev-environment-type setting has been renamed.' -ForegroundColor Yellow
+    Write-Host '  Old: DEV_ENVIRONMENT_TYPE' -ForegroundColor Yellow
+    Write-Host "  New: D365FO_DEV_ENVIRONMENT_TYPE  (current value: $plain)" -ForegroundColor Yellow
+    Write-Host ''
+    $answer = Read-Host 'Rename it in this .env now? [Y/n]'
+    if ($answer -eq 'n') {
+        Write-Host '  Left unchanged (the old name still works as a legacy fallback).' -ForegroundColor DarkGray
+        return
+    }
+
+    $content = Get-Content $envFile -Raw
+    $content = $content -replace '(?m)^(\s*)DEV_ENVIRONMENT_TYPE(\s*=)', '${1}D365FO_DEV_ENVIRONMENT_TYPE${2}'
+    Set-Content -Path $envFile -Value $content -NoNewline
+    Write-Host '  Renamed DEV_ENVIRONMENT_TYPE -> D365FO_DEV_ENVIRONMENT_TYPE' -ForegroundColor Cyan
+}
+
 # ── Helper: rebuild a single instance ───────────────────────────────────────
 function Rebuild-SingleInstance([System.IO.DirectoryInfo]$inst) {
     $envFile = Join-Path $inst.FullName '.env'
@@ -122,6 +162,7 @@ function Rebuild-SingleInstance([System.IO.DirectoryInfo]$inst) {
     Write-Host "Config: $envFile" -ForegroundColor DarkGray
     Write-Host ('=' * 60) -ForegroundColor DarkGray
 
+    Migrate-DevEnvTypeName $envFile
     Normalize-XppConfigName $envFile
 
     Write-Host ''

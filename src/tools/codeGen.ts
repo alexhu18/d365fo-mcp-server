@@ -7,6 +7,7 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { resolveObjectPrefix, applyObjectPrefix, deriveExtensionInfix, getObjectSuffix, applyObjectSuffix } from '../utils/modelClassifier.js';
 import { getConfigManager } from '../utils/configManager.js';
+import { enforceGrounding } from '../utils/provenanceStore.js';
 
 const CodeGenArgsSchema = z.object({
   pattern: z
@@ -46,13 +47,19 @@ const CodeGenArgsSchema = z.object({
       'Defaults to "process" when omitted. ' +
       'Example: serviceMethod="processOrders" → generates processOrders() on the Service class.'
     ),
+  groundingToken: z.string().optional()
+    .describe(
+      'Provenance token from prepare_change(). Required for extension patterns when ' +
+      'GROUNDING_ENFORCE=true. Proves the AI queried the real D365FO codebase before generating code.'
+    ),
 });
 
 // Templates for NEW elements: (name already includes prefix)
 const newElementTemplates: Record<string, (name: string) => string> = {
   class: (name) => `
 /// <summary>
-/// ${name} class
+/// Implements business logic and operations for the ${name} process.
+/// TODO: Add a more specific description of what this class is responsible for.
 /// </summary>
 public class ${name}
 {
@@ -64,12 +71,12 @@ public class ${name}
 
   runnable: (name) => `
 /// <summary>
-/// Runnable class ${name}
+/// Runnable entry point that executes the ${name} operation directly.
 /// </summary>
 internal final class ${name}
 {
     /// <summary>
-    /// Entry point
+    /// Entry point called by the menu item. Creates an instance and calls run().
     /// </summary>
     public static void main(Args _args)
     {
@@ -78,7 +85,8 @@ internal final class ${name}
     }
 
     /// <summary>
-    /// Run method
+    /// Executes the ${name} business logic.
+    /// TODO: Add a description of what this method processes.
     /// </summary>
     public void run()
     {
@@ -122,12 +130,13 @@ internal final class ${name}
 
   'batch-job': (name) => `
 /// <summary>
-/// Batch job controller for ${name}
+/// Controller that orchestrates the ${name} batch operation.
+/// Extends SysOperationServiceController — handles dialog, pack/unpack, and execution mode.
 /// </summary>
 class ${name}Controller extends SysOperationServiceController
 {
     /// <summary>
-    /// Entry point
+    /// Entry point called by the menu item action. Launches the SysOperation dialog.
     /// </summary>
     public static void main(Args _args)
     {
@@ -150,12 +159,14 @@ class ${name}Controller extends SysOperationServiceController
 }
 
 /// <summary>
-/// Batch job service for ${name}
+/// Service class that implements the ${name} batch processing logic.
+/// Called by the controller via the SysOperation framework.
 /// </summary>
 class ${name}Service extends SysOperationServiceBase
 {
     /// <summary>
-    /// Process batch job
+    /// Processes the ${name} batch operation. Called by the controller.
+    /// TODO: Add a description of what records or data this processes.
     /// </summary>
     public void process()
     {
@@ -468,6 +479,10 @@ const extensionTemplates: Record<string, (baseName: string, prefix: string) => s
 function sysOperationTemplate(name: string, serviceMethod = 'process'): string {
   return `
 // ── 1. DataContract ─────────────────────────────────────────────────────
+/// <summary>
+/// Data contract for the ${name} SysOperation. Stores user-supplied parameters
+/// that are serialized between the dialog and the service class.
+/// </summary>
 [DataContractAttribute]
 public final class ${name}DataContract
 {
@@ -516,7 +531,9 @@ class ${name}Controller extends SysOperationServiceController
 
 // ── 3. Service ───────────────────────────────────────────────────────────
 /// <summary>
-/// Service class for ${name}.
+/// Service class that contains the business logic for the ${name} operation.
+/// The method marked [SysEntryPointAttribute] is called by the controller.
+/// TODO: Add a description of what data or records this operation processes.
 /// </summary>
 class ${name}Service extends SysOperationServiceBase
 {
@@ -666,6 +683,9 @@ function ssrsReportFullTemplate(name: string): string {
 // ══════════════════════════════════════════════════════════════════
 
 // ── 1. DataContract ─────────────────────────────────────────────────────────
+/// <summary>
+/// Data contract for the ${name} SSRS report. Holds filter parameters shown in the dialog.
+/// </summary>
 [DataContractAttribute]
 public final class ${name}Contract
 {
@@ -690,6 +710,9 @@ public final class ${name}Contract
 }
 
 // ── 2. Data Provider ────────────────────────────────────────────────────────
+/// <summary>
+/// Data provider for the ${name} SSRS report. Fills the TmpTable used as the report dataset.
+/// </summary>
 [SRSReportParameterAttribute(classStr(${name}Contract))]
 public class ${name}DP extends SRSReportDataProviderBase
 {
@@ -720,6 +743,9 @@ public class ${name}DP extends SRSReportDataProviderBase
 }
 
 // ── 3. Controller ────────────────────────────────────────────────────────────
+/// <summary>
+/// Controller that binds the ${name} SSRS report to its contract and launches the dialog.
+/// </summary>
 public class ${name}Controller extends SrsReportRunController
 {
     public static void main(Args _args)
@@ -1828,6 +1854,15 @@ export async function codeGenTool(request: CallToolRequest) {
       };
     } else if (EXTENSION_PATTERNS.has(args.pattern)) {
       // Extension pattern — args.name is the BASE element; prefix becomes the infix
+
+      // Grounding enforcement: extension patterns require proof that the AI looked at the
+      // real codebase (via prepare_change) before generating extension code.
+      const groundingError = enforceGrounding(
+        args.groundingToken,
+        `generate_code(pattern="${args.pattern}", name="${args.name}")`,
+        args.name,
+      );
+      if (groundingError) return groundingError;
 
       // ── form-datasource-extension / form-control-extension (3-param templates) ──
       if (args.pattern === 'form-datasource-extension') {

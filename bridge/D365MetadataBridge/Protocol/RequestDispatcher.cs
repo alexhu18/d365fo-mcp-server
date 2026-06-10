@@ -120,7 +120,12 @@ namespace D365MetadataBridge.Protocol
                     case "searchobjects":
                         return HandleMetadata(request, () =>
                         {
-                            var type = request.GetStringParam("type") ?? "all";
+                            // The TS bridge client sends the type filter under "objectType";
+                            // accept both keys so the filter is honored either way (and never
+                            // silently downgraded to an unfiltered "all" search).
+                            var type = request.GetStringParam("type")
+                                ?? request.GetStringParam("objectType")
+                                ?? "all";
                             var query = request.GetStringParam("query")
                                 ?? throw new ArgumentException("Missing parameter: query");
                             var maxResults = request.GetIntParam("maxResults") ?? 50;
@@ -651,7 +656,8 @@ namespace D365MetadataBridge.Protocol
                                 ?? request.GetIntParam("value")
                                 ?? throw new ArgumentException("Missing: enumValue");
                             return _writeService!.AddEnumValue(enumName, valueName, value,
-                                request.GetStringParam("label"));
+                                request.GetStringParam("label"),
+                                request.GetStringParam("countryRegionCodes"));
                         });
 
                     case "modifyenumvalue":
@@ -984,7 +990,7 @@ namespace D365MetadataBridge.Protocol
                                         int.TryParse(ev?.ToString(), out enumVal);
                                     writeResult = _writeService.AddEnumValue(objectName,
                                         S("enumValueName") ?? S("valueName") ?? throw new ArgumentException("Missing: enumValueName"),
-                                        enumVal, S("label"));
+                                        enumVal, S("label"), S("countryRegionCodes"));
                                 }
                                 break;
 

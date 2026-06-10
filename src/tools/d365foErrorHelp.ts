@@ -380,6 +380,20 @@ function formatEntry(entry: ErrorEntry, context?: string): string {
 
 // ─── Tool Handler ────────────────────────────────────────────────────────────
 
+/**
+ * Programmatic lookup against ERROR_DB — used by build_d365fo_project to
+ * enrich structured compiler diagnostics with a fix hint without an extra
+ * tool round-trip. Returns the best match or undefined.
+ */
+export function lookupErrorFix(errorText: string): { title: string; fix: string[] } | undefined {
+  const scored = ERROR_DB
+    .map(entry => ({ entry, score: scoreError(entry, errorText, undefined) }))
+    .filter(s => s.score > 0)
+    .sort((a, b) => b.score - a.score);
+  if (scored.length === 0) return undefined;
+  return { title: scored[0].entry.title, fix: scored[0].entry.fix };
+}
+
 export function d365foErrorHelpTool(request: CallToolRequest) {
   try {
     const args = D365foErrorHelpArgsSchema.parse(request.params.arguments);

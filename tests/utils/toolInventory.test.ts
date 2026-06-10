@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { LOCAL_TOOLS } from '../../src/server/serverMode';
+import { TOOL_ANNOTATIONS } from '../../src/server/toolAnnotations';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,8 +30,8 @@ describe('tool inventory contract', () => {
   });
 
   it('exposes the expected total tool count', () => {
-    expect(mcpServerToolNames).toHaveLength(54);
-    expect(startupCatalogToolNames).toHaveLength(54);
+    expect(mcpServerToolNames).toHaveLength(58);
+    expect(startupCatalogToolNames).toHaveLength(58);
   });
 
   it('keeps local-only tool set aligned with the published tool inventory', () => {
@@ -40,7 +41,35 @@ describe('tool inventory contract', () => {
     }
 
     expect(LOCAL_TOOLS.size).toBe(25);
-    expect(mcpServerToolNames.filter(name => !LOCAL_TOOLS.has(name))).toHaveLength(29);
+    expect(mcpServerToolNames.filter(name => !LOCAL_TOOLS.has(name))).toHaveLength(33);
+  });
+
+  it('has a tool annotation (title + hints) for every published tool', () => {
+    const annotated = new Set(Object.keys(TOOL_ANNOTATIONS));
+    for (const toolName of mcpServerToolNames) {
+      expect(annotated.has(toolName), `missing TOOL_ANNOTATIONS entry for '${toolName}'`).toBe(true);
+      const a = TOOL_ANNOTATIONS[toolName];
+      expect(a.title.length, `empty title for '${toolName}'`).toBeGreaterThan(0);
+      expect(typeof a.readOnlyHint).toBe('boolean');
+      expect(a.openWorldHint).toBe(false);
+    }
+    // No orphan annotations for tools that no longer exist
+    const published = new Set(mcpServerToolNames);
+    for (const name of annotated) {
+      expect(published.has(name), `orphan TOOL_ANNOTATIONS entry '${name}'`).toBe(true);
+    }
+  });
+
+  it('marks write tools as non-read-only in annotations', () => {
+    const writeTools = [
+      'create_d365fo_file', 'modify_d365fo_file', 'create_label', 'rename_label',
+      'undo_last_modification', 'generate_smart_table', 'generate_smart_form',
+      'generate_smart_report', 'update_symbol_index', 'build_d365fo_project',
+      'trigger_db_sync', 'run_systest_class',
+    ];
+    for (const toolName of writeTools) {
+      expect(TOOL_ANNOTATIONS[toolName]?.readOnlyHint, `'${toolName}' must not be read-only`).toBe(false);
+    }
   });
 
   it('includes critical diagnostics and SDLC tools in both inventories', () => {

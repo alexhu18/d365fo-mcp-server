@@ -503,7 +503,7 @@ export async function tryBridgeSearch(
 ): Promise<ToolResult | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
-    const sr = await bridge.searchObjects(query, objectType);
+    const sr = await bridge.searchObjects(query, objectType, maxResults);
     if (!sr || sr.results.length === 0) return null;
 
     let out = `# Search: "${query}"${objectType ? ` (type: ${objectType})` : ''}\n\n`;
@@ -1076,7 +1076,7 @@ export async function bridgeAddField(
     };
   } catch (e) {
     console.error(`[BridgeAdapter] addField(${tableName}, ${fieldName}) failed: ${e}`);
-    return null;
+    return { success: false, message: String(e) };
   }
 }
 
@@ -1350,7 +1350,7 @@ export async function bridgeModifyField(
     };
   } catch (e) {
     console.error(`[BridgeAdapter] modifyField(${tableName}, ${fieldName}) failed: ${e}`);
-    return null;
+    return { success: false, message: String(e) };
   }
 }
 
@@ -1374,7 +1374,7 @@ export async function bridgeRenameField(
     };
   } catch (e) {
     console.error(`[BridgeAdapter] renameField(${tableName}, ${oldName} → ${newName}) failed: ${e}`);
-    return null;
+    return { success: false, message: String(e) };
   }
 }
 
@@ -1397,7 +1397,7 @@ export async function bridgeRemoveField(
     };
   } catch (e) {
     console.error(`[BridgeAdapter] removeField(${tableName}, ${fieldName}) failed: ${e}`);
-    return null;
+    return { success: false, message: String(e) };
   }
 }
 
@@ -1420,7 +1420,7 @@ export async function bridgeReplaceAllFields(
     };
   } catch (e) {
     console.error(`[BridgeAdapter] replaceAllFields(${tableName}) failed: ${e}`);
-    return null;
+    return { success: false, message: String(e) };
   }
 }
 
@@ -1433,10 +1433,11 @@ export async function bridgeAddEnumValue(
   valueName: string,
   value: number,
   label?: string,
+  countryRegionCodes?: string,
 ): Promise<{ success: boolean; message: string } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
-    const result = await bridge.addEnumValue(enumName, valueName, value, label);
+    const result = await bridge.addEnumValue(enumName, valueName, value, label, countryRegionCodes);
     return {
       success: result.success,
       message: result.success

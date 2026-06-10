@@ -7,6 +7,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { XppSymbol } from './types.js';
+import { isStandardModel } from '../utils/modelClassifier.js';
 
 /**
  * Detect if running in CI environment
@@ -22,6 +23,9 @@ export class XppSymbolIndex {
   private standardModels: string[] = [];
   private stmtCache: Map<string, Database.Statement> = new Map();
   private labelsStmtCache: Map<string, Database.Statement> = new Map();
+  // Buffer for property_stats observations — flushed once per model (batch INSERT)
+  // Key: "nodeType|property|value|model", Value: accumulated count
+  private propStatBuffer: Map<string, number> = new Map();
 
   // ─── Read-only connection pool ───────────────────────────────────────────────
   // SQLite WAL mode allows N concurrent readers + 1 writer without blocking each
@@ -567,6 +571,36 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_mit_name ON menu_item_targets(menu_item_name);
       CREATE INDEX IF NOT EXISTS idx_mit_target ON menu_item_targets(target_object);
       CREATE INDEX IF NOT EXISTS idx_mit_model ON menu_item_targets(model);
+    `);
+
+    // ── Index Metadata (key-value) ───────────────────────────────────────────
+    // Small bookkeeping table: e.g. last_indexed_at drives the staleness
+    // detector in get_workspace_info.
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS _index_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+
+    // ── Property Statistics ──────────────────────────────────────────────────
+    // Distribution of metadata property values across STANDARD models, mined
+    // during build-database. Drives data-driven BP property rules in
+    // validate_xpp: "what does Microsoft actually set on this node type"
+    // instead of hardcoded rule tables. Presence is encoded as the special
+    // values '(present)' / '(absent)'.
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS property_stats (
+        node_type TEXT NOT NULL,
+        property TEXT NOT NULL,
+        value TEXT NOT NULL,
+        model TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (node_type, property, value, model)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ps_node_prop ON property_stats(node_type, property);
     `);
 
     // ── Extension Metadata ───────────────────────────────────────────────────
@@ -1146,6 +1180,10 @@ export class XppSymbolIndex {
         const deExtPath = path.join(modelPath, 'data-entity-extensions');
         if (fs.existsSync(deExtPath)) this.indexExtensions(deExtPath, model, 'data-entity-extension');
 
+        // Flush buffered property_stats observations (batch write — much faster than
+        // per-field upserts scattered across the transaction)
+        this.flushPropertyStats();
+
         // Mark model as done atomically with its data (same transaction)
         markProgress?.run(model, Date.now());
       });
@@ -1188,29 +1226,28 @@ export class XppSymbolIndex {
       this.createFTSTriggers();
       console.log(`   ✅ Indexed ${models.length} model(s) in ${duration}s (FTS rebuilt in ${ftsDuration}s)`);
     }
+
+    this.touchLastIndexed();
   }
 
   /**
    * Sort models by JSON file count descending.
    * Ensures the largest models (e.g. Foundation with 56K files) are indexed first,
    * so the most data is committed to disk before any CI pipeline timeout.
+   *
+   * Uses a single recursive readdirSync per model (Node 18.17+) instead of
+   * 20 separate readdirSync calls per subdirectory — ~20× fewer syscalls.
    */
   private sortModelsBySize(metadataPath: string, models: string[]): string[] {
-    const subdirs = [
-      'classes', 'tables', 'forms', 'queries', 'views', 'enums', 'edts', 'reports',
-      'security-privileges', 'security-duties', 'security-roles',
-      'menu-item-displays', 'menu-item-actions', 'menu-item-outputs',
-      'table-extensions', 'class-extensions', 'form-extensions',
-      'enum-extensions', 'edt-extensions', 'data-entity-extensions',
-    ];
     const sized = models.map(model => {
-      let count = 0;
       const modelPath = path.join(metadataPath, model);
-      for (const sub of subdirs) {
-        const p = path.join(modelPath, sub);
-        if (fs.existsSync(p)) {
-          count += fs.readdirSync(p).filter(f => f.endsWith('.json')).length;
-        }
+      let count = 0;
+      try {
+        // readdirSync with recursive:true returns all entries in one call (Node 18.17+)
+        const entries = fs.readdirSync(modelPath, { recursive: true }) as string[];
+        count = entries.filter(f => (f as string).endsWith('.json')).length;
+      } catch {
+        // Unreadable model directory — treat as empty (will be sorted last)
       }
       return { model, count };
     });
@@ -1351,6 +1388,9 @@ export class XppSymbolIndex {
           filePath: sourceFilePath,
           model,
         });
+
+        // Mine property distribution for data-driven BP rules (standard models only)
+        this.recordTablePropertyStats(tableData, model);
 
         // Add field symbols
         if (tableData.fields && Array.isArray(tableData.fields)) {
@@ -1886,6 +1926,130 @@ export class XppSymbolIndex {
     }
   }
 
+  // ─── Index freshness bookkeeping ────────────────────────────────────────────
+
+  /** Record "the index was (re)built/updated now" — drives staleness detection. */
+  touchLastIndexed(): void {
+    try {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO _index_meta (key, value) VALUES ('last_indexed_at', ?)`,
+      ).run(new Date().toISOString());
+    } catch {
+      // Bookkeeping is best-effort
+    }
+  }
+
+  /** ISO timestamp of the last full or incremental index update, or null. */
+  getLastIndexedAt(): string | null {
+    try {
+      const row = this.getReadDb().prepare(
+        `SELECT value FROM _index_meta WHERE key = 'last_indexed_at'`,
+      ).get() as { value: string } | undefined;
+      return row?.value ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── Property statistics (data-driven BP rules) ────────────────────────────
+
+  /**
+   * Record one observation of a metadata property value.
+   * Presence checks use the special values '(present)' / '(absent)'.
+   */
+  recordPropertyStat(nodeType: string, property: string, value: string, model: string): void {
+    // Buffer observations in memory; flushed to DB in batch by flushPropertyStats()
+    const key = `${nodeType}|${property}|${value}|${model}`;
+    this.propStatBuffer.set(key, (this.propStatBuffer.get(key) ?? 0) + 1);
+  }
+
+  /**
+   * Flush all buffered property_stats observations to the database in a single
+   * batch. Call once at the end of each model's transaction. The buffer is
+   * cleared after flushing so repeated calls are safe.
+   */
+  flushPropertyStats(): void {
+    if (this.propStatBuffer.size === 0) return;
+    let stmt = this.stmtCache.get('flushPropertyStat');
+    if (!stmt) {
+      stmt = this.db.prepare(`
+        INSERT INTO property_stats (node_type, property, value, model, count)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(node_type, property, value, model) DO UPDATE SET count = count + excluded.count
+      `);
+      this.stmtCache.set('flushPropertyStat', stmt);
+    }
+    for (const [key, count] of this.propStatBuffer) {
+      const [nodeType, property, value, model] = key.split('|');
+      stmt.run(nodeType, property, value, model, count);
+    }
+    this.propStatBuffer.clear();
+  }
+
+  /**
+   * Ratio of '(present)' observations for a property across all mined models.
+   * Returns total=0 when no statistics exist (validate_xpp falls back to
+   * static defaults in that case).
+   */
+  getPropertyPresenceRatio(nodeType: string, property: string): { present: number; total: number; ratio: number } {
+    const rows = this.getReadDb().prepare(
+      `SELECT value, SUM(count) AS c FROM property_stats
+       WHERE node_type = ? AND property = ? GROUP BY value`,
+    ).all(nodeType, property) as Array<{ value: string; c: number }>;
+    let present = 0;
+    let total = 0;
+    for (const row of rows) {
+      total += row.c;
+      if (row.value === '(present)') present += row.c;
+    }
+    return { present, total, ratio: total > 0 ? present / total : 0 };
+  }
+
+  /** Most common values for a property, ordered by observation count. */
+  getPropertyValueDistribution(
+    nodeType: string,
+    property: string,
+    limit = 10,
+  ): Array<{ value: string; count: number }> {
+    return this.getReadDb().prepare(
+      `SELECT value, SUM(count) AS count FROM property_stats
+       WHERE node_type = ? AND property = ? AND value NOT IN ('(present)', '(absent)')
+       GROUP BY value ORDER BY count DESC LIMIT ?`,
+    ).all(nodeType, property, limit) as Array<{ value: string; count: number }>;
+  }
+
+  /**
+   * Mine property statistics from one parsed table JSON. Only standard
+   * (Microsoft) models are mined — the stats answer "what does the standard
+   * platform do", not "what did our customizations do".
+   */
+  private recordTablePropertyStats(tableData: any, model: string): void {
+    if (!isStandardModel(model)) return;
+    const presence = (v: unknown) => (v ? '(present)' : '(absent)');
+    try {
+      // xmlParser defaults label to the table name — same value means no real label
+      const hasLabel = !!tableData.label && tableData.label !== tableData.name;
+      this.recordPropertyStat('AxTable', 'Label', presence(hasLabel), model);
+      this.recordPropertyStat('AxTable', 'TableGroup', tableData.tableGroup || '(absent)', model);
+      this.recordPropertyStat('AxTable', 'PrimaryIndex', presence(tableData.primaryIndex), model);
+      this.recordPropertyStat('AxTable', 'ClusteredIndex', presence(tableData.clusteredIndex), model);
+      const indexes = Array.isArray(tableData.indexes) ? tableData.indexes : [];
+      this.recordPropertyStat(
+        'AxTable', 'AlternateKeyIndex',
+        presence(indexes.some((i: any) => i?.unique)), model,
+      );
+      const fields = Array.isArray(tableData.fields) ? tableData.fields : [];
+      for (const field of fields) {
+        this.recordPropertyStat(
+          'AxTableField', 'ExtendedDataType',
+          presence(field?.extendedDataType || field?.enumType), model,
+        );
+      }
+    } catch {
+      // Statistics are best-effort — never fail the indexing pass
+    }
+  }
+
   /**
    * Get class methods for autocomplete
    */
@@ -2348,6 +2512,7 @@ export class XppSymbolIndex {
     this.db.exec('DELETE FROM security_role_duties');
     this.db.exec('DELETE FROM menu_item_targets');
     this.db.exec('DELETE FROM extension_metadata');
+    this.db.exec('DELETE FROM property_stats');
     this.vacuum();
   }
 
@@ -2376,6 +2541,7 @@ export class XppSymbolIndex {
       this.db.prepare(`DELETE FROM security_role_duties WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM menu_item_targets WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM extension_metadata WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM property_stats WHERE model IN (${placeholders})`).run(...modelNames);
     });
     deleteAll();
 
@@ -2668,9 +2834,17 @@ export class XppSymbolIndex {
       return this.searchLabelsLike(query, opts);
     }
 
-    // Sanitize query for FTS5 (escape special chars)
+    // Sanitize query for FTS5 (strip chars that would cause a syntax error)
     const ftsQuery = query.replace(/['"*()]/g, ' ').trim();
-    if (!ftsQuery) return [];
+    // Route to LIKE when FTS5 would silently return 0 results:
+    // • '_' and '%' — word separators in the unicode61 tokenizer (also LIKE wildcards);
+    //   literal underscore/percent searches must go through LIKE with proper escaping.
+    // • Any query whose alphanumeric content disappears after sanitization (e.g. '-',
+    //   '.', '@', ':', '@SYS:') produces zero FTS5 tokens and no exception to trigger
+    //   the catch-based fallback below.
+    if (/[_%]/.test(query) || !/[a-zA-Z0-9]/.test(ftsQuery)) {
+      return this.searchLabelsLike(query, opts);
+    }
 
     // Cache statement keyed by which optional filters are active (4 variants)
     const stmtKey = `searchLabels_${model ? 'model' : 'nomodel'}_${labelFileId ? 'lfid' : 'nolfid'}`;
@@ -2710,7 +2884,10 @@ export class XppSymbolIndex {
     opts: { language?: string; model?: string; labelFileId?: string; limit?: number } = {},
   ): any[] {
     const { language = 'en-US', model, labelFileId, limit = 30 } = opts;
-    const pattern = `%${query}%`;
+    // Escape LIKE special characters so the query is treated as a literal substring.
+    // '\' is the escape character declared in the SQL ESCAPE clause below.
+    const escaped = query.replace(/[\\%_]/g, '\\$&');
+    const pattern = `%${escaped}%`;
 
     const stmtKey = `searchLabelsLike_${model ? 'model' : 'nomodel'}_${labelFileId ? 'lfid' : 'nolfid'}`;
     let stmt = this.labelsStmtCache.get(stmtKey);
@@ -2718,7 +2895,7 @@ export class XppSymbolIndex {
       let sql = `
         SELECT label_id, label_file_id, model, language, text, comment, file_path, 0 as rank
         FROM labels
-        WHERE (text LIKE ? OR label_id LIKE ?)
+        WHERE (text LIKE ? ESCAPE '\\' OR label_id LIKE ? ESCAPE '\\')
           AND LOWER(language) = LOWER(?)`;
       if (model)       sql += `\n          AND model = ?`;
       if (labelFileId) sql += `\n          AND label_file_id = ?`;

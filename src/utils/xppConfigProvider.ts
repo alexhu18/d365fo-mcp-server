@@ -13,6 +13,7 @@ export interface XppEnvironmentConfig {
   version: string;
   customPackagesPath: string;       // ModelStoreFolder
   microsoftPackagesPath: string;    // FrameworkDirectory
+  referencePackagesPaths: string[]; // ReferencePackagesPaths — all folders xppc should reference
   xrefDbName?: string;
   xrefDbServer?: string;
   description?: string;
@@ -100,13 +101,14 @@ export class XppConfigProvider {
           version: parsed.version,
           customPackagesPath: json.ModelStoreFolder,
           microsoftPackagesPath: json.FrameworkDirectory,
+          referencePackagesPaths: json.ReferencePackagesPaths ?? [],
           xrefDbName: json.CrossReferencesDatabaseName,
           xrefDbServer: json.CrossReferencesDbServerName,
           description: json.Description,
           fullFilename: entry.name.replace(/\.json$/, ''),
         });
-      } catch {
-        // Skip malformed files
+      } catch (err) {
+        console.warn(`[XppConfigProvider] Skipping malformed config "${entry.name}":`, err instanceof SyntaxError ? 'invalid JSON' : String(err));
       }
     }
 

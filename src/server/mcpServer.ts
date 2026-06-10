@@ -16,6 +16,7 @@ import { registerWorkspaceResources } from '../resources/workspaceResource.js';
 import { registerCodeReviewPrompt } from '../prompts/codeReview.js';
 import type { XppServerContext } from '../types/context.js';
 import { SERVER_MODE, LOCAL_TOOLS } from './serverMode.js';
+import { TOOL_ANNOTATIONS } from './toolAnnotations.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { setLastRoots, recordRootsListChanged } from '../utils/stdioSessionInfo.js';
 
@@ -137,6 +138,14 @@ export function createXppMcpServer(context: XppServerContext): Server {
       process.stderr.write(`[mcpServer] ℹ️  HTTP mode — skipping roots/list (transport is request-response only)\n`);
       return;
     }
+    // Instanced mode: .mcp.json / env vars already provide both model name and
+    // workspace path — the workspace is fully known and immutable per instance.
+    // Skipping the call avoids a -32001 timeout when mcp-remote is the transport
+    // (hard-coded 60 s timeout, server-initiated requests cannot complete over HTTP).
+    if (await getConfigManager().isStaticallyConfigured()) {
+      process.stderr.write(`[mcpServer] ℹ️  Static config complete — skipping roots/list (instanced mode)\n`);
+      return;
+    }
     try {
       const result = await server.request(
         { method: 'roots/list', params: {} },
@@ -157,6 +166,12 @@ export function createXppMcpServer(context: XppServerContext): Server {
     );
     const isHttpMode = !!process.env.WEBSITES_PORT || process.env.MCP_FORCE_HTTP === 'true';
     if (!server.getClientCapabilities()?.roots || isHttpMode) {
+      return;
+    }
+    // Instanced mode: workspace is immutable per server instance — the
+    // notification is irrelevant and the request would time out over mcp-remote.
+    if (await getConfigManager().isStaticallyConfigured()) {
+      process.stderr.write(`[mcpServer] ℹ️  Static config complete — skipping roots/list on change (instanced mode)\n`);
       return;
     }
     try {
@@ -184,24 +199,7 @@ export function createXppMcpServer(context: XppServerContext): Server {
       tools: [
         {
           name: 'search',
-          description: `🔍 Search 584,799+ pre-indexed D365FO objects by exact name (e.g., "CustTable", "SalesFormLetter") or keywords (e.g., "dimension helper", "validation table"). Returns basic info: name, type, model.
-
-Use WHEN:
-- You don't know the exact object name
-- Exploring what exists in standard D365FO
-- Quick discovery before detailed analysis with get_class_info() or get_table_info()
-
-Use get_class_info() or get_table_info() INSTEAD when:
-- You already know the exact name AND need full source code/methods
-- You need complete structure (all methods with implementations)
-
-Use batch_search() INSTEAD when:
-- You need to search for multiple objects at once → 3x faster
-
-Examples:
-- "CustTable" → finds CustTable table
-- "sales helper" → finds SalesHelper, SalesFormLetterHelper, etc.
-- "dimension" with type="class" → finds all classes with "dimension" in name`,
+          description: 'Search pre-indexed D365FO objects by name or keywords. Returns name, type, model. Use batch_search for multiple queries. Use get_class_info/get_table_info when you already know the exact name and need full details.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -233,22 +231,7 @@ Examples:
         },
         {
           name: 'batch_search',
-          description: `Execute multiple X++ symbol searches in parallel within a single request.
-
-This tool enables efficient exploration by running independent searches concurrently,
-reducing HTTP round-trip overhead and total execution time.
-
-Use cases:
-- Exploring multiple related concepts simultaneously (e.g., "dimension", "helper", "validation")
-- Comparing different search queries at once
-- Reducing workflow time for exploratory searches
-
-Performance:
-- 3 sequential searches: ~150ms (3 HTTP requests)
-- 3 parallel searches: ~50ms (1 HTTP request) → 3x faster
-
-Workspace-aware: Each query can optionally include workspace files by specifying
-workspacePath and includeWorkspace parameters.`,
+          description: 'Execute multiple symbol searches in parallel (max 10). 3x faster than sequential search calls. Supports deduplication and cross-referencing across results.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -331,27 +314,7 @@ workspacePath and includeWorkspace parameters.`,
         },
         {
           name: 'search_extensions',
-          description: `🔍 Search ONLY custom/ISV code, filtering out 500,000+ Microsoft standard objects. Essential for finding YOUR modifications vs. Microsoft's standard code.
-
-Filters to models tagged as:
-- Custom (your company's modifications)
-- ISV (third-party vendor extensions)  
-- VAR (partner extensions)
-
-Use WHEN:
-- Finding "what did WE change?"
-- Identifying custom extensions for a standard object (e.g., "CustTable")
-- Avoiding confusion between Microsoft standard code and your modifications
-- You only want to see custom/ISV classes, not the 500K+ Microsoft objects
-
-⚠️ READ-ONLY REFERENCE TOOL: Results show WHERE existing objects live. The model names in results are SOURCE models of those existing objects. They are NOT suggestions for where to create new objects.
-❌ NEVER use a model name from search_extensions results as the target for create_d365fo_file, create_label, or modify_d365fo_file.
-✅ The target model for ALL create/modify operations is ALWAYS from .mcp.json (modelName/projectPath).
-
-Examples:
-- "CustTable" → finds only YourCompany_CustTable_Extension (NOT Microsoft's CustTable)
-- "sales" with prefix="Contoso" → finds ContosoSalesHelper, ContosoSalesValidator
-- "dimension" → finds only YOUR custom dimension classes`,
+          description: 'Search only custom/ISV objects, filtering out Microsoft standard code. Model names in results are SOURCE models — never use them as target for create/modify operations.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -364,31 +327,7 @@ Examples:
         },
         {
           name: 'get_class_info',
-          description: `📊 Get COMPLETE class definition with ALL methods, full source code, inheritance chain, and attributes. Returns the ENTIRE class as if you opened the file in Visual Studio.
-
-Returns:
-- All methods with FULL signatures AND source code implementations
-- Inheritance (extends, implements interfaces)
-- Class attributes ([ExtensionOf], [SysObsolete], etc.)
-- All private/protected/public/static methods
-- Class-level properties
-
-Use WHEN:
-- You need to see method implementations (not just names)
-- Understanding class architecture before extending it
-- Creating Chain of Command (CoC) extensions (combine with get_method_signature())
-- Analyzing how a specific class works internally
-
-Use code_completion() INSTEAD when:
-- You only need method/field NAMES (IntelliSense-like)
-- You don't need source code implementations
-
-Use search() FIRST when:
-- You don't know the exact class name yet
-
-Examples:
-- get_class_info("SalesFormLetter") → returns full class with 50+ methods and complete source
-- get_class_info("CustTable") → returns table with fields + methods like validateWrite(), insert()`,
+          description: 'Get class definition: methods (signatures or full source), inheritance, attributes. Default compact=true returns signatures only. Use get_method_source for specific method bodies. Use code_completion for name-only listing.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -403,33 +342,7 @@ Examples:
         },
         {
           name: 'get_table_info',
-          description: `📊 PRIMARY TOOL for ALL table queries! Get complete table schema with all fields, indexes, relations, AND table methods.
-
-⭐ USE THIS for ANY question about table methods, fields, or structure!
-
-Returns:
-- All table METHODS with signatures and source code (calcAmount, validateWrite, etc.)
-- All fields with explicit EDT marker when present (format: EDT: <Name> (base: <Type>)), otherwise base type (format: Type: <Type>)
-- Indexes: primary key, unique indexes, clustered indexes
-- Relations: foreign keys to other tables with cardinality
-- Table properties: caching strategy, TableGroup, SaveDataPerCompany, etc.
-
-Use WHEN (includes all table-related queries):
-- ✅ "What methods are on SalesTable?" → get_table_info("SalesTable")
-- ✅ "Methods related to totals on SalesTable" → get_table_info("SalesTable")
-- ✅ "Show me calc methods on CustTable" → get_table_info("CustTable")
-- ✅ Understanding table structure before writing X++ queries
-- ✅ Creating table extensions with new fields
-- ✅ Understanding data relationships (foreign keys, navigation)
-- ✅ Before writing data migration or integration scripts
-- ✅ Analyzing table methods and validation logic
-
-DO NOT USE code_completion() for tables - it doesn't work!
-
-Examples:
-- get_table_info("SalesTable") → ALL methods (calcAmount, validateWrite, etc.) + fields + relations
-- get_table_info("CustTable") → 100+ fields, methods, relations to DirParty/LogisticsPostalAddress
-- get_table_info("InventTable") → product master fields, methods, relations to EcoResProduct`,
+          description: 'Get complete table schema: fields (with EDT info), indexes, relations, methods, and properties. Primary tool for any table-related query. Do NOT use code_completion for tables.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -441,35 +354,7 @@ Examples:
         },
         {
           name: 'code_completion',
-          description: `⚡ Get IntelliSense-like method and field name completions for CLASSES only. Faster than get_class_info() when you only need member names, not implementations.
-
-⚠️ CLASSES ONLY - For TABLES use get_table_info() instead!
-
-Returns:
-- Method names with basic signatures (parameters, return types)
-- Field names with types
-- Filtered by prefix if specified (e.g., "calc*" finds calcAmount, calcDiscount)
-
-Use WHEN:
-- Working with X++ CLASSES (not tables)
-- Writing code and need to see available methods quickly
-- You want to filter by prefix for faster discovery
-- You don't need to see method source code
-
-DO NOT USE for TABLES:
-- ❌ code_completion("SalesTable") → Use get_table_info("SalesTable") instead
-- ❌ code_completion("CustTable") → Use get_table_info("CustTable") instead
-- ❌ For ANY table, always use get_table_info()
-
-Use get_class_info() INSTEAD when:
-- You need to see method SOURCE CODE implementations
-- You need to understand HOW methods work internally
-- Creating Chain of Command extensions (need full method body)
-
-Examples (CLASSES only):
-- code_completion("SalesFormLetter") → lists methods/fields of the CLASS
-- code_completion("NumberSeq", prefix="get") → getNum, getVoucher, etc.
-- code_completion("DimensionHelper", prefix="validate") → validation methods`,
+          description: 'IntelliSense-like member name completions for CLASSES only. Returns method/field names with basic signatures. Faster than get_class_info when you only need names. For tables, use get_table_info instead.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -483,46 +368,7 @@ Examples (CLASSES only):
         },
         {
           name: 'generate_code',
-          description: `🎯 GENERATE X++ CODE - Call this FIRST when user asks to CREATE/BUILD D365FO objects!
-
-WHEN TO USE (keywords):
-- "create" / "build" / "implement" / "add new" / "generate" / "make"
-- "batch job" = batch-job, "helper class" = helper class, "runnable" = runnable class
-- ANY request to create NEW D365FO class, batch job, form handler, data entity
-- "SysOperation" / "DataContract" / "event handler" / "security privilege" / "menu item"
-
-WORKFLOW (ALWAYS follow):
-1. Call analyze_code_patterns("description") → learn from existing code patterns
-2. Call generate_code(pattern, name) → get X++ source code template
-3. Call create_d365fo_file(objectType="class", objectName=name, sourceCode=<from step 2>, addToProject=true)
-
-PATTERNS (X++ code):
-- "batch-job" → Batch job (extends RunBaseBatch) with dialog, pack/unpack, contract class
-- "class" → Standard helper/utility class
-- "runnable" → Runnable class with main() method
-- "form-handler" → Form event handler (datasource/control event subscribers)
-- "data-entity" → Data entity with staging table
-- "table-extension" → Table extension [ExtensionOf(tableStr(TableName))]
-- "sysoperation" → Full SysOperation: DataContract + Controller + Service (3 classes)
-  Controller uses new() override with parmClassName/parmMethodName (standard D365FO pattern)
-  Optional: serviceMethod param to name the Service method (default: "process")
-- "event-handler" → Class with [SubscribesTo] handlers for table/class events
-
-PATTERNS (XML output — use for AOT XML files):
-- "security-privilege" → AxSecurityPrivilege XML (generates View + Maintain privilege pair)
-- "menu-item" → AxMenuItemDisplay/Action/Output XML
-
-EXAMPLES:
-- "Create SysOperation for processing orders"
-  → generate_code(pattern="sysoperation", name="ProcessOrders")
-- "Create SysOperation for processing orders with custom method name"
-  → generate_code(pattern="sysoperation", name="ProcessOrders", serviceMethod="processOrders")
-- "Create event handler for CustTable"
-  → generate_code(pattern="event-handler", name="CustTable")
-- "Create security privilege for CustTable form"
-  → generate_code(pattern="security-privilege", name="CustTable", targetObject="CustTable")
-- "Create menu item for CustTable form"
-  → generate_code(pattern="menu-item", name="CustTable", menuItemType="display", targetObject="CustTable")`,
+          description: 'Generate X++ code from patterns. Call analyze_code_patterns first, then generate_code, then create_d365fo_file. Patterns: batch-job, sysoperation, class, runnable, event-handler, table-extension, class-extension, form-handler, form-datasource-extension, form-control-extension, security-privilege, menu-item, ssrs-report-full, lookup-form, dialog-box, dimension-controller, number-seq-handler, data-entity, data-entity-staging, service-class-ais, business-event, custom-telemetry, feature-class, composite-entity, custom-service, er-custom-function, map-extension, display-menu-controller.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -581,26 +427,7 @@ EXAMPLES:
         },
         {
           name: 'analyze_code_patterns',
-          description: `🧠 Analyze YOUR actual codebase to find most common classes, methods, and dependencies used in a scenario. Essential for creating code based on REAL D365FO patterns, not generic examples.
-
-Searches YOUR codebase and returns:
-- Most frequently used classes for the scenario
-- Common method patterns and naming conventions
-- Typical dependencies and imports
-- Real-world implementation examples
-
-⚠️ CALL THIS FIRST before generating new code to learn from existing patterns.
-
-Use WHEN:
-- Before creating new classes → see how similar classes are structured
-- Before implementing business logic → find similar implementations  
-- Learning D365FO conventions in your organization
-- Understanding how others solved similar problems
-
-Examples:
-- analyze_code_patterns("ledger journal creation") → finds LedgerJournalEngine, journal posting classes
-- analyze_code_patterns("sales order validation") → finds SalesTable validation patterns
-- analyze_code_patterns("dimension", classPattern="Helper") → finds dimension helper classes`,
+          description: 'Analyze the codebase to find common classes, methods, and dependencies for a scenario. Call BEFORE generate_code to learn from existing real patterns.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -613,24 +440,7 @@ Examples:
         },
         {
           name: 'suggest_method_implementation',
-          description: `🧠 Find REAL implementation examples of similar methods in YOUR codebase. Shows how others implemented the same/similar method, not generic templates.
-
-Searches YOUR codebase and returns:
-- Real method implementations with similar name/purpose
-- Common patterns for method signature (parameters, return type)
-- Typical method body structure and logic flow
-- Dependencies and classes commonly used together
-
-Use WHEN:
-- Implementing a standard D365FO method (validateWrite, insert, update, etc.)
-- You know the method name but not how to implement it
-- Want to see real examples from your codebase
-- Creating Chain of Command extensions based on existing patterns
-
-Examples:
-- suggest_method_implementation("CustTable", "validateWrite") → shows how others validate customer data
-- suggest_method_implementation("SalesTable", "insert") → shows common insert() patterns
-- suggest_method_implementation("MyHelper", "calculate") → finds similar calculation methods`,
+          description: 'Find real implementation examples of similar methods in the codebase. Shows how others implemented the same/similar method with actual code.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -655,23 +465,7 @@ Examples:
         },
         {
           name: 'analyze_class_completeness',
-          description: `🧠 Analyze a class and suggest missing methods by comparing with similar classes. Helps ensure your class follows common D365FO patterns and conventions.
-
-Analyzes YOUR codebase and returns:
-- Methods that similar classes have but your class is missing
-- Common method patterns in the same class category
-- Suggestions for standard methods (validateWrite, find, exist, etc.)
-- Completeness score based on similar classes
-
-Use WHEN:
-- After creating a new class → check if you're missing important methods
-- Reviewing existing class → ensure it follows patterns
-- Before code review → identify gaps
-- Learning what methods a class typically needs
-
-Examples:
-- analyze_class_completeness("MyCustomerHelper") → suggests missing find(), exist(), validate()
-- analyze_class_completeness("MySalesProcessor") → compares with other processor classes`,
+          description: 'Analyze a class and suggest missing methods by comparing with similar classes in the codebase. Identifies gaps like missing find(), exist(), validate() methods.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -682,25 +476,7 @@ Examples:
         },
         {
           name: 'get_api_usage_patterns',
-          description: `🧠 Shows how a specific API/class is ACTUALLY used in YOUR codebase. Returns real initialization patterns and method call sequences, not documentation.
-
-Searches YOUR codebase and returns:
-- Common initialization patterns (how to create instances)
-- Typical method call sequences (what methods are called together and in what order)
-- Required setup/configuration before using the API
-- Common parameters and return value usage
-- Real usage examples from your code
-
-Use WHEN:
-- First time using a complex D365FO API/class
-- Need to understand correct initialization sequence
-- Want to see real examples instead of reading documentation
-- Understanding how others use a specific class
-
-Examples:
-- get_api_usage_patterns("LedgerJournalEngine") → shows initialization + posting sequence
-- get_api_usage_patterns("NumberSeq") → shows how to generate number sequences  
-- get_api_usage_patterns("DimensionAttributeValueSet") → dimension creation patterns`,
+          description: 'Show how a specific API/class is actually used in the codebase: initialization sequences, method call patterns, and common parameters.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -712,83 +488,18 @@ Examples:
         },
         {
           name: 'create_d365fo_file',
-          description: `🔥 CREATE D365FO FILE - REPLACES BUILT-IN create_file FOR ALL D365FO OBJECTS!
+          description: `Create D365FO AOT object file (.xml) in the correct PackagesLocalDirectory location with proper XML structure and UTF-8 BOM. Auto-adds to VS project (.rnrproj).
 
-🚨 WARNING: BUILT-IN create_file WILL CORRUPT D365FO METADATA! NEVER USE IT FOR .xml FILES!
+⚠️ THIS IS THE WRITE/COMPLETION STEP. Analysis tools (analyze_code_patterns, search, get_class_info/get_table_info, generate_code/generate_smart_*) only PREPARE the design — they do NOT create anything on disk. Once the design is known, you MUST CALL create_d365fo_file to actually write the file. Do NOT stop after analysis or after presenting generated code: the task is incomplete until this tool has run and returned success (isError=false).
 
-WHEN TO USE (MUST use for ANY D365FO object creation):
-- User asks to CREATE, BUILD, IMPLEMENT, GENERATE new class, table, enum, form, query, view, data entity, or SSRS report
-- Keywords: "create", "build", "implement", "add new", "generate", "make"
-- "batch job" = batch-job class, "helper class" = helper class, "runnable" = runnable class, "report" = objectType="report"
-- ANY request to create a new D365FO object
+On error this tool returns isError=true with a message (e.g. file already exists, Microsoft model blocked). Read it and fix/retry — never treat a ⚠️/❌ response as success.
 
-WHY NOT create_file:
-❌ create_file → Wrong XML structure, no UTF-8 BOM, doesn't add to VS project, breaks AOT
-✅ create_d365fo_file → Correct AOT location, UTF-8 BOM, auto-adds to .rnrproj, validates structure
+Object types: class, table, enum, form, query, view, data-entity, report, edt, security-privilege, security-duty, security-role, menu-item-display/action/output, menu, table/class/form/enum/edt/data-entity-extension, menu-item-*-extension, menu-extension, business-event, tile, kpi.
 
-WHAT IT DOES:
-- Creates physical XML file in correct AOT location (K:\\AosService\\PackagesLocalDirectory\\{Model}\\{Model}\\AxClass\\{Name}.xml)
-- Automatically adds file to Visual Studio project (.rnrproj) if addToProject=true
-- Auto-detects correct model name from workspace .rnrproj file
-- Generates proper XML structure with UTF-8 BOM encoding
+For extensions: objectName="BaseObject.PrefixExtension" (e.g. "CustTable.ContosoExtension").
+Model name auto-detected from .mcp.json. Object name prefix auto-applied from EXTENSION_PREFIX.
 
-REQUIRED PARAMETERS:
-- objectType: NEW objects → class, table, enum, form, query, view, data-entity, report, edt
-             SECURITY    → security-privilege (AxSecurityPrivilege)
-                           security-duty      (AxSecurityDuty)       ← NOT the same as privilege!
-                           security-role      (AxSecurityRole)
-             MENU ITEMS  → menu-item-display, menu-item-action, menu-item-output, menu
-             EXTENSIONS  → table-extension, form-extension, enum-extension, edt-extension,
-                           data-entity-extension, menu-item-display-extension,
-                           menu-item-action-extension, menu-item-output-extension, menu-extension
-  ⚠️ SECURITY RULE: ALWAYS use the matching type — duty ≠ privilege ≠ role:
-     security-privilege → AxSecurityPrivilege folder
-     security-duty      → AxSecurityDuty folder
-     security-role      → AxSecurityRole folder
-  ⚠️ EXTENSION RULE: Extending an EXISTING standard object? ALWAYS use the -extension variant:
-     "table-extension" → AxTableExtension folder, objectName = "BaseTable.PrefixExtension"
-     "form-extension"  → AxFormExtension folder,  objectName = "BaseForm.PrefixExtension"
-     NEVER use objectType="table" to create a table extension — wrong folder, broken AOT!
-- objectName: Name of the new object (e.g., "ProcessOpenOrdersBatch" for batch job)
-  For extensions: "BaseElement.PrefixExtension" (e.g., "CustTable.ContosoExtension")
-- modelName: Any value (auto-corrected from .rnrproj)
-- addToProject: true (to automatically add to VS project)
-
-IF A FILE WAS CREATED WITH WRONG objectType (e.g. "table" instead of "table-extension"):
-❌ NEVER use PowerShell Move-Item / Rename-Item / Copy-Item to fix it
-✅ Call create_d365fo_file again with the CORRECT objectType and overwrite=true
-
-WORKFLOW:
-1. generate_code(pattern="batch-job", name="MyBatch") → Get X++ code
-2. create_d365fo_file(objectType="class", objectName="MyBatch", sourceCode=<step 1>, addToProject=true)
-
-AXCLASS sourceCode FORMAT — CRITICAL:
-The sourceCode string for a class MUST follow this exact layout:
-  • Class header (attributes + class keyword + extends/implements) WITH member variable
-    declarations INSIDE the outer { } — this block becomes <Declaration>
-  • Method bodies follow AFTER the closing } of the class header — each becomes a <Method>
-
-Example (correct):
-  [DataContractAttribute]
-  public class MyClass extends MyBase
-  {
-      int globalPackageNumber;
-      Qty totalExportedQty;
-  }
-  public int globalPackageNumber(int _v = globalPackageNumber)
-  {
-      globalPackageNumber = _v;
-      return globalPackageNumber;
-  }
-
-Common mistakes:
-  ❌ Putting member variables OUTSIDE the class { } (they will be lost in <Declaration>)
-  ❌ Omitting the class { } block entirely (all content treated as one method)
-  ❌ Putting member variables inside a method body
-
-EXAMPLES:
-- "Create batch job for processing orders" → create_d365fo_file(objectType="class", objectName="ProcessOrdersBatch", addToProject=true)
-- "Create helper class for sales calculations" → create_d365fo_file(objectType="class", objectName="SalesCalculationHelper", addToProject=true)`,
+SourceCode format for classes: class declaration with member vars inside { }, methods after closing }.`,
           inputSchema: {
             type: 'object',
             properties: {
@@ -840,13 +551,15 @@ EXAMPLES:
                   'Additional properties for the object being created. Supported keys by objectType:\n' +
                   '• class:           extends, implements, isFinal, isAbstract\n' +
                   '• table:           label, tableGroup, tableType, titleField1, titleField2, fields[]\n' +
-                  '• enum:            label, isExtensible, enumValues[{name,value?,label?,helpText?}]\n' +
+                  '• enum:            label, useEnumValue, configurationKey, isExtensible, enumValues[{name,value?,label?,helpText?}]\n' +
+                  '• enum-extension:  enumValues[{name,label?,value?,countryRegionCodes?}]\n' +
                   '• table-extension: fields[{name,edt?,enumType?,label?,mandatory?,fieldType?}] — fieldType defaults to AxTableFieldString; use AxTableFieldEnum for enum-based fields (also set enumType)\n' +
                   '• edt:             label, extends, edtType, stringSize\n' +
                   '• form:            caption, formTemplate, dataSource\n' +
                   '• security-privilege: label, targetObject (menu item ObjectName), objectType (MenuItemDisplay|MenuItemAction|MenuItemOutput, default: MenuItemDisplay), accessLevel (view=Read only | maintain=Read+Update+Create+Delete, default: view)\n' +
                   '• menu-item-*:     label, object, objectType\n' +
                   'Example enum: properties={"label":"@ContosoExt:Status","enumValues":[{"name":"Open","label":"@ContosoExt:Open"},{"name":"Closed","label":"@ContosoExt:Closed"}]}\n' +
+                  'Example enum-extension: properties={"enumValues":[{"name":"MyValue","label":"@MyModel:MyValue","countryRegionCodes":"CZ"}]}\n' +
                   'Example table-extension (string EDT field): properties={"fields":[{"name":"ContosoField","edt":"CustAccount","label":"@Contoso:Customer"}]}\n' +
                   'Example table-extension (enum field): properties={"fields":[{"name":"ContosoStatus","enumType":"NoYes","fieldType":"AxTableFieldEnum","label":"@Contoso:Status"}]}'
               },
@@ -878,6 +591,13 @@ EXAMPLES:
                   'Default: false. ' +
                   '\u274c NEVER use PowerShell/create_file to overwrite D365FO objects \u2014 always use overwrite=true here.',
                 default: false,
+              },
+              groundingToken: {
+                type: 'string',
+                description:
+                  'Provenance token returned by prepare_change. Proves the change was grounded in the indexed codebase. ' +
+                  'Required for *-extension objectTypes when GROUNDING_ENFORCE=true on the server. ' +
+                  'The token is object-bound: it only authorizes writes to the object it was issued for.',
               },
             },
             required: ['objectType', 'objectName'],
@@ -915,7 +635,7 @@ EXAMPLES:
                 description: `Additional properties depending on objectType:
 - class/form/query/view: extends, implements, label
 - table: label, tableGroup, fields[]
-- enum: label, isExtensible, enumValues[{name,value?,label?,helpText?}]
+- enum: label, useEnumValue, configurationKey, isExtensible, enumValues[{name,value?,label?,helpText?}]
 - table-extension: fields[{name,edt?,enumType?,label?,mandatory?,fieldType?}] — fieldType defaults to AxTableFieldString; use AxTableFieldEnum for enum-based fields (also set enumType)
 - report (ALL REQUIRED for correct XML):
     dpClassName   {string}  Data Provider class name (e.g. "ContosoInventByZoneDP")
@@ -933,26 +653,7 @@ EXAMPLES:
         },
         {
           name: 'find_references',
-          description: `🔍 Find ALL references (where-used analysis) to a class, method, field, table, or enum across entire D365FO codebase. Essential for impact analysis before making changes.
-
-Searches 584,799+ objects and returns:
-- All classes/methods that reference the target
-- File locations and line numbers
-- Context of how it's used (method calls, instantiation, etc.)
-- Dependencies and impact scope
-
-Use WHEN:
-- Before modifying/deleting a class, method, or field → understand impact
-- Finding all places that use a specific API
-- Understanding dependencies and coupling
-- Impact analysis for refactoring
-- "Who calls this method?"
-
-Examples:
-- find_references("DimensionAttributeValueSet") → finds all classes using dimensions
-- find_references("validateWrite", targetType="method") → finds all validateWrite() calls
-- find_references("CustTable.AccountNum", targetType="field") → finds all uses of AccountNum field
-- find_references("SalesStatus", targetType="enum") → finds all SalesStatus enum usage`,
+          description: 'Find all references (where-used) to a class, method, field, table, or enum across the entire codebase. Essential for impact analysis before refactoring.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -977,7 +678,7 @@ Examples:
         },
         {
           name: 'modify_d365fo_file',
-          description: '⚠️ WINDOWS ONLY: Safely modifies an existing D365FO XML file (class, table, enum, form, query, view). Supports adding/removing/modifying methods and fields, modifying properties. Validates XML after modification. IMPORTANT: This tool MUST run locally on Windows D365FO VM - it CANNOT work through Azure HTTP proxy (Linux).',
+          description: '⚠️ WINDOWS ONLY: Safely modifies an existing D365FO XML file (class, table, enum, form, query, view). Supports adding/removing/modifying methods and fields, modifying properties. Validates XML after modification. IMPORTANT: This tool MUST run locally on Windows D365FO VM - it CANNOT work through Azure HTTP proxy (Linux).\n\n⚠️ APPLIES IMMEDIATELY — there is NO dry-run/preview mode. The moment this tool is called it writes the change to disk via IMetadataProvider.Update(). Therefore: BEFORE calling, describe the exact change you intend to make in chat and let the user confirm; only then call this tool to apply it. To revert, use undo_last_modification (git checkout), or pass createBackup=true to also keep a .bak copy. On success the response reports the applied operation. On error the response has isError=true with a message — read it and fix/retry; never treat a ⚠️/❌ response as success.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1229,36 +930,20 @@ Examples:
                 type: 'string',
                 description: 'Path to workspace for finding file'
               },
+              groundingToken: {
+                type: 'string',
+                description:
+                  'Provenance token returned by prepare_change. Proves the change was grounded in the indexed codebase. ' +
+                  'Required for *-extension objectTypes when GROUNDING_ENFORCE=true on the server. ' +
+                  'The token is object-bound: it only authorizes writes to the object it was issued for.',
+              },
             },
             required: ['objectType', 'objectName', 'operation'],
           },
         },
         {
           name: 'get_method_signature',
-          description: `⚙️ Get EXACT method signature including parameters, return type, and modifiers. CRITICAL for creating Chain of Command (CoC) extensions - incorrect signatures cause compilation errors.
-
-Returns:
-- Complete method signature with modifiers (public, protected, private, static, final)
-- All parameters with types and default values
-- Return type
-- Method attributes ([Hookable], [Replaceable], etc.)
-
-MANDATORY WORKFLOW for CoC extensions:
-1. get_method_signature(className, methodName) → get EXACT signature
-2. Copy signature EXACTLY (parameters, types, modifiers must match)
-3. Create extension with [ExtensionOf(classStr(...))] attribute
-4. Implement with next keyword for CoC pattern
-
-Use WHEN:
-- Creating Chain of Command extensions (REQUIRED)
-- Before overriding/extending methods
-- Need exact parameter types and default values
-- Verifying method accessibility (public/protected/private)
-
-Examples:
-- get_method_signature("CustTable", "validateWrite") → returns: public boolean validateWrite(boolean _insertMode = false)
-- get_method_signature("SalesTable", "insert") → returns: public void insert()
-- get_method_signature("NumberSeq", "num") → returns: public static NumberSeqCode num()`,
+          description: 'Get exact method signature (modifiers, return type, parameters, attributes). REQUIRED before creating CoC extensions — incorrect signatures cause compilation errors.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1276,25 +961,7 @@ Examples:
         },
         {
           name: 'get_method_source',
-          description: `📄 Get the full X++ source code of a specific method. Use this when you need to understand the complete implementation — business logic, conditions, loops, error handling — not just the signature.
-
-⚠️ ONLY call this for methods you have already confirmed exist via \`get_class_info\`. Never guess or infer a method name from D365FO conventions (e.g. parm*, find, exist) — the method may not be defined in this class. If unsure, call \`get_class_info\` first and pick the method name from the returned list.
-
-Returns:
-- Complete method body as X++ code
-- Method signature
-- Model name
-
-Use WHEN:
-- Analysing what a method actually does (not just its signature)
-- Understanding business logic before writing an extension
-- Reviewing validation rules, posting logic, or workflow steps
-- Comparing implementations across classes
-
-Examples:
-- get_method_source("SalesTable", "validateWrite") → full validation logic
-- get_method_source("CustTable", "insert") → complete insert implementation
-- get_method_source("InventUpd_Reservation", "updateReservation") → full reservation logic`,
+          description: 'Get the full X++ source code of a specific method. Only call for methods confirmed to exist via get_class_info — never guess method names.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1312,37 +979,7 @@ Examples:
         },
         {
           name: 'get_form_info',
-          description: `📋 Get complete D365FO form structure including datasources, control hierarchy (buttons, grids, tabs, groups), methods, and form architecture. Essential for form customization and extensions.
-
-Returns:
-- Datasources with fields, methods, and data source configuration
-- Control tree: ButtonGroups, Grids, Tabs, TabPages, Groups, Fields
-- Form methods (init, run, close, datasource methods)
-- Control properties (Visible, Enabled, Mandatory, etc.)
-- Event handlers and overrides
-
-Use WHEN:
-- Customizing forms with extensions
-- Understanding form structure before modifications
-- Finding control names for code extensions
-- Analyzing datasource relationships
-- Creating form event handlers
-
-⚡ FAST CONTROL LOOKUP — use searchControl parameter:
-  get_form_info("SalesTable", searchControl="General") returns only controls whose
-  name contains "General", with path, parent name, and children.
-  ❌ NEVER use PowerShell Get-Content or grep to find tab names in form XML.
-  ✅ ALWAYS use searchControl instead — this tool CAN read ALL D365FO forms.
-
-⚠️ If you receive a "could not be read from disk" warning, the response will include
-  a ready-to-use retry command with filePath= already filled in.
-  ❌ NEVER fall back to PowerShell when this happens — just retry with filePath.
-
-Examples:
-- get_form_info("SalesTable") → full structure with datasources, grids, tab hierarchy
-- get_form_info("CustTable", searchControl="General") → find the General tab exact name
-- get_form_info("PurchTable", searchControl="LineView") → find the LineView grid name
-- get_form_info("MyForm", filePath="K:\\\\AOSService\\\\...\\\\AxForm\\\\MyForm.xml") → bypass DB lookup`,
+          description: 'Get form structure: datasources, control hierarchy, methods, properties. Use searchControl parameter for fast control name lookup (e.g. searchControl="General" to find tab names). Retry with filePath if disk-read warning occurs.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1380,27 +1017,7 @@ Examples:
         },
         {
           name: 'get_query_info',
-          description: `📊 Get complete D365FO query structure including datasources, joins, ranges, field lists, sorting, and grouping. Essential for understanding and extending queries used by forms, reports, and data entities.
-
-Returns:
-- All datasources in the query hierarchy
-- Joins between datasources (inner, outer, exists, notexists) with relations
-- Ranges (WHERE clause filters) with field, value, enabled status
-- Field lists (SELECT clause)
-- Sorting and grouping configuration
-- Query methods and dynamic behavior
-
-Use WHEN:
-- Understanding query logic before modification
-- Creating query extensions to add datasources/ranges
-- Analyzing report or form data sources
-- Debugging query performance issues
-- Understanding data relationships in queries
-
-Examples:
-- get_query_info("CustTransOpenQuery") → open customer transactions query with date/status ranges
-- get_query_info("InventTransQuery") → inventory transactions with item/site joins
-- get_query_info("LedgerJournalTransQuery") → journal lines query structure`,
+          description: 'Get query structure: datasources, joins, ranges, field lists, sorting. Essential for understanding queries used by forms, reports, and data entities.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1423,27 +1040,7 @@ Examples:
         },
         {
           name: 'get_view_info',
-          description: `📊 Get complete D365FO view or data entity structure including mapped fields, data sources, computed columns, relations, methods, and view architecture. Essential for data entity development and OData integration.
-
-Returns:
-- All fields with data source mappings
-- Computed columns (unmapped fields with methods)
-- Underlying tables and relations
-- View methods and business logic
-- Data entity properties (Public, IsPublic, DataManagementEnabled)
-- Staging table configuration (for data entities)
-
-Use WHEN:
-- Developing data entities for integration
-- Understanding OData API structure
-- Creating view extensions with new fields
-- Analyzing data entity business logic
-- Understanding DMF (Data Management Framework) entities
-
-Examples:
-- get_view_info("GeneralJournalAccountEntryView") → ledger entry view with dimension fields
-- get_view_info("CustCustomerV3Entity") → customer OData entity with party/address mappings
-- get_view_info("SalesOrderHeaderV2Entity") → sales order integration entity`,
+          description: 'Get view or data entity structure: mapped fields, data sources, computed columns, relations, OData/DMF configuration. Use get_data_entity_info for OData-specific metadata.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1466,27 +1063,7 @@ Examples:
         },
         {
           name: 'get_enum_info',
-          description: `🔢 Get complete D365FO enum (enumeration) definition including all enum values, integer values, labels, and properties. Essential for understanding enum options and creating enum extensions.
-
-Returns:
-- All enum values with their names
-- Integer value for each enum element
-- Labels/descriptions for each value
-- Enum properties (UseEnumValue, ConfigurationKey, etc.)
-- Style configuration (for display)
-
-Use WHEN:
-- Understanding available enum values for a field
-- Creating enum extensions with new values
-- Writing code that checks enum values
-- Understanding enum integer values for database queries
-- Documenting enum options
-
-Examples:
-- get_enum_info("SalesStatus") → None=0, Backorder=1, Delivered=2, Invoiced=3, Canceled=4
-- get_enum_info("NoYes") → No=0, Yes=1 (most common boolean enum)
-- get_enum_info("CustAccountType") → Customer=0, Vendor=1, Employee=2, etc.
-- get_enum_info("BOMType") → BOM types for production orders`,
+          description: 'Get enum definition: all values with names, integer values, and labels. Use for understanding available options before writing code or extending enums.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1500,27 +1077,7 @@ Examples:
         },
         {
           name: 'get_edt_info',
-          description: `📊 Get complete Extended Data Type (EDT) definition including base type, labels, reference table, and EDT properties. EDT names are UNIQUE ACROSS ALL MODELS.
-
-Returns:
-- Core EDT properties (Extends, EnumType, ReferenceTable, StringSize, DisplayLength, etc.)
-- Label/help/configuration metadata
-- Additional raw EDT properties when present
-
-Use WHEN:
-- You need to inspect an EDT before using it on table fields
-- You need reference table / relation metadata from AxEdt
-- You need to validate EDT inheritance (Extends) and display constraints
-
-FALLBACK Strategy (if EDT not found with modelName):
-- EDT names are globally unique, so omit modelName and retry
-- Call get_edt_info(edtName="MyEdt") without modelName → will search ALL models
-- If first call fails with a specific modelName, ALWAYS retry without modelName
-
-Examples:
-- get_edt_info("WhsInboundShipmentOrderMessageRecId") → finds EDT regardless of model
-- If model-specific lookup fails, retry: get_edt_info("WhsInboundShipmentOrderMessageRecId") (no modelName)
-- get_edt_info("CustAccount") → Customer account number EDT`,
+          description: 'Get EDT definition: base type, extends, reference table, labels, string size. EDT names are globally unique — omit modelName if lookup fails. Use mode="hierarchy" for ancestor chain and field usages.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1544,27 +1101,7 @@ Examples:
         },
         {
           name: 'get_report_info',
-          description: `📄 Read AxReport XML structure directly — datasets, fields, designs, RDL summary.
-
-Use this INSTEAD of PowerShell Get-Content when studying an existing SSRS report.
-Returns structured info without running any shell commands.
-
-Returns:
-- DataSets: name, DataSourceType, Query string, all AxReportDataSetField entries (Name/Alias/DataType/Caption)
-- Designs: name, Caption, linked DataSet, Style, whether RDL is embedded
-- RDL summary (element counts: Tablix, groups, parameters, language) — use includeRdl=true for full RDL
-- DataMethods presence, EmbeddedImages count
-
-Use WHEN:
-- Studying an existing report before creating a similar one
-- Checking what fields/aliases a DataSet exposes
-- Verifying report structure after create_d365fo_file
-- Understanding RDL design without opening Report Designer
-
-Examples:
-- get_report_info("InventValue") → datasets, fields, design structure of InventValue report
-- get_report_info("ContosoInventByZone") → datasets + RDL summary
-- get_report_info("ContosoInventByZone", includeRdl=true) → full embedded RDL XML`,
+          description: 'Read AxReport XML: datasets, fields, designs, RDL summary. Use includeRdl=true for full RDL content. Use instead of PowerShell when studying existing SSRS reports.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1592,20 +1129,7 @@ Examples:
         },
         {
           name: 'search_labels',
-          description: `🏷️ Full-text search across indexed D365FO AxLabelFile labels. Search by text, label ID or comment to find existing labels before creating new ones.
-
-Returns matching label IDs, their translated text, developer comment and the X++ reference syntax (@LabelFileId:LabelId).
-
-Use WHEN:
-- Looking for an existing label to reuse (always do this BEFORE create_label!)
-- Finding the correct reference syntax for a label
-- Discovering what labels exist in a custom model
-- Searching for labels by keyword (e.g. "customer", "batch", "error")
-
-Examples:
-- search_labels("batch group") → finds MyFeature, BatchGroup, etc.
-- search_labels("MyFeature", model="MyModel") → labels in custom MyModel model
-- search_labels("feature", language="cs") → Czech translations`,
+          description: 'Full-text search across indexed D365FO label files. Search by text, label ID, or comment. Returns label IDs, translations, and @LabelFileId:LabelId reference syntax. ALWAYS search before create_label.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1635,23 +1159,7 @@ Examples:
         },
         {
           name: 'get_label_info',
-          description: `🏷️ Get all language translations for a D365FO label ID, or list available AxLabelFile IDs in a model.
-
-Returns:
-- All translations (en-US, cs, de, sk, and other indexed languages)
-- Developer comment
-- X++ reference syntax: @LabelFileId:LabelId
-- Ready-to-use code snippets for X++ and metadata XML
-
-Use WHEN:
-- Verifying that a label has translations in all required languages
-- Getting the correct @LabelFileId:LabelId reference to use in code
-- Listing which label files exist in a custom model (omit labelId)
-
-Examples:
-- get_label_info("MyFeature", model="MyModel") → all translations
-- get_label_info(model="MyModel") → list label files in MyModel
-- get_label_info("BatchGroup") → all languages for BatchGroup`,
+          description: 'Get all language translations for a label ID, or list available label files in a model. Returns translations, developer comment, and @LabelFileId:LabelId reference syntax.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1673,25 +1181,7 @@ Examples:
         },
         {
           name: 'create_label',
-          description: `🏷️ Add a new label to an existing AxLabelFile in a custom D365FO model.
-
-Writes the label into EVERY language .label.txt file that exists in the model, creates XML descriptors if missing, and updates the MCP label index.
-
-By default labels are inserted alphabetically. Set sortLabels=false (or LABEL_SORT_ORDER=append in env) to append new labels at the end preserving existing file order.
-
-⚠️ ALWAYS call search_labels first to check if a suitable label already exists!
-
-Process:
-1. Reads each existing .label.txt file for the model
-2. Checks for duplicate label ID
-3. Inserts the new label (alphabetically or appended, based on sortLabels)
-4. Writes the updated file back to disk
-5. Updates the SQLite label index
-
-Examples:
-- create_label("MyNewField", "MyModel", "MyModel", [{language:"en-US", text:"My new field"}, {language:"cs", text:"Moje nové pole"}])
-- create_label with createLabelFileIfMissing=true → creates AxLabelFile structure from scratch
-- create_label with sortLabels=false → appends the new label at the end of each .label.txt file`,
+          description: 'Add a new label to an existing AxLabelFile. Writes into every language .label.txt, creates XML descriptors if missing, updates SQLite index. ALWAYS call search_labels first. Label IDs describe meaning — never add model prefix.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1773,19 +1263,7 @@ Examples:
         },
         {
           name: 'rename_label',
-          description: `🏷️ Rename a D365FO label ID everywhere it is used.
-
-Renames the label in ALL of the following places:
-1. Every .label.txt file in the model (the label entry itself)
-2. Every X++ source file (.xpp) that references @LabelFileId:OldId
-3. Every XML metadata file that references @LabelFileId:OldId (Label, HelpText, Caption, etc.)
-4. Updates the MCP SQLite label index
-
-⚠️ Run with dryRun=true first to preview the impact before committing!
-
-Examples:
-- rename_label(oldLabelId="OldName", newLabelId="NewName", labelFileId="MyModel", model="MyModel", dryRun=true)
-- rename_label(oldLabelId="OldName", newLabelId="NewName", labelFileId="MyModel", model="MyModel")`,
+          description: `Rename a D365FO label ID across all .label.txt files, X++ sources, and XML metadata in the model. Also updates the SQLite label index. Use dryRun=true first to preview impact.`,
           inputSchema: {
             type: 'object',
             properties: {
@@ -1832,13 +1310,7 @@ Examples:
         },
         {
           name: 'get_table_patterns',
-          description: `📊 Analyze common field types, index patterns, and relation structures for D365FO tables.
-
-Helps understand table design patterns before creating new tables. Use tableGroup to analyze patterns in standard table groups (Main, Transaction, Parameter, etc.) or similarTo to find tables with similar structure.
-
-Examples:
-- get_table_patterns(tableGroup="Transaction") → Analyze common fields/indexes in transaction tables
-- get_table_patterns(similarTo="CustTable") → Find tables with similar structure to CustTable`,
+          description: 'Analyze common field types, index patterns, and relation structures for D365FO tables. Filter by tableGroup (Main, Transaction, etc.) or find tables similar to a given table.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1861,14 +1333,7 @@ Examples:
         },
         {
           name: 'get_form_patterns',
-          description: `📋 Analyze common datasource configurations, control hierarchies, and D365FO form patterns.
-
-Helps understand form design patterns before creating new forms. Use formPattern to analyze D365FO standard patterns, dataSource to find forms using a specific table, or similarTo for specific form analysis.
-
-Examples:
-- get_form_patterns(formPattern="SimpleList") → Analyze SimpleList pattern forms
-- get_form_patterns(dataSource="CustTable") → Find all forms using CustTable
-- get_form_patterns(similarTo="CustTableListPage") → Find forms similar to CustTableListPage`,
+          description: 'Analyze common datasource configurations, control hierarchies, and D365FO form patterns. Filter by formPattern, dataSource table name, or similarTo form.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1895,16 +1360,7 @@ Examples:
         },
         {
           name: 'suggest_edt',
-          description: `🔍 Suggest Extended Data Types (EDT) for a field name using fuzzy matching and pattern analysis.
-
-Analyzes indexed EDT metadata to recommend appropriate Extended Data Types based on field name patterns and optional context. Returns confidence-ranked suggestions with EDT properties (base type, enum, reference table, label).
-
-Use BEFORE creating table fields to ensure you reuse existing EDTs instead of primitive types.
-
-Examples:
-- suggest_edt(fieldName="CustomerAccount") → Suggests CustAccount EDT
-- suggest_edt(fieldName="OrderAmount", context="sales order") → Suggests AmountCur, SalesAmountCur, etc.
-- suggest_edt(fieldName="TransDate") → Suggests TransDate EDT`,
+          description: 'Suggest Extended Data Types (EDT) for a field name using fuzzy matching. Returns confidence-ranked suggestions with EDT properties. Use BEFORE creating table fields to reuse existing EDTs.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1927,20 +1383,7 @@ Examples:
         },
         {
           name: 'generate_smart_table',
-          description: `🎨 AI-driven table generation with intelligent field/index/relation suggestions.
-
-Generates AxTable XML using pattern analysis from indexed metadata. Supports multiple strategies:
-1. Copy structure from existing table (copyFrom parameter)
-2. Analyze table group patterns and generate common fields (tableGroup + generateCommonFields)
-3. Use field hints and suggest EDTs (fieldsHint parameter)
-4. Combine all strategies for comprehensive generation
-
-Returns complete XML ready for create_d365fo_file or manual save.
-
-Examples:
-- generate_smart_table(name="MyOrderTable", tableGroup="Transaction", generateCommonFields=true)
-- generate_smart_table(name="MyTable", copyFrom="CustTable")
-- generate_smart_table(name="MyTable", fieldsHint="RecId, Name, Amount")`,
+          description: 'AI-driven table generation with intelligent field/index/relation suggestions from pattern analysis. Strategies: copyFrom existing table, tableGroup + generateCommonFields, or fieldsHint with auto-suggested EDTs. Returns complete XML for create_d365fo_file.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -2007,20 +1450,7 @@ Examples:
         },
         {
           name: 'generate_smart_form',
-          description: `🎨 AI-driven form generation with intelligent datasource/control suggestions.
-
-Generates AxForm XML using pattern analysis from indexed metadata. Supports multiple strategies:
-1. Copy structure from existing form (copyFrom parameter)
-2. Auto-generate datasource and grid from table (dataSource + generateControls)
-3. Analyze form pattern and apply structure (formPattern parameter)
-4. Combine strategies for comprehensive generation
-
-Returns complete XML ready for create_d365fo_file or manual save.
-
-Examples:
-- generate_smart_form(name="MyOrderForm", dataSource="MyOrderTable", generateControls=true)
-- generate_smart_form(name="MyForm", copyFrom="CustTableListPage")
-- generate_smart_form(name="MyForm", formPattern="SimpleList", dataSource="MyTable")`,
+          description: 'AI-driven form generation with intelligent datasource/control suggestions from pattern analysis. Strategies: copyFrom existing form, dataSource + generateControls, or formPattern application. Returns complete XML for create_d365fo_file.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -2070,31 +1500,7 @@ Examples:
         },
         {
           name: 'generate_smart_report',
-          description: `🎨 AI-driven SSRS report generation — creates up to 5 D365FO objects in one call.
-
-Generates:
-1. TmpTable (TempDB) — report data storage
-2. Contract class (DataContractAttribute) — dialog parameters
-3. DP class (SrsReportDataProviderBase) — data processing
-4. Controller class (SrsReportRunController) — menu item entry point (optional)
-5. AxReport XML + RDL design — dataset + tablix bound to DP/TmpTable
-
-Strategies:
-- fieldsHint: comma-separated field names → auto-suggest EDTs, build TmpTable + report fields
-- fields: structured field specs with explicit EDTs and .NET data types
-- contractParams: dialog parameters → Contract class with parm methods
-- copyFrom: copy field structure from existing report's TmpTable
-- designStyle: SimpleList (default) or GroupedWithTotals
-
-⛔ NEVER call generate_smart_report without fieldsHint, fields, or copyFrom — no fields = no XML.
-⛔ NEVER add model prefix to the name parameter — prefix is applied automatically.
-⛔ On Azure/Linux: call create_d365fo_file for EACH returned object block, in order.
-⛔ On Windows: DO NOT call create_d365fo_file — files are written directly.
-
-Examples:
-- generate_smart_report(name="InventByZones", fieldsHint="ItemId, ItemName, Qty, Zone", caption="Inventory by Zones")
-- generate_smart_report(name="CustBalance", fieldsHint="CustAccount, Name, Balance", contractParams=[{name:"FromDate",type:"TransDate"},{name:"ToDate",type:"TransDate"}])
-- generate_smart_report(name="SalesReport", copyFrom="SalesInvoice")`,
+          description: `AI-driven SSRS report generation — creates up to 5 objects (TmpTable, Contract, DP, Controller, AxReport+RDL) in one call. Use fieldsHint or fields for field specs, contractParams for dialog parameters. Never add model prefix to name — auto-applied. On Azure/Linux: call create_d365fo_file for each returned object. On Windows: files are written directly.`,
           inputSchema: {
             type: 'object',
             properties: {
@@ -2173,18 +1579,7 @@ Examples:
       // ── New tools: security, menu items, extensions ──────────────────────────────
       {
         name: 'get_security_artifact_info',
-        description: `Get detailed info for a D365FO security privilege, duty, or role.
-Walks the full hierarchy: Role → Duties → Privileges → Entry Points.
-
-Use for:
-- Auditing what a role or duty grants access to
-- Finding which roles cover a specific privilege
-- Understanding the entry-point/access-level details of a privilege
-
-Examples:
-  { name: "CustTableFullControl", artifactType: "privilege" }
-  { name: "CustTableMaintain", artifactType: "duty", includeChain: true }
-  { name: "AccountsReceivableClerk", artifactType: "role" }`,
+        description: 'Get detailed info for a D365FO security privilege, duty, or role. Walks full hierarchy: Role → Duties → Privileges → Entry Points.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2201,13 +1596,7 @@ Examples:
       },
       {
         name: 'get_menu_item_info',
-        description: `Get details for a D365FO menu item including target object and full security chain.
-
-Shows the privilege → duty → role chain that grants access to this menu item.
-
-Examples:
-  { name: "CustTable", itemType: "display" }
-  { name: "LedgerJournalTable", itemType: "any" }`,
+        description: 'Get details for a D365FO menu item including target object and full security chain (privilege → duty → role).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2224,19 +1613,7 @@ Examples:
       },
       {
         name: 'find_coc_extensions',
-        description: `Find all Chain of Command (CoC) extensions for a D365FO class or table method.
-
-Also shows event handler subscriptions (SubscribesTo) for the target class/table.
-
-Use this before writing a CoC extension to:
-1. Check if the method is already wrapped
-2. Understand which models extend this class
-3. Find potential conflicts
-
-Examples:
-  { className: "SalesFormLetter" }
-  { className: "SalesLine", methodName: "validateWrite" }
-  { className: "CustTable", includeEventHandlers: true }`,
+        description: 'Find all Chain of Command (CoC) extensions and event handler subscriptions for a D365FO class or table. Use before writing a CoC extension to check for conflicts.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2253,13 +1630,7 @@ Examples:
       },
       {
         name: 'get_table_extension_info',
-        description: `Get all extensions for a D365FO table and show the effective merged schema.
-
-Lists every extension across all models that add fields, indexes, or methods to the table.
-
-Examples:
-  { tableName: "CustTable" }
-  { tableName: "SalesLine", includeEffectiveSchema: true }`,
+        description: 'Get all extensions for a D365FO table across all models and show the effective merged schema (base + extension fields/indexes/methods).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2275,14 +1646,7 @@ Examples:
       },
       {
         name: 'get_data_entity_info',
-        description: `Get D365FO-specific metadata for a data entity (AxDataEntityView).
-
-Shows OData settings, DMF configuration, staging table, data sources, and keys.
-Use instead of get_view_info when working with entities for OData/DMF integrations.
-
-Examples:
-  { entityName: "CustCustomerV3Entity" }
-  { entityName: "SalesOrderHeaderV2Entity" }`,
+        description: 'Get D365FO data entity metadata: OData settings, DMF configuration, staging table, data sources, and keys. Use instead of get_view_info for OData/DMF work.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2293,15 +1657,7 @@ Examples:
       },
       {
         name: 'find_event_handlers',
-        description: `Find all event handler subscriptions for a D365FO class or table.
-
-Searches for static SubscribesTo handlers and delegate += subscriptions.
-Use before adding event handlers to check for duplicates.
-
-Examples:
-  { targetTable: "CustTable" }
-  { targetClass: "SalesFormLetter", eventName: "onPostRun" }
-  { targetTable: "SalesLine", eventName: "onValidatedWrite" }`,
+        description: 'Find all event handler subscriptions (SubscribesTo, delegate +=) for a D365FO class or table. Use before adding event handlers to check for duplicates.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2319,14 +1675,7 @@ Examples:
       },
       {
         name: 'get_security_coverage_for_object',
-        description: `Show what security privileges, duties, and roles cover a D365FO object.
-
-Traces the reverse chain: object → menu items → privileges → duties → roles.
-
-Examples:
-  { objectName: "CustTable" }
-  { objectName: "LedgerJournalTable", objectType: "form" }
-  { objectName: "CustTableListPage", objectType: "menu-item" }`,
+        description: 'Show what security privileges, duties, and roles cover a D365FO object. Traces reverse chain: object → menu items → privileges → duties → roles.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2343,19 +1692,7 @@ Examples:
       },
       {
         name: 'analyze_extension_points',
-        description: `Analyze available extension points for a D365FO class, table, or form.
-
-For classes: CoC-eligible methods, replaceable methods, delegates, and blocked methods.
-For tables: 8 standard table events + custom delegates.
-For forms: data sources and form methods.
-Shows which extension points are already used by existing extensions.
-
-Use this before writing any extension.
-
-Examples:
-  { objectName: "SalesLine", objectType: "table" }
-  { objectName: "SalesFormLetter", objectType: "class" }
-  { objectName: "CustTable", showExistingExtensions: true }`,
+        description: 'Analyze available extension points for a D365FO class, table, or form. Shows CoC-eligible methods, replaceable methods, delegates, blocked methods, and which points are already extended.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2377,20 +1714,7 @@ Examples:
       },
       {
         name: 'recommend_extension_strategy',
-        description: `Recommends the best D365FO extensibility mechanism for a given scenario.
-
-Prevents common design mistakes — e.g. using CoC where a Business Event or delegate is appropriate,
-or using a Business Event for inbound data where a Data Entity is correct.
-
-Returns: recommended mechanism, reasoning, risks/caveats, alternatives, anti-patterns, and next MCP tool calls.
-
-Use BEFORE writing any extension code to ensure the right approach.
-
-Examples:
-  { goal: "validate that SalesLine quantity is positive", objectName: "SalesLine" }
-  { goal: "send order confirmation to external ERP" }
-  { goal: "add custom field to CustTable form", objectName: "CustTable" }
-  { goal: "import vendor data from CSV", scenario: "inbound-data" }`,
+        description: 'Recommends the best D365FO extensibility mechanism for a given scenario (CoC, event handler, business event, data entity, etc.). Prevents common design mistakes. Returns recommendation, reasoning, risks, alternatives, and next MCP tool calls.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2416,24 +1740,7 @@ Examples:
       },
       {
         name: 'validate_object_naming',
-        description: `Validate a proposed D365FO object name against naming conventions.
-
-Checks:
-1. Extension naming rules: {Base}{Prefix}_Extension (class) or {Base}.{Prefix}Extension (AOT)
-2. Prefix requirements: custom objects must use ISV/model prefix — two valid patterns:
-   - Direct prefix:    MYVendPaymTermsMaintain    (prefix concatenated directly)
-   - Prefix separator: MY_VendPaymTermsMaintain   (prefix + underscore + name — also valid)
-   Underscore at any other position is an error.
-3. Type-specific rules: privilege → View/Maintain suffix, data entity → Entity suffix
-4. Conflict detection: exact match + similar names against the symbol index
-
-Auto-detects the model prefix from EXTENSION_PREFIX env var (same as get_workspace_info).
-Pass modelPrefix explicitly to override.
-
-Examples:
-  { proposedName: "VendTableMY_Extension", objectType: "class-extension", baseObjectName: "VendTable", modelPrefix: "MY" }
-  { proposedName: "CustTable.MyExtension", objectType: "table-extension", baseObjectName: "CustTable", modelPrefix: "My" }
-  { proposedName: "MY_VendPaymTermsMaintain", objectType: "security-privilege", modelPrefix: "MY" }`,
+        description: 'Validate a proposed D365FO object name against naming conventions: extension naming, ISV prefix, type-specific suffixes, and conflict detection against the symbol index.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2459,25 +1766,7 @@ Examples:
       },
       {
         name: 'get_workspace_info',
-        description: `🔌 ALWAYS call this FIRST at the start of every D365FO session to verify the workspace configuration.
-
-Returns the configured model name, package path, project path, environment type, EXTENSION_PREFIX value, and effective object prefix.
-Explicitly flags whether the model name is a placeholder (MyModel, MyPackage, etc.) — if so, STOP and inform the user before doing anything else.
-Also warns when EXTENSION_PREFIX is not set in the server environment (prefix will fall back to model name, which may be wrong for models with hyphens like "fm-mcp").
-
-When the configured modelName IS a placeholder, this tool auto-detects the real model name
-from the .rnrproj file and shows it as a concrete fix suggestion, so the user knows exactly
-what value to put in .mcp.json.
-
-**Solution switching (VS 2022):** When the user opens a different D365FO solution or says
-"switch to <ProjectName>", call get_workspace_info with projectName (preferred) or projectPath.
-  - projectName: just the model name, e.g. "ContosoEDS" — server resolves the path automatically.
-  - projectPath: full path to the .rnrproj file (fallback when name is ambiguous).
-The server switches context immediately without restart.
-If D365FO_SOLUTIONS_PATH is configured, the output lists all available projects.
-
-Use this instead of get_label_info or search to detect the correct model — those tools return
-SOURCE models of existing objects, not the TARGET model for new objects.`,
+        description: `ALWAYS call FIRST at session start. Returns model name, package path, framework directory, project path, environment type, and EXTENSION_PREFIX. Flags placeholder model names and missing prefix. Use projectName/projectPath params for solution switching. This is the authoritative source for target model — not search results.`,
         inputSchema: {
           type: 'object',
           properties: {
@@ -2495,14 +1784,7 @@ SOURCE models of existing objects, not the TARGET model for new objects.`,
       },
       {
         name: 'verify_d365fo_project',
-        description: `Verify that D365FO objects exist on disk at the correct AOT path and are referenced in the Visual Studio project (.rnrproj) file.
-
-Use this INSTEAD OF PowerShell to check whether create_d365fo_file placed files correctly.
-Reports ✅/❌ for each object on both disk presence and project inclusion.
-
-Examples:
-  { objects: [{ objectType: "table", objectName: "MyTable" }, { objectType: "class", objectName: "MyClass" }], projectPath: "K:\\\\AosService\\\\PackagesLocalDirectory\\\\MyPkg\\\\MyModel\\\\MyModel.rnrproj" }
-  { objects: [{ objectType: "menu-item-action", objectName: "MyMenuItem" }], modelName: "MyModel" }`,
+        description: 'Verify that D365FO objects exist on disk at the correct AOT path and are referenced in the .rnrproj project file. Use instead of PowerShell to check create_d365fo_file results.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2554,11 +1836,35 @@ Examples:
       },
       {
         name: 'build_d365fo_project',
-        description: 'Run MSBuild compilation on a D365FO Visual Studio project (.rnrproj) to capture X++ compiler errors without opening Visual Studio. Returns build output including errors and warnings.',
+        description:
+          'Builds a D365FO model using the X++ compiler (xppc.exe). ' +
+          'Compiles the ENTIRE MODEL — not just one project file. ' +
+          'Runs in the background: first call starts the build; call again to poll status and see output. ' +
+          'Use fullBuild:true when xppc reports "model element has not been successfully compiled since it was last changed" (stale symbol error). ' +
+          'Use buildReferencedModels:true to also build custom/ISV dependencies first (reads <ModuleReferences> from the model descriptor; skips Microsoft standard models; topological order).',
         inputSchema: {
           type: 'object',
           properties: {
-            projectPath: { type: 'string', description: 'Absolute path to the .rnrproj file (e.g. K:\\\\repos\\\\MySolution\\\\MyProject\\\\MyProject.rnrproj). Auto-detected from .mcp.json if omitted.' },
+            modelName: {
+              type: 'string',
+              description: 'D365FO model name to build (e.g. MyCustomModel). Auto-detected from workspace if omitted.',
+            },
+            projectPath: {
+              type: 'string',
+              description: '(Legacy) Absolute path to a .rnrproj file — used only to extract the model name when modelName is not provided.',
+            },
+            force: {
+              type: 'boolean',
+              description: 'Kill any running build processes for this model and restart.',
+            },
+            fullBuild: {
+              type: 'boolean',
+              description: 'Full recompile of the TARGET model only (deps stay incremental). Use when xppc reports stale symbol errors.',
+            },
+            buildReferencedModels: {
+              type: 'boolean',
+              description: 'Also build all custom/ISV models this model depends on before building the target. Skips Microsoft standard models.',
+            },
           },
           required: [],
         },
@@ -2595,7 +1901,8 @@ Examples:
           type: 'object',
           properties: {
             projectPath: { type: 'string', description: 'Absolute path to the .rnrproj file to analyze. Auto-detected from .mcp.json if omitted.' },
-            targetFilter: { type: 'string', description: 'Optional: filter results to a specific class, table, or object name' },
+            targetFilter: { type: 'string', description: 'Optional: filter results to a specific object name (class, table, form, enum, ...).' },
+            targetElementType: { type: 'string', description: 'Element type for the filter when using xppbp 10.0.24+ (equals-style CLI). Common values: class, table, form, enum, view, query. Defaults to "class" when targetFilter is set but this is omitted.' },
             modelName: { type: 'string', description: 'Model name to check. Auto-detected from .mcp.json if omitted.' },
             packagePath: { type: 'string', description: 'PackagesLocalDirectory root path. Auto-detected from .mcp.json if omitted.' },
           },
@@ -2691,8 +1998,151 @@ Examples:
           required: ['topic'],
         },
       },
+      {
+        name: 'validate_xpp',
+        description:
+          'Offline X++ / XML best-practice validator (<50 ms, all-platform, no xppbp.exe needed). ' +
+          'Returns structured violations {rule, severity, line, excerpt, fix}. ' +
+          'Call AFTER generating code and BEFORE write operations to catch BP issues in the same turn. ' +
+          'Rules: today() deprecated (SEL001), forceLiterals banned (SEL002), crossCompany placement (SEL003), ' +
+          'nested while-select (SEL004), function in where clause (SEL005), ' +
+          '[ExtensionOf] class not final (COC002), class not ending _Extension (COC003), ' +
+          'CoC default param values (COC001), hardcoded strings in info/warning/error (BP001), ' +
+          'doInsert/doUpdate/doDelete misuse (BP002), generic doc-comments (BP003), ' +
+          'missing AlternateKey on table XML (XML001). ' +
+          'Plus data-driven property rules mined from standard models (XML002 Label, ' +
+          'XML003 TableGroup, XML004 field EDT, XML005 ClusteredIndex).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            code: {
+              type: 'string',
+              description: 'X++ source code or XML metadata to validate. Paste the full generated text.',
+            },
+            codeType: {
+              type: 'string',
+              enum: ['xpp', 'xml-table', 'xml-any'],
+              default: 'xpp',
+              description: '"xpp" for X++ source (default), "xml-table" for AxTable XML, "xml-any" for other XML.',
+            },
+            context: {
+              type: 'string',
+              description: 'Optional: owning class/table name, used in diagnostic messages.',
+            },
+          },
+          required: ['code'],
+        },
+      },
+      {
+        name: 'resolve_references',
+        description:
+          'Semantic reference resolver (<200 ms, index-only) — verifies that every type, ' +
+          'table field, method (incl. arity), enum, label and intrinsic target (tableStr, ' +
+          'fieldStr, classStr, …) in generated X++ code EXISTS in the indexed codebase. ' +
+          'Catches hallucinated symbols BEFORE the compiler does. ' +
+          'Call AFTER generating code and BEFORE create_d365fo_file / modify_d365fo_file. ' +
+          'Returns structured violations {kind, severity, line, identifier, detail} — fix errors in the same turn. ' +
+          'When GROUNDING_ENFORCE=true, write tools run this check internally and reject code with errors.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            code: {
+              type: 'string',
+              description: 'X++ source code to resolve. Paste the full generated method/class text.',
+            },
+            context: {
+              type: 'string',
+              description: 'Optional: owning class/table name, used in diagnostic messages.',
+            },
+          },
+          required: ['code'],
+        },
+      },
+      {
+        name: 'prepare_change',
+        description:
+          'Single-round context aggregator for D365FO extension work. ' +
+          'Returns in ONE call: exact method signature, existing CoC wrappers, CoC eligibility, ' +
+          'recommended extension strategy, naming validation, and code patterns from the index. ' +
+          'Replaces the 4-step analyze→search→info→generate workflow with a single parallel call. ' +
+          'Returns a grounding token (30-min TTL) that proves the AI used real codebase data. ' +
+          'When GROUNDING_ENFORCE=true the token is required for extension generate_code and create_d365fo_file calls.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            goal: {
+              type: 'string',
+              description: 'One-sentence description of the intended change. Example: "Add CoC on CustTable.validateWrite to enforce a custom rule."',
+            },
+            objectName: {
+              type: 'string',
+              description: 'Name of the D365FO object to extend or modify. Example: "CustTable", "SalesFormLetter".',
+            },
+            methodName: {
+              type: 'string',
+              description: 'Target method name when the change involves a specific method (CoC or event handlers). Example: "validateWrite".',
+            },
+            objectType: {
+              type: 'string',
+              enum: ['class', 'table', 'form', 'query', 'view', 'enum', 'edt', 'data-entity', 'map', 'report'],
+              description: 'D365FO object type. Auto-detected from the symbol index when omitted.',
+            },
+            proposedName: {
+              type: 'string',
+              description: 'Proposed name for the new extension class/object. When provided, naming validation runs.',
+            },
+          },
+          required: ['goal', 'objectName'],
+        },
+      },
+      {
+        name: 'prepare_create',
+        description:
+          'Single-round context aggregator for creating NEW D365FO objects (mirror of prepare_change). ' +
+          'Returns in ONE call: name collision check, naming validation with the auto-applied prefix, ' +
+          'similar existing objects to copy patterns from, EDT suggestions for planned fields, ' +
+          'reusable labels, mined property defaults (standard-model statistics), and a grounding token. ' +
+          'Replaces the search → validate_object_naming → suggest_edt → search_labels sequence with one call. ' +
+          'Call BEFORE generating any new object.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            goal: {
+              type: 'string',
+              description: 'One-sentence description of what the new object is for. Example: "Parameter table for the Contoso import feature."',
+            },
+            objectName: {
+              type: 'string',
+              description: 'Proposed BASE name WITHOUT model prefix (same value you would pass to create_d365fo_file). Example: "ImportParameters".',
+            },
+            objectType: {
+              type: 'string',
+              enum: [
+                'class', 'table', 'form', 'enum', 'edt', 'query', 'view',
+                'data-entity', 'report', 'menu-item-display', 'menu-item-action',
+                'menu-item-output', 'security-privilege', 'security-duty', 'security-role',
+              ],
+              description: 'Type of the new D365FO object.',
+            },
+            fieldsHint: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'For tables/views: planned field names — each gets EDT suggestions from the index.',
+            },
+          },
+          required: ['goal', 'objectName', 'objectType'],
+        },
+      },
     ],
     };
+
+    // Attach MCP tool annotations (display title + behavior hints).
+    // VS Code shows annotations.title in the chat UI ("Ran Search D365FO index"
+    // instead of "Ran search") and uses readOnlyHint to skip write confirmations.
+    allTools.tools = allTools.tools.map(t => ({
+      ...t,
+      annotations: TOOL_ANNOTATIONS[t.name],
+    })) as typeof allTools.tools;
 
     // Apply server mode filter
     if (SERVER_MODE === 'read-only') {

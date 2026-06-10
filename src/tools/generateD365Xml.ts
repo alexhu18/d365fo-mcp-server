@@ -376,11 +376,23 @@ ${titleField1Xml}${titleField2Xml}\t<DeleteActions />
     properties?: Record<string, any>
   ): string {
     const label = properties?.label || enumName;
+    const useEnumValue = properties?.useEnumValue ? 'Yes' : 'No';
+    const configKeyXml = properties?.configurationKey
+      ? `\t<ConfigurationKey>${properties.configurationKey}</ConfigurationKey>\n`
+      : '';
 
     // Build <EnumValues> block from properties.enumValues array
     // Each entry: { name: string; value?: number; label?: string; helpText?: string }
     const enumValueSpecs: Array<{ name: string; value?: number; label?: string; helpText?: string }> =
       Array.isArray(properties?.enumValues) ? properties.enumValues : [];
+
+    // D365FO hard limit: max 251 elements (0–250). Warn early — compiler rejects beyond this.
+    if (enumValueSpecs.length > 251) {
+      throw new Error(
+        `Enum '${enumName}' has ${enumValueSpecs.length} values but D365FO supports a maximum of 251 (0–250). ` +
+        `Consider redesigning as a class hierarchy or splitting into multiple enums.`
+      );
+    }
 
     let enumValuesXml: string;
     if (enumValueSpecs.length === 0) {
@@ -405,10 +417,12 @@ ${titleField1Xml}${titleField2Xml}\t<DeleteActions />
     // IsExtensible goes after EnumValues; value is lowercase true/false
     const isExtensibleXml = properties?.isExtensible ? '\t<IsExtensible>true</IsExtensible>\n' : '';
 
+    // Element order matches real D365FO: Name → ConfigurationKey → Label → UseEnumValue → EnumValues → IsExtensible
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxEnum xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 \t<Name>${enumName}</Name>
-\t<Label>${label}</Label>
+${configKeyXml}\t<Label>${label}</Label>
+\t<UseEnumValue>${useEnumValue}</UseEnumValue>
 ${enumValuesXml}${isExtensibleXml}</AxEnum>
 `;
   }
@@ -1032,7 +1046,7 @@ ${defaultParamGroupXml}
       case 'edt-extension':
         return this.generateAxSimpleExtensionXml('AxEdtExtension', objectName);
       case 'enum-extension':
-        return this.generateAxSimpleExtensionXml('AxEnumExtension', objectName);
+        return this.generateAxEnumExtensionXml(objectName, properties);
       case 'data-entity-extension':
         return this.generateAxSimpleExtensionXml('AxDataEntityViewExtension', objectName);
       case 'menu-item-display':
@@ -1097,6 +1111,44 @@ ${defaultParamGroupXml}
 \t<Name>${name}</Name>
 \t<PropertyModifications />
 </${rootElement}>`;
+  }
+
+  /**
+   * Generate AxEnumExtension XML.
+   * Name convention: BaseEnumName.PrefixExtension
+   *
+   * Supported properties:
+   *   enumValues: Array<{ name, label?, value?, countryRegionCodes?, helpText? }>
+   */
+  static generateAxEnumExtensionXml(name: string, properties?: Record<string, any>): string {
+    const enumValueSpecs: Array<{
+      name: string; label?: string; value?: number; countryRegionCodes?: string; helpText?: string;
+    }> = Array.isArray(properties?.enumValues) ? properties.enumValues : [];
+
+    let enumValuesXml: string;
+    if (enumValueSpecs.length === 0) {
+      enumValuesXml = '\t<EnumValues />';
+    } else {
+      enumValuesXml = '\t<EnumValues>';
+      for (const v of enumValueSpecs) {
+        enumValuesXml += `\n\t\t<AxEnumValue>`;
+        enumValuesXml += `\n\t\t\t<Name>${v.name}</Name>`;
+        if (v.countryRegionCodes) enumValuesXml += `\n\t\t\t<CountryRegionCodes>${v.countryRegionCodes}</CountryRegionCodes>`;
+        if (v.label) enumValuesXml += `\n\t\t\t<Label>${v.label}</Label>`;
+        if (v.helpText) enumValuesXml += `\n\t\t\t<HelpText>${v.helpText}</HelpText>`;
+        if (v.value !== undefined && v.value !== 0) enumValuesXml += `\n\t\t\t<Value>${v.value}</Value>`;
+        enumValuesXml += `\n\t\t</AxEnumValue>`;
+      }
+      enumValuesXml += '\n\t</EnumValues>';
+    }
+
+    return `<?xml version="1.0" encoding="utf-8"?>
+<AxEnumExtension xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+\t<Name>${name}</Name>
+${enumValuesXml}
+\t<PropertyModifications />
+\t<ValueModifications />
+</AxEnumExtension>`;
   }
 
   static generateAxTableExtensionXml(name: string, properties?: Record<string, any>): string {
@@ -1401,7 +1453,7 @@ export async function handleGenerateD365Xml(
         '  1. Pass modelName explicitly in the tool call arguments\n' +
         '  2. Add modelName to .mcp.json context: { "context": { "modelName": "YourModel" } }\n' +
         '  3. Add workspacePath ending with the package/model name: { "context": { "workspacePath": "K:\\\\...\\\\YourModel" } }';
-      return { content: [{ type: 'text', text: errorMsg }] };
+      return { content: [{ type: 'text', text: errorMsg }], isError: true };
     }
 
     console.error(

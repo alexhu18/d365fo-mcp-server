@@ -1,33 +1,62 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- hoisted mocks -----------------------------------------------------------
-const { execFilePromisified, execFileMock, accessMock, writeFileMock, unlinkMock } = vi.hoisted(() => {
-  const execFilePromisified = vi.fn();
-  const execFileMock: any = vi.fn();
-  execFileMock[Symbol.for('nodejs.util.promisify.custom')] = (
-    file: string,
-    args: string[],
-    opts: any,
-  ) => execFilePromisified(file, args, opts);
+const {
+  accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, spawnMock, execFileMock,
+  cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
+  cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
+  cfgGetActiveXppConfig, cfgGetModelName,
+} = vi.hoisted(() => {
   const accessMock = vi.fn();
   const writeFileMock = vi.fn().mockResolvedValue(undefined);
+  const appendFileMock = vi.fn().mockResolvedValue(undefined);
   const unlinkMock = vi.fn().mockResolvedValue(undefined);
-  return { execFilePromisified, execFileMock, accessMock, writeFileMock, unlinkMock };
+  const readFileMock = vi.fn();
+  const readdirMock = vi.fn().mockRejectedValue(new Error('not found'));
+  const spawnMock = vi.fn();
+  // execFile needs to call its callback for util.promisify to work
+  const execFileMock: any = vi.fn((_file: string, _args: string[], _opts: any, cb: Function) => {
+    cb(null, { stdout: '', stderr: '' });
+  });
+  const cfgEnsureLoaded = vi.fn();
+  const cfgGetProjectPath = vi.fn().mockResolvedValue('C:\\MyProject\\MyProject.rnrproj');
+  const cfgGetPackagePath = vi.fn().mockReturnValue(null);
+  const cfgGetContext = vi.fn().mockReturnValue({});
+  const cfgGetCustomPackagesPath = vi.fn().mockResolvedValue(null);
+  const cfgGetMicrosoftPackagesPath = vi.fn().mockResolvedValue(null);
+  const cfgGetActiveXppConfig = vi.fn().mockResolvedValue(null);
+  const cfgGetModelName = vi.fn().mockReturnValue(null);
+  return {
+    accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, spawnMock, execFileMock,
+    cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
+    cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
+    cfgGetActiveXppConfig, cfgGetModelName,
+  };
 });
 
-vi.mock('child_process', () => ({ execFile: execFileMock }));
+vi.mock('child_process', () => ({ spawn: spawnMock, execFile: execFileMock }));
+vi.mock('fs', () => ({
+  openSync: vi.fn().mockReturnValue(3),
+  closeSync: vi.fn(),
+}));
 vi.mock('fs/promises', () => ({
   access: accessMock,
   writeFile: writeFileMock,
   unlink: unlinkMock,
-  appendFile: vi.fn().mockResolvedValue(undefined),
+  readFile: readFileMock,
+  appendFile: appendFileMock,
+  readdir: readdirMock,
 }));
 vi.mock('../../src/utils/configManager.js', () => ({
   getConfigManager: () => ({
-    ensureLoaded: vi.fn(),
-    getProjectPath: vi.fn().mockResolvedValue('C:\\MyProject\\MyProject.rnrproj'),
-    getPackagePath: vi.fn().mockReturnValue(null),
-    getContext: vi.fn().mockReturnValue({}),
+    ensureLoaded: cfgEnsureLoaded,
+    getProjectPath: cfgGetProjectPath,
+    getPackagePath: cfgGetPackagePath,
+    getContext: cfgGetContext,
+    getCustomPackagesPath: cfgGetCustomPackagesPath,
+    getMicrosoftPackagesPath: cfgGetMicrosoftPackagesPath,
+    getActiveXppConfig: cfgGetActiveXppConfig,
+    getModelName: cfgGetModelName,
   }),
 }));
 vi.mock('../../src/utils/operationLocks.js', () => ({
@@ -39,202 +68,384 @@ vi.mock('../../src/utils/operationLocks.js', () => ({
 import path from 'path';
 import { buildProjectTool } from '../../src/tools/buildProject';
 
-// --- helpers -----------------------------------------------------------------
-const VSWHERE = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe';
-const VS_INSTALL = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise';
-const VSDEVCMD = path.join(VS_INSTALL, 'Common7', 'Tools', 'VsDevCmd.bat');
-const MSBUILD = path.join(VS_INSTALL, 'MSBuild', 'Current', 'Bin', 'MSBuild.exe');
-const DEVENV = path.join(VS_INSTALL, 'Common7', 'IDE', 'devenv.com');
+const PROJECT_PATH = 'C:\\MyProject\\MyProject.rnrproj';
+const MODEL_NAME = 'MyModel';
+const RNRPROJ_XML = `<Project><Model>${MODEL_NAME}</Model></Project>`;
+const PKG = 'C:\\AOSService\\PackagesLocalDirectory';
+const XPPC = path.join(PKG, 'bin', 'xppc.exe');
 
-function allowPaths(paths: string[]) {
-  accessMock.mockImplementation(async (p: string) => {
-    if (paths.includes(p)) return;
-    throw new Error(`ENOENT: ${p}`);
-  });
+function makeFakeChild(pid = 12345) {
+  const child: any = {
+    pid,
+    unref: vi.fn(),
+    on: vi.fn(),
+  };
+  return child;
 }
 
-function setupVswhere(installPath: string) {
-  execFilePromisified.mockImplementation(
-    async (file: string, _args: string[], _opts: any) => {
-      if (file === VSWHERE) return { stdout: `${installPath}\r\n`, stderr: '' };
-      return { stdout: '', stderr: '' };
-    },
-  );
+/** accessMock passes only listed paths */
+function allowPaths(paths: string[]) {
+  accessMock.mockImplementation(async (p: string) => {
+    if (paths.some(allowed => p === allowed || p.replace(/\\/g, '/') === allowed.replace(/\\/g, '/'))) return;
+    throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+  });
 }
 
 describe('build_d365fo_project', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     writeFileMock.mockResolvedValue(undefined);
+    appendFileMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
-  });
-
-  // --- MSBuild + VsDevCmd (primary path) ---
-
-  it('writes a temp .cmd with VsDevCmd and MSBuild on separate lines', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV]);
-    setupVswhere(VS_INSTALL);
-
-    await buildProjectTool({}, {});
-
-    expect(writeFileMock).toHaveBeenCalledTimes(1);
-    const [tempPath, batContent] = writeFileMock.mock.calls[0];
-    expect(tempPath).toMatch(/d365build_[0-9a-f]+\.cmd$/);
-    expect(batContent).toContain('@echo off');
-    expect(batContent).toContain(`call "${VSDEVCMD}"`);
-    expect(batContent).toContain(`"${MSBUILD}"`);
-    expect(batContent).not.toContain('&&');
-
-    const cmdCall = execFilePromisified.mock.calls.find((c: any[]) => c[0] === 'cmd.exe');
-    expect(cmdCall).toBeDefined();
-    expect(cmdCall![1]).toEqual(['/C', tempPath]);
-  });
-
-  it('cleans up the temp .cmd after build', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV]);
-    setupVswhere(VS_INSTALL);
-
-    await buildProjectTool({}, {});
-
-    expect(unlinkMock).toHaveBeenCalledTimes(1);
-    expect(unlinkMock).toHaveBeenCalledWith(writeFileMock.mock.calls[0][0]);
-  });
-
-  it('cleans up even when build fails', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV]);
-    execFilePromisified.mockImplementation(async (file: string) => {
-      if (file === VSWHERE) return { stdout: `${VS_INSTALL}\r\n`, stderr: '' };
-      const err: any = new Error('Build failed');
-      err.stdout = 'error CS0001: something broke';
-      err.stderr = '';
-      throw err;
+    readdirMock.mockRejectedValue(new Error('not found'));
+    cfgGetProjectPath.mockResolvedValue(PROJECT_PATH);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetContext.mockReturnValue({});
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    cfgGetModelName.mockReturnValue(null);
+    execFileMock.mockImplementation((_file: string, _args: string[], _opts: any, cb: Function) => {
+      cb(null, { stdout: '', stderr: '' });
     });
-
-    await buildProjectTool({}, {});
-    expect(unlinkMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('runs MSBuild directly when VsDevCmd is missing', async () => {
-    allowPaths([VSWHERE, MSBUILD, DEVENV]);
-    setupVswhere(VS_INSTALL);
-
-    await buildProjectTool({}, {});
-
-    expect(writeFileMock).not.toHaveBeenCalled();
-    expect(execFilePromisified.mock.calls.find((c: any[]) => c[0] === MSBUILD)).toBeDefined();
-  });
-
-  it('handles VS paths with spaces correctly', async () => {
-    const spaceInstall = 'C:\\Program Files\\Microsoft Visual Studio\\2026\\Preview';
-    const spaceDevCmd = path.join(spaceInstall, 'Common7', 'Tools', 'VsDevCmd.bat');
-    const spaceMsbuild = path.join(spaceInstall, 'MSBuild', 'Current', 'Bin', 'MSBuild.exe');
-    const spaceDevenv = path.join(spaceInstall, 'Common7', 'IDE', 'devenv.com');
-
-    allowPaths([VSWHERE, spaceMsbuild, spaceDevCmd, spaceDevenv]);
-    setupVswhere(spaceInstall);
-
-    await buildProjectTool({}, {});
-
-    const [, batContent] = writeFileMock.mock.calls[0];
-    expect(batContent).toContain(`call "${spaceDevCmd}"`);
-    expect(batContent).toContain(`"${spaceMsbuild}"`);
-  });
-
-  it('falls back to hardcoded candidates when vswhere is unavailable', async () => {
-    const hcMsbuild = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Current\\Bin\\MSBuild.exe';
-    const hcDevCmd = 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\Common7\\Tools\\VsDevCmd.bat';
-
-    allowPaths([hcMsbuild, hcDevCmd]);
-    execFilePromisified.mockResolvedValue({ stdout: '', stderr: '' });
-
-    await buildProjectTool({}, {});
-
-    expect(writeFileMock).toHaveBeenCalledTimes(1);
-    const [, batContent] = writeFileMock.mock.calls[0];
-    expect(batContent).toContain(`call "${hcDevCmd}"`);
-    expect(batContent).toContain(`"${hcMsbuild}"`);
-  });
-
-  it('sets PackagesFolder env vars in batch file', async () => {
-    const PKG = 'C:\\AOSService\\PackagesLocalDirectory';
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV, PKG]);
-    setupVswhere(VS_INSTALL);
-
-    await buildProjectTool({}, {});
-
-    const batContent = writeFileMock.mock.calls[0][1] as string;
-    expect(batContent).toContain(`set "PackagesFolder=${PKG}"`);
-    expect(batContent).toContain(`set "MetadataDir=${PKG}"`);
-    expect(batContent).toContain(`set "PATH=%PATH%;${PKG}\\bin"`);
-  });
-
-  // --- devenv.com /build fallback ---
-
-  it('falls back to devenv.com on MSB4062', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV]);
-    execFilePromisified.mockImplementation(async (file: string) => {
-      if (file === VSWHERE) return { stdout: `${VS_INSTALL}\r\n`, stderr: '' };
-      if (file === 'cmd.exe') {
-        const err: any = new Error('Build failed');
-        err.stdout = 'error MSB4062: The "CopyReferencesTask" task could not be loaded from the assembly Microsoft.Dynamics.Framework.Tools.BuildTasks.17.0';
-        err.stderr = '';
-        throw err;
-      }
-      if (file === DEVENV) return { stdout: 'Build: 1 succeeded, 0 failed, 0 skipped', stderr: '' };
-      return { stdout: '', stderr: '' };
+    // By default no state file exists
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
+  });
+
+  it('starts a background xppc.exe build and returns started message', async () => {
+    const child = makeFakeChild(42);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [exe, args] = spawnMock.mock.calls[0];
+    expect(exe).toBe(XPPC);
+    expect(args).toContain(`-metadata=${PKG}`);
+    expect(args).toContain(`-modelmodule=${MODEL_NAME}`);
+    expect(result.content[0].text).toContain('build started');
+    expect(result.isError).toBeFalsy();
+  });
+
+  it('writes a build state file when launching xppc.exe', async () => {
+    const child = makeFakeChild(99);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    // writeFile is called to persist build state JSON (last write has the real PID)
+    const stateCall = writeFileMock.mock.calls.filter((c: any[]) => c[0].includes('d365build_state')).at(-1);
+    expect(stateCall).toBeDefined();
+    const state = JSON.parse(stateCall![1]);
+    expect(state.pid).toBe(99);
+    expect(state.status).toBe('running');
+    expect(state.tool).toBe('xppc.exe');
+  });
+
+  it('calls child.unref() to prevent blocking server shutdown', async () => {
+    const child = makeFakeChild();
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(child.unref).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns error when packages path cannot be resolved', async () => {
+    // No CHE candidates accessible, no configManager paths
+    accessMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Cannot resolve D365FO package paths');
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('returns error when xppc.exe is not found', async () => {
+    // PKG dir exists but xppc.exe does not
+    allowPaths([PROJECT_PATH, PKG]);
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('xppc.exe');
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('returns error when model name cannot be determined', async () => {
+    allowPaths([PKG, XPPC]);
 
     const result = await buildProjectTool({}, {});
 
-    expect(result.content[0].text).toContain('devenv.com');
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Cannot determine model name');
+  });
+
+  it('returns in-progress status when build is already running', async () => {
+    const stateJson = JSON.stringify({
+      pid: 777,
+      projectPath: PROJECT_PATH,
+      tool: 'xppc.exe',
+      startTime: new Date().toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_abc.log',
+      status: 'running',
+    });
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return stateJson;
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      if (p.includes('d365build_log')) return 'Compiling...';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    // Simulate PID 777 being alive via process.kill mock
+    const origKill = process.kill.bind(process);
+    vi.spyOn(process, 'kill').mockImplementation((pid: any, sig: any) => {
+      if (pid === 777 && sig === 0) return true as any;
+      return origKill(pid, sig);
+    });
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(result.content[0].text).toContain('Call again to refresh');
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it('returns succeeded result when previous build finished successfully', async () => {
+    const stateJson = JSON.stringify({
+      pid: 888,
+      projectPath: PROJECT_PATH,
+      tool: 'xppc.exe',
+      startTime: new Date(Date.now() - 30_000).toISOString(),
+      endTime: new Date().toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_xyz.log',
+      status: 'succeeded',
+      exitCode: 0,
+    });
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return stateJson;
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      if (p.includes('d365build_log')) return 'Build complete.';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
     expect(result.content[0].text).toContain('succeeded');
     expect(result.isError).toBeFalsy();
-
-    const devenvCall = execFilePromisified.mock.calls.find((c: any[]) => c[0] === DEVENV);
-    expect(devenvCall).toBeDefined();
-    expect(devenvCall![1]).toContain('/build');
-    expect(devenvCall![1]).toContain('Debug');
+    expect(spawnMock).not.toHaveBeenCalled();
+    // State file should be cleared
+    expect(unlinkMock).toHaveBeenCalled();
   });
 
-  it('reports MSB4062 with instructions when devenv.com is unavailable', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD]);
-    execFilePromisified.mockImplementation(async (file: string) => {
-      if (file === VSWHERE) return { stdout: `${VS_INSTALL}\r\n`, stderr: '' };
-      if (file === 'cmd.exe') {
-        const err: any = new Error('Build failed');
-        err.stdout = 'error MSB4062: Microsoft.Dynamics.Framework.Tools.BuildTasks';
-        err.stderr = '';
-        throw err;
-      }
-      return { stdout: '', stderr: '' };
+  it('returns error result when previous build failed', async () => {
+    const stateJson = JSON.stringify({
+      pid: 999,
+      projectPath: PROJECT_PATH,
+      tool: 'xppc.exe',
+      startTime: new Date(Date.now() - 60_000).toISOString(),
+      endTime: new Date().toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_fail.log',
+      status: 'failed',
+      exitCode: 1,
+    });
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return stateJson;
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      if (p.includes('d365build_log')) return 'error AX0001: Something broke';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
 
-    const result = await buildProjectTool({}, {});
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('MSB4062');
-    expect(result.content[0].text).toContain('devenv.com was not found');
-    expect(result.content[0].text).toContain('Visual Studio 2022');
-  });
-
-  it('reports devenv.com build failure', async () => {
-    allowPaths([VSWHERE, MSBUILD, VSDEVCMD, DEVENV]);
-    execFilePromisified.mockImplementation(async (file: string) => {
-      if (file === VSWHERE) return { stdout: `${VS_INSTALL}\r\n`, stderr: '' };
-      if (file === 'cmd.exe') {
-        const err: any = new Error('Build failed');
-        err.stdout = 'error MSB4062: Microsoft.Dynamics.Framework.Tools.BuildTasks';
-        err.stderr = '';
-        throw err;
-      }
-      if (file === DEVENV) return { stdout: 'Build: 0 succeeded, 1 failed\nerror AX0001: bad', stderr: '' };
-      return { stdout: '', stderr: '' };
-    });
-
-    const result = await buildProjectTool({}, {});
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain('devenv.com');
     expect(result.content[0].text).toContain('FAILED');
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it('passes -metadata and -compilermetadata args to xppc.exe', async () => {
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT = 'C:\\AOSService\\PackagesLocalDirectory';
+    const xppc = path.join(MSFT, 'bin', 'xppc.exe');
+
+    cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+
+    const child = makeFakeChild(55);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, xppc]);
+
+    await buildProjectTool({ projectPath: PROJECT_PATH }, {});
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [, args] = spawnMock.mock.calls[0];
+    expect(args).toContain(`-metadata=${CUSTOM}`);
+    expect(args).toContain(`-compilermetadata=${MSFT}`);
+    expect(args).toContain(`-modelmodule=${MODEL_NAME}`);
+  });
+
+  it('force=true kills orphaned build and restarts', async () => {
+    const stateJson = JSON.stringify({
+      pid: 1234,
+      projectPath: PROJECT_PATH,
+      tool: 'xppc.exe',
+      startTime: new Date().toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_old.log',
+      status: 'running',
+    });
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return stateJson;
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    const child = makeFakeChild(5678);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH, force: true }, {});
+
+    // A new build was started
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(result.content[0].text).toContain('build started');
+  });
+
+  it('marks build as failed when xppc exits 0 but log contains Compile Error', async () => {
+    let closeCallback: ((code: number | null) => void) | undefined;
+    const child = {
+      pid: 42,
+      unref: vi.fn(),
+      on: vi.fn().mockImplementation((event: string, cb: any) => {
+        if (event === 'close') closeCallback = cb;
+      }),
+    };
+    spawnMock.mockReturnValue(child);
+    allowPaths([XPPC, PKG]);
+    cfgGetModelName.mockReturnValue(MODEL_NAME);
+
+    await buildProjectTool({ modelName: MODEL_NAME }, {});
+    expect(closeCallback).toBeDefined();
+
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.endsWith('.xppc.err')) return "Compile Error: Class Method dynamics://MyModel/MyClass/myMethod: [(28,27),(28,28)]: ';' expected.";
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    await closeCallback!(0);
+
+    const lastStateWrite = writeFileMock.mock.calls
+      .filter((c: any[]) => c[0].includes('d365build_state'))
+      .at(-1);
+    expect(lastStateWrite).toBeDefined();
+    const state = JSON.parse(lastStateWrite![1]);
+    expect(state.status).toBe('failed');
+    expect(state.exitCode).toBe(0);
+  });
+
+  it('marks build as succeeded when xppc exits 0 and log has no Compile Error', async () => {
+    let closeCallback: ((code: number | null) => void) | undefined;
+    const child = {
+      pid: 42,
+      unref: vi.fn(),
+      on: vi.fn().mockImplementation((event: string, cb: any) => {
+        if (event === 'close') closeCallback = cb;
+      }),
+    };
+    spawnMock.mockReturnValue(child);
+    allowPaths([XPPC, PKG]);
+    cfgGetModelName.mockReturnValue(MODEL_NAME);
+
+    await buildProjectTool({ modelName: MODEL_NAME }, {});
+    expect(closeCallback).toBeDefined();
+
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.endsWith('.xppc.err')) return 'Compile Warning: MyClass: potential issue.';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    await closeCallback!(0);
+
+    const lastStateWrite = writeFileMock.mock.calls
+      .filter((c: any[]) => c[0].includes('d365build_state'))
+      .at(-1);
+    expect(lastStateWrite).toBeDefined();
+    const state = JSON.parse(lastStateWrite![1]);
+    expect(state.status).toBe('succeeded');
+    expect(state.exitCode).toBe(0);
+  });
+
+  it('buildJobKey is case-insensitive: MYMODEL and mymodel resolve same state file path', async () => {
+    const readPaths: string[] = [];
+
+    // First call: no state, spawns build — record which state path was attempted
+    const child = makeFakeChild(42);
+    spawnMock.mockReturnValue(child);
+    allowPaths([XPPC, PKG]);
+    cfgGetModelName.mockReturnValue(null);
+
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) { readPaths.push(p); throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+
+    await buildProjectTool({ modelName: 'mymodel' }, {});
+    const firstPath = readPaths[0];
+    expect(firstPath).toBeDefined();
+
+    // Second call: uppercase model — should hit the same state file path
+    vi.resetAllMocks();
+    writeFileMock.mockResolvedValue(undefined);
+    unlinkMock.mockResolvedValue(undefined);
+    readdirMock.mockRejectedValue(new Error('not found'));
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    cfgGetModelName.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetContext.mockReturnValue({});
+    allowPaths([XPPC, PKG]);
+
+    const runningState = JSON.stringify({
+      pid: 42, modelName: 'mymodel', tool: 'xppc.exe',
+      startTime: new Date().toISOString(), logFile: 'C:\\Temp\\log.log', status: 'running',
+    });
+    const readPaths2: string[] = [];
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) { readPaths2.push(p); return runningState; }
+      if (p.includes('d365build_log')) return 'Compiling...';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    vi.spyOn(process, 'kill').mockReturnValue(true as any);
+
+    const result = await buildProjectTool({ modelName: 'MYMODEL' }, {});
+    const secondPath = readPaths2[0];
+    expect(secondPath).toBeDefined();
+    expect(result.content[0].text).toContain('Call again to refresh');
+    expect(firstPath).toBe(secondPath);
+
+    vi.restoreAllMocks();
+  });
+
+  it('uses explicit modelName param without requiring projectPath or rnrproj', async () => {
+    const child = makeFakeChild(77);
+    spawnMock.mockReturnValue(child);
+    allowPaths([XPPC, PKG]);
+    cfgGetModelName.mockReturnValue(null);
+
+    const result = await buildProjectTool({ modelName: 'ExplicitModel' }, {});
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [, args] = spawnMock.mock.calls[0];
+    expect(args).toContain('-modelmodule=ExplicitModel');
+    expect(result.content[0].text).toContain('build started');
+    expect(result.isError).toBeFalsy();
   });
 });

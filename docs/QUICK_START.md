@@ -53,6 +53,8 @@ npm run build
 
 ---
 
+> **Using Claude Code CLI instead of GitHub Copilot?** See [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) — different config format (`"mcpServers"` key, `alwaysLoad: true`) and `CLAUDE.md` placement.
+
 ## Step 3 — Connect Copilot
 
 ### 3a. Enable MCP in GitHub and Visual Studio
@@ -169,7 +171,8 @@ See [Scenario F in SETUP.md](SETUP.md#scenario-f-multiple-instances--one-machine
 
 ## Step 4 — Place copilot-instructions.md
 
-Copy the instruction file so Copilot knows D365FO workflow rules:
+Copy the bootstrap instruction file so Copilot has minimal D365FO context even before
+the MCP server connects:
 
 ```powershell
 # Place .github in a parent folder shared by all D365FO solutions:
@@ -178,6 +181,11 @@ Copy-Item -Path ".github" -Destination "C:\source\repos\" -Recurse
 
 VS 2022 searches for `.github\copilot-instructions.md` upward from the `.sln` folder —
 one copy in a common parent covers all solutions underneath.
+
+> **Note:** This file is intentionally small (~50 lines). The complete X++ rules, query
+> grammar, and workflow details are delivered at runtime via the MCP prompt
+> `xpp_system_instructions`. The bootstrap file only ensures correct tool routing if the
+> MCP server hasn't connected yet.
 
 ---
 
@@ -221,7 +229,7 @@ All available parameters in one block with comments:
       "args": ["K:\\d365fo-mcp-server\\dist\\index.js"],
       "env": {
         // ── Server mode ──────────────────────────────────────────────
-        // "full"       — all 54 tools (default for local)
+        // "full"       — All 58 tools (default for local)
         // "read-only"  — search/analysis tools only (Azure deployment)
         // "write-only" — file operations only (local companion in hybrid)
         "MCP_SERVER_MODE": "write-only",
@@ -368,7 +376,7 @@ After starting, check the server log for:
 
 | Topic | Documentation |
 |-------|--------------|
-| All 54 tools with parameters | [MCP_TOOLS.md](MCP_TOOLS.md) |
+| All 58 tools with parameters | [MCP_TOOLS.md](MCP_TOOLS.md) |
 | Practical usage examples (CoC, reports, security) | [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) |
 | Complete `.mcp.json` reference (all properties) | [MCP_CONFIG.md](MCP_CONFIG.md) |
 | Server deployment to Azure | [SETUP.md](SETUP.md) / [SETUP_AZURE.md](SETUP_AZURE.md) |
@@ -377,3 +385,4 @@ After starting, check the server log for:
 | Architecture overview | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | ISV / custom model configuration | [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) |
 | Azure DevOps pipelines | [PIPELINES.md](PIPELINES.md) |
+| **Claude Code CLI setup** | [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) |

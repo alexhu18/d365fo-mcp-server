@@ -1165,6 +1165,7 @@ namespace D365MetadataBridge.Services
 
             void Search(string objType, IList<string> keys)
             {
+                if (keys == null) return;
                 foreach (var n in keys)
                 {
                     if (result.Results.Count >= maxResults) return;
@@ -1173,23 +1174,86 @@ namespace D365MetadataBridge.Services
                 }
             }
 
+            // Materialize primary keys from a provider collection.
+            // IMPORTANT: these are accessed STRONGLY-TYPED through the public
+            // Microsoft.Dynamics.AX.Metadata.Providers.IMetadataProvider interface — NOT via
+            // `dynamic`. The concrete provider (DiskMetadataProvider) is an internal type, and
+            // the DLR cannot bind to public members of an internal type from this assembly:
+            // `dynamic dyn = prov; dyn.MenuItemDisplays` throws RuntimeBinderException
+            // ("'object' does not contain a definition for 'MenuItemDisplays'") and silently
+            // yields nothing — which is exactly how menu items/security stayed invisible.
+            // Interface access binds at compile time and works. Keys are enumerated (not cast
+            // to IList<string>) so a lazy IEnumerable<string> return is handled safely too.
+            List<string> Keys(string label, Func<IEnumerable<string>> getter)
+            {
+                var list = new List<string>();
+                try
+                {
+                    var raw = getter();
+                    if (raw != null)
+                        foreach (var k in raw) list.Add(k);
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] Search: could not list '{label}': {ex.GetType().Name}: {ex.Message}");
+                }
+                return list;
+            }
+
             void SearchProvider(IMetadataProvider prov)
             {
                 try
                 {
                     switch (type.ToLowerInvariant())
                     {
-                        case "table": Search("table", prov.Tables.GetPrimaryKeys()); break;
-                        case "class": Search("class", prov.Classes.GetPrimaryKeys()); break;
-                        case "enum": Search("enum", prov.Enums.GetPrimaryKeys()); break;
-                        case "edt": Search("edt", prov.Edts.GetPrimaryKeys()); break;
-                        case "form": Search("form", prov.Forms.GetPrimaryKeys()); break;
+                        case "table": Search("table", Keys("table", () => prov.Tables.GetPrimaryKeys())); break;
+                        case "class": Search("class", Keys("class", () => prov.Classes.GetPrimaryKeys())); break;
+                        case "enum": Search("enum", Keys("enum", () => prov.Enums.GetPrimaryKeys())); break;
+                        case "edt": Search("edt", Keys("edt", () => prov.Edts.GetPrimaryKeys())); break;
+                        case "form": Search("form", Keys("form", () => prov.Forms.GetPrimaryKeys())); break;
+                        case "query": Search("query", Keys("query", () => prov.Queries.GetPrimaryKeys())); break;
+                        case "view": Search("view", Keys("view", () => prov.Views.GetPrimaryKeys())); break;
+                        case "data-entity":
+                        case "dataentity": Search("data-entity", Keys("data-entity", () => prov.DataEntityViews.GetPrimaryKeys())); break;
+
+                        case "menu-item-display": Search("menu-item-display", Keys("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys())); break;
+                        case "menu-item-action": Search("menu-item-action", Keys("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys())); break;
+                        case "menu-item-output": Search("menu-item-output", Keys("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys())); break;
+
+                        case "security-privilege": Search("security-privilege", Keys("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys())); break;
+                        case "security-duty": Search("security-duty", Keys("security-duty", () => prov.SecurityDuties.GetPrimaryKeys())); break;
+                        case "security-role": Search("security-role", Keys("security-role", () => prov.SecurityRoles.GetPrimaryKeys())); break;
+
+                        case "table-extension": Search("table-extension", Keys("table-extension", () => prov.TableExtensions.GetPrimaryKeys())); break;
+                        // IMetadataProvider has no ClassExtensions collection — CoC/augmentation
+                        // classes live in the regular Classes collection (named *_Extension). The
+                        // bridge can't filter them out here, so return nothing and let the caller
+                        // fall back to the SQLite index, which indexes class-extension explicitly.
+                        case "class-extension":
+                            Console.Error.WriteLine("[DEBUG] Search: class-extension requested — no IMetadataProvider collection; falling back to SQLite index");
+                            break;
+                        case "form-extension": Search("form-extension", Keys("form-extension", () => prov.FormExtensions.GetPrimaryKeys())); break;
+                        case "enum-extension": Search("enum-extension", Keys("enum-extension", () => prov.EnumExtensions.GetPrimaryKeys())); break;
+                        case "edt-extension": Search("edt-extension", Keys("edt-extension", () => prov.EdtExtensions.GetPrimaryKeys())); break;
+                        case "data-entity-extension": Search("data-entity-extension", Keys("data-entity-extension", () => prov.DataEntityViewExtensions.GetPrimaryKeys())); break;
+
                         default:
-                            Search("table", prov.Tables.GetPrimaryKeys());
-                            Search("class", prov.Classes.GetPrimaryKeys());
-                            Search("enum", prov.Enums.GetPrimaryKeys());
-                            Search("edt", prov.Edts.GetPrimaryKeys());
-                            Search("form", prov.Forms.GetPrimaryKeys());
+                            // "all" (or any unrecognized filter): enumerate every object kind so
+                            // nothing — menu items included — is silently invisible to search.
+                            Search("table", Keys("table", () => prov.Tables.GetPrimaryKeys()));
+                            Search("class", Keys("class", () => prov.Classes.GetPrimaryKeys()));
+                            Search("enum", Keys("enum", () => prov.Enums.GetPrimaryKeys()));
+                            Search("edt", Keys("edt", () => prov.Edts.GetPrimaryKeys()));
+                            Search("form", Keys("form", () => prov.Forms.GetPrimaryKeys()));
+                            Search("query", Keys("query", () => prov.Queries.GetPrimaryKeys()));
+                            Search("view", Keys("view", () => prov.Views.GetPrimaryKeys()));
+                            Search("data-entity", Keys("data-entity", () => prov.DataEntityViews.GetPrimaryKeys()));
+                            Search("menu-item-display", Keys("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys()));
+                            Search("menu-item-action", Keys("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys()));
+                            Search("menu-item-output", Keys("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys()));
+                            Search("security-privilege", Keys("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys()));
+                            Search("security-duty", Keys("security-duty", () => prov.SecurityDuties.GetPrimaryKeys()));
+                            Search("security-role", Keys("security-role", () => prov.SecurityRoles.GetPrimaryKeys()));
                             break;
                     }
                 }
@@ -1216,20 +1280,21 @@ namespace D365MetadataBridge.Services
         {
             try
             {
-                dynamic providerDynamic = _provider;
-                dynamic privileges = providerDynamic.SecurityPrivileges;
+                // Access collections via IMetadataProvider interface (compile-time binding).
+                // Avoids RuntimeBinderException when DiskMetadataProvider (internal type)
+                // is accessed through dynamic from another assembly.
+                var privileges = _provider.SecurityPrivileges;
                 dynamic? axObj = privileges.Read(name);
                 // Fallback to reference provider (UDE: Microsoft packages)
                 if (axObj == null && _referenceProvider != null)
                 {
-                    dynamic refProv = _referenceProvider!;
-                    privileges = refProv.SecurityPrivileges;
+                    privileges = _referenceProvider!.SecurityPrivileges;
                     axObj = privileges.Read(name);
                 }
                 if (axObj == null) return null;
 
                 string? model = null;
-                try { var mi = privileges.GetModelInfo(name); if (mi?.Count > 0) model = ((IEnumerable<dynamic>)mi).First().Name; } catch { }
+                try { var mi = privileges.GetModelInfo(name); if (mi?.Count > 0) model = mi.First().Name; } catch { }
 
                 var entryPoints = new List<object>();
                 try
@@ -1250,17 +1315,17 @@ namespace D365MetadataBridge.Services
                 var parentDuties = new List<object>();
                 try
                 {
-                    foreach (var dutyName in providerDynamic.SecurityDuties.GetPrimaryKeys())
+                    foreach (var dutyName in _provider.SecurityDuties.GetPrimaryKeys())
                     {
                         try
                         {
-                            dynamic duty = providerDynamic.SecurityDuties.Read((string)dutyName);
+                            dynamic duty = _provider.SecurityDuties.Read(dutyName);
                             if (duty?.Privileges == null) continue;
                             foreach (var p in duty.Privileges)
                             {
                                 if ((string)p.Name == name)
                                 {
-                                    parentDuties.Add(new { name = (string)dutyName });
+                                    parentDuties.Add(new { name = dutyName });
                                     break;
                                 }
                             }
@@ -1296,20 +1361,21 @@ namespace D365MetadataBridge.Services
         {
             try
             {
-                dynamic providerDynamic = _provider;
-                dynamic duties = providerDynamic.SecurityDuties;
+                // Access collections via IMetadataProvider interface (compile-time binding).
+                // Avoids RuntimeBinderException when DiskMetadataProvider (internal type)
+                // is accessed through dynamic from another assembly.
+                var duties = _provider.SecurityDuties;
                 dynamic? axObj = duties.Read(name);
                 // Fallback to reference provider (UDE: Microsoft packages)
                 if (axObj == null && _referenceProvider != null)
                 {
-                    dynamic refProv = _referenceProvider!;
-                    duties = refProv.SecurityDuties;
+                    duties = _referenceProvider!.SecurityDuties;
                     axObj = duties.Read(name);
                 }
                 if (axObj == null) return null;
 
                 string? model = null;
-                try { var mi = duties.GetModelInfo(name); if (mi?.Count > 0) model = ((IEnumerable<dynamic>)mi).First().Name; } catch { }
+                try { var mi = duties.GetModelInfo(name); if (mi?.Count > 0) model = mi.First().Name; } catch { }
 
                 var childPrivileges = new List<object>();
                 try
@@ -1335,17 +1401,17 @@ namespace D365MetadataBridge.Services
                 var parentRoles = new List<object>();
                 try
                 {
-                    foreach (var roleName in providerDynamic.SecurityRoles.GetPrimaryKeys())
+                    foreach (var roleName in _provider.SecurityRoles.GetPrimaryKeys())
                     {
                         try
                         {
-                            dynamic role = providerDynamic.SecurityRoles.Read((string)roleName);
+                            dynamic role = _provider.SecurityRoles.Read(roleName);
                             if (role?.Duties == null) continue;
                             foreach (var d in role.Duties)
                             {
                                 if ((string)d.Name == name)
                                 {
-                                    parentRoles.Add(new { name = (string)roleName });
+                                    parentRoles.Add(new { name = roleName });
                                     break;
                                 }
                             }
@@ -1382,20 +1448,21 @@ namespace D365MetadataBridge.Services
         {
             try
             {
-                dynamic providerDynamic = _provider;
-                dynamic roles = providerDynamic.SecurityRoles;
+                // Access collections via IMetadataProvider interface (compile-time binding).
+                // Avoids RuntimeBinderException when DiskMetadataProvider (internal type)
+                // is accessed through dynamic from another assembly.
+                var roles = _provider.SecurityRoles;
                 dynamic? axObj = roles.Read(name);
                 // Fallback to reference provider (UDE: Microsoft packages)
                 if (axObj == null && _referenceProvider != null)
                 {
-                    dynamic refProv = _referenceProvider!;
-                    roles = refProv.SecurityRoles;
+                    roles = _referenceProvider!.SecurityRoles;
                     axObj = roles.Read(name);
                 }
                 if (axObj == null) return null;
 
                 string? model = null;
-                try { var mi = roles.GetModelInfo(name); if (mi?.Count > 0) model = ((IEnumerable<dynamic>)mi).First().Name; } catch { }
+                try { var mi = roles.GetModelInfo(name); if (mi?.Count > 0) model = mi.First().Name; } catch { }
 
                 var childDuties = new List<object>();
                 try
@@ -1470,25 +1537,34 @@ namespace D365MetadataBridge.Services
                 // Try primary provider first, then reference provider (UDE fallback)
                 foreach (var prov in new[] { _provider, _referenceProvider }.Where(p => p != null))
                 {
-                    dynamic providerDynamic = prov!;
-
                     foreach (var tryType in tryTypes)
                     {
                         try
                         {
-                            dynamic items = tryType switch
+                            // Access collections via IMetadataProvider interface (compile-time binding).
+                            // Avoids RuntimeBinderException when DiskMetadataProvider (internal type)
+                            // is accessed through dynamic from another assembly.
+                            dynamic? axObj = tryType switch
                             {
-                                "display" => providerDynamic.MenuItemDisplays,
-                                "action" => providerDynamic.MenuItemActions,
-                                "output" => providerDynamic.MenuItemOutputs,
+                                "display" => (object?)prov!.MenuItemDisplays.Read(name),
+                                "action"  => (object?)prov!.MenuItemActions.Read(name),
+                                "output"  => (object?)prov!.MenuItemOutputs.Read(name),
                                 _ => throw new InvalidOperationException()
                             };
-
-                            dynamic axObj = items.Read(name);
                             if (axObj == null) continue;
 
                             string? model = null;
-                            try { var mi = items.GetModelInfo(name); if (mi?.Count > 0) model = ((IEnumerable<dynamic>)mi).First().Name; } catch { }
+                            try
+                            {
+                                var rawMi = tryType switch
+                                {
+                                    "display" => (object?)prov!.MenuItemDisplays.GetModelInfo(name),
+                                    "action"  => (object?)prov!.MenuItemActions.GetModelInfo(name),
+                                    _         => (object?)prov!.MenuItemOutputs.GetModelInfo(name),
+                                };
+                                if (rawMi != null) { dynamic dmi = rawMi; if (dmi.Count > 0) model = (string?)dmi.First().Name; }
+                            }
+                            catch { }
 
                             return new
                             {

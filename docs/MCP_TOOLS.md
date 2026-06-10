@@ -1,17 +1,17 @@
 # All Available Tools
 
 When you ask GitHub Copilot a question about D365FO code, it automatically calls one of these
-54 tools to look up the answer or generate code. You do not need to name the tools yourself —
+58 tools to look up the answer or generate code. You do not need to name the tools yourself —
 just ask in plain English.
 
 > **C# Metadata Bridge (Windows D365FO VMs only):** On a Windows VM with D365FO installed,
-> 20 tools automatically try the C# metadata bridge first — providing always-fresh,
+> 16 tools automatically try the C# metadata bridge first — providing always-fresh,
 > runtime-resolved metadata via `IMetadataProvider` and compiler-resolved cross-references
 > via `DYNAMICSXREFDB`. If the bridge is unavailable (Azure, Linux, CI) or the object is
 > not found, the tools transparently fall back to the SQLite database.
 > Bridge-sourced results include a `_Source: C# bridge_` marker.
 >
-> **Cross-reference enrichment (P1-P5):** `find_references` returns categorized reference
+> **Cross-reference enrichment:** `find_references` returns categorized reference
 > types (call/extends/field-access) and caller details. `find_coc_extensions` shows which
 > methods each extension class wraps. `find_event_handlers` supports eventName/handlerType
 > filtering. `get_api_usage_patterns` returns compiler-resolved callers grouped by class.
@@ -117,7 +117,7 @@ The following tools empower Copilot to trigger X++ compilation, testing, and db 
 |------|------------|-------------|
 | **generate_d365fo_xml** | Anywhere (cloud + local) | Returns XML content — Copilot then creates the file |
 | **create_d365fo_file** | Local Windows VM only | Creates the physical file and adds it to the VS project |
-| **modify_d365fo_file** | Local Windows VM only | Safely edits an existing file with automatic backup |
+| **modify_d365fo_file** | Local Windows VM only | Edits an existing file in place (applies immediately; optional `.bak` backup) |
 | **verify_d365fo_project** | Local Windows VM only | Reads `.rnrproj` on K:\ to verify objects exist on disk and are referenced in the project file |
 
 ### Security & Extensions (10 tools)
@@ -141,8 +141,25 @@ The following tools empower Copilot to trigger X++ compilation, testing, and db 
 |------|-------------|---------------|
 | **search_labels** | Full-text search across all AxLabelFile labels | "Find a label for 'customer account'" |
 | **get_label_info** | All translations for a label ID, or list label files | "Show all translations of MyFeature in MyModel" |
-| **create_label** | Add a new label to all language files in a model | "Create label MyNewField in MyModel" |
+| **create_label** | Add a new label to all language files in a model (or only the locales listed in `languages`) | "Create label MyNewField in MyModel" |
 | **rename_label** | Rename a label ID in .label.txt, X++ source and XML metadata | "Rename label OldName to NewName in MyModel" |
+
+### Code Quality & Grounding (4 tools)
+
+| Tool | What it does | Example prompt |
+|------|-------------|---------------|
+| **validate_xpp** | Offline X++/XML BP validator — <50 ms, all-platform, no xppbp.exe needed. Returns `{rule, severity, line, excerpt, fix}[]` incl. data-driven property rules (XML002–XML005) mined from your standard models. Call after generating code, before write operations. | "Validate this generated class for BP issues" |
+| **resolve_references** | Semantic reference resolver — verifies every type, table field, method (incl. arity), enum, label and intrinsic target (`tableStr`, `fieldStr`, …) in generated X++ against the indexed codebase. Catches hallucinated symbols before the compiler does. | "Check that this generated code only references real symbols" |
+| **prepare_change** | Single-round context aggregator for extension work. Returns method signature, existing CoC wrappers, eligibility, strategy, naming validation, and a grounding token in one parallel call. | "Prepare context for extending CustTable.validateWrite" |
+| **prepare_create** | Single-round context aggregator for NEW objects. Returns collision check, naming with the auto-applied prefix, similar objects to copy patterns from, EDT suggestions for planned fields, reusable labels, mined property defaults, and a grounding token. | "Prepare context for a new Contoso import parameters table" |
+
+> **Grounding enforcement:** `prepare_change` issues a SHA-256 provenance token (30-min TTL) **bound to the object it was issued for**. When `GROUNDING_ENFORCE=true` is set in `.env`:
+> - extension patterns in `generate_code` and extension objectTypes in `create_d365fo_file` / `modify_d365fo_file` require a valid token for the target object, and
+> - X++ source passed to `create_d365fo_file` / `modify_d365fo_file` is run through `resolve_references` — the write is rejected while any identifier cannot be proven against the index.
+>
+> This ensures generated code is grounded in your actual codebase, not AI training data.
+>
+> **Hybrid deployment note:** grounding tokens live in the issuing process's memory. In `write-only` mode (local companion) `prepare_change` is not exposed and tokens issued by the read-only/Azure instance cannot be validated locally, so `GROUNDING_ENFORCE=true` is **ignored** there (with a startup warning) — otherwise the agent would loop forever between the two servers. Only enable enforcement on a `full`-mode server.
 
 ---
 
@@ -188,6 +205,32 @@ avoid noise from the 500 000+ standard Microsoft symbols.
 Find all my ISV_ classes
 Show me custom extensions for CustTable
 Search for MyModel helper classes
+```
+
+---
+
+### code_completion
+
+Lists methods and fields available on a class or table, with optional name-prefix filtering.
+Use this for lightweight symbol look-up when you already know the object name and want to see
+what members are available — without fetching the full class definition.
+
+> ℹ️ For full class details including method source code, use **get_class_info**.
+> For full table schemas, use **get_table_info**.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `className` | Yes | Class or table name |
+| `prefix` | No | Method/field name prefix to filter results |
+| `includeWorkspace` | No | Also scan local workspace files (requires `workspacePath`) |
+| `workspacePath` | No | Path to local workspace root for scanning |
+
+**Examples:**
+```
+What methods start with 'calc' on SalesTable?
+List all methods on LedgerJournalEngine
+Show fields starting with 'Cust' on CustTable
 ```
 
 ---
@@ -398,8 +441,8 @@ plain-language explanation plus a corrective action — no symbol-index access n
 it works in both Azure read-only and local modes.
 
 **When to call:** Whenever the compiler Output window, Error List, or runtime infolog shows
-an unfamiliar error. Rule 22 in `copilot-instructions.md` mandates calling this tool
-**before guessing a fix.**
+an unfamiliar error. The system instructions mandate calling this tool **before guessing
+a fix** (see `xpp_system_instructions` MCP prompt / `src/prompts/systemInstructions.ts`).
 
 **Parameters:**
 | Parameter | Required | Description |
@@ -462,12 +505,54 @@ Show me patterns for financial dimension handling
 
 ---
 
+### suggest_method_implementation
+
+Finds real examples of how similar methods are implemented in your codebase and generates
+an X++ method skeleton based on method-name heuristics. Call this before writing a method
+from scratch to ground the implementation in proven patterns.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `className` | Yes | Class that will contain the method |
+| `methodName` | Yes | Name of the method to implement |
+| `returnType` | No | Return type of the method (default: `void`) |
+| `parameters` | No | Array of `{ name, type }` parameter objects |
+
+**Examples:**
+```
+How do others implement validateWrite() on a sales-related table?
+Show me similar implementations of calcDiscount() with return type AmountMST
+Generate a skeleton for processPayment() returning boolean
+```
+
+---
+
+### analyze_class_completeness
+
+Checks a class against similar classes in the codebase to identify standard methods it
+is missing. Useful for ensuring a new class is fully implemented before review.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `className` | Yes | Name of the class to analyze |
+
+**Examples:**
+```
+Is MyHelper class complete?
+What standard methods is MySalesService missing?
+Analyze completeness of ContosoInvoiceController
+```
+
+---
+
 ### get_api_usage_patterns
 
 Shows how a specific API class or method is actually used in your codebase: typical
 initialization code, common method call sequences, and related APIs.
 
-> **Bridge-first (P5):** When the C# bridge is connected, this tool queries
+> **Bridge-first:** When the C# bridge is connected, this tool queries
 > `DYNAMICSXREFDB` for compiler-resolved callers of the API, grouped by class with
 > method list and call count. Falls back to SQLite pattern analysis when the bridge
 > is unavailable.
@@ -596,12 +681,16 @@ Use this when the MCP server is hosted in Azure and does not have local file sys
 
 ### modify_d365fo_file
 
-Edits an existing D365FO XML file safely:
+Edits an existing D365FO XML file:
 
-1. Creates a backup (`.bak`) before touching anything
-2. Makes the change (add/edit/remove a method or field)
-3. Validates that the XML is still well-formed
-4. Rolls back from the backup if anything goes wrong
+1. Makes the change (add/edit/remove a method or field) via IMetadataProvider
+2. Validates that the XML is still well-formed
+3. Optionally writes a `.bak` first when `createBackup=true` (default: `false`)
+
+> ⚠️ **Applies immediately — there is no dry-run/preview mode.** The change is written
+> to disk the moment the tool is called. Describe the intended change in chat and let the
+> user confirm *before* calling. To revert, use `undo_last_modification` (git checkout) or
+> pass `createBackup=true` to keep a `.bak` copy. Failures are returned with `isError=true`.
 
 Supports `packageName` parameter for when the package name differs from the model name.
 In UDE environments this is auto-resolved; in traditional environments it defaults to
@@ -695,12 +784,17 @@ Show me the X++ snippet for label BatchGroup
 
 ### create_label
 
-Adds a new label to every language `.label.txt` file in a model. Inserts the entry
-alphabetically (as required by the D365FO label file format), creates the AxLabelFile XML
-descriptors if the model doesn't have any yet, and updates the MCP index so the new label
-is immediately searchable.
+Adds a new label to every language `.label.txt` file in a model (or only the locales given in
+`languages`). Inserts the entry alphabetically (as required by the D365FO label file format),
+creates the AxLabelFile XML descriptors if the model doesn't have any yet, and updates the MCP
+index so the new label is immediately searchable.
 
 > **Always call `search_labels` first** to verify the label doesn't already exist.
+
+> **Note — `LabelResources/` is shared across the whole model.** By default the label is written
+> to *every* locale folder present in the model, even folders that exist only because a sibling
+> label file (e.g. a multi-language report) ships them. For a customization that needs just one
+> language, pass `languages: ["en-US"]` to avoid creating empty placeholder files for the others.
 
 **Parameters:**
 - `labelId` — new label ID, e.g. `MyNewField` (required)
@@ -708,6 +802,8 @@ is immediately searchable.
 - `model` — model name, e.g. `MyModel` (required)
 - `translations` — array of `{ language, text }` objects (required); provide all supported
   languages
+- `languages` — restrict which locale `.label.txt` files are written/created, e.g. `["en-US"]`.
+  When omitted/empty, writes to every language folder already present in the model (default)
 - `defaultComment` — developer comment added to each translation
 - `packageName` — package name for label file location; auto-resolved from model if omitted
 - `packagePath` — override base path (default: auto-detected from environment)
@@ -1015,6 +1111,105 @@ Verifies that D365FO objects exist on disk at the correct AOT path and are refer
 
 ---
 
+### build_d365fo_project
+
+Triggers an MSBuild / xppc.exe compilation of the D365FO model. Repeated calls poll the
+running job and return the latest log output — no need to re-invoke separately to check status.
+
+> ⚠️ **LOCAL_TOOLS only** — requires a local Windows VM with D365FO installed.
+> Never call this automatically — only on explicit user request.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `modelName` | No | Model name to build; auto-detected from `.mcp.json` if omitted |
+| `projectPath` | No | `.rnrproj` path (used only to extract model name if `modelName` omitted) |
+| `force` | No | Kill any stuck build process and restart (default: `false`) |
+
+**Examples:**
+```
+Build my project and show me the errors
+Build the ContosoRobotics model
+Force-restart the stuck build
+```
+
+---
+
+### trigger_db_sync
+
+Runs SyncEngine.exe to synchronize the D365FO database schema to match current metadata.
+Supports full-model sync or targeted partial sync for specific tables.
+
+> ⚠️ **LOCAL_TOOLS only** — requires a local Windows VM with D365FO installed.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `modelName` | No | Model name to sync; auto-detected from `.mcp.json` if omitted |
+| `tables` | No | Array of table names for partial sync |
+| `tableName` | No | Single table name shorthand (equivalent to `tables: [tableName]`) |
+| `projectPath` | No | `.rnrproj` path; used to extract syncable objects for smart partial sync |
+| `syncViews` | No | Also sync views and data entities (default: `false`) |
+| `connectionString` | No | SQL connection string override |
+| `packagePath` | No | `PackagesLocalDirectory` root override |
+
+**Examples:**
+```
+Sync the database to reflect my table changes
+Sync only MyCustomTable and MyOrderTable
+Sync the whole FmMcp model including views
+```
+
+---
+
+### run_bp_check
+
+Runs the Microsoft xppbp.exe best-practice linter against the model or a specific object.
+Returns a pass/warning/error summary and raw BP output.
+
+> ⚠️ **LOCAL_TOOLS only** — requires a local Windows VM with D365FO installed.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `modelName` | No | Model name to check; auto-detected from `.mcp.json` if omitted |
+| `projectPath` | No | `.rnrproj` path; auto-detected if omitted |
+| `targetFilter` | No | Filter to a specific class, table, or object name |
+| `packagePath` | No | `PackagesLocalDirectory` root override |
+
+**Examples:**
+```
+Run best practice checks on my latest changes
+Run BP check filtered to MyCustomClass
+Check the ContosoRobotics model for best practice violations
+```
+
+---
+
+### run_systest_class
+
+Invokes the D365FO SysTest framework against a specific test class (and optionally a single
+test method). Uses SysTestRunner.exe when available, falling back to xppbp.exe.
+
+> ⚠️ **LOCAL_TOOLS only** — requires a local Windows VM with D365FO installed.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `className` | Yes | SysTest class name to run |
+| `testMethod` | No | Specific test method within the class (runs all methods if omitted) |
+| `modelName` | No | Model containing the test class; auto-detected if omitted |
+| `packagePath` | No | `PackagesLocalDirectory` root override |
+
+**Examples:**
+```
+Run the unit tests in MyTestClass
+Run only the testValidateWrite method in MyTableTest
+Run all tests in ContosoSalesServiceTest
+```
+
+---
+
 ### update_symbol_index
 
 Re-indexes a D365FO XML file in the SQLite symbol database. Since `create_d365fo_file`
@@ -1125,11 +1320,17 @@ auto-detected model name as a concrete fix suggestion.
 > stop and fix `.mcp.json` before creating any files — without the correct model name, new
 > objects will land in the wrong model.
 
+On UDE / Power Platform Tools environments, D365FO splits metadata into two roots: a writable
+custom root (`Package path`, from `ModelStoreFolder`) and a read-only Microsoft root
+(`Framework dir`, from `FrameworkDirectory`). Both are reported so callers can resolve symbols
+across either tree, but file creation must always target the package path.
+
 **Takes no parameters.**
 
 **Returns:**
 - Model name (from `.mcp.json`) and whether it is a placeholder
-- Package path and project path
+- Package path (custom metadata root) and project path
+- Framework directory (Microsoft metadata root) — UDE only; empty on classic VMs
 - Environment type (`ude`, `traditional`, or `azure`)
 - If placeholder: the real model name auto-detected from `.rnrproj` + exact fix instruction
 
@@ -1137,6 +1338,231 @@ auto-detected model name as a concrete fix suggestion.
 ```
 Check my D365FO workspace configuration
 What model am I working in?
+```
+
+---
+
+### get_security_artifact_info
+
+Returns full details for a security privilege, duty, or role including the complete
+hierarchy chain: role → duties → privileges → entry points (forms, tables, menu items).
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `name` | Yes | Name of the security artifact |
+| `artifactType` | Yes | `privilege`, `duty`, or `role` |
+| `includeChain` | No | Walk and display the full hierarchy (default: `true`) |
+
+**Examples:**
+```
+Show me everything in the CustTableFullControl privilege
+What duties does the TradeSalesClerk role include?
+List all entry points in the SalesOrderMaintain duty
+```
+
+---
+
+### get_security_coverage_for_object
+
+Finds which roles, duties, and privileges grant access to a given form, table, or menu item.
+Returns a per-menu-item breakdown with aggregate role counts.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `objectName` | Yes | Form, table, class, or menu item name |
+| `objectType` | No | `form`, `table`, `class`, `menu-item`, or `auto` (default: `auto`) |
+
+**Examples:**
+```
+What roles can access the CustTable form?
+Which security privileges cover SalesTable?
+Who has access to the VendPaymProposal form?
+```
+
+---
+
+### get_menu_item_info
+
+Returns menu item metadata (type, target object, label) and the full security chain from
+the menu item up through privilege → duty → role. Falls back to fuzzy suggestions when the
+exact name is not found.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `name` | Yes | Menu item name |
+| `itemType` | No | `display`, `action`, `output`, or `any` (default: `any`) |
+
+**Examples:**
+```
+What form does the CustTable menu item open?
+Show me the security chain for SalesTableListPage menu item
+What output menu items exist for SalesInvoice?
+```
+
+---
+
+### find_coc_extensions
+
+Finds all Chain of Command (CoC) extension classes that wrap methods on the specified class
+or table. Bridge-first: uses DYNAMICSXREFDB when available for compiler-resolved results;
+falls back to SQLite extension metadata and filesystem scan.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `className` | Yes | Base class or table name being extended |
+| `methodName` | No | Filter results to a specific wrapped method |
+| `includeEventHandlers` | No | Also list static event subscriptions for this class/table (default: `true`) |
+
+**Examples:**
+```
+Does CustTable.validateWrite have any CoC wrappers?
+Find all CoC extensions on SalesFormLetter
+Which classes extend SalesLine.insert()?
+```
+
+---
+
+### find_event_handlers
+
+Finds all event handler methods that subscribe to events on a class or table. Bridge-first:
+uses DYNAMICSXREFDB when available; falls back to FTS5 source-snippet search.
+Supports filtering by event name and handler type.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `targetClass` | One of | Class whose events to find handlers for |
+| `targetTable` | One of | Table whose events to find handlers for |
+| `eventName` | No | Filter to a specific event (e.g. `onInserted`, `onValidatedWrite`) |
+| `handlerType` | No | `static`, `delegate`, or `all` (default: `all`) |
+
+> At least one of `targetClass` or `targetTable` is required.
+
+**Examples:**
+```
+Who handles the onInserted event of SalesLine?
+Find all event handlers on CustTable
+Show only delegate handlers on InventTable
+```
+
+---
+
+### get_table_extension_info
+
+Lists all extension objects that extend a base table — added fields, indexes, methods, and
+event subscriptions — and optionally merges them with the base schema into an effective
+schema summary.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `tableName` | Yes | Base table name whose extensions should be found |
+| `includeEffectiveSchema` | No | Merge base + extension fields/indexes into a combined totals view (default: `true`) |
+
+**Examples:**
+```
+What fields did ISV packages add to CustTable?
+Show all extensions of InventTable with effective schema
+List everything added to SalesLine by any extension
+```
+
+---
+
+### get_data_entity_info
+
+Returns data entity metadata: category, OData public name, data sources, field mappings,
+primary key, and enabled integrations. Bridge-first, with SQLite fuzzy suggestions on miss.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `entityName` | Yes | Name of the data entity (AxDataEntityView object name) |
+
+**Examples:**
+```
+Show me CustCustomerV3Entity details
+What OData name does VendorV2Entity expose?
+What data sources does SalesOrderHeaderV2Entity use?
+```
+
+---
+
+### analyze_extension_points
+
+Analyzes an X++ class, table, or form and returns all available extension surfaces:
+CoC-eligible methods, delegates, standard events, and (optionally) existing wrappers and
+subscribers already present in the codebase.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `objectName` | Yes | Class, table, or form name to analyze |
+| `objectType` | No | `class`, `table`, `form`, or `auto` (default: `auto`) |
+| `showExistingExtensions` | No | Also list existing CoC wrappers and event subscribers (default: `false`) |
+
+**Examples:**
+```
+What can I extend on SalesLine?
+Show extension points for CustTable including existing extensions
+What delegates does SalesFormLetter expose?
+```
+
+---
+
+### recommend_extension_strategy
+
+Rule-based advisor that recommends the best D365FO extensibility mechanism for a described
+goal — preventing wrong choices such as CoC where a Business Event or data entity is more
+appropriate. Returns the recommended strategy, reasoning, risks, alternatives,
+anti-patterns to avoid, and suggested next MCP calls.
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `goal` | Yes | Plain-English description of what you want to achieve |
+| `objectName` | No | Target D365FO object, if known |
+| `scenario` | No | One of: `data-validation`, `field-defaulting`, `business-logic-change`, `outbound-integration`, `inbound-data`, `ui-modification`, `document-output`, `number-sequence`, `security-access`, `batch-processing`, `custom`. Auto-detected from `goal` if omitted. |
+
+**Examples:**
+```
+Should I use CoC or Business Event to notify an external system?
+How should I default a field value when a new sales order is created?
+What is the best way to add a custom field to the vendor invoice form?
+```
+
+---
+
+### validate_object_naming
+
+Validates a proposed D365FO object name against naming conventions and detects conflicts
+in the symbol index. Supports both `prefix` and `model-name` extension naming styles
+(controlled by `EXTENSION_NAMING_STYLE`).
+
+**Parameters:**
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `proposedName` | Yes | The full object name to validate |
+| `objectType` | Yes | Object type: `class`, `table`, `form`, `enum`, `edt`, `query`, `view`, `table-extension`, `class-extension`, `form-extension`, `enum-extension`, `edt-extension`, `menu-item`, `security-privilege`, `security-duty`, `security-role`, `data-entity` |
+| `baseObjectName` | Extension types | Name of the base object being extended (required for all `*-extension` types) |
+| `modelPrefix` | No | Expected ISV/model prefix (2-4 uppercase letters, e.g. `"CR"`, `"WHS"`). Auto-detected from the symbol index if omitted. |
+| `modelName` | No | Target model name. Relevant only when `EXTENSION_NAMING_STYLE=model-name`, where the extension token is the model name instead of the prefix infix (e.g. `CustTable_ContosoRobotics_Extension`). Auto-detected from the active workspace config if omitted. |
+
+**Extension naming styles:**
+
+| Style | Class extension | Element extension |
+|-------|----------------|------------------|
+| `prefix` (default) | `{Base}{Prefix}_Extension` | `{Base}.{Prefix}Extension` |
+| `model-name` | `{Base}_{ModelName}_Extension` | `{Base}.{ModelName}` |
+
+**Examples:**
+```
+Is SalesTableCR_Extension a valid extension class name for SalesTable?
+Validate CustTable.ContosoRoboticsExtension as a table-extension
+Validate CustTable_ContosoRobotics_Extension as class-extension with modelName="ContosoRobotics"
 ```
 
 ---

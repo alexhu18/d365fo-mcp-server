@@ -3,21 +3,21 @@ import { execFile } from 'child_process';
 import util from 'util';
 import path from 'path';
 import fs from 'fs/promises';
-import os from 'os';
 import { getConfigManager } from '../utils/configManager.js';
 import { withOperationLock } from '../utils/operationLocks.js';
 
 const execFileAsync = util.promisify(execFile);
 
 // Keyword that xppbp.exe prints when it doesn't recognise the arguments
-const HELP_TEXT_PATTERN = /^usage:|BPCheck Tool|^xppbp\.exe|unrecognized|missing required/im;
+const HELP_TEXT_PATTERN = /^usage:|BPCheck Tool|^xppbp\.exe|unrecognized|missing required|X\+\+ Best Practice Options/im;
 
 export const runBpCheckToolDefinition = {
   name: 'run_bp_check',
   description: 'Runs xppbp.exe against the project to enforce Microsoft Best Practices.',
   parameters: z.object({
     projectPath: z.string().optional().describe('The absolute path to the .rnrproj file to check. Auto-detected from .mcp.json if omitted.'),
-    targetFilter: z.string().optional().describe('Optional: filter results to a specific class, table, or object name'),
+    targetFilter: z.string().optional().describe('Optional: filter results to a specific object name (class, table, form, enum, ...).'),
+    targetElementType: z.string().optional().describe('Element type for the filter, used with xppbp 10.0.24+ (equals-style CLI). Common values: class, table, form, enum, view, query. Defaults to "class" when targetFilter is set but targetElementType is omitted.'),
     modelName: z.string().optional().describe('Model name to check. Auto-detected from .mcp.json if omitted.'),
     packagePath: z.string().optional().describe('PackagesLocalDirectory root. Auto-detected if omitted.')
   })
@@ -35,15 +35,10 @@ async function tryXppbp(xppbpPath: string, args: string[]): Promise<{ stdout: st
 }
 
 export const runBpCheckTool = async (params: any, _context: any) => {
-  const { targetFilter } = params;
+  const { targetFilter, targetElementType } = params;
   try {
     const configManager = getConfigManager();
     await configManager.ensureLoaded();
-
-    // Resolve package path
-    const packagesRoot = params.packagePath
-      || configManager.getPackagePath()
-      || 'K:\\AosService\\PackagesLocalDirectory';
 
     // Resolve model name
     const modelName = params.modelName || configManager.getModelName();
@@ -54,74 +49,122 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       };
     }
 
-    // Resolve project path — required by most xppbp.exe versions
+    // Resolve project path — optional in UDE environments where xppbp no longer requires -vsproj
     const resolvedProjectPath = params.projectPath || await configManager.getProjectPath();
-    if (!resolvedProjectPath) {
-      return {
-        content: [{
-          type: 'text',
-          text: '❌ Cannot determine project path.\n\nProvide projectPath parameter or set it in .mcp.json:\n```json\n{ "servers": { "context": { "projectPath": "C:\\\\path\\\\to\\\\MyProject.rnrproj" } } }\n```'
-        }],
-        isError: true
-      };
-    }
 
-    // Locate xppbp.exe
+    // In UDE the custom packages path (ModelStoreFolder) is the metadata root,
+    // while the framework packages path (FrameworkDirectory) is the binaries root.
+    // For traditional environments both roles are served by packagesRoot.
+    const microsoftPackagesPath = await configManager.getMicrosoftPackagesPath();
+    const customPackagesPath = await configManager.getCustomPackagesPath();
+
+    // Explicit override from params takes priority; otherwise derive from XPP config
+    // so the version is never hardcoded — it comes from XPP_CONFIG_NAME in the instance .env.
+    const packagesRoot = params.packagePath
+      || microsoftPackagesPath
+      || configManager.getPackagePath()
+      || 'K:\\AosService\\PackagesLocalDirectory';
+
+    // Locate xppbp.exe — always in the Microsoft/framework packages Bin, not the custom model folder.
     const xppbpPath = path.join(packagesRoot, 'Bin', 'xppbp.exe');
     try {
       await fs.access(xppbpPath);
     } catch {
       return {
-        content: [{ type: 'text', text: `❌ xppbp.exe not found at: ${xppbpPath}\n\nMake sure PackagesLocalDirectory is correctly configured in .mcp.json (packagePath).` }],
+        content: [{ type: 'text', text: `❌ xppbp.exe not found at: ${xppbpPath}\n\nMake sure XPP_CONFIG_NAME is set correctly in your instance .env so the FrameworkDirectory is resolved automatically.` }],
         isError: true
       };
     }
 
-    // Temp XML log file — xppbp writes structured results here
-    const logFile = path.join(os.tmpdir(), `xppbp_${Date.now()}.xml`);
+    // metadataPath: where X++ source XML lives (custom model metadata)
+    const metadataPath = customPackagesPath || packagesRoot;
+    // packagesRootPath: where compiled binaries live (framework packages)
+    const packagesRootPath = microsoftPackagesPath || packagesRoot;
 
     /**
-     * Build the args array for one invocation attempt.
-     * D365FO 10.0.20+ uses  -metadata:<path>  (preferred).
-     * Older builds used      -packagesroot:<path>.
-     * We try the modern flag first and fall back on the legacy flag when
-     * the output looks like the xppbp help/usage text.
+     * xppbp.exe CLI flag styles observed across versions:
+     *
+     *   Style A — colon separator (older):
+     *     -metadata:<path>  -module:<name>  -model:<name>  -packagesRoot:<path>  -all
+     *     -filter:<name>  (filter by element name)
+     *
+     *   Style B — equals separator (newer, 10.0.24+):
+     *     -metadata=<path>  -module=<name>  -model=<name>  -packagesRoot=<path>  -all
+     *     class:<Name>  (positional element-type filter, e.g. "class:MyClass")
+     *
+     *   Style C — legacy packagesroot only (no -metadata flag):
+     *     -packagesroot:<path>  -module:<name>  -model:<name>  -all
+     *
+     * We try A → B → C in order, stopping at the first that doesn't return help text.
      */
-    const buildArgs = (metadataFlag: '-metadata:' | '-packagesroot:'): string[] => {
+
+    // Style A — colon separator
+    const buildArgsColonStyle = (metadataFlag: string): string[] => {
       const a: string[] = [
-        `${metadataFlag}${packagesRoot}`,
+        `${metadataFlag}${metadataPath}`,
+        `-module:${modelName}`,
         `-model:${modelName}`,
-        `-vsproj:${resolvedProjectPath}`,
-        `-xmlLog:${logFile}`
+        `-packagesRoot:${packagesRootPath}`,
+        `-all`,
       ];
       if (targetFilter) a.push(`-filter:${targetFilter}`);
+      return a;
+    };
+
+    // Style B — equals separator (xppbp 10.0.24+: positional "<type>:<Name>" filter, no leading dash)
+    const buildArgsEqStyle = (): string[] => {
+      const a: string[] = [
+        `-metadata=${metadataPath}`,
+        `-module=${modelName}`,
+        `-model=${modelName}`,
+        `-packagesRoot=${packagesRootPath}`,
+        `-all`,
+      ];
+      // Positional element filter: "<type>:<Name>" — type comes from targetElementType
+      // (defaults to 'class' when omitted for backwards compatibility).
+      if (targetFilter) {
+        const elemType = (targetElementType ?? 'class').toLowerCase();
+        a.push(`${elemType}:${targetFilter}`);
+      }
       return a;
     };
 
     let stdout = '';
     let stderr = '';
 
-    // --- First attempt: modern -metadata: flag ---
-    const args = buildArgs('-metadata:');
     const { combined, lastStdout, lastStderr } = await withOperationLock(
-      `bp:${resolvedProjectPath}`,
+      `bp:${modelName}`,
       async () => {
-        console.error(`[run_bp_check] Attempt 1: "${xppbpPath}" ${args.join(' ')}`);
+        // --- Attempt 1: colon style with -metadata: ---
+        const args1 = buildArgsColonStyle('-metadata:');
+        console.error(`[run_bp_check] Attempt 1 (-metadata: colon): "${xppbpPath}" ${args1.join(' ')}`);
         try {
-          ({ stdout, stderr } = await tryXppbp(xppbpPath, args));
+          ({ stdout, stderr } = await tryXppbp(xppbpPath, args1));
         } catch (e: any) {
           stdout = e.stdout ?? '';
           stderr = e.stderr ?? '';
         }
-
         let localCombined = [stdout, stderr].filter(Boolean).join('\n').trim();
 
-        // --- Fallback: legacy -packagesroot: flag ---
+        // --- Attempt 2: equals style (-metadata=, -module=, ...) ---
         if (HELP_TEXT_PATTERN.test(localCombined) || localCombined === '') {
-          const fallbackArgs = buildArgs('-packagesroot:');
-          console.error(`[run_bp_check] Attempt 2 (legacy flag): "${xppbpPath}" ${fallbackArgs.join(' ')}`);
+          const args2 = buildArgsEqStyle();
+          console.error(`[run_bp_check] Attempt 2 (-metadata= equals): "${xppbpPath}" ${args2.join(' ')}`);
           try {
-            ({ stdout, stderr } = await tryXppbp(xppbpPath, fallbackArgs));
+            ({ stdout, stderr } = await tryXppbp(xppbpPath, args2));
+          } catch (e: any) {
+            stdout = e.stdout ?? '';
+            stderr = e.stderr ?? '';
+          }
+          localCombined = [stdout, stderr].filter(Boolean).join('\n').trim();
+        }
+
+        // --- Attempt 3: legacy -packagesroot: (no -metadata flag) ---
+        if (HELP_TEXT_PATTERN.test(localCombined) || localCombined === '') {
+          const args3 = buildArgsColonStyle('-packagesroot:');
+          console.error(`[run_bp_check] Attempt 3 (legacy -packagesroot:): "${xppbpPath}" ${args3.join(' ')}`);
+          try {
+            ({ stdout, stderr } = await tryXppbp(xppbpPath, args3));
           } catch (e: any) {
             stdout = e.stdout ?? '';
             stderr = e.stderr ?? '';
@@ -141,33 +184,34 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       return {
         content: [{
           type: 'text',
-          text: `❌ xppbp.exe returned its help text for both -metadata: and -packagesroot: flags.\n\nThis usually means the installed xppbp.exe version uses a different CLI.\n\nRaw output:\n\n${combined}`
+          text: `❌ xppbp.exe returned its help text for all three flag-style attempts (-metadata:, -metadata=, -packagesroot:).\n\nThis usually means the installed xppbp.exe version uses an unrecognised CLI format.\n\nRaw output:\n\n${combined}`
         }],
         isError: true
       };
     }
 
-    // --- Read XML log file if xppbp wrote one ---
-    let logContent = '';
-    try {
-      logContent = await fs.readFile(logFile, 'utf-8');
-      await fs.unlink(logFile).catch(() => { /* best-effort cleanup */ });
-    } catch {
-      // xppbp didn't write a log file — fall back to stdout/stderr
-      logContent = combined;
-    }
+    // Use stdout/stderr directly — xppbp prints violations as plain text.
+    // (-car: generates an Excel file which is not human-readable as text.)
+    const logContent = combined;
 
-    // Detect violations in XML log or plain text output
-    const hasErrors = /BPError|<Diagnostic|severity="error"/i.test(logContent)
-      || /BPError|severity\s*[:=]\s*error/i.test(combined);
+    // Detect violations in output.
+    // xppbp emits two distinct line patterns:
+    //   Errors:   "BPError..." or XML <Diagnostic severity="error">
+    //   Warnings: "BestPractices Warning: ..." or "BestPractices Error: ..."
+    // Both must trigger the warning status — a warning is still a violation.
+    const hasIssues = /BPError|<Diagnostic|severity="error"|BestPractices (Warning|Error):/i.test(logContent)
+      || /BPError|severity\s*[:=]\s*error/i.test(combined)
+      || /^Warnings:\s*[1-9]/m.test(combined)
+      || /^Errors:\s*[1-9]/m.test(combined);
 
-    const summary = hasErrors ? '⚠️ BP Check completed with issues' : '✅ BP Check passed';
+    const summary = hasIssues ? '⚠️ BP Check completed with issues' : '✅ BP Check passed';
     const details = logContent || combined || '(no output)';
 
     return {
       content: [{
         type: 'text',
-        text: `${summary}\n\nModel: ${modelName}\nProject: ${resolvedProjectPath}` +
+        text: `${summary}\n\nModel: ${modelName}` +
+          (resolvedProjectPath ? `\nProject: ${resolvedProjectPath}` : '') +
           (targetFilter ? `\nFilter: ${targetFilter}` : '') +
           `\n\n${details}`
       }]

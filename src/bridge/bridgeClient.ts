@@ -61,8 +61,18 @@ export type { BridgeReadyPayload, BridgeInfoPayload } from './bridgeTypes.js';
 export * from './bridgeTypes.js';
 
 const BRIDGE_EXE_NAME = 'D365MetadataBridge.exe';
-const READY_TIMEOUT_MS = 30_000;   // 30s for metadata provider init
-const CALL_TIMEOUT_MS = 60_000;    // 60s per call (large searches can take time)
+
+/** Parse a positive-integer env var with a fallback (ignores invalid/non-positive values). */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Configurable via env so large installations / slow VMs can raise the limits.
+const READY_TIMEOUT_MS = envInt('BRIDGE_READY_TIMEOUT_MS', 30_000); // 30s for metadata provider init
+const CALL_TIMEOUT_MS = envInt('BRIDGE_CALL_TIMEOUT_MS', 60_000);   // 60s per call (large searches can take time)
 
 export interface BridgeClientOptions {
   /** Path to the D365MetadataBridge.exe (auto-detected if omitted) */
@@ -372,9 +382,10 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeMethodSource>('getMethodSource', { className, methodName });
   }
 
-  async searchObjects(query: string, objectType?: string): Promise<BridgeSearchResult> {
+  async searchObjects(query: string, objectType?: string, maxResults?: number): Promise<BridgeSearchResult> {
     const params: Record<string, unknown> = { query };
     if (objectType) params.objectType = objectType;
+    if (maxResults != null) params.maxResults = maxResults;
     return this.call<BridgeSearchResult>('searchObjects', params);
   }
 
@@ -584,8 +595,8 @@ export class BridgeClient extends EventEmitter {
   }
 
   /** Add a value to an enum */
-  async addEnumValue(enumName: string, valueName: string, value: number, label?: string): Promise<BridgeWriteResult> {
-    return this.call<BridgeWriteResult>('addEnumValue', { objectName: enumName, enumValueName: valueName, enumValue: value, label });
+  async addEnumValue(enumName: string, valueName: string, value: number, label?: string, countryRegionCodes?: string): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addEnumValue', { objectName: enumName, enumValueName: valueName, enumValue: value, label, countryRegionCodes });
   }
 
   /** Modify an existing enum value's properties */

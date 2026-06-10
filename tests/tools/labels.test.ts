@@ -3,7 +3,7 @@
  * Covers: search_labels, get_label_info, create_label, rename_label
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { searchLabelsTool } from '../../src/tools/searchLabels';
 import { getLabelInfoTool } from '../../src/tools/getLabelInfo';
 import { createLabelTool } from '../../src/tools/createLabel';
@@ -227,6 +227,18 @@ describe('create_label', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
+
+  // Tests below override the shared fs mocks (some with persistent mockResolvedValue).
+  // Restore them to the factory defaults after each test so state never leaks into the
+  // rename_label suite that follows.
+  afterEach(async () => {
+    const fsMock = await import('fs');
+    (fsMock.promises.readFile as any).mockImplementation(async () => '; Label file\nMyExistingLabel=Existing label text\n');
+    (fsMock.promises.writeFile as any).mockImplementation(async () => {});
+    (fsMock.promises.mkdir as any).mockImplementation(async () => {});
+    (fsMock.promises.access as any).mockImplementation(async () => {});
+    (fsMock.promises.readdir as any).mockImplementation(async () => []);
+  });
 
   it('creates label with multiple translations', async () => {
     // Simulate label not existing yet
@@ -456,6 +468,141 @@ describe('create_label', () => {
     expect(result.isError).toBe(true);
   });
 
+  it('writes to every existing model language when `languages` is omitted (default fan-out)', async () => {
+    const fsMock = await import('fs');
+    const writes: { path: string; content: string }[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writes.push({ path: p, content });
+    });
+    // LabelResources is shared across the model: lt / nb-NO exist only because sibling
+    // label files ship them, but the default behavior still writes to all of them.
+    (fsMock.promises.readdir as any).mockResolvedValue(['en-US', 'fi', 'lt', 'nb-NO']);
+    (fsMock.promises.readFile as any).mockResolvedValue('﻿');
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'NewFeatureLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        addToProject: false,
+        translations: [{ language: 'en-US', text: 'New feature' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    expect(writes.some(w => w.path.endsWith('MyModel.en-US.label.txt'))).toBe(true);
+    expect(writes.some(w => w.path.endsWith('MyModel.fi.label.txt'))).toBe(true);
+    expect(writes.some(w => w.path.endsWith('MyModel.lt.label.txt'))).toBe(true);
+    expect(writes.some(w => w.path.endsWith('MyModel.nb-NO.label.txt'))).toBe(true);
+  });
+
+  it('writes ONLY the requested locales when `languages` is provided', async () => {
+    const fsMock = await import('fs');
+    const writes: { path: string; content: string }[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writes.push({ path: p, content });
+    });
+    // Model has 4 locale folders, but this customization only needs en-US.
+    (fsMock.promises.readdir as any).mockResolvedValue(['en-US', 'fi', 'lt', 'nb-NO']);
+    (fsMock.promises.readFile as any).mockResolvedValue('﻿');
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'NewFeatureLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        addToProject: false,
+        languages: ['en-US'],
+        translations: [{ language: 'en-US', text: 'New feature' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    // en-US written; fi / lt / nb-NO must NOT be touched (no stray placeholder files)
+    expect(writes.some(w => w.path.endsWith('MyModel.en-US.label.txt'))).toBe(true);
+    expect(writes.some(w => w.path.endsWith('MyModel.fi.label.txt'))).toBe(false);
+    expect(writes.some(w => w.path.endsWith('MyModel.lt.label.txt'))).toBe(false);
+    expect(writes.some(w => w.path.endsWith('MyModel.nb-NO.label.txt'))).toBe(false);
+    // and no orphaned XML descriptors for the unrequested locales
+    expect(writes.some(w => w.path.endsWith('MyModel_lt.xml'))).toBe(false);
+    expect(writes.some(w => w.path.endsWith('MyModel_nb-NO.xml'))).toBe(false);
+  });
+
+  it('creates a missing locale folder when requested via `languages`', async () => {
+    const fsMock = await import('fs');
+    const writes: { path: string; content: string }[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writes.push({ path: p, content });
+    });
+    // Model currently only has en-US; caller explicitly wants en-US + sv (new locale).
+    (fsMock.promises.readdir as any).mockResolvedValue(['en-US']);
+    (fsMock.promises.readFile as any).mockResolvedValue('﻿');
+    // descriptor / new-file existence checks should report "missing" so they get created
+    (fsMock.promises.access as any).mockRejectedValue(new Error('ENOENT'));
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'NewFeatureLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        addToProject: false,
+        languages: ['en-US', 'sv'],
+        translations: [
+          { language: 'en-US', text: 'New feature' },
+          { language: 'sv', text: 'Ny funktion' },
+        ],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    expect(writes.some(w => w.path.endsWith('MyModel.en-US.label.txt'))).toBe(true);
+    expect(writes.some(w => w.path.endsWith('MyModel.sv.label.txt'))).toBe(true);
+    // fi / lt / nb-NO never requested and not present — must not appear
+    expect(writes.some(w => w.path.endsWith('MyModel.fi.label.txt'))).toBe(false);
+  });
+
+  it('resolves to on-disk casing when `languages` locale differs in case (Linux unzip)', async () => {
+    // Scenario: MS packages were unzipped on Linux — locale directories are lowercase (en-us, de).
+    // The caller passes standard BCP-47 values (en-US, de).
+    // The tool must write to the existing on-disk paths, NOT create new en-US/ de/ sibling folders.
+    const fsMock = await import('fs');
+    const writes: { path: string; content: string }[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writes.push({ path: p, content });
+    });
+    // On-disk the folders are lowercase (Linux unzip behaviour)
+    (fsMock.promises.readdir as any).mockResolvedValue(['en-us', 'de']);
+    (fsMock.promises.readFile as any).mockResolvedValue('\uFEFF');
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'CaseMismatchLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        addToProject: false,
+        // Caller uses standard BCP-47 casing
+        languages: ['en-US', 'de'],
+        translations: [
+          { language: 'en-US', text: 'Case test' },
+          { language: 'de', text: 'Groß-Klein-Test' },
+        ],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+
+    // Must write into the existing lowercase directory names, not create new mixed-case ones
+    expect(writes.some(w => /[/\\]en-us[/\\]/.test(w.path))).toBe(true);
+    expect(writes.some(w => /[/\\]de[/\\]/.test(w.path))).toBe(true);
+
+    // Must NOT create a second en-US/ folder alongside en-us/
+    expect(writes.some(w => /[/\\]en-US[/\\]/.test(w.path))).toBe(false);
+  });
+
   it('defaults description to VS project name when no comment is provided', async () => {
     const fsMock = await import('fs');
     const writeCalls: string[] = [];
@@ -621,6 +768,50 @@ describe('create_label', () => {
     expect(lines[2]).toContain('ZebraLabel=');
   });
 
+  it('orders underscore after letters (case-insensitive ordinal, matching Visual Studio)', async () => {
+    // Regression for the create_label sort-collation bug: a locale-aware comparer
+    // (localeCompare 'en', sensitivity 'base') sorts '_' BEFORE letters, but Visual
+    // Studio uses case-insensitive ordinal where '_' (0x5F) sorts AFTER A–Z. The
+    // disagreement shuffles `word_`-prefixed IDs on every write → spurious git churn.
+    // Empirically proven order in VS: Gx, px, _x (underscore last).
+    const fsMock = await import('fs');
+    const writeCalls: string[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (_p: string, content: string) => {
+      writeCalls.push(content);
+    });
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    // Existing file holds the three probe labels in scrambled order.
+    (fsMock.promises.readFile as any).mockResolvedValueOnce(
+      '﻿Zmvnsorttest_x=underscore\nZmvnsorttestGx=upper G\nZmvnsorttestpx=lower p\n',
+    );
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'ZmvnsorttestAx',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        addToProject: false,
+        translations: [{ language: 'en-US', text: 'added' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.includes('ZmvnsorttestGx='));
+    expect(labelWrite).toBeDefined();
+    const ids = labelWrite!
+      .split('\n')
+      .filter(l => l.includes('='))
+      .map(l => l.split('=')[0].replace('﻿', ''));
+    // Case-insensitive ordinal: Ax, Gx, px (G<P), then _x LAST ('_'=0x5F > letters).
+    expect(ids).toEqual([
+      'ZmvnsorttestAx',
+      'ZmvnsorttestGx',
+      'Zmvnsorttestpx',
+      'Zmvnsorttest_x',
+    ]);
+  });
+
   it('respects LABEL_SORT_ORDER=append env var when sortLabels not specified', async () => {
     const fsMock = await import('fs');
     const writeCalls: string[] = [];
@@ -694,6 +885,97 @@ describe('create_label', () => {
       else process.env.LABEL_SORT_ORDER = origEnv;
     }
   });
+
+  it('preserves CRLF line endings when the original file uses CRLF', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: string[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (_p: string, content: string) => {
+      writeCalls.push(content);
+    });
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    // Existing file uses CRLF (Windows / TFVC default for D365FO label files)
+    (fsMock.promises.readFile as any).mockResolvedValueOnce(
+      '﻿AppleLabel=Apple text\r\nZebraLabel=Zebra text\r\n',
+    );
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'MiddleLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        translations: [{ language: 'en-US', text: 'Middle text' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.includes('MiddleLabel='));
+    expect(labelWrite).toBeDefined();
+    // The written file MUST keep CRLF — switching to LF makes every line look modified in VCS diffs.
+    expect(labelWrite).toContain('\r\n');
+    expect(labelWrite).toContain('AppleLabel=Apple text\r\n');
+    expect(labelWrite).toContain('MiddleLabel=Middle text\r\n');
+    // And it must not introduce bare LF (i.e. every LF should be preceded by CR)
+    const bareLfMatches = labelWrite!.match(/(?<!\r)\n/g);
+    expect(bareLfMatches).toBeNull();
+  });
+
+  it('preserves LF line endings when the original file uses LF', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: string[] = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (_p: string, content: string) => {
+      writeCalls.push(content);
+    });
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    (fsMock.promises.readFile as any).mockResolvedValueOnce(
+      '﻿AppleLabel=Apple text\nZebraLabel=Zebra text\n',
+    );
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'MiddleLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        translations: [{ language: 'en-US', text: 'Middle text' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.includes('MiddleLabel='));
+    expect(labelWrite).toBeDefined();
+    expect(labelWrite).not.toContain('\r\n');
+    expect(labelWrite).toContain('MiddleLabel=Middle text\n');
+  });
+
+  it('defaults to CRLF for a brand-new label file (no existing content)', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: Array<{ path: string; content: string }> = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writeCalls.push({ path: p, content });
+    });
+    // No existing language folders — triggers the createLabelFileIfMissing path
+    (fsMock.promises.readdir as any).mockResolvedValueOnce([]);
+    // readFile is never called when the file is brand-new; if it is, return empty
+    (fsMock.promises.readFile as any).mockResolvedValue('');
+
+    const result = await createLabelTool(
+      req('create_label', {
+        labelId: 'BrandNew',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        createLabelFileIfMissing: true,
+        updateIndex: false,
+        translations: [{ language: 'en-US', text: 'Brand new label' }],
+      }),
+      ctx,
+    );
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.content.includes('BrandNew='));
+    expect(labelWrite).toBeDefined();
+    // New D365FO label files default to CRLF (Windows-native, matches TFVC defaults)
+    expect(labelWrite!.content).toContain('BrandNew=Brand new label\r\n');
+  });
 });
 
 // ─── rename_label ────────────────────────────────────────────────────────────
@@ -746,5 +1028,83 @@ describe('rename_label', () => {
   it('returns error when required fields are missing', async () => {
     const result = await renameLabelTool(req('rename_label', { oldLabelId: 'Foo' }), ctx);
     expect(result.isError).toBe(true);
+  });
+
+  it('preserves CRLF line endings when renaming inside a CRLF .label.txt', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: Array<{ path: string; content: string }> = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writeCalls.push({ path: p, content });
+    });
+    // First readdir call returns the language list; later collectFiles calls fall
+    // back to the default [] mock so the subsequent .xpp/.xml scan finds nothing.
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    // CRLF source file with the label to rename plus a couple of siblings.
+    // The rename tool reads the file three times (existence check, duplicate
+    // check, and the actual rewrite), so use mockResolvedValue.
+    (fsMock.promises.readFile as any).mockResolvedValue(
+      '﻿AppleLabel=Apple text\r\nOldFeatureName=Some text\r\nZebraLabel=Zebra text\r\n',
+    );
+
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'OldFeatureName' }),
+    ]);
+
+    const result = await renameLabelTool(
+      req('rename_label', {
+        oldLabelId: 'OldFeatureName',
+        newLabelId: 'NewFeatureName',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+      }),
+      ctx,
+    );
+    if (result.isError) throw new Error(`rename_label failed: ${result.content[0].text}`);
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.path.endsWith('.label.txt'));
+    expect(labelWrite).toBeDefined();
+    // Renamed line must use CRLF, and surrounding lines must not be silently downgraded to LF
+    expect(labelWrite!.content).toContain('NewFeatureName=Some text\r\n');
+    expect(labelWrite!.content).toContain('AppleLabel=Apple text\r\n');
+    const bareLfMatches = labelWrite!.content.match(/(?<!\r)\n/g);
+    expect(bareLfMatches).toBeNull();
+  });
+
+  it('preserves LF line endings when renaming inside a LF .label.txt', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: Array<{ path: string; content: string }> = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writeCalls.push({ path: p, content });
+    });
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    // LF source file — e.g. a repo checked out on Linux or with core.autocrlf=false.
+    (fsMock.promises.readFile as any).mockResolvedValue(
+      '\uFEFFAppleLabel=Apple text\nOldFeatureName=Some text\nZebraLabel=Zebra text\n',
+    );
+
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'OldFeatureName' }),
+    ]);
+
+    const result = await renameLabelTool(
+      req('rename_label', {
+        oldLabelId: 'OldFeatureName',
+        newLabelId: 'NewFeatureName',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+      }),
+      ctx,
+    );
+    if (result.isError) throw new Error(`rename_label failed: ${result.content[0].text}`);
+    expect(result.isError).toBeFalsy();
+    const labelWrite = writeCalls.find(c => c.path.endsWith('.label.txt'));
+    expect(labelWrite).toBeDefined();
+    // Renamed line must keep LF — tool must not upgrade a LF file to CRLF.
+    expect(labelWrite!.content).toContain('NewFeatureName=Some text\n');
+    expect(labelWrite!.content).toContain('AppleLabel=Apple text\n');
+    // No CRLF sequences must be present — file must stay pure LF.
+    expect(labelWrite!.content).not.toContain('\r\n');
   });
 });

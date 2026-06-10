@@ -46,7 +46,7 @@ import { securityCoverageInfoTool } from './securityCoverageInfo.js';
 import { analyzeExtensionPointsTool } from './analyzeExtensionPoints.js';
 import { validateObjectNamingTool } from './validateObjectNaming.js';
 import { verifyD365ProjectTool } from './verifyD365Project.js';
-import { resolveObjectPrefix, isCustomModel, getObjectSuffix } from '../utils/modelClassifier.js';
+import { resolveObjectPrefix, isCustomModel, getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix } from '../utils/modelClassifier.js';
 import { getStdioSessionInfo } from '../utils/stdioSessionInfo.js';
 import { updateSymbolIndexTool } from './updateSymbolIndex.js';
 import { buildProjectTool } from './buildProject.js';
@@ -58,7 +58,17 @@ import { extensionStrategyAdvisorTool } from './extensionStrategyAdvisor.js';
 import { undoLastModificationTool } from './undoLastModification.js';
 import { xppKnowledgeTool } from './xppKnowledge.js';
 import { d365foErrorHelpTool } from './d365foErrorHelp.js';
-import { recordToolStart, startMetricsLogging } from '../utils/toolMetrics.js';
+import { validateXppTool } from './validateXpp.js';
+import { resolveReferencesTool } from './resolveReferences.js';
+import { prepareChangeTool } from './prepareChange.js';
+import { prepareCreateTool } from './prepareCreate.js';
+import { recordToolStart, startMetricsLogging, recordCallSequence } from '../utils/toolMetrics.js';
+import {
+  DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
+  dedupKey, getDedupedResult, storeDedupResult, appendNote,
+} from '../utils/callDedup.js';
+import { checkIndexStaleness } from '../utils/indexStaleness.js';
+import * as nodePath from 'path';
 import { buildProgressMessage } from '../utils/toolProgressMessage.js';
 
 /**
@@ -118,6 +128,8 @@ const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
   create_d365fo_file:               'uncapped',
   generate_d365fo_xml:              'uncapped',
   get_report_info:                  'uncapped',
+  // Method source must never be truncated — partial code is useless
+  get_method_source:                'uncapped',
   // New tools with longer output
   get_security_artifact_info:       8000,
   get_security_coverage_for_object: 8000,
@@ -137,6 +149,7 @@ const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
 function getCapForTool(toolName: string): number | 'uncapped' {
   return TOOL_CAP_SIZES[toolName] ?? TOOL_CAP_SIZES['default'];
 }
+
 
 function capToolResponse(toolName: string, result: any): any {
   const cap = getCapForTool(toolName);
@@ -204,8 +217,25 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       };
     }
 
+    // ── Loop detection + duplicate-call dedup ────────────────────────────────
+    const callKey = dedupKey(toolName, request.params.arguments);
+    const occurrences = recordCallSequence(toolName, callKey);
+    if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
+      const cached = getDedupedResult(callKey);
+      if (cached !== undefined) {
+        console.error(`[toolHandler] ♻️  ${toolName}: identical call within ${DEDUP_TTL_MS / 1000}s — served from dedup cache`);
+        return appendNote(
+          cached,
+          `> ♻️ Duplicate call — this exact ${toolName} call was answered moments ago; ` +
+          `the result above is identical. Use the data you already have instead of re-querying.`,
+        );
+      }
+    }
+
     const finishMetrics = recordToolStart(toolName);
-    const result = await (async () => {
+    let result: any;
+    try {
+    result = await (async () => {
       // Build the progress description for this tool call.
       const args = request.params.arguments as Record<string, any> | undefined;
       const progressMsg = buildProgressMessage(toolName, args);
@@ -384,6 +414,14 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         return d365foErrorHelpTool(request);
       case 'get_xpp_knowledge':
         return xppKnowledgeTool(request);
+      case 'validate_xpp':
+        return validateXppTool(request, context);
+      case 'resolve_references':
+        return resolveReferencesTool(request, context);
+      case 'prepare_change':
+        return prepareChangeTool(request, context);
+      case 'prepare_create':
+        return prepareCreateTool(request, context);
       case 'get_workspace_info': {
         const args = (request as any).params?.arguments || {};
 
@@ -414,9 +452,10 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           }
         }
 
-        const { modelName, modelSource, projectPath, projectSource, packagePath, packageSource } =
+        const { modelName, modelSource, isModelSourceAutoDetected, projectPath, projectSource, packagePath, packageSource } =
           await configManager.getWorkspaceInfoDiagnostics();
         const envType = await configManager.getDevEnvironmentType();
+        const frameworkDirectory = await configManager.getMicrosoftPackagesPath();
 
         // Prefix diagnostics
         const extensionPrefixEnv = process.env.EXTENSION_PREFIX?.trim() || null;
@@ -436,17 +475,25 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           'fleetmanagementunittests', 'tutorial',
         ]);
         const isPlaceholder = !modelName || PLACEHOLDER_NAMES.has(modelName.toLowerCase());
+        // The "Microsoft standard model" warning only makes sense for an AUTO-DETECTED
+        // model: its whole premise is that a .rnrproj scan landed on a standard/demo
+        // model because the developer forgot to change the VS new-project wizard default.
+        // An explicitly configured model (D365FO_MODEL_NAME env var or a modelName key
+        // in .mcp.json) was named deliberately, so second-guessing it produces false
+        // positives — e.g. a model whose ISV prefix is only an abbreviation of its name.
+        const isAutoDetectedSource = isModelSourceAutoDetected;
         // Also flag when auto-detection found a Microsoft standard model name
         // that isn't in the PLACEHOLDER_NAMES set but is not a custom model.
         const isStandardMsModel = modelName
-          ? !isCustomModel(modelName) && !isPlaceholder
+          ? !isCustomModel(modelName) && !isPlaceholder && isAutoDetectedSource
           : false;
 
         const lines: string[] = [
           `## D365FO Workspace Configuration`,
           ``,
           `Model name      : ${modelName ?? '(not configured)'}  (source: ${modelSource})`,
-          `Package path    : ${packagePath ?? '(not configured)'}  (source: ${packageSource})`,
+          `Package path    : ${packagePath ?? '(not configured)'}  (custom metadata, source: ${packageSource})`,
+          `Framework dir   : ${frameworkDirectory ?? '(not applicable — single-root setup)'}  (Microsoft metadata, read-only)`,
           `Project path    : ${projectPath ?? '(not detected)'}  (source: ${projectSource})`,
           `Env type        : ${envType}`,
           ``,
@@ -467,6 +514,33 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
             : `ℹ️  EXTENSION_SUFFIX is not set. No suffix will be applied. This is normal — most projects use prefixes only.`,
           ``,
         ];
+
+        // ── Extension naming style ────────────────────────────────────────────
+        // The prefix doubles as the extension infix UNLESS EXTENSION_NAMING_STYLE
+        // is set to "model-name", in which case extension elements/classes embed the
+        // MODEL NAME (Visual Studio default). The tool ALWAYS normalises the extension
+        // token to whatever this style dictates — so pass the BASE object name and let
+        // the tool name it; do not hand-build the infix yourself.
+        const extNamingStyle = getExtensionNamingStyle();
+        const extInfix = deriveExtensionInfix(effectivePrefix);
+        const sampleClassExt = extNamingStyle === 'model-name' && modelName
+          ? `CustTable_${modelName}_Extension`
+          : `CustTable${extInfix}_Extension`;
+        const sampleElemExt = extNamingStyle === 'model-name' && modelName
+          ? `CustTable.${modelName}`
+          : `CustTable.${extInfix}Extension`;
+        lines.push(
+          `## Extension Naming`,
+          ``,
+          `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
+          extNamingStyle === 'model-name'
+            ? `✅ model-name style — extension token is the MODEL NAME (Visual Studio default).`
+            : `ℹ️  prefix style (default) — extension token is the EXTENSION_PREFIX infix.`,
+          `  • Extension class  → ${sampleClassExt}`,
+          `  • Element extension → ${sampleElemExt}`,
+          `  ⚠️  Pass the BASE object name (e.g. "CustTable") to create_d365fo_file and let the tool apply the token — any infix you embed will be normalised to the above.`,
+          ``,
+        );
 
         if (isPlaceholder) {
           // Only scan .rnrproj files when model name looks like a placeholder — avoids
@@ -518,10 +592,6 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           );
         } else {
           lines.push(`✅ Configuration looks valid. Proceed with D365FO operations using model "${modelName}".`);
-          const customModels = context.symbolIndex.getCustomModels?.() ?? [];
-          if (customModels.length > 0) {
-            lines.push(`Custom models in index: ${customModels.join(', ')}`);
-          }
         }
 
         // List all projects found under D365FO_SOLUTIONS_PATH so the user can switch
@@ -536,6 +606,21 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           }
           lines.push(``);
           lines.push(`To switch project: call get_workspace_info with projectName = "<ModelName>"`);
+        }
+
+        // -----------------------------------------------------------------------
+        // Index freshness — compare workspace mtimes vs last_indexed_at so the
+        // model (and user) know whether symbol lookups reflect current code.
+        // -----------------------------------------------------------------------
+        try {
+          const lastIndexedAt = context.symbolIndex.getLastIndexedAt?.() ?? null;
+          const modelMetadataDir = packagePath && modelName
+            ? nodePath.join(packagePath, modelName)
+            : null;
+          const staleness = checkIndexStaleness(lastIndexedAt, modelMetadataDir);
+          lines.push('', ...staleness.lines);
+        } catch {
+          // Freshness reporting is best-effort — never break get_workspace_info
         }
 
         // -----------------------------------------------------------------------
@@ -592,12 +677,40 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         };
     } })();
     })();
+    } catch (err) {
+      // Central safety net: convert ANY thrown error (incl. zod validation,
+      // bridge failures, unexpected exceptions) into a proper tool result with
+      // isError:true so the agent SEES the failure and can react/retry, instead
+      // of it surfacing as an opaque JSON-RPC protocol error. Individual tools
+      // may still return their own richer isError messages; this only catches
+      // what escapes them.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[toolHandler] ❌ ${toolName} threw: ${message}`);
+      result = {
+        content: [{ type: 'text', text: `❌ ${toolName} failed: ${message}` }],
+        isError: true,
+      };
+    }
 
-    const capped = capToolResponse(toolName, result);
+    let capped = capToolResponse(toolName, result);
     // Record metrics: detect empty result (no content or first text item is empty)
     const firstText = capped?.content?.[0]?.text;
     const isEmpty = !firstText || firstText.trim().length === 0 || firstText === 'No results returned';
     finishMetrics(isEmpty);
+
+    if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
+      storeDedupResult(callKey, capped);
+      // Loop hint: 3+ identical calls in the recent window means the model is
+      // cycling (cache misses only happen when calls are >60 s apart).
+      if (occurrences >= 3) {
+        capped = appendNote(
+          capped,
+          `> ⚠️ Loop detected: this is occurrence #${occurrences} of the exact same ${toolName} call. ` +
+          `The answer does not change between calls. If you are missing information, ` +
+          `use a DIFFERENT tool or different parameters (see suggestions above), or ask the user.`,
+        );
+      }
+    }
     return capped;
   });
 }

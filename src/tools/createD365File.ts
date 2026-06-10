@@ -9,12 +9,15 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { Parser, Builder } from 'xml2js';
 import { getConfigManager, fallbackPackagePath } from '../utils/configManager.js';
-import { registerCustomModel, resolveObjectPrefix, applyObjectPrefix, getObjectSuffix, applyObjectSuffix } from '../utils/modelClassifier.js';
+import { registerCustomModel, resolveObjectPrefix, applyObjectPrefix, getObjectSuffix, applyObjectSuffix, getExtensionNamingStyle } from '../utils/modelClassifier.js';
 import { PackageResolver } from '../utils/packageResolver.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../utils/xppDocGen.js';
 import { decodeXmlEntitiesFromXppSource } from './modifyD365File.js';
 import { bridgeValidateAfterWrite, canBridgeCreate, bridgeCreateObject } from '../bridge/index.js';
+import { enforceGrounding } from '../utils/provenanceStore.js';
+import { gateOnReferenceErrors } from './resolveReferences.js';
 import { invalidateCache } from './updateSymbolIndex.js';
+import { normalizeD365Xml } from '../utils/d365XmlNormalizer.js';
 
 /**
  * Per-project-file mutex to serialise concurrent addToProject calls.
@@ -107,6 +110,13 @@ const CreateD365FileArgsSchema = z.object({
     .describe(
       'Allow overwriting an existing file. Use together with xmlContent when you need to completely ' +
       'rewrite an object (e.g. table with corrupted field names). Default: false (returns error if file already exists).'
+    ),
+  groundingToken: z
+    .string()
+    .optional()
+    .describe(
+      'Provenance token returned by prepare_change. Proves the change was grounded in the indexed codebase. ' +
+      'Required for *-extension objectTypes when GROUNDING_ENFORCE=true on the server.'
     ),
 });
 
@@ -700,12 +710,22 @@ ${fieldsXml}\t<FullTextIndexes />
   ): string {
     const label = properties?.label || enumName;
     const useEnumValue = properties?.useEnumValue ? 'Yes' : 'No';
-
+    const configKeyXml = properties?.configurationKey
+      ? `\t<ConfigurationKey>${properties.configurationKey}</ConfigurationKey>\n`
+      : '';
 
     // Build <EnumValues> block from properties.enumValues array
     // Each entry: { name: string; value?: number; label?: string; helpText?: string }
     const enumValueSpecs: Array<{ name: string; value?: number; label?: string; helpText?: string }> =
       Array.isArray(properties?.enumValues) ? properties.enumValues : [];
+
+    // D365FO hard limit: max 251 elements (0–250). Warn early — compiler rejects beyond this.
+    if (enumValueSpecs.length > 251) {
+      throw new Error(
+        `Enum '${enumName}' has ${enumValueSpecs.length} values but D365FO supports a maximum of 251 (0–250). ` +
+        `Consider redesigning as a class hierarchy or splitting into multiple enums.`
+      );
+    }
 
     let enumValuesXml: string;
     if (enumValueSpecs.length === 0) {
@@ -730,10 +750,11 @@ ${fieldsXml}\t<FullTextIndexes />
     // IsExtensible goes after EnumValues; value is lowercase true/false
     const isExtensibleXml = properties?.isExtensible ? '\t<IsExtensible>true</IsExtensible>\n' : '';
 
+    // Element order matches real D365FO: Name → ConfigurationKey → Label → UseEnumValue → EnumValues → IsExtensible
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxEnum xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 \t<Name>${enumName}</Name>
-\t<Label>${label}</Label>
+${configKeyXml}\t<Label>${label}</Label>
 \t<UseEnumValue>${useEnumValue}</UseEnumValue>
 ${enumValuesXml}${isExtensibleXml}</AxEnum>
 `;
@@ -1427,7 +1448,7 @@ ${defaultParamGroupXml}
       case 'edt-extension':
         return this.generateAxSimpleExtensionXml('AxEdtExtension', objectName);
       case 'enum-extension':
-        return this.generateAxSimpleExtensionXml('AxEnumExtension', objectName);
+        return this.generateAxEnumExtensionXml(objectName, properties);
       case 'data-entity-extension':
         return this.generateAxSimpleExtensionXml('AxDataEntityViewExtension', objectName);
       case 'menu-item-display':
@@ -1494,6 +1515,47 @@ ${defaultParamGroupXml}
    *  5. <AxReportDesign> has xmlns="" and i:type="AxReportPrecisionDesign" attributes
    *     (VS Designer won't show Designs sub-nodes without these)
    */
+
+  /**
+   * Sanitize AxEnum XML — fixes common AI-generator mistakes that cause VS2022 to
+   * silently ignore enum values or refuse to open the file:
+   *
+   *  1. <Values>…</Values>  →  <EnumValues>…</EnumValues>
+   *     AI models frequently map the JSON `enumValues` array to a plain <Values> wrapper;
+   *     D365FO deserializer requires <EnumValues>.
+   *
+   *  2. <AxEnum> without xmlns:i="http://www.w3.org/2001/XMLSchema-instance"
+   *     The attribute is required for the i:type resolution inside the file.
+   *
+   *  3. More than 251 <AxEnumValue> elements — D365FO compiler hard limit.
+   */
+  static sanitizeEnumXml(xml: string): string {
+    // 1. Rename <Values> container to <EnumValues>
+    if (/<Values>/.test(xml) && !/<EnumValues>/.test(xml)) {
+      xml = xml.replace(/<Values>/g, '<EnumValues>').replace(/<\/Values>/g, '</EnumValues>');
+      console.error('[sanitizeEnumXml] Renamed <Values> → <EnumValues>');
+    }
+
+    // 2. Add xmlns:i to <AxEnum> root if missing
+    if (!xml.includes('xmlns:i=')) {
+      xml = xml.replace(
+        /(<AxEnum)(\s|>)/,
+        '$1 xmlns:i="http://www.w3.org/2001/XMLSchema-instance"$2'
+      );
+      console.error('[sanitizeEnumXml] Added xmlns:i to <AxEnum>');
+    }
+
+    // 3. Validate max 251 enum values (D365FO compiler hard limit, MS Learn confirmed)
+    const valueCount = (xml.match(/<AxEnumValue>/g) ?? []).length;
+    if (valueCount > 251) {
+      console.error(
+        `[sanitizeEnumXml] ⚠️ WARNING: ${valueCount} enum values detected — D365FO supports max 251 (0–250). ` +
+        `The compiler will reject this file. Consider splitting into multiple enums or using a class hierarchy.`
+      );
+    }
+
+    return xml;
+  }
 
   /**
    * Sanitize AxTable XML to ensure correct D365FO field element format.
@@ -2278,7 +2340,7 @@ ${defaultParamGroupXml}
   }
 
   /**
-   * Generate a minimal extension XML for AxEdtExtension, AxEnumExtension,
+   * Generate a minimal extension XML for AxEdtExtension,
    * AxDataEntityViewExtension, AxMenuItemDisplayExtension, AxMenuItemActionExtension,
    * AxMenuItemOutputExtension.
    * Name convention: BaseObjectName.ExtensionName  (e.g. CustTable.MyExtension)
@@ -2289,6 +2351,45 @@ ${defaultParamGroupXml}
 \t<Name>${name}</Name>
 \t<PropertyModifications />
 </${rootElement}>`;
+  }
+
+  /**
+   * Generate AxEnumExtension XML.
+   * Name convention: BaseEnumName.PrefixExtension
+   *
+   * Supported properties:
+   *   enumValues: Array<{ name, label?, value?, countryRegionCodes?, helpText? }>
+   */
+  static generateAxEnumExtensionXml(name: string, properties?: Record<string, any>): string {
+    // Build <EnumValues> block
+    const enumValueSpecs: Array<{
+      name: string; label?: string; value?: number; countryRegionCodes?: string; helpText?: string;
+    }> = Array.isArray(properties?.enumValues) ? properties.enumValues : [];
+
+    let enumValuesXml: string;
+    if (enumValueSpecs.length === 0) {
+      enumValuesXml = '\t<EnumValues />';
+    } else {
+      enumValuesXml = '\t<EnumValues>';
+      for (const v of enumValueSpecs) {
+        enumValuesXml += `\n\t\t<AxEnumValue>`;
+        enumValuesXml += `\n\t\t\t<Name>${v.name}</Name>`;
+        if (v.countryRegionCodes) enumValuesXml += `\n\t\t\t<CountryRegionCodes>${v.countryRegionCodes}</CountryRegionCodes>`;
+        if (v.label) enumValuesXml += `\n\t\t\t<Label>${v.label}</Label>`;
+        if (v.helpText) enumValuesXml += `\n\t\t\t<HelpText>${v.helpText}</HelpText>`;
+        if (v.value !== undefined && v.value !== 0) enumValuesXml += `\n\t\t\t<Value>${v.value}</Value>`;
+        enumValuesXml += `\n\t\t</AxEnumValue>`;
+      }
+      enumValuesXml += '\n\t</EnumValues>';
+    }
+
+    return `<?xml version="1.0" encoding="utf-8"?>
+<AxEnumExtension xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+\t<Name>${name}</Name>
+${enumValuesXml}
+\t<PropertyModifications />
+\t<ValueModifications />
+</AxEnumExtension>`;
   }
 
   /**
@@ -3218,9 +3319,31 @@ export async function handleCreateD365File(
   context?: {
     bridge?: import('../bridge/bridgeClient.js').BridgeClient;
     cache?: import('../cache/redisCache.js').RedisCacheService;
+    symbolIndex?: import('../metadata/symbolIndex.js').XppSymbolIndex;
   },
 ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
   const args = CreateD365FileArgsSchema.parse(request.params.arguments);
+
+  // Grounding enforcement: extension objects modify the behaviour of existing
+  // code, so when GROUNDING_ENFORCE=true the model must prove (via prepare_change)
+  // that it inspected the real object before writing the extension.
+  if (args.objectType.endsWith('-extension')) {
+    const groundingError = enforceGrounding(
+      args.groundingToken,
+      `create_d365fo_file(objectType="${args.objectType}", objectName="${args.objectName}")`,
+      args.objectName,
+    );
+    if (groundingError) return groundingError;
+  }
+
+  // Semantic reference gate: when GROUNDING_ENFORCE=true, every identifier in the
+  // X++ source must be proven against the symbol index before it reaches disk.
+  const referenceError = gateOnReferenceErrors(
+    args.sourceCode,
+    context?.symbolIndex,
+    `create_d365fo_file(objectType="${args.objectType}", objectName="${args.objectName}")`,
+  );
+  if (referenceError) return referenceError;
 
   try {
     // Step 1: Try to find and parse .rnrproj to get actual ModelName
@@ -3314,7 +3437,7 @@ export async function handleCreateD365File(
         '  3. Add workspacePath ending with the package/model name: { "context": { "workspacePath": "C:\\\\AosService\\\\PackagesLocalDirectory\\\\YourModel" } }\n' +
         '  4. Add projectPath or solutionPath to .mcp.json so the model is auto-extracted from .rnrproj';
       console.error(`[create_d365fo_file] ${errorMsg}`);
-      return { content: [{ type: 'text', text: errorMsg }] };
+      return { content: [{ type: 'text', text: errorMsg }], isError: true };
     }
 
     // ⚠️ CRITICAL WARNING: If no project/solution path available anywhere
@@ -3375,7 +3498,8 @@ export async function handleCreateD365File(
               type: 'text',
               text: errorMsg
             }
-          ]
+          ],
+          isError: true,
         };
       }
     }
@@ -3414,15 +3538,20 @@ export async function handleCreateD365File(
 
     // Apply extension prefix to object name
     const objectPrefix = resolveObjectPrefix(actualModelName);
+    const namingStyle = getExtensionNamingStyle();
 
     // If EXTENSION_PREFIX differs from modelName, the AI may have embedded the modelName
     // in the extension name. Strip it so applyObjectPrefix injects the correct prefix only.
+    // NOTE: this stripping only makes sense for the prefix-infix style. Under the
+    // model-name style the model name IS the desired token, so the stripping below is
+    // skipped and applyObjectPrefix (given actualModelName) normalises the name instead.
     let effectiveObjectName = args.objectName;
 
     // Case A: dot-notation extension elements (table/form/EDT/enum extensions)
     // e.g. "CustTable.MyModelExtension" with modelName="MyModel" → "CustTable.Extension"
     // applyObjectPrefix then produces "CustTable.MyExtension"
     if (
+      namingStyle !== 'model-name' &&
       args.objectName.includes('.') &&
       args.objectName.toLowerCase().endsWith('extension') &&
       actualModelName &&
@@ -3444,6 +3573,7 @@ export async function handleCreateD365File(
     // e.g. "SalesFormLetterContoso_Extension" with modelName="ContosoExt" → "SalesFormLetter_Extension"
     // applyObjectPrefix then produces "SalesFormLetterContoso_Extension"
     if (
+      namingStyle !== 'model-name' &&
       args.objectName.endsWith('_Extension') &&
       actualModelName &&
       objectPrefix.toLowerCase() !== actualModelName.toLowerCase()
@@ -3476,9 +3606,42 @@ export async function handleCreateD365File(
       );
     }
 
-    let finalObjectName = applyObjectPrefix(effectiveObjectName, objectPrefix);
+    // Case D: class extensions (CoC) provided as a bare base class name, i.e. WITHOUT
+    // the "_Extension" suffix.
+    // e.g. objectType="class-extension", objectName="SalesFormLetter"
+    // → effectiveObjectName="SalesFormLetter_Extension" so applyObjectPrefix's
+    //   extension-class branch produces the correct name for the active style:
+    //     prefix style     → SalesFormLetterCr_Extension
+    //     model-name style → SalesFormLetter_ContosoRobotics_Extension
+    //
+    // Without this, a bare base name has no dot and does not end in "_Extension", so it
+    // falls into applyObjectPrefix's NORMAL CASE and is treated as a brand-new object —
+    // wrongly producing "CrSalesFormLetter". This mirrors the dot-notation Case C above;
+    // class-extension was the only extension type missing bare-name normalisation
+    // (the EXTENSION_NAMING_STYLE work added the model-name branches but assumed the
+    // caller always supplies the "_Extension" form for CoC classes).
+    if (args.objectType === 'class-extension' && !effectiveObjectName.endsWith('_Extension')) {
+      effectiveObjectName = `${effectiveObjectName}_Extension`;
+      console.error(
+        `[create_d365fo_file] Bare class-extension name auto-converted to _Extension form: ` +
+        `${args.objectName} → ${effectiveObjectName}`
+      );
+    }
+
+    // Pass actualModelName so the model-name naming style can use it as the extension
+    // token. For the default prefix style (or non-extension objects) it is ignored.
+    let finalObjectName = applyObjectPrefix(effectiveObjectName, objectPrefix, actualModelName);
+    // Trailing suffix (EXTENSION_SUFFIX) applies to NEW objects only — never to
+    // extension elements/classes. (For the prefix style applyObjectSuffix already
+    // skips _Extension and dot-notation "…Extension" names; this guard additionally
+    // covers the model-name style's "Base.ModelName" form, which has no "Extension"
+    // word and would otherwise wrongly receive the suffix.)
+    const isExtensionObjectType =
+      args.objectType === 'class-extension' || DOT_NOTATION_EXTENSION_TYPES.has(args.objectType);
     const objectSuffix = getObjectSuffix();
-    finalObjectName = applyObjectSuffix(finalObjectName, objectSuffix);
+    if (!isExtensionObjectType) {
+      finalObjectName = applyObjectSuffix(finalObjectName, objectSuffix);
+    }
     if (finalObjectName !== args.objectName) {
       console.error(`[create_d365fo_file] Applied naming: ${args.objectName} → ${finalObjectName}`);
     }
@@ -3675,6 +3838,7 @@ export async function handleCreateD365File(
                 `  3. Choose a different objectName.`,
             },
           ],
+          isError: true,
         };
       }
     }
@@ -3711,10 +3875,12 @@ export async function handleCreateD365File(
           if (props.methods) bridgeParams.methods = props.methods as { name: string; source?: string }[];
         }
 
-        // For enums: pass values from properties
+        // For enums: pass values from properties.
+        // Accept both `enumValues` (documented in tool description) and `values` (legacy).
         if (args.objectType === 'enum' && args.properties) {
           const props = args.properties as Record<string, unknown>;
-          if (props.values) bridgeParams.values = props.values as Record<string, unknown>[];
+          const enumVals = (props.enumValues ?? props.values) as Record<string, unknown>[] | undefined;
+          if (enumVals) bridgeParams.values = enumVals;
         }
 
         // For views: pass fields from properties
@@ -3857,6 +4023,12 @@ export async function handleCreateD365File(
       xmlContent = XmlTemplateGenerator.sanitizeQueryXml(xmlContent);
     }
 
+    // Sanitize enum XML — fixes <Values> → <EnumValues> and adds xmlns:i if missing.
+    // Applies to both template-generated and caller-provided xmlContent.
+    if (args.objectType === 'enum') {
+      xmlContent = XmlTemplateGenerator.sanitizeEnumXml(xmlContent);
+    }
+
     // Safety net: ensure every pair of adjacent </Method>…<Method> is separated by
     // exactly one blank line. This guards against xmlContent supplied by callers
     // (e.g. from generate_smart_table or generate_d365fo_xml) that might already be
@@ -3876,11 +4048,9 @@ export async function handleCreateD365File(
       `[create_d365fo_file] XML preview: ${xmlContent.substring(0, 200)}...`
     );
 
-    // Write file with UTF-8 BOM (required for D365FO XML files)
+    // Write file matching D365FO convention: no BOM, CRLF, no trailing newline
     try {
-      const utf8BOM = Buffer.from([0xEF, 0xBB, 0xBF]);
-      const xmlBuffer = Buffer.concat([utf8BOM, Buffer.from(xmlContent, 'utf-8')]);
-      await fs.writeFile(normalizedFullPath, xmlBuffer);
+      await fs.writeFile(normalizedFullPath, normalizeD365Xml(xmlContent), 'utf-8');
     } catch (writeError) {
       console.error(`[create_d365fo_file] Failed to write file:`, writeError);
       
@@ -4057,6 +4227,7 @@ export async function handleCreateD365File(
           text: `❌ Error creating D365FO file:\n\n${error instanceof Error ? error.message : 'Unknown error'}`,
         },
       ],
+      isError: true,
     };
   }
 }

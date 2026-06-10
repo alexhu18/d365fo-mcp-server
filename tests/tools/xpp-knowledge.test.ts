@@ -194,4 +194,45 @@ describe('get_xpp_knowledge', () => {
     expect(text).toContain('Power Platform');
     expect(text).toContain('virtual entit');
   });
+
+  it('returns select-statement entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'select-statement' }));
+    const text = getText(result);
+    expect(text).toContain('select');
+    expect(text).toContain('crossCompany');
+  });
+
+  it('returns coc-authoring entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'coc-authoring' }));
+    const text = getText(result);
+    expect(text).toContain('next');
+    expect(text).toContain('ExtensionOf');
+  });
+
+  it('returns xpp-class-rules entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'xpp-class-rules' }));
+    const text = getText(result);
+    expect(text).toContain('class');
+    expect(text).toContain('public');
+  });
+
+  it('returns sysda entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'sysda' }));
+    const text = getText(result);
+    expect(text).toContain('SysDa');
+  });
+
+  it('returns query-object-model entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'query-object-model' }));
+    const text = getText(result);
+    expect(text).toContain('Query');
+    expect(text).toContain('QueryRun');
+  });
+
+  it('returns formrun-lifecycle entry by ID', async () => {
+    const result = await xppKnowledgeTool(req({ topic: 'formrun-lifecycle' }));
+    const text = getText(result);
+    expect(text).toContain('FormRun');
+    expect(text).toContain('init');
+  });
 });

@@ -1798,6 +1798,284 @@ else
     ],
     related: ['data-entities', 'alerts-business-events', 'dual-write'],
   },
+
+  // ── Select Statement Grammar ────────────────────────────────────────────
+  {
+    id: 'select-statement',
+    title: 'X++ select Statement — Complete Grammar Reference',
+    keywords: ['select', 'while select', 'findoption', 'firstonly', 'crosscompany', 'forupdate', 'join', 'outer join', 'exists join', 'notexists join', 'forceliterals', 'forceplaceholders', 'in operator', 'aggregate', 'sum', 'count', 'group by', 'validtimestate', 'index hint', 'grammar'],
+    summary:
+      'Complete grammar reference for X++ select/while select. Statement order: [FindOptions] [FieldList from] tableBuffer [index] [order by / group by] [where …] [join … [where …]]. ' +
+      'FindOptions go BETWEEN "select" and the table buffer. Each joined buffer has its own where clause immediately after it.',
+    rules: [
+      'FindOptions (crossCompany, firstOnly, forUpdate, forceNestedLoop, forceSelectOrder, forcePlaceholders, pessimisticLock, optimisticLock, repeatableRead, validTimeState, noFetch, reverse, firstFast) go BETWEEN "select" and the table buffer / field list',
+      'crossCompany belongs on the OUTER (driving) buffer — never on a joined buffer. Optional container filter: select crossCompany : myContainer table …',
+      'Each joined buffer gets its own "where" clause immediately after it; order by / group by appear after the full join chain',
+      '"in" operator: "where field in container" — container = X++ container type; works with str/int/int64/real/enum/boolean/date/utcDateTime. NOT a Set, List class, or subquery',
+      'forceLiterals is FORBIDDEN — SQL injection risk; use forcePlaceholders (default for non-join selects) or omit',
+      'No function calls in WHERE — assign result to a local variable first (performance + BP compliance)',
+      'outer join is LEFT OUTER only — no RIGHT outer, no "left" keyword; check joined buffer.RecId == 0 to detect "no match"',
+      'Join criteria use "where", not "on" — X++ has no "on" keyword',
+      '"index hint" requires buffer.allowIndexHint(true) to be called first; otherwise silently ignored — use only when measured',
+      'Aggregates (sum/avg/count/minof/maxof): when sum would be null X++ returns NO row — guard with "if (buffer)" after the select',
+      'Non-aggregated fields in select list must appear in "group by" when aggregates are used',
+      'validTimeState(dateFrom, dateTo): use for date-effective tables (ValidTimeStateFieldType ≠ None)',
+      'doInsert/doUpdate/doDelete bypass overridden methods and event handlers — reserved for data-fix/migration scenarios only',
+      'For dynamic queries from user input: use executeQueryWithParameters API — NEVER concatenate into where clause',
+    ],
+    examples: [
+      {
+        label: 'crossCompany — correct vs wrong placement',
+        code: `// ✅ CORRECT — crossCompany on the driving buffer
+select crossCompany custTable
+    join custInvoiceJour
+    where custInvoiceJour.OrderAccount == custTable.AccountNum;
+
+// ❌ WRONG — crossCompany on joined buffer
+select custTable
+    join crossCompany custInvoiceJour where …;`,
+      },
+      {
+        label: '"in" operator with container',
+        code: `container statusFilter = [CustVendorBlocked::No, CustVendorBlocked::Invoice];
+CustTable custTable;
+while select AccountNum from custTable
+    where custTable.Blocked in statusFilter
+{
+    info(custTable.AccountNum);
+}`,
+      },
+      {
+        label: 'Function in WHERE — wrong vs correct',
+        code: `// ❌ WRONG — function call directly in WHERE
+select salesTable where salesTable.ShippingDateRequested == DateTimeUtil::getSystemDate(...);
+
+// ✅ CORRECT — assign to variable first
+date cutoffDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+select salesTable where salesTable.ShippingDateRequested == cutoffDate;`,
+      },
+    ],
+    related: ['query-patterns', 'set-based', 'query-object-model'],
+  },
+
+  // ── CoC Authoring Non-negotiables ───────────────────────────────────────
+  {
+    id: 'coc-authoring',
+    title: 'CoC Authoring Non-negotiables',
+    keywords: ['coc', 'chain of command', 'next', 'default parameter', 'wrappable', 'hookable', 'final', 'extensionof', 'wrapper', 'form coc', 'formdatasourcestr', 'static coc', 'replaceable', 'pre', 'post', 'wrap'],
+    summary:
+      'Strict rules for authoring CoC wrappers. The most common mistake is copying default parameter values. ' +
+      'next must always be called at first-level scope. Always use get_method_signature before writing any wrapper.',
+    rules: [
+      'NEVER copy default parameter values into the wrapper signature — wrapper uses bare parameter types only',
+      'next must be at first-level statement scope: NOT inside if/while/for, NOT after return, NOT inside a logical expression. PU21+: permitted inside try/catch/finally',
+      'Wrapper must always call next — except on [Replaceable] methods',
+      'Signature otherwise matches base exactly: return type, param types and order, static modifier',
+      'Static method wrappers must repeat "static". Forms cannot have static-method CoC',
+      'Cannot wrap constructors; new parameterless public methods on extension class become the extension\'s own constructor',
+      'Extension class shape: [ExtensionOf(<Str>(...))] final class <Target>_Extension — MUST be final',
+      '[Hookable(false)] blocks CoC entirely. [Wrappable(false)] blocks wrapping; final methods need [Wrappable(true)] to allow wrapping',
+      'Form-nested wrapping uses formdatasourcestr, formdatafieldstr, formControlStr. Cannot ADD new methods via CoC — only wrap existing ones (init, validateWrite, clicked, …)',
+      'Wrappers can read/call protected members of the augmented class (PU9+); cannot reach private',
+      'Pre-processing: call business logic before next. Post-processing: call next first, then business logic. Wrap: call next inside the logic',
+      'Use get_method_signature tool to get exact parameter types before writing the wrapper',
+    ],
+    examples: [
+      {
+        label: 'Default parameter — wrong vs correct',
+        code: `// Base method
+public void salute(str message = "Hi") { … }
+
+// ✅ CORRECT — no default value in wrapper
+public void salute(str message)
+{
+    next salute(message);
+}
+
+// ❌ WRONG — copying the default breaks the CoC contract
+public void salute(str message = "Hi")
+{
+    next salute(message);  // compile error in strict mode
+}`,
+      },
+      {
+        label: 'next placement — correct vs wrong scope',
+        code: `// ✅ CORRECT — next at first-level scope (post-processing)
+public boolean validateWrite()
+{
+    boolean ret = next validateWrite();  // first-level ✅
+    if (this.CreditMax > 1000000)
+        ret = checkFailed("@MyModel:CreditLimitExceeded");
+    return ret;
+}
+
+// ❌ WRONG — next inside an if block
+public void post()
+{
+    if (this.shouldPost())
+        next post();  // NOT first-level scope ❌
+}`,
+      },
+    ],
+    related: ['coc', 'event-handlers'],
+  },
+
+  // ── X++ Class & Method Rules ─────────────────────────────────────────────
+  {
+    id: 'xpp-class-rules',
+    title: 'X++ Class & Method Rules',
+    keywords: ['class', 'method', 'access modifier', 'public', 'protected', 'private', 'internal', 'final', 'abstract', 'static', 'constructor', 'new', 'construct', 'parm', 'this', 'extension method', 'override', 'optional parameter', 'pass by value', 'var', 'const', 'macro'],
+    summary:
+      'X++ class and method rules: access defaults, constructor pattern, modifier order, this usage, extension methods, optional parameters, and pass-by-value semantics.',
+    rules: [
+      'Class default access = public. Removing "public" does NOT make a class non-public. Use internal, final, abstract deliberately',
+      'Instance fields default = protected — NEVER make them public; expose via parmFoo() accessors',
+      'Constructor pattern: new() is protected, public static construct() factory; init() for post-construction setup',
+      'Method modifier order: [edit|display] [public|protected|private|internal] [static|abstract|final]',
+      'Override visibility: must be at least as accessible as the base method. private is not overridable',
+      'Optional parameters must come after required ones; all preceding parameters must be supplied. Use prmIsDefault(_x) to detect "was this passed"',
+      'All parameters are pass-by-value — mutating a parameter does NOT affect the caller\'s variable',
+      '"this" is required for instance method calls; cannot qualify class-declaration member variables (use bare name); cannot be used in static methods; cannot qualify static methods (use ClassName::method())',
+      'Extension methods (target Class/Table/View/Map): extension class must be static, name ends _Extension; methods are public static; first param is the target type, supplied by runtime',
+      'Constants over macros: public const str FOO = "bar"; at class scope; reference via ClassName::FOO or unqualified inside the class',
+      '"var" keyword only when the type is obvious from initialization; skip when ambiguous',
+      'Declare variables close to first use, smallest scope; compiler rejects shadowing',
+    ],
+    related: ['coc-authoring', 'coc'],
+  },
+
+  // ── SysDa Framework ─────────────────────────────────────────────────────
+  {
+    id: 'sysda',
+    title: 'SysDa Framework — Fluent Query API',
+    keywords: ['sysda', 'sysdaqueryobject', 'sysdafindstatement', 'sysdafindobj', 'sysdaupdatestatement', 'sysdaupdateobject', 'sysdainsertstatement', 'sysdadeletestatement', 'sysdaequalsexpression', 'sysdafieldexpression', 'sysdavalueexpression', 'fluent query', 'dynamic query', 'sysdajoinkind'],
+    summary:
+      'SysDa is the modern X++ fluent/object-oriented query API. Use for dynamic queries where shape depends on runtime conditions. ' +
+      'Use "select/while select" for static, known-at-compile-time queries (cleaner, faster to read, compile-time field validation).',
+    rules: [
+      'SysDaQueryObject: root query builder — set table buffer via constructor: new SysDaQueryObject(custTable)',
+      'SysDaSearchObject / SysDaSearchStatement: execute query and populate buffers in a while loop via nextRecord()',
+      'SysDaFindObject / SysDaFindStatement: firstOnly equivalent — returns true/false, populates buffer',
+      'SysDaUpdateObject / SysDaUpdateStatement: set-based update without row-by-row fetch',
+      'SysDaInsertObject / SysDaInsertStatement: set-based insert from another query result',
+      'SysDaDeleteObject / SysDaDeleteStatement: set-based delete',
+      'Joins: qe.joinClause(SysDaJoinKind::InnerJoin, joinQe) — supports Inner, Outer, Exists, NotExists',
+      'Where clause: qe.whereClause(new SysDaEqualsExpression(new SysDaFieldExpression(...), new SysDaValueExpression(...)))',
+      'Use SysDa when: query shape depends on runtime conditions, building framework/reusable logic, dynamic field selection',
+      'Use "select/while select" when: static queries, compile-time field validation, clarity is preferred',
+    ],
+    examples: [
+      {
+        label: 'Basic SysDa search',
+        code: `CustTable custTable;
+var qe = new SysDaQueryObject(custTable);
+qe.whereClause(new SysDaEqualsExpression(
+    new SysDaFieldExpression(custTable, fieldStr(CustTable, AccountNum)),
+    new SysDaValueExpression('US-001')
+));
+var so = new SysDaSearchStatement();
+while (so.nextRecord(qe))
+{
+    info(custTable.AccountNum);
+}`,
+      },
+      {
+        label: 'SysDa inner join',
+        code: `CustTable custTable;
+CustTrans custTrans;
+var qMain  = new SysDaQueryObject(custTable);
+var qJoin  = new SysDaQueryObject(custTrans);
+qJoin.whereClause(new SysDaEqualsExpression(
+    new SysDaFieldExpression(custTrans, fieldStr(CustTrans, AccountNum)),
+    new SysDaFieldExpression(custTable, fieldStr(CustTable, AccountNum))
+));
+qMain.joinClause(SysDaJoinKind::InnerJoin, qJoin);
+
+var so = new SysDaSearchStatement();
+while (so.nextRecord(qMain))
+{
+    info(custTable.AccountNum);
+}`,
+      },
+    ],
+    related: ['query-patterns', 'query-object-model'],
+  },
+
+  // ── AOT Query Object Model ──────────────────────────────────────────────
+  {
+    id: 'query-object-model',
+    title: 'AOT Query Object Model (Query / QueryRun)',
+    keywords: ['query', 'queryrun', 'querybuilddsource', 'querybuildatasouce', 'querybuildrange', 'queryvalue', 'sysquery', 'findorcreaterange', 'adddatasource', 'addrange', 'addsortfield', 'joinmode', 'allowcrosscompany', 'addcompanyrange'],
+    summary:
+      'The Query/QueryRun classes execute AOT-defined or runtime-built queries. Use for form/report data binding, ' +
+      'when users dynamically modify filters (SysQueryForm), or when the same query is reused across multiple consumers.',
+    rules: [
+      'Query: defines structure (data sources, ranges, sorting, joins)',
+      'QueryBuildDataSource (QBDS): one table in the query — add via query.addDataSource(tableNum(T))',
+      'QueryBuildRange: filter — qbds.addRange(fieldNum(T, Field)).value(queryValue("X"))',
+      'QueryRun: executes the query and iterates results via next() and get(tableNum(T))',
+      'SysQuery::findOrCreateRange(qbds, fieldNum): idempotent range addition — use instead of addRange to avoid duplicate ranges',
+      'QueryBuildDataSource::addDataSource(): nested join (child data source within parent DS)',
+      'qbds.joinMode(JoinMode::ExistsJoin): set join type at runtime — ExistsJoin, NotExistsJoin, OuterJoin, InnerJoin',
+      'query.allowCrossCompany(true) + query.addCompanyRange("dat"): cross-company at Query level',
+      'Use AOT Query objects when: forms/reports bind to them, reusable across multiple consumers',
+      'Use runtime Query when: user can dynamically modify filters (SysQueryRun), batch dialog filtering needed',
+      'Use "select" for: inline data access where no dynamic filter UI is needed',
+    ],
+    examples: [
+      {
+        label: 'Runtime Query with range and sorting',
+        code: `Query query = new Query();
+QueryBuildDataSource qbds = query.addDataSource(tableNum(CustTable));
+qbds.addRange(fieldNum(CustTable, CustGroup)).value(queryValue('10'));
+qbds.addSortField(fieldNum(CustTable, AccountNum));
+QueryRun qr = new QueryRun(query);
+while (qr.next())
+{
+    CustTable ct = qr.get(tableNum(CustTable));
+    info(ct.AccountNum);
+}`,
+      },
+      {
+        label: 'SysQuery::findOrCreateRange — idempotent pattern',
+        code: `// Use in form init() or executeQuery() CoC — safe to call multiple times
+QueryBuildDataSource qbds = this.queryBuildDataSource();
+SysQuery::findOrCreateRange(
+    qbds,
+    fieldNum(CustTable, CustGroup)).value('DOM');`,
+      },
+    ],
+    related: ['query-patterns', 'sysda'],
+  },
+
+  // ── FormRun Lifecycle ───────────────────────────────────────────────────
+  {
+    id: 'formrun-lifecycle',
+    title: 'FormRun Lifecycle & Form Extension Points',
+    keywords: ['formrun', 'form lifecycle', 'form init', 'form run', 'executequery', 'formdatasource', 'active', 'validatewrite', 'clicked', 'modified', 'form extension', 'research', 'element.args', 'element.design', 'formcontrol', 'formletterservicecontroller'],
+    summary:
+      'D365FO forms follow a strict initialization sequence. Extensions use CoC on lifecycle methods. ' +
+      'Never guess control names — use get_form_info(formName, searchControl="...") before extending.',
+    rules: [
+      'Initialization sequence: form.init() → FormDataSource.init() per DS → form.run() → FormDataSource.executeQuery()',
+      'form.init(): form structure loaded, data sources NOT yet active — safe for: adding ranges, modifying query before first run',
+      'FormDataSource.init(): each data source initializes — add default ranges here, link types resolved',
+      'FormDataSource.executeQuery(): fires on each refresh — modify query dynamically here (e.g., based on active record)',
+      'FormDataSource.active(): fires when cursor moves to a new record — update dependent data sources or UI state',
+      'FormDataSource.validateWrite(): custom validation before save — return false to prevent save',
+      'FormDataSource.write(): post-save logic — record is already committed when this fires',
+      'FormControl.clicked(): button click handler. FormControl.modified(): field value changed handler',
+      'FormDataSource.research(retainPosition: true): refresh grid keeping cursor position (preferred over executeQuery for UI refresh)',
+      'element.args(): access caller context (menu item, record, enum parameter passed via Args)',
+      'FormDataSource.queryBuildDataSource(): access underlying QueryBuildDataSource for runtime range manipulation',
+      'element.design().controlName(formControlStr(MyForm, MyControl)): access control instance by name at runtime',
+      'NEVER guess control names — they differ from field names and are often prefixed; use get_form_info(formName, searchControl="...")',
+      'Use [ExtensionOf(formStr(...))] for form-level CoC; forms cannot have static-method CoC',
+      'Add data sources via modify_d365fo_file(operation="add-data-source")',
+      'Add controls via modify_d365fo_file(operation="add-control", parentControl="TabGeneral")',
+    ],
+    related: ['coc', 'form-patterns'],
+  },
 ];
 
 // ─── Search Logic ───────────────────────────────────────────────────────────

@@ -27,7 +27,14 @@ import { loadEnv } from '../../src/utils/loadEnv.js';
 const mockConfig = vi.mocked(dotenv.config);
 
 // ── Env-var isolation ────────────────────────────────────────────────────────
-const TRACKED_VARS = ['ENV_FILE', 'DB_PATH', 'LABELS_DB_PATH', 'METADATA_PATH'] as const;
+const TRACKED_VARS = [
+  'ENV_FILE',
+  'DB_PATH',
+  'LABELS_DB_PATH',
+  'METADATA_PATH',
+  'DEV_ENVIRONMENT_TYPE',
+  'D365FO_DEV_ENVIRONMENT_TYPE',
+] as const;
 let savedEnv: Partial<Record<string, string>> = {};
 
 beforeEach(() => {
@@ -199,5 +206,51 @@ describe('relative path resolution', () => {
     expect(process.env.DB_PATH).toBeUndefined();
     expect(process.env.LABELS_DB_PATH).toBeUndefined();
     expect(process.env.METADATA_PATH).toBeUndefined();
+  });
+});
+
+// ── Dev-environment-type alias (external prefixed → internal plain) ───────────
+// The public/canonical setting is D365FO_DEV_ENVIRONMENT_TYPE, but the code
+// reads the plain DEV_ENVIRONMENT_TYPE. loadEnv bridges the two: prefixed wins,
+// a lone plain entry is tolerated as silent legacy.
+describe('dev-environment-type alias', () => {
+  it('copies the prefixed value into the plain name when only prefixed is set', () => {
+    mockConfig.mockImplementation(() => {
+      process.env.D365FO_DEV_ENVIRONMENT_TYPE = 'ude';
+      return { parsed: {} } as any;
+    });
+
+    loadEnv(FAKE_CALLER_URL);
+
+    expect(process.env.DEV_ENVIRONMENT_TYPE).toBe('ude');
+  });
+
+  it('lets the prefixed value win when both names are set', () => {
+    mockConfig.mockImplementation(() => {
+      process.env.DEV_ENVIRONMENT_TYPE = 'traditional';
+      process.env.D365FO_DEV_ENVIRONMENT_TYPE = 'ude';
+      return { parsed: {} } as any;
+    });
+
+    loadEnv(FAKE_CALLER_URL);
+
+    expect(process.env.DEV_ENVIRONMENT_TYPE).toBe('ude');
+  });
+
+  it('preserves a lone plain entry (legacy fallback) when prefixed is unset', () => {
+    mockConfig.mockImplementation(() => {
+      process.env.DEV_ENVIRONMENT_TYPE = 'traditional';
+      return { parsed: {} } as any;
+    });
+
+    loadEnv(FAKE_CALLER_URL);
+
+    expect(process.env.DEV_ENVIRONMENT_TYPE).toBe('traditional');
+  });
+
+  it('leaves the plain name unset when neither is provided', () => {
+    loadEnv(FAKE_CALLER_URL);
+
+    expect(process.env.DEV_ENVIRONMENT_TYPE).toBeUndefined();
   });
 });

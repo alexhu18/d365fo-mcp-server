@@ -135,6 +135,21 @@ describe('generate_code', () => {
     expect(result.isError).toBe(true);
   });
 
+  it('rejects extension pattern when GROUNDING_ENFORCE=true and no token', async () => {
+    const original = process.env.GROUNDING_ENFORCE;
+    process.env.GROUNDING_ENFORCE = 'true';
+    try {
+      const result = await codeGenTool(
+        req('generate_code', { pattern: 'table-extension', name: 'CustTable', modelName: 'MyModel' }),
+      );
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/grounding|prepare_change/i);
+    } finally {
+      if (original === undefined) delete process.env.GROUNDING_ENFORCE;
+      else process.env.GROUNDING_ENFORCE = original;
+    }
+  });
+
   it('generates a business-event template', async () => {
     const result = await codeGenTool(
       req('generate_code', { pattern: 'business-event', name: 'OrderConfirmed', modelName: 'MyModel' }),

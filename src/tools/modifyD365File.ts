@@ -28,6 +28,9 @@ import {
 } from '../bridge/index.js';
 import { invalidateCache } from './updateSymbolIndex.js';
 import { ProjectFileManager, ProjectFileFinder } from './createD365File.js';
+import { normalizeD365Xml } from '../utils/d365XmlNormalizer.js';
+import { enforceGrounding } from '../utils/provenanceStore.js';
+import { gateOnReferenceErrors } from './resolveReferences.js';
 
 /**
  * Decode the standard XML entities (&lt;, &gt;, &apos;, &quot;, &amp;) and normalise
@@ -78,19 +81,23 @@ async function directXmlReplaceCode(
   newCode: string,
 ): Promise<{ success: boolean; message: string } | null> {
   try {
-    // Read as Buffer to detect and preserve UTF-8 BOM (D365FO XML files use BOM)
-    const buf = await fs.readFile(filePath);
-    const hasBom = buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF;
-    const content = buf.toString('utf-8');
+    // D365FO XML files on disk are CRLF, but oldCode passed by the AI is typically
+    // copied from get_method / get_class_info output that already strips CRs.
+    // Normalize both sides to LF for matching, then let normalizeD365Xml put the
+    // file back into D365FO's canonical shape (no BOM, CRLF, no trailing newline).
+    const rawContent = await fs.readFile(filePath, 'utf-8');
+    const content = rawContent.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+    const normOld = oldCode.replace(/\r\n/g, '\n');
+    const normNew = newCode.replace(/\r\n/g, '\n');
 
-    if (!content.includes(oldCode)) {
+    if (!content.includes(normOld)) {
       return null; // oldCode not found in file at all
     }
 
     // Ensure there is exactly one occurrence so we replace the correct block.
     // String.prototype.replace() without /g only replaces the FIRST occurrence,
     // which would silently leave other occurrences and produce ambiguous results.
-    const occurrences = content.split(oldCode).length - 1;
+    const occurrences = content.split(normOld).length - 1;
     if (occurrences > 1) {
       return {
         success: false,
@@ -98,15 +105,12 @@ async function directXmlReplaceCode(
       };
     }
 
-    const updated = content.replace(oldCode, newCode);
+    const updated = content.replace(normOld, normNew);
     if (updated === content) {
       return null; // no change made
     }
 
-    // Preserve BOM if it was present: Node's utf-8 encoding strips BOM on read
-    // but '\uFEFF' prefix restores it on write.
-    const bomPrefix = hasBom && !updated.startsWith('\uFEFF') ? '\uFEFF' : '';
-    await fs.writeFile(filePath, bomPrefix + updated, 'utf-8');
+    await fs.writeFile(filePath, normalizeD365Xml(updated), 'utf-8');
     console.error(`[modify_d365fo_file] ✅ directXmlReplaceCode fallback: replaced in ${filePath}`);
     return {
       success: true,
@@ -164,6 +168,10 @@ const ModifyD365FileArgsSchema = z.object({
     'Explicit integer value for the enum value. ' +
     'If omitted for add-enum-value, the next available value is assigned automatically. ' +
     'Use with modify-enum-value to change the integer value (rare — may break existing data).'
+  ),
+  enumValueCountryRegionCodes: z.string().optional().describe(
+    'ISO country/region codes for the enum value, comma-separated (e.g. "CZ", "CZ,SK"). ' +
+    'Used with add-enum-value to restrict the value to specific locales.'
   ),
 
   // For add-display-method
@@ -342,7 +350,7 @@ const ModifyD365FileArgsSchema = z.object({
   propertyValue: z.string().optional().describe('New property value'),
   
   // Options
-  createBackup: z.boolean().optional().default(false).describe('Create backup before modification (default: false)'),
+  createBackup: z.boolean().optional().default(false).describe('Create a .bak backup of the file before modifying it (default: false). Changes can also be reverted with undo_last_modification (git checkout) without a backup. Set true when the file is not under source control.'),
   modelName: z.string().optional().describe('Model name (auto-detected if not provided). Pass this if the file was just created and is not yet indexed.'),
   packageName: z.string().optional().describe('Package name. Auto-resolved if omitted.'),
   workspacePath: z.string().optional().describe('Path to workspace for finding file'),
@@ -361,11 +369,38 @@ const ModifyD365FileArgsSchema = z.object({
   solutionPath: z.string().optional().describe(
     'Path to VS solution directory. Used to find .rnrproj when projectPath is not given.'
   ),
+  groundingToken: z.string().optional().describe(
+    'Provenance token returned by prepare_change. Proves the change was grounded in the indexed codebase. ' +
+    'Required for *-extension objectTypes when GROUNDING_ENFORCE=true on the server.'
+  ),
 });
 
 export async function modifyD365FileTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = ModifyD365FileArgsSchema.parse(request.params.arguments);
+
+    // Grounding enforcement: modifying an extension changes the behaviour of an
+    // existing base object — when GROUNDING_ENFORCE=true the model must prove
+    // (via prepare_change) that it inspected the real object first.
+    if (args.objectType.endsWith('-extension')) {
+      const groundingError = enforceGrounding(
+        args.groundingToken,
+        `modify_d365fo_file(objectType="${args.objectType}", objectName="${args.objectName}", operation="${args.operation}")`,
+        args.objectName,
+      );
+      if (groundingError) return groundingError;
+    }
+
+    // Semantic reference gate: when GROUNDING_ENFORCE=true, every identifier in
+    // X++ source about to be written must be proven against the symbol index.
+    const xppToWrite = args.sourceCode ?? args.methodCode ?? args.newCode;
+    const referenceError = gateOnReferenceErrors(
+      xppToWrite,
+      context.symbolIndex,
+      `modify_d365fo_file(objectType="${args.objectType}", objectName="${args.objectName}", operation="${args.operation}")`,
+    );
+    if (referenceError) return referenceError;
+
     const { symbolIndex } = context;
     const {
       objectType,
@@ -407,6 +442,7 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
               `**Candidates** (${resolution.multiple.length}):\n${candidateList}\n\n` +
               `Re-call \`add-control\` with the exact \`parentControl\` name from the list above.`,
           }],
+          isError: true,
         };
       }
 
@@ -771,6 +807,7 @@ export async function modifyD365FileTool(request: CallToolRequest, context: XppS
             (args as any).enumValueName,
             (args as any).enumValue ?? 0,
             (args as any).enumValueLabel,
+            (args as any).enumValueCountryRegionCodes,
           );
         }
         break;
@@ -1052,7 +1089,13 @@ async function findD365File(
     // which are never accessible at runtime.  Relative paths (e.g. "ContosoExt/ContosoExt/AxClass/Foo.xml")
     // also come from this source and cannot be used directly.
     // Fall through to findD365FileOnDisk which builds the correct absolute path from config.
-    if (dbResult && path.isAbsolute(dbResult)) {
+    //
+    // Use cross-platform absolute detection so that Windows-style drive paths (C:\...)
+    // are recognised as absolute even when the server runs on Linux/macOS (path.isAbsolute
+    // returns false for Windows paths on POSIX hosts, causing spurious fallback loops).
+    const isAbsoluteXPlat = (p: string) =>
+      path.isAbsolute(p) || /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p);
+    if (dbResult && isAbsoluteXPlat(dbResult)) {
       try {
         await import('fs').then(m => m.promises.access(dbResult!));
         return dbResult;

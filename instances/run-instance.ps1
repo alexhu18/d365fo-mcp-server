@@ -63,12 +63,21 @@ function Get-EnvValue([string]$envFile, [string]$key) {
     return $null
 }
 
+# ── Helper: read the dev-environment-type setting ───────────────────────────
+# Canonical name is the D365FO_-prefixed form; the plain name is a legacy
+# fallback (see rebuild-instance.ps1 for the one-time rename nudge).
+function Get-DevEnvType([string]$envFile) {
+    $v = Get-EnvValue $envFile 'D365FO_DEV_ENVIRONMENT_TYPE'
+    if (-not $v) { $v = Get-EnvValue $envFile 'DEV_ENVIRONMENT_TYPE' }
+    return $v
+}
+
 # ── Run ─────────────────────────────────────────────────────────────────────
 $envFile = Join-Path $selected.FullName '.env'
 $env:ENV_FILE = $envFile
 
 # ── Warn if XPP_CONFIG_NAME no longer resolves ──────────────────────────────
-$envType = Get-EnvValue $envFile 'DEV_ENVIRONMENT_TYPE'
+$envType = Get-DevEnvType $envFile
 $configName = Get-EnvValue $envFile 'XPP_CONFIG_NAME'
 if ($configName -and ($envType -ne 'traditional')) {
     # Rebuild normalises XPP_CONFIG_NAME to the full versioned filename, so a

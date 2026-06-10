@@ -75,8 +75,17 @@ C:\source\repos\                   ← parent folder (common ancestor of all sol
 Copy-Item -Path ".github" -Destination "C:\source\repos\" -Recurse
 ```
 
-GitHub Copilot automatically picks up `copilot-instructions.md` and uses it to give
-the AI the right D365FO context for every conversation.
+GitHub Copilot automatically picks up `copilot-instructions.md` as a bootstrap layer.
+It contains the rules the agent relies on **without any extra action** — tool mapping, key
+constraints, the terminal prohibition, and the confirm-before-write workflow (create/modify
+apply immediately, there is no dry-run). **This step is not optional:** it is the only channel
+that delivers the workflow rules to the agent automatically.
+
+A fuller version of these instructions is also exposed as the MCP prompt `xpp_system_instructions`
+(defined in `src/prompts/systemInstructions.ts`). ⚠️ MCP prompts are **opt-in** — they are NOT
+injected automatically; the user must explicitly invoke the prompt in the client (e.g. pick
+`xpp_system_instructions` from the MCP prompt picker in chat). Do not rely on it being present by
+default — keep `copilot-instructions.md` in place so the critical rules are always loaded.
 
 ---
 
@@ -205,6 +214,7 @@ locally. Suitable for individual developers who do not want to use Azure.
 git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
 cd K:\d365fo-mcp-server
 npm install
+npm run build
 cd bridge\D365MetadataBridge && dotnet build -c Release && cd ..\..  # Build the C# bridge
 copy .env.example .env
 ```
@@ -212,7 +222,7 @@ copy .env.example .env
 Edit `.env`:
 
 ```env
-DEV_ENVIRONMENT_TYPE=auto
+D365FO_DEV_ENVIRONMENT_TYPE=auto
 PACKAGES_PATH=K:/AosService/PackagesLocalDirectory
 CUSTOM_MODELS=YourPackageName
 ```

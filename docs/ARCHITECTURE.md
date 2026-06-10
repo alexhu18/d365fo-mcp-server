@@ -36,7 +36,7 @@ graph TB
     subgraph "MCP Server Components"
         HTTP[HTTP Transport Layer\n Express + Rate Limiting]
         PROTO[MCP Protocol Handler\n JSON-RPC 2.0]
-        TOOLS[Tool Handlers\n 54 MCP Tools]
+        TOOLS[Tool Handlers\n 58 MCP Tools]
         DB[(Symbols Database\n FTS5, 584K+ symbols)]
         LDB[(Labels Database\n FTS5, 19M+ labels, 70 languages)]
         CACHE[Redis Cache\n Optional]
@@ -102,12 +102,12 @@ sequenceDiagram
     alt Initialize
         MCP-->>IDE: Server Capabilities
     else Tools List
-        MCP-->>IDE: 54 Tool Definitions
+        MCP-->>IDE: 58 Tool Definitions
     else Tool Call
         MCP->>Handler: Route to Handler
         Handler->>Tool: Execute Tool
         alt Read Operation (get_table_info, get_class_info, ...)
-            Tool->>Bridge: tryBridge*() — bridge-primary (12 tools)
+            Tool->>Bridge: tryBridge*() — bridge-primary (16 tools)
             alt Bridge Available & Object Found
                 Bridge-->>Tool: Live Metadata Result
             else Bridge Unavailable
@@ -804,7 +804,7 @@ graph LR
     subgraph "MCP Protocol Methods"
         INIT[initialize\n Server Capabilities]
         NOTIFY[notifications/initialized\n Handshake Complete]
-        TOOLS_LIST[tools/list\n 54 Available Tools]
+        TOOLS_LIST[tools/list\n 58 Available Tools]
         TOOLS_CALL[tools/call\n Execute Tool]
         RES_LIST[resources/list\n Empty]
         RES_TMPL[resources/templates/list\n Empty]
@@ -813,7 +813,7 @@ graph LR
     end
 
     INIT -.-> CAPS[Capabilities: tools, resources, prompts]
-    TOOLS_LIST -.-> TOOL_DEFS["54 tools: search, batch_search, search_extensions, get_class_info, get_table_info, code_completion, get_method_signature, get_method_source, find_references, get_form_info, get_query_info, get_view_info, get_enum_info, get_edt_info, get_report_info, generate_code, analyze_code_patterns, suggest_method_implementation, analyze_class_completeness, get_api_usage_patterns, get_xpp_knowledge, get_d365fo_error_help, generate_d365fo_xml, create_d365fo_file, modify_d365fo_file, search_labels, get_label_info, create_label, rename_label, get_table_patterns, get_form_patterns, generate_smart_table, generate_smart_form, generate_smart_report, suggest_edt, get_security_artifact_info, get_security_coverage_for_object, get_menu_item_info, find_coc_extensions, find_event_handlers, get_table_extension_info, get_data_entity_info, analyze_extension_points, recommend_extension_strategy, validate_object_naming, get_workspace_info, verify_d365fo_project, update_symbol_index, build_d365fo_project, trigger_db_sync, run_bp_check, run_systest_class, review_workspace_changes, undo_last_modification"]
+    TOOLS_LIST -.-> TOOL_DEFS["58 tools: search, batch_search, search_extensions, get_class_info, get_table_info, code_completion, get_method_signature, get_method_source, find_references, get_form_info, get_query_info, get_view_info, get_enum_info, get_edt_info, get_report_info, generate_code, analyze_code_patterns, suggest_method_implementation, analyze_class_completeness, get_api_usage_patterns, get_xpp_knowledge, get_d365fo_error_help, validate_xpp, resolve_references, prepare_change, prepare_create, generate_d365fo_xml, create_d365fo_file, modify_d365fo_file, search_labels, get_label_info, create_label, rename_label, get_table_patterns, get_form_patterns, generate_smart_table, generate_smart_form, generate_smart_report, suggest_edt, get_security_artifact_info, get_security_coverage_for_object, get_menu_item_info, find_coc_extensions, find_event_handlers, get_table_extension_info, get_data_entity_info, analyze_extension_points, recommend_extension_strategy, validate_object_naming, get_workspace_info, verify_d365fo_project, update_symbol_index, build_d365fo_project, trigger_db_sync, run_bp_check, run_systest_class, review_workspace_changes, undo_last_modification"]
     TOOLS_CALL -.-> EXEC[Tool Execution: search DB, parse XML, return results]
     style INIT fill:#4CAF50,color:#fff
     style TOOLS_CALL fill:#2196F3,color:#fff

@@ -1,8 +1,8 @@
-﻿# D365 F&O MCP Server
+# D365 F&O MCP Server
 
 <div align="center">
 
-**54 AI tools that know every X++ class, table, method, and EDT in your D365FO codebase**
+**58 AI tools that know every X++ class, table, method, and EDT in your D365FO codebase**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen.svg)](https://nodejs.org/)
@@ -16,24 +16,24 @@
 
 ## Why this exists
 
-GitHub Copilot excels at C#, Python, and JavaScript — languages with rich public training data. X++ is different. Your D365FO codebase is private, highly customized, and deeply interconnected: thousands of CoC extensions layered over standard Microsoft code, ISV packages adding their own tables and classes, custom EDTs that drive field validation across dozens of forms. Copilot has never seen any of it.
+AI coding assistants excel at C#, Python, and JavaScript — languages with rich public training data. X++ is different. Your D365FO codebase is private, highly customized, and deeply interconnected: thousands of CoC extensions layered over standard Microsoft code, ISV packages adding their own tables and classes, custom EDTs that drive field validation across dozens of forms. No AI has seen any of it.
 
-The result is AI that confidently generates code that doesn't compile: wrong method signatures, missing parameters, fields that don't exist on the table, CoC chains broken because Copilot didn't know an extension already wrapped the method.
+The result is AI that confidently generates code that doesn't compile: wrong method signatures, missing parameters, fields that don't exist on the table, CoC chains broken because the AI didn't know an extension already wrapped the method.
 
-This MCP server solves that by pre-indexing your entire D365FO installation — hundreds of thousands of symbols across standard and custom models — and exposing it to Copilot as 54 specialized tools. Before generating any X++ code, Copilot can look up exact method signatures, check what CoC extensions already exist, trace security hierarchies, find label translations, and understand the full shape of your data model. The result is code that compiles on the first try and integrates correctly with your existing customizations.
+This MCP server solves that by pre-indexing your entire D365FO installation — hundreds of thousands of symbols across standard and custom models — and exposing it as 58 specialized tools. Works with **GitHub Copilot** and **Claude Code CLI**. Before generating any X++ code, the AI can look up exact method signatures, check what CoC extensions already exist, trace security hierarchies, find label translations, and understand the full shape of your data model. The result is code that compiles on the first try and integrates correctly with your existing customizations.
 
 ![Solution Architecture](docs/img/solution-architecture-diagram.png)
 
 | Without this server | With this server |
 |---------------------|-----------------|
-| Copilot guesses method signatures → compile errors | Exact signatures pulled from your actual codebase |
+| AI guesses method signatures → compile errors | Exact signatures pulled from your actual codebase |
 | "Does CustTable.validateWrite() have any CoC wrappers?" requires manual AOT search | `find_coc_extensions` answers in < 50 ms |
-| ISV and custom model extensions invisible to Copilot | All models fully indexed and searchable |
+| ISV and custom model extensions invisible to AI | All models fully indexed and searchable |
 | Security hierarchy takes hours to trace manually | `get_security_coverage_for_object` traces Role → Duty → Privilege → Entry Point instantly |
-| Copilot generates hardcoded strings instead of label references | `search_labels` finds the right `@SYS`/`@MODULE` label key immediately |
+| AI generates hardcoded strings instead of label references | `search_labels` finds the right `@SYS`/`@MODULE` label key immediately |
 | "Which tables reference CustTable?" requires digging through AOT relations | `get_table_relations` returns every FK relation and cardinality in one call |
 | EDT base types and field lengths are a constant lookup | `get_edt_details` returns the full EDT definition including extends chain |
-| Copilot doesn't know which SysOperation framework class to extend | `search_classes` with a description filter surfaces the right base class |
+| AI doesn't know which SysOperation framework class to extend | `search_classes` with a description filter surfaces the right base class |
 | New CoC extension may silently duplicate an existing one | `find_coc_extensions` reveals all existing wrappers before you write a line |
 | Menu item to form mapping requires navigating the AOT manually | `get_menu_item_details` resolves the full path from menu item to form to data source |
 
@@ -117,6 +117,34 @@ Copy-Item -Path ".github" -Destination "C:\source\repos\" -Recurse
 
 ---
 
+## Connect to Claude Code CLI
+
+Claude Code uses a different config format from Copilot — `"mcpServers"` key, explicit `"type"` field, and `"alwaysLoad": true` to prevent tool deferral.
+
+**1.** Install Claude Code CLI: `npm install -g @anthropic-ai/claude-code`
+
+**2.** Register the server (writes to `~/.claude.json`):
+
+```powershell
+# Azure-hosted
+claude mcp add-json --scope user d365fo-mcp-tools '{"type":"http","url":"https://your-server.azurewebsites.net/mcp/","alwaysLoad":true}'
+
+# Local stdio
+claude mcp add-json --scope user d365fo-mcp-tools '{"type":"stdio","command":"node","args":["K:\\d365fo-mcp-server\\dist\\index.js"],"env":{"DB_PATH":"K:\\d365fo-mcp-server\\data\\xpp-metadata.db","LABELS_DB_PATH":"K:\\d365fo-mcp-server\\data\\xpp-metadata-labels.db","D365FO_SOLUTIONS_PATH":"K:\\repos\\MySolution\\projects","D365FO_WORKSPACE_PATH":"K:\\AosService\\PackagesLocalDirectory\\YourPackageName\\YourModelName"},"alwaysLoad":true}'
+```
+
+> `alwaysLoad: true` loads the d365fo tool list at session start, preventing Claude from routing X++ lookups to other connected code intelligence tools or built-in search.
+
+**3.** Copy `CLAUDE.template.md` to the parent folder of your D365FO solutions, renaming it to `CLAUDE.md`:
+
+```powershell
+Copy-Item -Path "K:\d365fo-mcp-server\CLAUDE.template.md" -Destination "C:\source\repos\CLAUDE.md"
+```
+
+> **Full Claude Code setup guide (all scenarios, project-scoped `.mcp.json`, troubleshooting):** [docs/CLAUDE_CODE_SETUP.md](docs/CLAUDE_CODE_SETUP.md)
+
+---
+
 ## Azure Deployment
 
 Host on Azure App Service so the whole team shares one instance — nobody needs the server running locally.
@@ -145,7 +173,7 @@ Setup guide: [docs/SETUP.md](docs/SETUP.md) · CI/CD pipeline: [docs/PIPELINES.m
 | [docs/QUICK_START.md](docs/QUICK_START.md) | **Start here** — 5 steps to get running, all `.mcp.json` parameters, logging |
 | [docs/SETUP.md](docs/SETUP.md) | Detailed installation, configuration, all deployment scenarios A–F |
 | [docs/MCP_CONFIG.md](docs/MCP_CONFIG.md) | `.mcp.json` reference — workspace paths, UDE, project settings, all env vars |
-| [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md) | All 54 tools with parameters and example prompts |
+| [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md) | All 58 tools with parameters and example prompts |
 | [docs/USAGE_EXAMPLES.md](docs/USAGE_EXAMPLES.md) | Practical examples: search, CoC, SysOperation, security |
 | [docs/CUSTOM_EXTENSIONS.md](docs/CUSTOM_EXTENSIONS.md) | ISV / custom model configuration and multi-model extraction |
 | [docs/WORKSPACE_DETECTION.md](docs/WORKSPACE_DETECTION.md) | How the server auto-detects your D365FO project, model, and package path |
@@ -155,3 +183,4 @@ Setup guide: [docs/SETUP.md](docs/SETUP.md) · CI/CD pipeline: [docs/PIPELINES.m
 | [docs/PIPELINES.md](docs/PIPELINES.md) | Automated metadata extraction and deployment via Azure DevOps |
 | [docs/TESTING.md](docs/TESTING.md) | Running tests, test structure, mock guidelines, coverage |
 | [docs/SQLITE_DEPENDENCY.md](docs/SQLITE_DEPENDENCY.md) | SQLite vs C# Bridge — which tools use which data source |
+| [docs/CLAUDE_CODE_SETUP.md](docs/CLAUDE_CODE_SETUP.md) | Connecting Claude Code CLI — `.mcp.json` + `CLAUDE.md` setup |

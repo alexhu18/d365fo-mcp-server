@@ -53,4 +53,15 @@ export function loadEnv(callerImportMetaUrl: string): void {
       process.env[key] = resolve(envDir, val);
     }
   }
+
+  // Bridge external setting names to the internal variable the code reads.
+  // The public/canonical setting is the D365FO_-prefixed name (same convention
+  // as D365FO_PACKAGE_PATH), but internally every consumer reads the plain
+  // DEV_ENVIRONMENT_TYPE. Copy the prefixed value into the plain name so a
+  // single normalization point serves all consumers — no read-site changes.
+  // Prefixed wins when both are set; a lone plain entry (loaded natively by
+  // dotenv) is tolerated as silent legacy so existing installs keep working.
+  if (process.env.D365FO_DEV_ENVIRONMENT_TYPE) {
+    process.env.DEV_ENVIRONMENT_TYPE = process.env.D365FO_DEV_ENVIRONMENT_TYPE;
+  }
 }
