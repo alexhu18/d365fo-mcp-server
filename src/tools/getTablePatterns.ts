@@ -60,19 +60,8 @@ export async function handleGetTablePatterns(
 export async function getTablePatternsTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = GetTablePatternsArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
+    const { symbolIndex } = context;
     const { tableGroup, similarTo, limit } = args;
-
-    // Check cache first - pattern analysis is expensive and semi-static
-    const cacheKey = cache.generateSearchKey(
-      similarTo || tableGroup || 'all',
-      limit,
-      'table_pattern'
-    );
-    const cachedOutput = await cache.get<string>(cacheKey);
-    if (cachedOutput) {
-      return { content: [{ type: 'text', text: cachedOutput }] };
-    }
 
     let output = `# Table Patterns Analysis\n\n`;
 
@@ -88,7 +77,6 @@ export async function getTablePatternsTool(request: CallToolRequest, context: Xp
       throw new Error('Either tableGroup or similarTo must be provided');
     }
 
-    await cache.setPatternAnalysis(cacheKey, output);
 
     return {
       content: [{ type: 'text', text: output }],
@@ -290,8 +278,5 @@ async function analyzeTableGroup(symbolIndex: any, tableGroup: string, limit: nu
   return output;
 }
 
-export const getTablePatternsToolDefinition = {
-  name: 'get_table_patterns',
-  description: '📊 Analyze common field types, index patterns, and relation structures for table groups. Helps generate smart table structures based on existing patterns. Use tableGroup for general patterns or similarTo for specific table analysis.',
-  inputSchema: GetTablePatternsArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

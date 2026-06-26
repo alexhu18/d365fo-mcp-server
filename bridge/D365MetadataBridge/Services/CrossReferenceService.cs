@@ -83,10 +83,33 @@ namespace D365MetadataBridge.Services
         {
             var references = new List<ReferenceInfoModel>();
 
+            // Container segments that can own methods/fields, used to expand a
+            // member-qualified ("Owner.member") input across object types.
+            string[] memberContainers = { "Tables", "Classes", "Forms", "Views", "DataEntityViews", "Queries", "Maps" };
+
             var pathVariants = new List<string>();
+            bool memberQualified = false;
             if (objectPath.StartsWith("/"))
             {
+                // Explicit AOT path — use exactly as given (e.g. /Tables/SalesTable/Methods/initFromX).
                 pathVariants.Add(objectPath);
+                memberQualified = objectPath.Contains("/Methods/") || objectPath.Contains("/Fields/");
+            }
+            else if (objectPath.Contains("."))
+            {
+                // Member-qualified bare input ("Owner.member"): scope to a single
+                // method/field on its declaring type. We don't know whether Owner is
+                // a Table/Class/… so expand method+field variants across containers;
+                // only the path that actually exists will match.
+                memberQualified = true;
+                var dot = objectPath.LastIndexOf('.');
+                var owner = objectPath.Substring(0, dot);
+                var member = objectPath.Substring(dot + 1);
+                foreach (var c in memberContainers)
+                {
+                    pathVariants.Add($"/{c}/{owner}/Methods/{member}");
+                    pathVariants.Add($"/{c}/{owner}/Fields/{member}");
+                }
             }
             else
             {
@@ -100,11 +123,16 @@ namespace D365MetadataBridge.Services
                 pathVariants.Add($"/Forms/{objectPath}");
             }
 
-            // Also add sub-paths (methods, fields) so we catch method-level references
+            // Also add sub-paths (methods, fields) so we catch method-level references.
+            // A member-qualified target already points at an exact leaf path, so adding
+            // "/%" children would wrongly pull in unrelated nested references — skip it.
             var extraPaths = new List<string>();
-            foreach (var p in pathVariants)
+            if (!memberQualified)
             {
-                extraPaths.Add(p + "/%"); // LIKE pattern for children
+                foreach (var p in pathVariants)
+                {
+                    extraPaths.Add(p + "/%"); // LIKE pattern for children
+                }
             }
 
             // Build parameterized query with IN + LIKE

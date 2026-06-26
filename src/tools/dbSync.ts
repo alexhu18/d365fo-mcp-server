@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs/promises';
@@ -166,43 +165,8 @@ function truncateOutput(text: string): string {
     text.slice(-half);
 }
 
-export const dbSyncToolDefinition = {
-  name: 'trigger_db_sync',
-  description: 'Triggers a D365FO database sync (SyncEngine.exe). ' +
-    'Supports full-model sync or partial sync of specific tables/views. ' +
-    'Partial sync is faster and sufficient after adding/renaming fields, indexes, or creating a new table. ' +
-    'Pass projectPath to auto-extract tables from the .rnrproj and do a smart partial sync.',
-  parameters: z.object({
-    modelName: z.string().optional().describe(
-      'Model name to sync. Auto-detected from .mcp.json if omitted.'
-    ),
-    tables: z.array(z.string()).optional().describe(
-      'Sync only these specific tables (partial sync). ' +
-      'Use when you added/modified fields or indexes on known tables — much faster than full sync. ' +
-      'Example: ["CustTable", "MyCustomTable"]. Omit for full-model sync.'
-    ),
-    tableName: z.string().optional().describe(
-      'Single table shorthand — equivalent to tables=["tableName"]. ' +
-      'Kept for backwards compatibility; prefer tables[] for multiple objects.'
-    ),
-    projectPath: z.string().optional().describe(
-      'Path to .rnrproj file. Extracts all table/table-extension/view names from the project ' +
-      'and runs a partial sync for just those objects. Auto-detected from .mcp.json if omitted ' +
-      'when no explicit tables are given.'
-    ),
-    syncViews: z.boolean().optional().default(false).describe(
-      'When true, also syncs views and data entities in addition to tables. ' +
-      'Required after creating/modifying data entities or views. Default: false.'
-    ),
-    connectionString: z.string().optional().describe(
-      'SQL Server connection string. Defaults to "Data Source=localhost;Initial Catalog=AxDB;Integrated Security=True". ' +
-      'Override when AxDB is on a different server or uses SQL auth.'
-    ),
-    packagePath: z.string().optional().describe(
-      'PackagesLocalDirectory root. Auto-detected from .mcp.json if omitted.'
-    )
-  })
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 export const dbSyncTool = async (params: any, _context: any) => {
   const { syncViews = false } = params;

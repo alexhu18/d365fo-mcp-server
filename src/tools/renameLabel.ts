@@ -20,6 +20,7 @@ import * as path from 'path';
 import { getConfigManager } from '../utils/configManager.js';
 import { PackageResolver } from '../utils/packageResolver.js';
 import { detectEol } from '../utils/eolUtils.js';
+import { isExtensionLabelFile } from '../metadata/labelParser.js';
 
 // UTF-8 BOM
 const UTF8_BOM = '\uFEFF';
@@ -54,6 +55,15 @@ const RenameLabelArgsSchema = z.object({
     .describe(
       'Additional absolute directory paths to scan for X++ / XML references. ' +
       'The model package directory is always included automatically.',
+    ),
+  allowExtensionLabelFile: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      'Escape hatch to allow operating on a label file EXTENSION (a labelFileId ' +
+        'carrying the "_Extension" marker). Off by default: labels belong in the ' +
+        "model's own ORIGINAL label file, not in an extension.",
     ),
   dryRun: z
     .boolean()
@@ -169,6 +179,25 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       };
     }
 
+    // Guard: don't operate on a label file EXTENSION (e.g. "Base_Extension").
+    // Labels belong in the model's own ORIGINAL label file. Opt out with
+    // allowExtensionLabelFile=true.
+    if (isExtensionLabelFile(labelFileId) && !args.allowExtensionLabelFile) {
+      return {
+        content: [{
+          type: 'text',
+          text:
+            `❌ "${labelFileId}" is a label file EXTENSION, not an original label file.\n\n` +
+            `Labels belong in the model's own (original) label file — extensions (…_Extension…) ` +
+            `only extend a base label file owned by another model.\n\n` +
+            `➡️  List the model's label files with labels(action="info", model="${model}") ` +
+            `and re-run with the original labelFileId.\n\n` +
+            `If you really must operate on this extension, pass allowExtensionLabelFile=true.`,
+        }],
+        isError: true,
+      };
+    }
+
     // ── 1. Resolve package path ──────────────────────────────────────────────
     const configManager = getConfigManager();
     const envType = await configManager.getDevEnvironmentType();
@@ -235,7 +264,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
           text:
             `❌ Label "${oldLabelId}" not found in any .label.txt file of ` +
             `label file "${labelFileId}" in model "${model}".\n\n` +
-            `Use search_labels or get_label_info to verify the label ID and label file.`,
+            `Use labels(action="search") or labels(action="info") to verify the label ID and label file.`,
         }],
         isError: true,
       };

@@ -7,6 +7,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { glob } from 'glob';
 import { parseStringPromise } from 'xml2js';
+import { isFileUnderRoot } from '../utils/pathContainment.js';
 
 export interface WorkspaceFile {
   path: string;
@@ -47,16 +48,24 @@ export interface WorkspaceContext {
 }
 
 export class WorkspaceScanner {
-  private workspaceCache: Map<string, WorkspaceFile[]> = new Map();
+  private workspaceCache: Map<string, { files: WorkspaceFile[]; scannedAt: number }> = new Map();
+
+  /**
+   * Short cache TTL so the context pipeline reflects freshly-saved files within
+   * seconds rather than the old 5-minute window. Combined with invalidate()
+   * (called after writes) this keeps "recently edited" / "active file" current
+   * without an fs.watch. Lazy expiry — no background timer to leak.
+   */
+  private static readonly CACHE_TTL_MS = 15_000;
 
   /**
    * Scan workspace for X++ files
    */
   async scanWorkspace(workspacePath: string): Promise<WorkspaceFile[]> {
-    // Check cache
+    // Serve from cache while still fresh (lazy expiry).
     const cached = this.workspaceCache.get(workspacePath);
-    if (cached) {
-      return cached;
+    if (cached && Date.now() - cached.scannedAt < WorkspaceScanner.CACHE_TTL_MS) {
+      return cached.files;
     }
 
     const files: WorkspaceFile[] = [];
@@ -69,6 +78,15 @@ export class WorkspaceScanner {
     });
 
     for (const filePath of xmlFiles) {
+      // Defense in depth: verify that each globbed file (after symlink
+      // resolution) still resolves under the validated workspace root.
+      // A symlink placed inside the workspace could otherwise redirect a read
+      // to an arbitrary location outside the allowed root.
+      if (!isFileUnderRoot(filePath, workspacePath)) {
+        console.warn(`[WorkspaceScanner] Skipping ${filePath} — resolves outside workspace root ${workspacePath}`);
+        continue;
+      }
+
       const stat = await fs.stat(filePath);
       const fileName = path.basename(filePath, '.xml');
       
@@ -83,11 +101,22 @@ export class WorkspaceScanner {
       });
     }
 
-    // Cache for 5 minutes
-    this.workspaceCache.set(workspacePath, files);
-    setTimeout(() => this.workspaceCache.delete(workspacePath), 5 * 60 * 1000);
+    this.workspaceCache.set(workspacePath, { files, scannedAt: Date.now() });
 
     return files;
+  }
+
+  /**
+   * Drop cached scan results so the next scanWorkspace re-reads from disk.
+   * Call after a write (create/modify/undo) so "recently edited" and the
+   * active-file resolution reflect the change immediately.
+   */
+  invalidate(workspacePath?: string): void {
+    if (workspacePath) {
+      this.workspaceCache.delete(workspacePath);
+    } else {
+      this.workspaceCache.clear();
+    }
   }
 
   /**
@@ -304,9 +333,9 @@ export class WorkspaceScanner {
   }
 
   /**
-   * Clear cache
+   * Clear cache (alias of invalidate() with no argument).
    */
   clearCache(): void {
-    this.workspaceCache.clear();
+    this.invalidate();
   }
 }

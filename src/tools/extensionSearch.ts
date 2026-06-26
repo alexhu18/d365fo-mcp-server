@@ -16,57 +16,10 @@ const ExtensionSearchArgsSchema = z.object({
 export async function extensionSearchTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = ExtensionSearchArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
-    // Check cache first
-    const cacheKey = cache.generateExtensionSearchKey(args.query, args.prefix, args.limit);
-    const cachedResults = await cache.get<any[]>(cacheKey);
-    
-    if (cachedResults) {
-      // Group cached results by model
-      const byModel = cachedResults.reduce((acc: any, symbol: any) => {
-        if (!acc[symbol.model]) {
-          acc[symbol.model] = [];
-        }
-        acc[symbol.model].push(symbol);
-        return acc;
-      }, {});
-
-      const formatted = Object.entries(byModel)
-        .map(([model, symbols]: [string, any]) => {
-          const items = symbols
-            .map((s: any) => {
-              const parentPrefix = s.parentName ? `${s.parentName}.` : '';
-              const signature = s.signature ? ` - ${s.signature}` : '';
-              return `  [${s.type.toUpperCase()}] ${parentPrefix}${s.name}${signature}`;
-            })
-            .join('\n');
-          return `Model: ${model}\n${items}`;
-        })
-        .join('\n\n');
-
-      const customModels = symbolIndex.getCustomModels();
-      const modelsInfo =
-        customModels.length > 0
-          ? `\n\n⚠️ Available Custom Models (READ-ONLY reference — SOURCE models of existing objects. Do NOT use as target model for new objects. Use model from .mcp.json): ${customModels.join(', ')}`
-          : '';
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Found ${cachedResults.length} matches in custom extensions (cached):\n\n${formatted}${modelsInfo}`,
-          },
-        ],
-      };
-    }
+    const { symbolIndex } = context;
 
     // Query database
     const results = symbolIndex.searchCustomExtensions(args.query, args.prefix, args.limit);
-    
-    // Cache results
-    if (results.length > 0) {
-      await cache.set(cacheKey, results);
-    }
 
     if (results.length === 0) {
       const prefixMsg = args.prefix ? ` with prefix "${args.prefix}"` : '';

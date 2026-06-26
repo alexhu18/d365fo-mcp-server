@@ -24,17 +24,8 @@ const XppKnowledgeArgsSchema = z.object({
   ),
 });
 
-export const xppKnowledgeToolDefinition = {
-  name: 'get_xpp_knowledge',
-  description:
-    'Queryable knowledge base of D365FO X++ patterns, best practices, and AX2012→D365FO migration guidance. ' +
-    'Returns distilled, verified patterns with code examples. Use BEFORE generating code to avoid deprecated ' +
-    'APIs and AX2012 anti-patterns. Topics: batch jobs, transactions, queries, CoC/extensions, security, ' +
-    'data entities, temp tables, number sequences, form patterns, set-based operations, error handling, ' +
-    'SysOperation framework, inventory management, feature management, dual-write, DMF, ' +
-    'warehouse management, trade agreements, configuration keys, Power Platform integration, and more.',
-  inputSchema: XppKnowledgeArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 // ─── Knowledge Entry Type ───────────────────────────────────────────────────
 
@@ -344,7 +335,7 @@ while (qr.next())
     rules: [
       'Extension class MUST be [ExtensionOf(classStr/tableStr/formStr(Target))]',
       'Extension class MUST be final',
-      'Method signature MUST match the original exactly (use get_method_signature tool)',
+      'Method signature MUST match the original exactly (use get_method(include="signature") tool)',
       'ALWAYS call next <methodName>() — skipping it breaks the chain for other extensions',
       'Cannot access private members of the original class',
       'Can wrap: public, protected methods; cannot wrap: private, static',
@@ -416,6 +407,8 @@ final class SalesFormLetter_MyModel_Extension
       'DataEventHandler signature: static void handler(Common _sender, DataEventArgs _e)',
       'Validating events: cast _e to ValidateEventArgs, call _e.parmValidateResult(false) to fail',
       'NEVER use SubscribesTo + delegateStr for standard table data events — use DataEventHandler',
+      'REUSE BEFORE CREATING: call extension_info(mode="events") first — if a handler class for the target already exists in the custom model, add the new handler method there instead of creating a parallel class',
+      'Both _EH and _EventHandler handler-class naming styles exist — follow the style already used in the model; never introduce a feature-named handler class (<Form>_<Feature>_EH) unless the user explicitly asks for a separate class',
     ],
     examples: [
       {
@@ -583,8 +576,8 @@ class MyReportDP extends SRSReportDataProviderBase
       'Label file: the prefix comes from the file name (e.g. @ContosoExt:CustomerName)',
       'Use strFmt() for parameterized messages: strFmt("@MyModel:ItemNotFound", itemId)',
       'Use literalStr() when BP complains about strFmt argument not being a label — wraps non-label string safely',
-      'search_labels() before create_label() — avoid duplicates',
-      'Provide translations for all required languages in create_label()',
+      'labels(action="search") before labels(action="create") — avoid duplicates',
+      'Provide translations for all required languages in labels(action="create")',
     ],
     related: ['error-handling'],
   },
@@ -606,7 +599,7 @@ class MyReportDP extends SRSReportDataProviderBase
       'infolog.add() → info()/warning()/error() global functions',
       'fieldnum(tableName, fieldName) → still valid but use fieldNum() macro for compile-time safety',
       '[SysObsolete] attribute: ALWAYS read the message — it names the replacement',
-      'When get_method_source returns a method with [SysObsolete], do NOT call it — use the stated replacement',
+      'When get_method(include="source") returns a method with [SysObsolete], do NOT call it — use the stated replacement',
     ],
     related: ['labels', 'data-entities', 'sysoperation'],
   },
@@ -620,30 +613,116 @@ class MyReportDP extends SRSReportDataProviderBase
       'Number sequences generate unique, configurable identifiers for master data and transactions. ' +
       'They support scope (shared, company, legal entity) and format segments.',
     rules: [
-      'Define in NumberSequenceModuleXxx class (e.g. NumberSequenceModuleCustPaym)',
-      'loadModule() method: register each number sequence reference with its EDT, label, and scope',
-      'Use NumberSeqFormHandler on forms for auto-number behavior',
-      'Continuous sequences: no gaps allowed — performance impact, use only when legally required',
-      'Non-continuous (default): allows gaps — faster, use for internal IDs',
-      'Call NumberSeq::newGetNum() to fetch next number at runtime',
-      'Scope: DataArea (per-company), Global (cross-company), OperatingUnit',
-      'Format: {Company}-{NumberSequence:#######} — configurable in Number sequences form',
+      'Module class EXTENDS NumberSeqApplicationModule — exact name. ❌ NOT "NumberSequenceApplicationModule" (that class does not exist).',
+      'It is a subclass (extends), so override loadModule() and call super() at the top. ❌ NOT next() — next() is ONLY for [ExtensionOf] CoC classes, never for an extends subclass.',
+      'loadModule() registers each reference with NumberSeqDatatype::construct(), then parmDatatypeId(extendedTypeNum(MyEdt)) + parmWizardIsContinuous/parmWizardIsManual/parmWizardIsChangeDownAllowed/… , then this.create(datatype). ❌ Do NOT assign fields on a NumberSeqReference/NumberSequenceReference buffer (DataTypeId, WizardContinuous, AllowManual… are parm*() methods on NumberSeqDatatype, NOT table fields) and there is NO this.addModuleEntry().',
+      'Override numberSeqModule() to return your NumberSeqModule enum value.',
+      'A new module class is NOT auto-loaded: extend the NumberSeqModule enum and register the module via an event handler on NumberSeqGlobal (or CoC) so loadModule() runs.',
+      'Form auto-numbering: NumberSeqFormHandler::newForm(<ParametersTable>::numRef<Id>().NumberSequenceId, element, <datasource>, fieldNum(<Table>, <Id>)). First arg is a RefRecId via the .NumberSequenceId field. ❌ NOT .NumberSequence and ❌ NOT a string code.',
+      'Runtime fetch: NumberSeqReference::findReference(extendedTypeNum(MyId)) → NumberSeq::newGetNum(ref) → .num(); call .abort() to release on rollback.',
+      'Continuous (no gaps): perf cost — only when legally required. Non-continuous (default) allows gaps, faster for internal IDs.',
+      'Scope: DataArea (per-company), Global (cross-company), OperatingUnit.',
+      'Verify exact parm*() names against the SDK with get_object_info(objectType="class", name="NumberSeqDatatype") before relying on them.',
     ],
     examples: [
       {
-        label: 'Fetching next number',
+        label: 'Module class — register the reference in loadModule() (correct API)',
+        code: `public class NumberSeqModuleAslRent extends NumberSeqApplicationModule
+{
+    protected void loadModule()
+    {
+        NumberSeqDatatype datatype = NumberSeqDatatype::construct();
+        datatype.parmDatatypeId(extendedTypeNum(AslRentEquipmentId));
+        datatype.parmReferenceHelp(literalStr("Equipment ID"));
+        datatype.parmWizardIsContinuous(false);
+        datatype.parmWizardIsManual(NoYes::No);
+        datatype.parmWizardIsChangeDownAllowed(NoYes::Yes);
+        datatype.parmWizardIsChangeUpAllowed(NoYes::Yes);
+        datatype.parmWizardHighest(0);
+        datatype.parmSortField(1);
+        datatype.addParameterType(NumberSeqParameterType::DataArea, true, false);
+        this.create(datatype);            // NOT a NumberSeqReference field assignment
+    }
+
+    public NumberSeqModule numberSeqModule()
+    {
+        return NumberSeqModule::AslRent;  // your NumberSeqModule enum value
+    }
+}`,
+      },
+      {
+        label: 'Form auto-numbering handler',
+        code: `NumberSeqFormHandler numberSeqFormHandler;   // form member
+
+public NumberSeqFormHandler numberSeqFormHandler()
+{
+    if (!numberSeqFormHandler)
+    {
+        numberSeqFormHandler = NumberSeqFormHandler::newForm(
+            AslRentParameters::numRefAslRentEquipmentId().NumberSequenceId, // RefRecId, not a string
+            element,
+            AslRentEquipmentTable_ds,
+            fieldNum(AslRentEquipmentTable, AslRentEquipmentId));
+    }
+    return numberSeqFormHandler;
+}`,
+      },
+      {
+        label: 'Fetching next number at runtime',
         code: `NumberSequenceReference numSeqRef =
-    NumberSeqReference::findReference(
-        extendedTypeNum(MyDocumentId));
+    NumberSeqReference::findReference(extendedTypeNum(AslRentEquipmentId));
 
 NumberSeq numSeq = NumberSeq::newGetNum(numSeqRef);
-MyDocumentId newId = numSeq.num();
+AslRentEquipmentId newId = numSeq.num();
 
-// If insert fails, release the number:
+// If the insert is rolled back, release the number:
 // numSeq.abort();`,
       },
     ],
     related: ['transactions'],
+  },
+
+  // ── Workflow Development ────────────────────────────────────────────────
+  {
+    id: 'workflow',
+    title: 'Workflow Development (WorkflowDocument, WorkflowType)',
+    keywords: ['workflow', 'workflowdocument', 'workflowtype', 'workflowapproval', 'workflowtask', 'approval', 'submit', 'cansubmittoworkflow'],
+    summary:
+      'D365FO workflows are built from a Document (condition fields), a Type, Approvals/Tasks, ' +
+      'and event handlers. Structure: Document → Type → Approvals/Tasks → EventHandlers.',
+    rules: [
+      'Key base classes: WorkflowDocument, WorkflowType, WorkflowApproval, WorkflowTask',
+      'WorkflowDocument subclass defines which table fields are available as workflow conditions',
+      'SubmitToWorkflowMenuItem action menu item provides the submit button on the form',
+      'canSubmitToWorkflow() method on the table controls when submit is enabled',
+      'Approval/Task event handlers use WorkflowWorkItemActionManager for complete/reject/delegate',
+      'Call search("WorkflowDocument", type="class") for real implementations to model after',
+    ],
+    related: ['event-handlers', 'sysoperation'],
+  },
+
+  // ── Best Practice (BP) checker rules ────────────────────────────────────
+  {
+    id: 'bp-rules',
+    title: 'Best Practice (BP) Rules — Generated Code Must Be BP-Clean',
+    keywords: ['bp', 'best practice', 'bpupgradecodetoday', 'bperrorlabelistext', 'bperroredtnotmigrated', 'bpcheck', 'xmldoc', 'doc comment', 'alternate key', 'edt extension', 'stringsize', 'hardcoded string'],
+    summary:
+      'All generated X++ and metadata must pass the D365FO Best Practice checker without warnings. ' +
+      'These are the BP rules the offline validator (validate_code(mode="syntax")) and xppbp.exe enforce most often.',
+    rules: [
+      'BPUpgradeCodeToday: NEVER use today() — use DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()); applies to default parameters, comparisons, and queries',
+      'NEVER call a function inside a WHERE condition — assign to a local variable first, then use the variable',
+      'BPErrorLabelIsText: no literal strings in Info()/warning()/error() or labels — use @ModelName:LabelId; check labels(action="search") first, create with labels(action="create")',
+      'BPErrorUnknownLabel: labels(action="create") BEFORE referencing the label in code; labels adds AxLabelFile descriptors to the VS project automatically (addToProject=true)',
+      'BPErrorEDTNotMigrated: a field whose EDT carries an implicit relation (ItemId → InventTable) needs an explicit <AxTableRelation>; generate auto-detects these — manual field adds need a matching relation too',
+      'BPCheckNestedLoopinCode: never nest while select inside while select — use join, temp table, or Map pre-load; report DP classes use insert_recordset or a single joined query',
+      'BPCheckAlternateKeyAbsent: every table needs at least one index with <AlternateKey>Yes</AlternateKey> (generate adds it automatically)',
+      'BPXmlDocNoDocumentationComments: every public/protected class and method needs a MEANINGFUL /// <summary> — "MyClass class." or "validateWrite." fail BP review; describe what it does, parameters, and the semantic meaning of the return value',
+      'EDT extensions (AxEdtExtension, objectType="edt-extension") can ONLY change Label, HelpText, FormHelp, ConfigurationKey, HelpAlign, Alignment, NoOfDecimals, DecimalSeparator, SignDisplay — and only when the base EDT has IsExtensible=Yes',
+      'EDT extensions can NEVER change Extends (re-parenting) or StringSize/DisplayLength on a derived EDT — to widen a string, create a new EDT extending the existing one, or use a table extension modify-field with stringSize (mind databaseStringSize so data is not truncated)',
+      'The d365fo_file(action="modify") validator refuses illegal EDT-extension property changes up-front — relay the message verbatim, do not work around it',
+    ],
+    related: ['labels', 'deprecated', 'set-based'],
   },
 
   // ── Form Patterns ───────────────────────────────────────────────────────
@@ -655,16 +734,22 @@ MyDocumentId newId = numSeq.num();
       'D365FO forms follow standard patterns enforced by the form pattern dialog. ' +
       'Extensions add controls/overrides without modifying the original form.',
     rules: [
-      'Standard patterns: SimpleList, SimpleListDetails, DetailsMaster, DetailsTransaction, Dialog, ListPage, TableOfContents, Lookup',
+      'Standard patterns: SimpleList, SimpleListDetails, DetailsMaster, DetailsTransaction, Dialog, DropDialog, ListPage, TableOfContents, Lookup, Workspace — each defines REQUIRED containers in a REQUIRED order',
+      'NEW FORM workflow: object_patterns(domain="form", action="analyze", recommend={...}) → object_patterns(domain="form", action="spec", pattern) → generate_object(mode="scaffold", objectType="form", cloneFrom=referenceForm, tableMapping={...}) → object_patterns(domain="form", action="validate") → d365fo_file(action="create")',
+      'CLONING an existing reference form (CustGroup for SimpleList, CustTable for DetailsMaster, SalesTable for DetailsTransaction, PaymTerm for SimpleListDetails, CustParameters for TableOfContents) is the PREFERRED strategy — patterns and sub-patterns are preserved',
+      'Container sub-patterns (Pattern element on Group/TabPage): FieldsFieldGroups (fields + max 1 level of groups, NO static text/images), CustomAndQuickFilters (QuickFilter required), ToolbarAndList, SidePanel — validate with object_patterns(domain="form", action="validate")',
+      'Structural pattern violations BLOCK d365fo_file(action="create") while FORM_PATTERN_ENFORCE=true (default): wrong control order, missing required container, disallowed child type, unknown pattern/version',
       'ALWAYS use form extensions — never modify standard forms (overlayering is blocked)',
       'Form extension file: AxFormExtension XML — holds new controls, data sources, property overrides',
       'Form extension class: [ExtensionOf(formStr(Target))] — holds CoC logic for form methods',
-      'Use get_form_info(formName, searchControl="...") to find exact control names before extending',
-      'New controls: add via modify_d365fo_file(operation="add-control", parentControl="TabGeneral")',
-      'Data sources: add via modify_d365fo_file(operation="add-data-source")',
-      'NEVER use PowerShell or read_file to inspect form XML — use get_form_info',
+      'Use get_object_info(objectType="form", name=formName, options={searchControl:"..."}) to find exact control names before extending',
+      'New controls: add via d365fo_file(action="modify", operation="add-control", parentControl="TabGeneral") — the control type is checked against the parent container\'s sub-pattern',
+      'Data sources: add via d365fo_file(action="modify", operation="add-data-source")',
+      'NEVER use PowerShell or read_file to inspect form XML — use get_object_info(objectType="form", name=...)',
+      'A user-provided example form is a PATTERN CONTRACT: read it with get_object_info(objectType="form", name=...), keep the same pattern family, and verify the generated form keeps the required scaffolding (datasources, design pattern/version, ActionPane/Body/Tab/FastTab/grid/QuickFilter) — missing pattern elements are a failed generation even if the XML is well-formed',
+      'Edits must be additive: never drop unrelated <Controls>, <DataSources>, <DataSourceModifications>, methods, or pattern metadata — use targeted d365fo_file(action="modify") operations and verify the diff with review_workspace_changes afterwards',
     ],
-    related: ['coc', 'event-handlers'],
+    related: ['coc', 'event-handlers', 'formrun-lifecycle'],
   },
 
   // ── Security ────────────────────────────────────────────────────────────
@@ -683,8 +768,8 @@ MyDocumentId newId = numSeq.num();
       'Role = job function: "Accounts receivable clerk" → groups duties',
       'Table permissions: set on the privilege entry point, cascading to related tables',
       'XDS (Extensible Data Security): row-level security policies',
-      'Use get_security_coverage_for_object() to check what covers a form/table/menu item',
-      'Use get_security_artifact_info() to inspect a role/duty/privilege hierarchy',
+      'Use security_info(mode="coverage") to check what covers a form/table/menu item',
+      'Use security_info(mode="artifact") to inspect a role/duty/privilege hierarchy',
     ],
     related: ['form-patterns'],
   },
@@ -1402,7 +1487,7 @@ public static void runErFormat(ERFormatMappingId _formatMappingId, FilePath _out
       'Entry point on privilege = menu item name; access level: Read | Create | Update | Delete | Correct | View | NoAccess',
       'Duty: groups related privileges for a business task (e.g. "Maintain customer invoices")',
       'Role: assigned to user; groups duties for a complete job function (e.g. "Accounts receivable clerk")',
-      'Use generate_code(pattern="security-privilege") to generate both View and Maintain XML pairs',
+      'Use generate_object(mode="pattern", pattern="security-privilege") to generate both View and Maintain XML pairs',
       'Privilege XML: AxSecurityPrivilege folder; Duty XML: AxSecurityDuty; Role XML: AxSecurityRole',
       'NEVER use objectType="security-privilege" for duties — each maps to a different AOT folder',
       'To check user access in code: SecurityRights::hasMenuItemAccess(menuItemStr(X), MenuItemType::Display)',
@@ -1464,8 +1549,8 @@ if (SecurityRights::hasTableAccess(tableNum(MyCustomTable), AccessType::Read))
       'DP getter: [SRSReportDataSetAttribute(tableStr(MyTmp))] public MyTmp getMyTmp()',
       'Controller: sets report name via ssrsReportStr(), opens dialog, runs report',
       'AxReport XML: DataSet with DataSourceType=ReportDataProvider, Query=SELECT * FROM DPClass.TmpTable',
-      'Use generate_smart_report MCP tool to generate all 5 objects at once',
-      'For existing reports, use get_report_info() — NEVER read report XML with PowerShell',
+      'Use generate MCP tool to generate all 5 objects at once',
+      'For existing reports, use get_object_info(objectType="report", name=...) — NEVER read report XML with PowerShell',
     ],
     related: ['temp-tables', 'sysoperation'],
   },
@@ -1865,7 +1950,7 @@ select salesTable where salesTable.ShippingDateRequested == cutoffDate;`,
     keywords: ['coc', 'chain of command', 'next', 'default parameter', 'wrappable', 'hookable', 'final', 'extensionof', 'wrapper', 'form coc', 'formdatasourcestr', 'static coc', 'replaceable', 'pre', 'post', 'wrap'],
     summary:
       'Strict rules for authoring CoC wrappers. The most common mistake is copying default parameter values. ' +
-      'next must always be called at first-level scope. Always use get_method_signature before writing any wrapper.',
+      'next must always be called at first-level scope. Always use get_method(include="signature") before writing any wrapper.',
     rules: [
       'NEVER copy default parameter values into the wrapper signature — wrapper uses bare parameter types only',
       'next must be at first-level statement scope: NOT inside if/while/for, NOT after return, NOT inside a logical expression. PU21+: permitted inside try/catch/finally',
@@ -1878,7 +1963,9 @@ select salesTable where salesTable.ShippingDateRequested == cutoffDate;`,
       'Form-nested wrapping uses formdatasourcestr, formdatafieldstr, formControlStr. Cannot ADD new methods via CoC — only wrap existing ones (init, validateWrite, clicked, …)',
       'Wrappers can read/call protected members of the augmented class (PU9+); cannot reach private',
       'Pre-processing: call business logic before next. Post-processing: call next first, then business logic. Wrap: call next inside the logic',
-      'Use get_method_signature tool to get exact parameter types before writing the wrapper',
+      'Use get_method(include="signature") tool to get exact parameter types before writing the wrapper',
+      'REUSE BEFORE CREATING: if a CoC extension class for the target already exists in the custom model (prepare(mode="change") / extension_info(mode="coc") lists them), add the wrapper there — never create a parallel feature-named class (<Target>_<Feature>_Extension) unless the user explicitly requests separation',
+      'The class suffix comes from EXTENSION_NAMING_STYLE and existing related artifacts — never from feature names, tickets, or customer names; if it cannot be derived, ask the user',
     ],
     examples: [
       {
@@ -2055,7 +2142,7 @@ SysQuery::findOrCreateRange(
     keywords: ['formrun', 'form lifecycle', 'form init', 'form run', 'executequery', 'formdatasource', 'active', 'validatewrite', 'clicked', 'modified', 'form extension', 'research', 'element.args', 'element.design', 'formcontrol', 'formletterservicecontroller'],
     summary:
       'D365FO forms follow a strict initialization sequence. Extensions use CoC on lifecycle methods. ' +
-      'Never guess control names — use get_form_info(formName, searchControl="...") before extending.',
+      'Never guess control names — use get_object_info(objectType="form", name=formName, options={searchControl:"..."}) before extending.',
     rules: [
       'Initialization sequence: form.init() → FormDataSource.init() per DS → form.run() → FormDataSource.executeQuery()',
       'form.init(): form structure loaded, data sources NOT yet active — safe for: adding ranges, modifying query before first run',
@@ -2069,10 +2156,12 @@ SysQuery::findOrCreateRange(
       'element.args(): access caller context (menu item, record, enum parameter passed via Args)',
       'FormDataSource.queryBuildDataSource(): access underlying QueryBuildDataSource for runtime range manipulation',
       'element.design().controlName(formControlStr(MyForm, MyControl)): access control instance by name at runtime',
-      'NEVER guess control names — they differ from field names and are often prefixed; use get_form_info(formName, searchControl="...")',
+      'NEVER guess control names — they differ from field names and are often prefixed; use get_object_info(objectType="form", name=formName, options={searchControl:"..."})',
       'Use [ExtensionOf(formStr(...))] for form-level CoC; forms cannot have static-method CoC',
-      'Add data sources via modify_d365fo_file(operation="add-data-source")',
-      'Add controls via modify_d365fo_file(operation="add-control", parentControl="TabGeneral")',
+      'Add data sources via d365fo_file(action="modify", operation="add-data-source")',
+      'Add controls via d365fo_file(action="modify", operation="add-control", parentControl="TabGeneral")',
+      'Typical overrides per pattern — SimpleList/setup: DS initValue + validateWrite; DetailsMaster: form init + DS active/validateWrite; DetailsTransaction: lines DS initValue (defaults from header) + header DS active; Dialog: form init (read element.args()) + closeOk; Lookup: form init + DS executeQuery (caller-context filter)',
+      'generate_object(mode="scaffold", objectType="form", includeMethodStubs=true) injects these pattern-appropriate stubs automatically; object_patterns(domain="form", action="spec", pattern) lists them',
     ],
     related: ['coc', 'form-patterns'],
   },
@@ -2101,16 +2190,51 @@ function scoreEntry(entry: KnowledgeEntry, queryTokens: string[]): number {
   return score;
 }
 
-function searchKnowledge(topic: string): KnowledgeEntry[] {
-  const tokens = topic
+/**
+ * Tokenize a topic query. Splits on whitespace/comma/semicolon/slash, then for
+ * every token that itself contains a hyphen or underscore ALSO emits the split
+ * sub-words. The original (joined) token is kept so entry-ID matches like
+ * `set-based` still hit `entry.id === token`, while hyphenated multi-word
+ * queries like `number-sequence` also match word-level keywords/titles (which
+ * store the words separated by spaces, e.g. keyword "number sequence").
+ */
+function tokenize(topic: string): string[] {
+  const base = topic
     .toLowerCase()
     .replace(/[^a-z0-9áčďéěíňóřšťúůýž_\-/\s]/g, '')
     .split(/[\s,;/]+/)
     .filter(t => t.length > 1);
 
+  const out = new Set<string>();
+  for (const tok of base) {
+    out.add(tok);
+    if (tok.includes('-') || tok.includes('_')) {
+      for (const part of tok.split(/[-_]+/).filter(p => p.length > 1)) {
+        out.add(part);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Minimum top score for a query to count as a confident match. A score below
+ * this means no title/keyword/ID hit landed — only incidental summary-substring
+ * overlap (1–2 pts) — so the results are surfaced as low-confidence suggestions
+ * rather than authoritative answers. Without this floor, `number-sequence`
+ * silently returned Electronic Reporting docs (the nearest substring hit).
+ */
+const CONFIDENT_SCORE = 3;
+
+function searchKnowledge(topic: string): { entries: KnowledgeEntry[]; topScore: number } {
+  const tokens = tokenize(topic);
+
   if (tokens.length === 0) {
     // Return all entries sorted alphabetically
-    return [...KNOWLEDGE_BASE].sort((a, b) => a.title.localeCompare(b.title));
+    return {
+      entries: [...KNOWLEDGE_BASE].sort((a, b) => a.title.localeCompare(b.title)),
+      topScore: 0,
+    };
   }
 
   const scored = KNOWLEDGE_BASE
@@ -2118,7 +2242,10 @@ function searchKnowledge(topic: string): KnowledgeEntry[] {
     .filter(item => item.score > 0)
     .sort((a, b) => b.score - a.score);
 
-  return scored.map(s => s.entry);
+  return {
+    entries: scored.map(s => s.entry),
+    topScore: scored.length > 0 ? scored[0].score : 0,
+  };
 }
 
 // ─── Formatters ─────────────────────────────────────────────────────────────
@@ -2217,7 +2344,7 @@ function formatDetailed(entries: KnowledgeEntry[]): string {
 export async function xppKnowledgeTool(request: CallToolRequest) {
   try {
     const args = XppKnowledgeArgsSchema.parse(request.params.arguments);
-    const entries = searchKnowledge(args.topic);
+    const { entries, topScore } = searchKnowledge(args.topic);
 
     // Empty topic → compact table of contents listing ALL entries
     const isListAll = args.topic.trim() === '';
@@ -2226,11 +2353,21 @@ export async function xppKnowledgeTool(request: CallToolRequest) {
       formatted =
         '# X++ Knowledge Base — All Topics\n\n' +
         entries.map(e => `- \`${e.id}\`: **${e.title}**`).join('\n') +
-        '\n\n_Query a specific topic with \`get_xpp_knowledge\` for rules and code examples._';
+        '\n\n_Query a specific topic with \`get_knowledge(kind="knowledge")\` for rules and code examples._';
     } else {
       formatted = args.format === 'detailed'
         ? formatDetailed(entries)
         : formatConcise(entries);
+
+      // Low-confidence guard: when something matched but only weakly (incidental
+      // substring overlap, no title/keyword/ID hit), warn so the caller doesn't
+      // treat unrelated content as authoritative.
+      if (entries.length > 0 && topScore < CONFIDENT_SCORE) {
+        formatted =
+          `⚠️ No strong match for "${args.topic}" — showing the closest entries below, which may be ` +
+          `unrelated. Browse the full list with \`get_knowledge(kind="knowledge")\` and an empty topic, ` +
+          `or refine your query.\n\n${formatted}`;
+      }
     }
 
     return {
@@ -2240,7 +2377,7 @@ export async function xppKnowledgeTool(request: CallToolRequest) {
     return {
       content: [{
         type: 'text',
-        text: `Error in get_xpp_knowledge: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        text: `Error in get_knowledge(kind="knowledge"): ${error instanceof Error ? error.message : 'Unknown error'}`,
       }],
       isError: true,
     };

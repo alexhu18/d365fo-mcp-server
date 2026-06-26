@@ -19,7 +19,7 @@ const CompletionArgsSchema = z.object({
 export async function completionTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = CompletionArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache, workspaceScanner } = context;
+    const { symbolIndex, workspaceScanner } = context;
 
     // ── Bridge fast-path (C# IMetadataProvider) ──
     // Try bridge BEFORE the table guard — bridge handles both classes and tables
@@ -37,12 +37,12 @@ export async function completionTool(request: CallToolRequest, context: XppServe
             text: `❌ WRONG TOOL: "${args.className}" is a TABLE!\n\n` +
                   `⚠️ code_completion() ONLY works with X++ CLASSES.\n` +
                   `   For tables, it always returns empty or fails.\n\n` +
-                  `✅ CORRECT TOOL: get_table_info("${args.className}")\n\n` +
-                  `get_table_info() returns:\n` +
+                  `✅ CORRECT TOOL: get_object_info(objectType="table", name="${args.className}")\n\n` +
+                  `get_object_info() returns:\n` +
                   `- All table methods with source code\n` +
                   `- All fields with types and EDTs\n` +
                   `- Relations and indexes\n\n` +
-                  `**Do NOT retry code_completion() for tables - use get_table_info() instead.**`,
+                  `**Do NOT retry code_completion() for tables - use get_object_info(objectType="table", ...) instead.**`,
           },
         ],
         isError: true,
@@ -73,16 +73,6 @@ export async function completionTool(request: CallToolRequest, context: XppServe
       }
     }
 
-    // Check cache first
-    const cacheKey = `completion:${args.className}:${args.prefix}`;
-    const cachedResults = await cache.get<any[]>(cacheKey);
-    
-    if (cachedResults) {
-      return {
-        content: [{ type: 'text', text: formatCompletions(cachedResults, args.className, args.prefix) }],
-      };
-    }
-
     // Use the built-in getCompletions method that properly handles both classes and tables
     const completions = symbolIndex.getCompletions(args.className, args.prefix);
 
@@ -91,7 +81,7 @@ export async function completionTool(request: CallToolRequest, context: XppServe
       const classExists = symbolIndex.getSymbolByName(args.className, 'class') !== null;
       const tableExists = symbolIndex.getSymbolByName(args.className, 'table') !== null;
       
-      // ⚠️ CRITICAL: If it's a table, explicitly reject and redirect to get_table_info
+      // ⚠️ CRITICAL: If it's a table, explicitly reject and redirect to get_object_info(objectType="table")
       if (tableExists) {
         return {
           content: [
@@ -99,8 +89,8 @@ export async function completionTool(request: CallToolRequest, context: XppServe
               type: 'text',
               text: `❌ TOOL ERROR: "${args.className}" is a TABLE, not a class!\n\n` +
                     `⚠️ code_completion() only works with CLASSES.\n\n` +
-                    `✅ CORRECT TOOL: Use get_table_info("${args.className}") instead.\n\n` +
-                    `get_table_info() returns ALL table methods, fields, relations, and source code.\n\n` +
+                    `✅ CORRECT TOOL: Use get_object_info(objectType="table", name="${args.className}") instead.\n\n` +
+                    `get_object_info() returns ALL table methods, fields, relations, and source code.\n\n` +
                     `**Do not retry code_completion() - it will always fail for tables.**`,
             },
           ],
@@ -137,14 +127,11 @@ export async function completionTool(request: CallToolRequest, context: XppServe
                   `- The class/table has no members\n` +
                   `- The prefix "${args.prefix}" doesn't match any members\n` +
                   `- XML metadata is not available (only symbol index)\n\n` +
-                  `Try using \`get_class_info("${args.className}")\` or \`get_table_info("${args.className}")\` for more details.`,
+                  `Try using \`get_object_info(objectType="class", name="${args.className}")\` or \`get_object_info(objectType="table", name="${args.className}")\` for more details.`,
           },
         ],
       };
     }
-
-    // Cache results
-    await cache.set(cacheKey, completions, 300); // Cache for 5 minutes
 
     const formatted = formatCompletions(completions, args.className, args.prefix);
 

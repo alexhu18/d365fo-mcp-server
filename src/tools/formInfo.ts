@@ -14,13 +14,14 @@ import type { XppServerContext } from '../types/context.js';
 import { promises as fs } from 'fs';
 import { parseStringPromise } from 'xml2js';
 import { tryBridgeForm } from '../bridge/bridgeAdapter.js';
+import { assertWritePathAllowed } from '../utils/pathContainment.js';
 
 const GetFormInfoArgsSchema = z.object({
   formName: z.string().describe('Name of the form'),
   modelName: z.string().optional().describe('Model name (auto-detected if not provided)'),
   filePath: z.string().optional().describe(
     'Absolute path to the form XML file on disk. ' +
-    'Use this when get_form_info previously returned a "could not be read from disk" warning with a guessed path. ' +
+    'Use this when get_object_info(objectType="form") previously returned a "could not be read from disk" warning with a guessed path. ' +
     'Bypasses the DB path lookup entirely. ' +
     'Example: filePath="K:\\AOSService\\PackagesLocalDirectory\\ContosoCore\\ContosoCore\\AxForm\\MyForm.xml"'
   ),
@@ -82,13 +83,25 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
     // 0. If an explicit filePath is provided, skip bridge entirely.
     // This is the retry path for newly-created forms not yet in bridge metadata.
     if (explicitFilePath) {
+      // Security: validate that the supplied path falls within a configured D365FO
+      // package root before reading any file content.  Without this check a
+      // prompt-injection attack could read arbitrary local files via this parameter.
+      const containment = await assertWritePathAllowed(explicitFilePath);
+      if (!containment.ok) {
+        return {
+          content: [{ type: 'text', text:
+            `❌ get_object_info(form): filePath rejected — ${containment.reason}`,
+          }],
+          isError: true,
+        };
+      }
       let xmlContent: string | null = null;
       try {
         xmlContent = await fs.readFile(explicitFilePath, 'utf-8');
       } catch (e) {
         return {
           content: [{ type: 'text', text:
-            `❌ get_form_info: cannot read form XML at explicit filePath="${explicitFilePath}": ` +
+            `❌ get_object_info(form): cannot read form XML at explicit filePath="${explicitFilePath}": ` +
             `${e instanceof Error ? e.message : String(e)}\n\n` +
             `Check the path is correct and accessible. DO NOT use PowerShell — fix the filePath parameter.`,
           }],
@@ -119,7 +132,7 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
         `The bridge is connected and metadata is available, but form "${formName}" was not found ` +
         `in either the primary or reference packages path. Verify the form name spelling or ` +
         `pass the explicit filePath parameter:\n` +
-        `  get_form_info(formName="${formName}", filePath="<absolute path to .xml>")`;
+        `  get_object_info(objectType="form", name="${formName}", options={filePath:"<absolute path to .xml>"})`;
     }
 
     return {
@@ -241,7 +254,7 @@ function formatControlSearchResults(
 
   if (results.length === 0) {
     out += `No controls found matching "${query}".\n\n`;
-    out += `Tip: call get_form_info without searchControl to browse the full control hierarchy.\n`;
+    out += `Tip: call get_object_info(objectType="form", name=...) without searchControl to browse the full control hierarchy.\n`;
     return out;
   }
 
@@ -562,8 +575,5 @@ function countControls(controls: FormControl[]): number {
   return count;
 }
 
-export const getFormInfoToolDefinition = {
-  name: 'get_form_info',
-  description: '📋 Extract form structure: controls, datasources, methods. Returns control hierarchy with properties, datasource configuration (table, permissions, fields), and form methods. Essential for understanding form layout and adding controls or datasource methods.',
-  inputSchema: GetFormInfoArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

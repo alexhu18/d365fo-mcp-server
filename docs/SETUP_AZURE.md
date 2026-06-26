@@ -24,21 +24,17 @@ If you are a developer who only wants to **use** an existing server, see [SETUP.
 - **Node.js** 24.x LTS (for building the application and metadata on your Windows VM)
 - **Python** 3.x (required by `node-gyp` during `npm install`)
 - **Git**
-- An Azure subscription with permissions to create App Service and Storage Account (Redis is optional; skip unless you have evidence of cache benefit)
+- An Azure subscription with permissions to create App Service and Storage Account
 
 ---
 
 ## Architecture Overview
 
-```
-Developer's Windows VM
-  GitHub Copilot (VS 2022)
-       │
-       ├──► Azure App Service (read-only)
-       │      └── downloads xpp-metadata.db from Blob Storage on cold start
-       │
-       └──► Local write-only companion (optional, hybrid setup)
-              └── node dist/index.js --stdio
+```mermaid
+graph LR
+    COP[GitHub Copilot / Claude<br/>on the developer VM] -->|search & analysis| APP["App Service<br/>(read-only)"]
+    COP -->|file writes, hybrid| LOCAL["Local companion<br/>(write-only, stdio)"]
+    BLOB[("Blob Storage<br/>xpp-metadata.db + labels.db")] -->|cold-start download| APP
 ```
 
 **Azure resources:**
@@ -48,7 +44,6 @@ Developer's Windows VM
 | Azure Blob Storage | Stores `xpp-metadata.db` (~2–3 GB depending on UnitTest models) and labels database (~500 MB) | Standard LRS |
 | Azure App Service Plan | Hosts the Node.js server | B3 (dev/test), P0v3 (production) |
 | Azure App Service (Web App) | Runs the MCP server | Linux, Node 24 LTS |
-| Azure Managed Redis | Optional. Only helpful when many users hammer the same queries; the SQLite index is already in-process and sub-10 ms, so most deployments see no measurable gain. | B0 Basic or higher |
 
 ---
 
@@ -74,7 +69,7 @@ In the **Azure Portal**:
 5. Enable **System-assigned managed identity** on the Web App
    (Web App → Settings → Identity → System assigned → On)
 
-For a one-click deployment that also includes the app settings and startup command from step 2, use this Azure Deploy button (note: this will not include the optional Redis resource).
+For a one-click deployment that also includes the app settings and startup command from step 2, use this Azure Deploy button.
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdynamics365ninja%2Fd365fo-mcp-server%2Frefs%2Fheads%2Fmain%2Finfrastructure%2Fazuredeploy.json)
 
@@ -102,16 +97,6 @@ In the Azure Portal, go to the App Service → **Settings** → **Environment va
 | Setting | Value | Notes |
 |---------|-------|-------|
 | `API_KEY` | e.g. `my-secret-key-here` | When set, all `/mcp` requests must include `X-Api-Key` header. `/health` is always public. Generate a strong random key (e.g. `openssl rand -hex 32`). Leave empty to disable. |
-
-**Optional — Redis (skip unless measured):**
-
-Most deployments should leave this disabled. The server already serves reads from an in-process SQLite database backed by WAL and FTS5, which is typically faster than a round-trip to Redis. Enable only if profiling shows repeated identical queries from many users dominating your traffic.
-
-| Setting | Value |
-|---------|-------|
-| `REDIS_ENABLED` | `true` |
-| `REDIS_URL` | Connection URL from Azure Cache for Redis |
-| `REDIS_CLUSTER_MODE` | `true` if using Azure Managed Redis (Enterprise/cluster tier) |
 
 Set the **Startup Command** under **Settings → Configuration**:
 
@@ -185,7 +170,7 @@ Expected response:
 {"status":"ok","mode":"read-only", ...}
 ```
 
-Confirm the tool count matches `read-only` mode (all tools except `create_d365fo_file`, `modify_d365fo_file`, `create_label`).
+Confirm the tool count matches `read-only` mode (all tools except the write actions of `d365fo_file` and `labels`).
 
 ---
 

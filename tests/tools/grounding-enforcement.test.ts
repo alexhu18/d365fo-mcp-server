@@ -42,7 +42,7 @@ describe('create_d365fo_file grounding enforcement', () => {
     }));
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Grounding required');
-    expect(result.content[0].text).toContain('prepare_change');
+    expect(result.content[0].text).toContain('prepare(mode="change"');
   });
 
   it('rejects a token issued for a different object', async () => {

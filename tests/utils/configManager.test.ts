@@ -417,3 +417,66 @@ describe('isStaticallyConfigured', () => {
     delete process.env.D365FO_MODEL_NAME;
   });
 });
+
+// ─── getWorkspaceInfoDiagnostics — provenance labels ─────────────────────────
+
+describe('getWorkspaceInfoDiagnostics provenance', () => {
+  beforeEach(() => {
+    vi.stubEnv('DEV_ENVIRONMENT_TYPE', '');
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('labels packageSource as env var when D365FO_PACKAGE_PATH is set', async () => {
+    process.env.D365FO_PACKAGE_PATH = 'K:\\AosService\\PackagesLocalDirectory';
+    const mgr = makeManager({});
+    (mgr as any).xppConfigLoaded = true;
+    (mgr as any).xppConfig = null;
+
+    const diag = await mgr.getWorkspaceInfoDiagnostics();
+    expect(diag.packageSource).toBe('D365FO_PACKAGE_PATH env var');
+    delete process.env.D365FO_PACKAGE_PATH;
+  });
+
+  it('labels packageSource as .mcp.json when packagePath comes from file config only', async () => {
+    const mgr = makeManager({ packagePath: 'K:\\AosService\\PackagesLocalDirectory' });
+    (mgr as any).xppConfigLoaded = true;
+    (mgr as any).xppConfig = null;
+
+    const diag = await mgr.getWorkspaceInfoDiagnostics();
+    expect(diag.packageSource).toBe('.mcp.json');
+  });
+
+  it('returns customPackagesPath and its source from env var', async () => {
+    process.env.D365FO_CUSTOM_PACKAGES_PATH = 'C:\\repos\\MyProject\\src\\Metadata';
+    const mgr = makeManager({});
+    (mgr as any).xppConfigLoaded = true;
+    (mgr as any).xppConfig = null;
+
+    const diag = await mgr.getWorkspaceInfoDiagnostics();
+    expect(diag.customPackagesPath).toBe('C:\\repos\\MyProject\\src\\Metadata');
+    expect(diag.customPackagesSource).toBe('D365FO_CUSTOM_PACKAGES_PATH env var');
+    delete process.env.D365FO_CUSTOM_PACKAGES_PATH;
+  });
+
+  it('returns customPackagesPath and its source from .mcp.json', async () => {
+    const mgr = makeManager({ customPackagesPath: 'C:\\repos\\MyProject\\src\\Metadata' });
+    (mgr as any).xppConfigLoaded = true;
+    (mgr as any).xppConfig = null;
+
+    const diag = await mgr.getWorkspaceInfoDiagnostics();
+    expect(diag.customPackagesPath).toBe('C:\\repos\\MyProject\\src\\Metadata');
+    expect(diag.customPackagesSource).toBe('.mcp.json');
+  });
+
+  it('returns null customPackagesPath when neither env var nor config is set', async () => {
+    const mgr = makeManager({});
+    (mgr as any).xppConfigLoaded = true;
+    (mgr as any).xppConfig = null;
+
+    const diag = await mgr.getWorkspaceInfoDiagnostics();
+    expect(diag.customPackagesPath).toBeNull();
+    expect(diag.customPackagesSource).toBe('(not configured)');
+  });
+});

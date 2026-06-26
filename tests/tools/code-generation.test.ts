@@ -52,7 +52,7 @@ const buildContext = (overrides: Partial<XppServerContext> = {}): XppServerConte
     findSimilarMethods: vi.fn(() => []),
     suggestMissingMethods: vi.fn(() => []),
     getApiUsagePatterns: vi.fn(() => []),
-    db: { prepare: vi.fn(() => ({ all: vi.fn(() => []), get: vi.fn(() => undefined), run: vi.fn() })) },
+    db: { prepare: vi.fn(() => ({ all: vi.fn(() => []), get: vi.fn((...args: any[]) => typeof args[0] === 'string' ? { name: args[0] } : undefined), run: vi.fn() })) },
     getReadDb: vi.fn(function(this: any) { return this.db; }),
   } as any,
   parser: {
@@ -278,6 +278,64 @@ describe('generate_d365fo_xml', () => {
   });
 });
 
+// ─── XmlTemplateGenerator.generateAxSecurityPrivilegeXml ────────────────────
+
+describe('XmlTemplateGenerator.generateAxSecurityPrivilegeXml', () => {
+  it('emits empty DataEntityPermissions when no dataEntity is provided (backward compat)', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityPrivilegeXml('MyPrivilegeMaintain', {
+      label: '@MyModel:MyLabel',
+      targetObject: 'MyMenuItem',
+      accessLevel: 'maintain',
+    });
+    expect(xml).toContain('<DataEntityPermissions />');
+    expect(xml).not.toContain('AxSecurityDataEntityPermission');
+  });
+
+  it('generates DataEntityPermissions with Read-only Grant for view privilege', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityPrivilegeXml('MyPrivilegeView', {
+      label: '@MyModel:MyLabel',
+      dataEntity: 'MyEntityView',
+      accessLevel: 'view',
+    });
+    expect(xml).toContain('<AxSecurityDataEntityPermission>');
+    expect(xml).toContain('<Name>MyEntityView</Name>');
+    expect(xml).toContain('<Grant>');
+    expect(xml).toContain('<Read>Allow</Read>');
+    expect(xml).not.toContain('<Create>');
+    expect(xml).not.toContain('<Delete>');
+    expect(xml).toContain('<Fields />');
+    expect(xml).toContain('<Methods />');
+  });
+
+  it('generates DataEntityPermissions with full CRUD + Correct for maintain privilege', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityPrivilegeXml('MyPrivilegeMaintain', {
+      label: '@MyModel:MyLabel',
+      dataEntity: 'MyEntityMaintain',
+      accessLevel: 'maintain',
+    });
+    expect(xml).toContain('<Read>Allow</Read>');
+    expect(xml).toContain('<Create>Allow</Create>');
+    expect(xml).toContain('<Update>Allow</Update>');
+    expect(xml).toContain('<Delete>Allow</Delete>');
+    expect(xml).toContain('<Correct>Allow</Correct>');
+    expect(xml).toContain('<Fields />');
+    expect(xml).toContain('<Methods />');
+    // Canonical Microsoft serializer order (verified against shipped
+    // ApplicationCommon privileges): Grant before Name, CRUD alphabetical.
+    expect(xml).toMatch(
+      /<AxSecurityDataEntityPermission>\s*<Grant>\s*<Correct>Allow<\/Correct>\s*<Create>Allow<\/Create>\s*<Delete>Allow<\/Delete>\s*<Read>Allow<\/Read>\s*<Update>Allow<\/Update>\s*<\/Grant>\s*<Name>MyEntityMaintain<\/Name>\s*<Fields \/>\s*<Methods \/>/,
+    );
+  });
+
+  it('defaults to view (Read only) when accessLevel is omitted', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityPrivilegeXml('MyPrivilegeView', {
+      dataEntity: 'MyEntity',
+    });
+    expect(xml).toContain('<Read>Allow</Read>');
+    expect(xml).not.toContain('<Create>');
+  });
+});
+
 // ─── XmlTemplateGenerator.splitXppClassSource ────────────────────────────────
 
 describe('XmlTemplateGenerator.splitXppClassSource', () => {
@@ -314,6 +372,79 @@ describe('XmlTemplateGenerator.splitXppClassSource', () => {
     const { declaration } = XmlTemplateGenerator.splitXppClassSource(source);
     // Empty body: no extra blank line injected
     expect(declaration).toMatch(/{\n}$/);
+  });
+});
+
+// ─── XmlTemplateGenerator security generators ───────────────────────────────
+
+describe('XmlTemplateGenerator security duty/role generators', () => {
+  it('emits privilege references on a duty from properties.privileges', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityDutyXml('MyDuty', {
+      label: '@My:Duty',
+      privileges: ['MyView', 'MyMaintain'],
+    });
+    expect(xml).toContain('<AxSecurityRolePermissionSet>\n\t\t\t<Name>MyView</Name>');
+    expect(xml).toContain('<Name>MyMaintain</Name>');
+    expect(xml).not.toContain('<Privileges />');
+  });
+
+  it('accepts a comma-separated privilege string', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityDutyXml('MyDuty', {
+      privileges: 'MyView, MyMaintain',
+    });
+    expect(xml).toContain('<Name>MyView</Name>');
+    expect(xml).toContain('<Name>MyMaintain</Name>');
+  });
+
+  it('keeps an empty self-closing Privileges when none are given', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityDutyXml('MyDuty', {});
+    expect(xml).toContain('<Privileges />');
+  });
+
+  it('emits duty references on a role from properties.duties', () => {
+    const xml = XmlTemplateGenerator.generateAxSecurityRoleXml('MyRole', {
+      duties: ['MyDuty1', 'MyDuty2'],
+    });
+    expect(xml).toContain('<AxSecurityRoleDutyPermission>\n\t\t\t<Name>MyDuty1</Name>');
+    expect(xml).toContain('<Name>MyDuty2</Name>');
+    expect(xml).not.toContain('<Duties />');
+  });
+});
+
+// ─── table create: enum field generation ─────────────────────────────────────
+
+describe('XmlTemplateGenerator.generateAxTableXml enum fields', () => {
+  it('emits AxTableFieldEnum + EnumType from enumType (extension-style field spec)', () => {
+    const xml = XmlTemplateGenerator.generateAxTableXml('ContosoRentEquipment', {
+      fields: [{ name: 'EquipmentStatus', enumType: 'NoYes', label: '@Contoso:Status' }],
+    });
+    expect(xml).toContain('i:type="AxTableFieldEnum"');
+    expect(xml).toContain('<EnumType>NoYes</EnumType>');
+    expect(xml).not.toContain('AxTableFieldString');
+  });
+
+  it('honors an explicit fieldType="AxTableFieldEnum"', () => {
+    const xml = XmlTemplateGenerator.generateAxTableXml('ContosoRentEquipment', {
+      fields: [{ name: 'EquipmentStatus', fieldType: 'AxTableFieldEnum', enumType: 'NoYes' }],
+    });
+    expect(xml).toContain('i:type="AxTableFieldEnum"');
+    expect(xml).toContain('<EnumType>NoYes</EnumType>');
+  });
+
+  it('still maps the primitive type="Enum" spec to an enum field', () => {
+    const xml = XmlTemplateGenerator.generateAxTableXml('ContosoRentEquipment', {
+      fields: [{ name: 'EquipmentStatus', type: 'Enum', enumType: 'NoYes' }],
+    });
+    expect(xml).toContain('i:type="AxTableFieldEnum"');
+    expect(xml).toContain('<EnumType>NoYes</EnumType>');
+  });
+
+  it('leaves plain string fields untouched', () => {
+    const xml = XmlTemplateGenerator.generateAxTableXml('ContosoRentEquipment', {
+      fields: [{ name: 'EquipmentName', edt: 'Name' }],
+    });
+    expect(xml).toContain('i:type="AxTableFieldString"');
+    expect(xml).not.toContain('<EnumType>');
   });
 });
 
@@ -360,6 +491,28 @@ describe('generate_smart_table', () => {
     );
     expect(result?.content[0].text).toMatch(/<Indexes>|UniqueIndex|Idx/i);
   });
+
+  it('preserves both fields when the same hint name appears twice (dedup regression #2)', async () => {
+    // Agent passed the EDT name twice ("AmountMST, AmountMST") instead of distinct
+    // field names. The second occurrence must be renamed AmountMST2, not dropped.
+    const result = await handleGenerateSmartTable(
+      {
+        name: 'RentalLine',
+        modelName: 'MyModel',
+        fieldsHint: 'AgreementId, AmountMST, AmountMST',
+      },
+      ctx.symbolIndex,
+    );
+    expect(result?.isError).toBeFalsy();
+    const xml = result?.content[0].text ?? '';
+    // Both amount fields present under different names
+    expect(xml).toContain('AmountMST');
+    expect(xml).toContain('AmountMST2');
+    // Not silently collapsed to a single AmountMST
+    const count = (xml.match(/AmountMST(?!2)/g) ?? []).length;
+    expect(count).toBeGreaterThanOrEqual(1); // original present
+    expect(xml).toContain('AmountMST2');     // duplicate renamed
+  });
 });
 
 // ─── generate_smart_form ─────────────────────────────────────────────────────
@@ -389,6 +542,23 @@ describe('generate_smart_form', () => {
     );
     expect(result?.content[0].text).toContain('MyCustomForm');
     expect(result?.content[0].text).toContain('MyCustomTable');
+  });
+
+  it('warns when the requested pattern has no template and degrades to another', async () => {
+    // "Task" has a catalog spec (TaskSingle) but no builder template, so it
+    // silently falls back to SimpleList. The output must say so and point at a
+    // reference form to clone instead.
+    const result = await handleGenerateSmartForm(
+      {
+        name: 'MyTaskForm',
+        modelName: 'MyModel',
+        dataSource: 'MyCustomTable',
+        formPattern: 'Task',
+      },
+      ctx.symbolIndex,
+    );
+    expect(result?.content[0].text).toContain('No dedicated template');
+    expect(result?.content[0].text).toContain('cloneFrom');
   });
 });
 

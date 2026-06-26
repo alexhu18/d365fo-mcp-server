@@ -39,18 +39,8 @@ export const resolveReferencesArgsSchema = z.object({
   ),
 });
 
-export const resolveReferencesToolDefinition = {
-  name: 'resolve_references',
-  description:
-    'Semantic reference resolver (<200 ms, index-only) — verifies that every type, ' +
-    'table field, method (incl. arity), enum, label and intrinsic target (tableStr, ' +
-    'fieldStr, classStr, …) in generated X++ code EXISTS in the indexed codebase. ' +
-    'Catches hallucinated symbols BEFORE the compiler does. ' +
-    'Call AFTER generating code and BEFORE create_d365fo_file / modify_d365fo_file. ' +
-    'Returns {kind, severity, line, identifier, detail}[] — fix errors in the same turn. ' +
-    'When GROUNDING_ENFORCE=true, write tools run this check internally and reject code with errors.',
-  inputSchema: resolveReferencesArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts — the single source of truth for tool instructions.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -527,8 +517,8 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
           line: lineOf(code, s.index),
           identifier: `@${fileId}:${labelId}`,
           detail: fileKnown
-            ? `Label id "${labelId}" not found in label file "${fileId}". Use search_labels to find the right id or create_label to add it.`
-            : `Label file "${fileId}" not found in the index. If it is new, create the label first (create_label), then re-run.`,
+            ? `Label id "${labelId}" not found in label file "${fileId}". Use labels to find the right id or labels to add it.`
+            : `Label file "${fileId}" not found in the index. If it is new, create the label first (labels), then re-run.`,
         });
       }
     } else if (legacy) {
@@ -540,7 +530,7 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
           severity: 'warning',
           line: lineOf(code, s.index),
           identifier: `@${legacy[1]}`,
-          detail: `Legacy label "@${legacy[1]}" not found in the labels index. Verify with get_label_info.`,
+          detail: `Legacy label "@${legacy[1]}" not found in the labels index. Verify with labels.`,
         });
       }
     }
@@ -586,7 +576,7 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
             severity: 'error',
             line,
             identifier: `${target}.${member}`,
-            detail: `Field "${member}" not found on ${target} (checked fields, system fields, table extensions). Use get_table_info("${target}").`,
+            detail: `Field "${member}" not found on ${target} (checked fields, system fields, table extensions). Use get_object_info(objectType="table", name="${target}").`,
           });
         }
       } else if (fn === 'methodstr' || fn === 'staticmethodstr') {
@@ -598,7 +588,7 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
             severity: 'error',
             line,
             identifier: `${target}.${member}`,
-            detail: `Method "${member}" not found on ${target} (checked inheritance chain and extensions). Use get_class_info("${target}").`,
+            detail: `Method "${member}" not found on ${target} (checked inheritance chain and extensions). Use get_object_info(objectType="class", name="${target}").`,
           });
         }
       } else {
@@ -644,7 +634,7 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
         severity: 'error',
         line,
         identifier: `${typeName}::${member}`,
-        detail: `Static method "${member}" not found on ${typeName} (checked inheritance chain and extensions). Use get_class_info("${typeName}") or get_method_signature.`,
+        detail: `Static method "${member}" not found on ${typeName} (checked inheritance chain and extensions). Use get_object_info(objectType="class", name="${typeName}") or get_method(include="signature").`,
       });
       continue;
     }
@@ -738,7 +728,7 @@ export function resolveXppReferences(code: string, deps: ResolverDeps): ResolveR
             severity: 'error',
             line,
             identifier: `${typeName}.${member}`,
-            detail: `Field "${member}" not found on ${typeName} (checked fields, system fields, table extensions). Use get_table_info("${typeName}").`,
+            detail: `Field "${member}" not found on ${typeName} (checked fields, system fields, table extensions). Use get_object_info(objectType="table", name="${typeName}").`,
           });
         }
       }

@@ -1,20 +1,14 @@
 /**
  * Object Info Tools Tests
- * Covers: get_class_info, get_table_info, get_method_signature,
- *         get_form_info, get_query_info, get_view_info,
- *         get_enum_info, get_edt_info, get_report_info
+ * Exercises the unified get_object_info reader (objectType = class/table/form/
+ * query/view/enum/edt/report) plus get_method_signature (still a dedicated tool).
+ * get_object_info forwards to the per-type handler via READER_DISPATCH, so these
+ * tests cover the public surface end-to-end.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { classInfoTool } from '../../src/tools/classInfo';
-import { tableInfoTool } from '../../src/tools/tableInfo';
+import { getObjectInfoTool } from '../../src/tools/getObjectInfo';
 import { getMethodSignatureTool } from '../../src/tools/methodSignature';
-import { getFormInfoTool } from '../../src/tools/formInfo';
-import { getQueryInfoTool } from '../../src/tools/queryInfo';
-import { getViewInfoTool } from '../../src/tools/viewInfo';
-import { getEnumInfoTool } from '../../src/tools/enumInfo';
-import { getEdtInfoTool } from '../../src/tools/edtInfo';
-import { getReportInfoTool } from '../../src/tools/reportInfo';
 import type { XppServerContext } from '../../src/types/context';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
@@ -170,7 +164,7 @@ const buildContext = (overrides: Partial<XppServerContext> = {}): XppServerConte
 
 // ─── get_class_info ──────────────────────────────────────────────────────────
 
-describe('get_class_info', () => {
+describe('get_object_info (class)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -183,7 +177,7 @@ describe('get_class_info', () => {
       makeSymbol({ id: 2, name: 'run', type: 'method', parentName: 'SalesFormLetter', signature: 'public void run()' }),
     ]);
 
-    const result = await classInfoTool(req('get_class_info', { className: 'SalesFormLetter' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'class', name:'SalesFormLetter' }), ctx);
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('SalesFormLetter');
@@ -195,26 +189,26 @@ describe('get_class_info', () => {
     );
     (ctx.symbolIndex.getClassMethods as any).mockReturnValue([]);
 
-    const result = await classInfoTool(req('get_class_info', { className: 'MyClass' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'class', name:'MyClass' }), ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('MyClass');
   });
 
   it('returns not-found message for unknown class', async () => {
     (ctx.symbolIndex.getSymbolByName as any).mockReturnValue(undefined);
-    const result = await classInfoTool(req('get_class_info', { className: 'NoSuchClass' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'class', name:'NoSuchClass' }), ctx);
     expect(result.content[0].text).toMatch(/not found|no.*class/i);
   });
 
   it('returns error when className is missing', async () => {
-    const result = await classInfoTool(req('get_class_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'class' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_table_info ──────────────────────────────────────────────────────────
 
-describe('get_table_info', () => {
+describe('get_object_info (table)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -225,7 +219,7 @@ describe('get_table_info', () => {
       content: [{ type: 'text', text: '# Table: `SalesLine`\n\n**Model:** ApplicationSuite\n\n## Fields\n\nItemId: EDT: ItemId\n' }],
     });
 
-    const result = await tableInfoTool(req('get_table_info', { tableName: 'SalesLine' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'table', name:'SalesLine' }), ctx);
 
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
@@ -235,12 +229,12 @@ describe('get_table_info', () => {
 
   it('returns not-found for unknown table', async () => {
     (ctx.symbolIndex.getSymbolByName as any).mockReturnValue(undefined);
-    const result = await tableInfoTool(req('get_table_info', { tableName: 'GhostTable' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'table', name:'GhostTable' }), ctx);
     expect(result.content[0].text).toMatch(/not found|no.*table/i);
   });
 
   it('returns error when tableName is missing', async () => {
-    const result = await tableInfoTool(req('get_table_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'table' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
@@ -303,7 +297,7 @@ describe('get_method_signature', () => {
 
 // ─── get_form_info ───────────────────────────────────────────────────────────
 
-describe('get_form_info', () => {
+describe('get_object_info (form)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -314,7 +308,7 @@ describe('get_form_info', () => {
       content: [{ type: 'text', text: '# Form: `SalesTable`\n\n**Model:** ApplicationSuite\n' }],
     });
 
-    const result = await getFormInfoTool(req('get_form_info', { formName: 'SalesTable' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'form', name:'SalesTable' }), ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('SalesTable');
   });
@@ -323,20 +317,20 @@ describe('get_form_info', () => {
     const stmt = { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
     ctx.symbolIndex.db.prepare = vi.fn(() => stmt) as any;
 
-    const result = await getFormInfoTool(req('get_form_info', { formName: 'NoForm' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'form', name:'NoForm' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|no.*form/i);
   });
 
   it('returns error when formName is missing', async () => {
-    const result = await getFormInfoTool(req('get_form_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'form' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_query_info ──────────────────────────────────────────────────────────
 
-describe('get_query_info', () => {
+describe('get_object_info (query)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -347,7 +341,7 @@ describe('get_query_info', () => {
       content: [{ type: 'text', text: '# Query: `SalesTableListPage`\n\n**Model:** ApplicationSuite\n' }],
     });
 
-    const result = await getQueryInfoTool(req('get_query_info', { queryName: 'SalesTableListPage' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'query', name:'SalesTableListPage' }), ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('SalesTableListPage');
   });
@@ -356,20 +350,20 @@ describe('get_query_info', () => {
     const stmt = { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
     ctx.symbolIndex.db.prepare = vi.fn(() => stmt) as any;
 
-    const result = await getQueryInfoTool(req('get_query_info', { queryName: 'NoQuery' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'query', name:'NoQuery' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|no.*query/i);
   });
 
   it('returns error when queryName is missing', async () => {
-    const result = await getQueryInfoTool(req('get_query_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'query' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_view_info ───────────────────────────────────────────────────────────
 
-describe('get_view_info', () => {
+describe('get_object_info (view)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -380,7 +374,7 @@ describe('get_view_info', () => {
       content: [{ type: 'text', text: '# View: `SalesOrderView`\n\n**Model:** ApplicationSuite\n' }],
     });
 
-    const result = await getViewInfoTool(req('get_view_info', { viewName: 'SalesOrderView' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'view', name:'SalesOrderView' }), ctx);
     // Bridge returned data — success
     expect(result.content[0].text).toContain('SalesOrderView');
   });
@@ -389,20 +383,20 @@ describe('get_view_info', () => {
     const stmt = { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
     ctx.symbolIndex.db.prepare = vi.fn(() => stmt) as any;
 
-    const result = await getViewInfoTool(req('get_view_info', { viewName: 'NoView' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'view', name:'NoView' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|no.*view/i);
   });
 
   it('returns error when viewName is missing', async () => {
-    const result = await getViewInfoTool(req('get_view_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'view' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_enum_info ───────────────────────────────────────────────────────────
 
-describe('get_enum_info', () => {
+describe('get_object_info (enum)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -413,7 +407,7 @@ describe('get_enum_info', () => {
       content: [{ type: 'text', text: '# Enum: `SalesStatus`\n\nInvoiced\n' }],
     });
 
-    const result = await getEnumInfoTool(req('get_enum_info', { enumName: 'SalesStatus' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'enum', name:'SalesStatus' }), ctx);
     expect(result.isError).toBeFalsy();
     const text = result.content[0].text;
     expect(text).toContain('SalesStatus');
@@ -424,20 +418,20 @@ describe('get_enum_info', () => {
     const stmt = { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
     ctx.symbolIndex.db.prepare = vi.fn(() => stmt) as any;
 
-    const result = await getEnumInfoTool(req('get_enum_info', { enumName: 'NoEnum' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'enum', name:'NoEnum' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|no.*enum/i);
   });
 
   it('returns error when enumName is missing', async () => {
-    const result = await getEnumInfoTool(req('get_enum_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'enum' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_edt_info ────────────────────────────────────────────────────────────
 
-describe('get_edt_info', () => {
+describe('get_object_info (edt)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
@@ -448,7 +442,7 @@ describe('get_edt_info', () => {
       content: [{ type: 'text', text: '# EDT: `CustAccount`\n\n**Extends:** AccountNum\n' }],
     });
 
-    const result = await getEdtInfoTool(req('get_edt_info', { edtName: 'CustAccount' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'edt', name:'CustAccount' }), ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('CustAccount');
   });
@@ -457,40 +451,40 @@ describe('get_edt_info', () => {
     const stmt = { get: vi.fn(() => undefined), all: vi.fn(() => []), run: vi.fn() };
     ctx.symbolIndex.db.prepare = vi.fn(() => stmt) as any;
 
-    const result = await getEdtInfoTool(req('get_edt_info', { edtName: 'NoEdt' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'edt', name:'NoEdt' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|no.*edt|no.*extended/i);
   });
 
   it('returns error when edtName is missing', async () => {
-    const result = await getEdtInfoTool(req('get_edt_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'edt' }), ctx);
     expect(result.isError).toBe(true);
   });
 });
 
 // ─── get_report_info ─────────────────────────────────────────────────────────
 
-describe('get_report_info', () => {
+describe('get_object_info (report)', () => {
   let ctx: XppServerContext;
 
   beforeEach(() => { ctx = buildContext(); });
 
   it('returns not-found when report is not on disk', async () => {
     // fs.access throws ENOENT (mocked above), so report won't be found
-    const result = await getReportInfoTool(req('get_report_info', { reportName: 'SalesInvoice' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'report', name:'SalesInvoice' }), ctx);
     // Tool returns isError: true when report not found on disk
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found|could not/i);
   });
 
   it('returns not-found for unknown report', async () => {
-    const result = await getReportInfoTool(req('get_report_info', { reportName: 'NoReport' }), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'report', name:'NoReport' }), ctx);
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not found/i);
   });
 
   it('returns error when reportName is missing', async () => {
-    const result = await getReportInfoTool(req('get_report_info', {}), ctx);
+    const result = await getObjectInfoTool(req('get_object_info', { objectType: 'report' }), ctx);
     expect(result.isError).toBe(true);
   });
 });

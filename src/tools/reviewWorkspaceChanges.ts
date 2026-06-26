@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { execFile } from 'child_process';
 import util from 'util';
 import path from 'path';
@@ -17,13 +16,8 @@ async function git(args: string[], cwd: string): Promise<string> {
   return stdout;
 }
 
-export const reviewWorkspaceChangesToolDefinition = {
-  name: 'review_workspace_changes',
-  description: 'Fetches uncommitted X++ changes (git diff) and processes them into a clean format for AI Code Review against D365 Best Practices.',
-  parameters: z.object({
-    directoryPath: z.string().describe('The absolute path to the local repository')
-  })
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 /**
  * Extract absolute file paths from a git diff header ("+++ b/..." lines)

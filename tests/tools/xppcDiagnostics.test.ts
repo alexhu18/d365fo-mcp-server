@@ -90,7 +90,7 @@ describe('formatStructuredDiagnostics', () => {
     expect(errIdx).toBeGreaterThan(-1);
     expect(warnIdx).toBeGreaterThan(errIdx);
     expect(text).toContain('(line 10, col 5)');
-    expect(text).toContain('modify_d365fo_file');
+    expect(text).toContain('d365fo_file(action="modify")');
   });
 
   it('enriches known errors with a fix hint from the error knowledge base', () => {

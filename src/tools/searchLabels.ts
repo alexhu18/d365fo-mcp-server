@@ -53,7 +53,7 @@ export async function searchLabelsTool(request: CallToolRequest, context: XppSer
               (language !== 'en-US' ? ` in language "${language}"` : '') +
               (model ? ` in model "${model}"` : '') +
               '.\n\n' +
-              `💡 Tip: Use create_label to add a new label to your custom model.\n` +
+              `💡 Tip: Use labels(action="create") to add a new label to your custom model.\n` +
               `💡 To search a different language use the language parameter (e.g. "cs", "de", "sk").`,
           },
         ],
@@ -100,36 +100,5 @@ export async function searchLabelsTool(request: CallToolRequest, context: XppSer
   }
 }
 
-export const searchLabelsToolDefinition = {
-  name: 'search_labels',
-  description:
-    'Full-text search across indexed D365FO AxLabelFile labels. ' +
-    'Use this BEFORE creating new labels to check if a suitable label already exists. ' +
-    'Returns label ID, text, comment and the X++ reference syntax (@LabelFileId:LabelId).',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      query: {
-        type: 'string',
-        description: 'Search text — searches label ID, text and comments',
-      },
-      language: {
-        type: 'string',
-        description: 'Language/locale (default: en-US). Examples: cs, de, sk',
-      },
-      model: {
-        type: 'string',
-        description: 'Restrict to a specific model (e.g. ContosoExt)',
-      },
-      labelFileId: {
-        type: 'string',
-        description: 'Restrict to a specific label file ID (e.g. ContosoExt, SYS)',
-      },
-      limit: {
-        type: 'number',
-        description: 'Maximum number of results (default 30)',
-      },
-    },
-    required: ['query'],
-  },
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

@@ -23,7 +23,7 @@ const ClassInfoArgsSchema = z.object({
 export async function classInfoTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = ClassInfoArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, parser, cache, workspaceScanner } = context;
+    const { symbolIndex, parser, workspaceScanner } = context;
     // Validate workspace path if provided
     if (args.includeWorkspace && args.workspacePath) {
       const validation = await validateWorkspacePath(args.workspacePath);
@@ -49,48 +49,9 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
       // If not found in workspace, continue to external search
     }
 
-    // Check cache first
-    const cacheKey = cache.generateClassKey(args.className);
-    const cachedClass = await cache.get<any>(cacheKey);
-    
-    if (cachedClass) {
-      const methodOffset = args.methodOffset ?? 0;
-      const totalMethods = cachedClass.methods.length;
-      const pagedMethods = cachedClass.methods.slice(methodOffset, methodOffset + METHOD_PAGE_SIZE);
-      const hasMore = methodOffset + METHOD_PAGE_SIZE < totalMethods;
-
-      const methodLines = pagedMethods
-        .map(
-          (m: any) =>
-            `- \`${m.isStatic ? 'static ' : ''}${m.returnType || 'void'} ${m.name}(${m.parameters?.join(', ') || ''})\``
-        )
-        .join('\n');
-
-      const extendsInfo = cachedClass.extendsClass ? `\n**Extends:** ${cachedClass.extendsClass}` : '';
-      const modifiers = [];
-      if (cachedClass.isFinal) modifiers.push('final');
-      if (cachedClass.isAbstract) modifiers.push('abstract');
-      const modifiersInfo = modifiers.length > 0 ? ` (${modifiers.join(', ')})` : '';
-
-      let text = `# Class: ${cachedClass.name}${modifiersInfo}${extendsInfo}\n\n`;
-      text += `## Methods (${totalMethods} total, showing ${methodOffset + 1}–${Math.min(methodOffset + METHOD_PAGE_SIZE, totalMethods)})\n\n`;
-      text += methodLines;
-      if (hasMore) {
-        text += `\n\n> ⚠️ **${totalMethods - methodOffset - METHOD_PAGE_SIZE} more methods.** Call again with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\` to see next page.`;
-      }
-
-      return {
-        content: [{ type: 'text', text }],
-      };
-    }
-
     // Try C# bridge first (IMetadataProvider — live D365FO metadata).
-    // Priority order per read-path spec: Bridge → DB → Disk. Bridge is authoritative
-    // because it reflects whatever the currently-running D365FO instance sees;
-    // DB is a pre-indexed mirror; disk is the slowest last-resort parse.
     const bridgeResult = await tryBridgeClass(context.bridge, args.className, args.compact !== false, args.methodOffset ?? 0);
     if (bridgeResult) {
-      await cache.setClassInfo(cacheKey, bridgeResult).catch(() => {});
       return bridgeResult;
     }
 
@@ -112,7 +73,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 
     // compact=true (default): serve entirely from DB — no filesystem access, instant response
     if (args.compact !== false) {
-      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0, cache, cacheKey);
+      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0);
     }
 
     // compact=false: parse XML for source bodies, with timeout guard to avoid hanging
@@ -130,7 +91,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 
     if (!classInfo.success || !classInfo.data) {
       // Fallback to DB when XML not available (build agent, no D365FO install, timeout)
-      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0, cache, cacheKey);
+      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0);
     }
 
     const cls = classInfo.data;
@@ -178,7 +139,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
           output += `**Documentation:**\n${method.documentation}\n\n`;
         }
         
-        output += `\`\`\`xpp\n${method.source.substring(0, 200)}${method.source.length > 200 ? '\n// ... (use get_method_signature for full body)' : ''}\n\`\`\`\n\n`;
+        output += `\`\`\`xpp\n${method.source.substring(0, 200)}${method.source.length > 200 ? '\n// ... (use get_method(include="signature") for full body)' : ''}\n\`\`\`\n\n`;
       }
     }
 
@@ -186,19 +147,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
       output += `> ⚠️ **${totalMethods - methodOffset - METHOD_PAGE_SIZE} more methods not shown.** Call again with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\` to see the next page.\n\n`;
     }
 
-    // Write to cache for 24 hours (normalize to shape expected by cache-hit path)
-    await cache.setClassInfo(cacheKey, {
-      name: cls.name,
-      extendsClass: cls.extends,
-      isFinal: cls.isFinal,
-      isAbstract: cls.isAbstract,
-      methods: cls.methods.map((m: any) => ({
-        name: m.name,
-        isStatic: m.isStatic,
-        returnType: m.returnType,
-        parameters: m.parameters.map((p: { type: string; name: string }) => `${p.type} ${p.name}`),
-      })),
-    });
+    // (formerly wrote to cache here)
 
     return {
       content: [
@@ -230,8 +179,6 @@ async function buildDbOnlyResponse(
   classSymbol: any,
   symbolIndex: any,
   methodOffset: number,
-  cache: any,
-  cacheKey: string
 ): Promise<any> {
   const methods = symbolIndex.getClassMethods(className) as Array<{ name: string; signature?: string; isStatic?: boolean }>;
 
@@ -254,21 +201,7 @@ async function buildDbOnlyResponse(
   if (hasMore) {
     output += `\n> ⚠️ ${totalMethods - methodOffset - METHOD_PAGE_SIZE} more — call with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\`\n`;
   }
-  output += `\n> 💡 Use \`get_method_signature\` for a full method body.\n`;
-
-  // Cache so next call is instant
-  await cache.setClassInfo(cacheKey, {
-    name: className,
-    extendsClass: classSymbol.extendsClass ?? null,
-    isFinal: false,
-    isAbstract: false,
-    methods: methods.map((m: any) => ({
-      name: m.name,
-      isStatic: m.isStatic ?? false,
-      returnType: m.signature ?? 'void',
-      parameters: [],
-    })),
-  });
+  output += `\n> 💡 Use \`get_method(include="signature")\` for a full method body.\n`;
 
   return { content: [{ type: 'text', text: output }] };
 }

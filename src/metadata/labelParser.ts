@@ -28,6 +28,24 @@ export interface ParsedLabel {
 }
 
 /**
+ * True when a label file ID refers to a label file EXTENSION rather than an
+ * original (base) label file owned by the model.
+ *
+ * D365FO names label file extensions with an `_Extension` marker, optionally
+ * followed by a model prefix — e.g. `Base_Extension` or `Base_ExtensionContoso`.
+ * On disk the content file is `${labelFileId}.${locale}.label.txt`, so the
+ * `_Extension` marker is carried in the label file ID itself.
+ *
+ * New labels must always be created in the model's own ORIGINAL label file.
+ * An extension only extends a base label file owned by another model; adding
+ * brand-new labels there is almost always a mistake (and is what leads clients
+ * to wrongly prefix the label IDs).
+ */
+export function isExtensionLabelFile(labelFileId: string): boolean {
+  return /_Extension/i.test(labelFileId);
+}
+
+/**
  * Parse a single .label.txt file into ParsedLabel records.
  */
 export function parseLabelFile(
@@ -84,7 +102,6 @@ export function parseLabelFile(
  */
 export async function discoverLabelFiles(
   modelDir: string,  // e.g. K:\AosService\PackagesLocalDirectory\MyPackage\MyModel
-  verbose: boolean = false,
 ): Promise<Array<{ labelFileId: string; language: string; filePath: string }>> {
   const results: Array<{ labelFileId: string; language: string; filePath: string }> = [];
   
@@ -110,31 +127,7 @@ export async function discoverLabelFiles(
   let locales: string[];
   try {
     locales = await fs.readdir(axLabelDir);
-  } catch (err) {
-    if (verbose) {
-      // Check if parent AxLabelFile directory exists (try both cases)
-      const axLabelFileDirOriginal = path.join(modelDir, 'AxLabelFile');
-      const axLabelFileDirLower = path.join(modelDir, 'axlabelfile');
-      const axLabelExists = fsSync.existsSync(axLabelFileDirOriginal) || fsSync.existsSync(axLabelFileDirLower);
-      
-      if (!axLabelExists) {
-        console.log(`      ℹ️  No AxLabelFile/axlabelfile directory in ${modelDir}`);
-        
-        // Debug: show what directories actually exist
-        try {
-          const actualDirs = fsSync.readdirSync(modelDir).filter(n => {
-            const stat = fsSync.statSync(path.join(modelDir, n));
-            return stat.isDirectory();
-          }).slice(0, 5);
-          if (actualDirs.length > 0) {
-            console.log(`         Available dirs: ${actualDirs.join(', ')}`);
-          }
-        } catch { /* ignore */ }
-      } else {
-        const whichCase = fsSync.existsSync(axLabelFileDirOriginal) ? 'AxLabelFile' : 'axlabelfile';
-        console.log(`      ℹ️  Found ${whichCase} but no LabelResources subdirectory in ${modelDir}`);
-      }
-    }
+  } catch {
     return results; // No AxLabelFile folder
   }
 
@@ -198,9 +191,9 @@ export async function indexModelLabels(
   symbolIndex: XppSymbolIndex,
   modelDir: string,
   model: string,
-  opts?: { skipFtsRebuild?: boolean; verbose?: boolean },
+  opts?: { skipFtsRebuild?: boolean },
 ): Promise<number> {
-  const labelFiles = await discoverLabelFiles(modelDir, opts?.verbose);
+  const labelFiles = await discoverLabelFiles(modelDir);
   if (labelFiles.length === 0) return 0;
 
   const allEntries: Parameters<XppSymbolIndex['bulkAddLabels']>[0] = [];
@@ -254,7 +247,6 @@ export async function indexAllLabels(
     // junction points, which readdirSync reports as isSymbolicLink()=true
     // rather than isDirectory()=true.
     models = entries.filter(e => e.isDirectory() || e.isSymbolicLink()).map(e => e.name);
-    console.log(`   🔍 Found ${models.length} potential model folders in ${packagesPath}`);
   } catch {
     console.error(`[LabelParser] Cannot read packages path: ${packagesPath}`);
     return { totalLabels, modelsIndexed };
@@ -263,8 +255,6 @@ export async function indexAllLabels(
   let skippedByFilter = 0;
   let skippedMissingDir = 0;
   let skippedNoLabels = 0;
-  const verboseDebug = process.env.DEBUG_LABELS === 'true';
-  let processedModels = 0;
 
   for (const packageOrModel of models) {
     if (modelFilter && !modelFilter(packageOrModel)) {
@@ -314,36 +304,13 @@ export async function indexAllLabels(
 
     // Process each model directory found within this package
     for (const { modelDir, modelName } of modelDirs) {
-      processedModels++;
-      // Enable verbose for first 3 models or when DEBUG_LABELS=true
-      const enableVerbose = verboseDebug || processedModels <= 3;
-
-      if (enableVerbose && processedModels === 1) {
-        const isNested = modelDirs.length > 1 || modelName !== packageOrModel;
-        console.log(`   📁 Using ${isNested ? 'nested' : 'flat'} structure`);
-        // Show which case was detected
-        const axLabelOriginal = path.join(modelDir, 'AxLabelFile');
-        const axLabelLower = path.join(modelDir, 'axlabelfile');
-        if (fsSync.existsSync(axLabelOriginal)) {
-          console.log(`   📁 Case: Windows (AxLabelFile with capital letters)`);
-        } else if (fsSync.existsSync(axLabelLower)) {
-          console.log(`   📁 Case: Linux (axlabelfile lowercase) - using case-insensitive matching`);
-        }
-      }
-
       // Skip per-model FTS rebuild; do a single rebuild after all models are indexed
-      const count = await indexModelLabels(symbolIndex, modelDir, modelName, { skipFtsRebuild: true, verbose: enableVerbose });
+      const count = await indexModelLabels(symbolIndex, modelDir, modelName, { skipFtsRebuild: true });
       if (count > 0) {
         totalLabels += count;
         modelsIndexed++;
-        if (enableVerbose) {
-          console.log(`      ✓ ${modelName}: ${count} labels`);
-        }
       } else {
         skippedNoLabels++;
-        if (enableVerbose) {
-          console.log(`      ✗ ${modelName}: no labels found`);
-        }
       }
     }
   }

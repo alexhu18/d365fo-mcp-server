@@ -4,7 +4,7 @@
  * Returns method modifiers, return type, parameters with types
  *
  * PRIMARY: C# bridge (IMetadataProvider) via tryBridgeMethodSignature.
- * SQLite is used only as a gate (verify class/method exists) and for cache.
+ * SQLite is used only as a gate (verify class/method exists).
  */
 
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -40,15 +40,8 @@ interface MethodSignature {
 export async function getMethodSignatureTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = GetMethodSignatureArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache, parser } = context;
+    const { symbolIndex, parser } = context;
     const { className, methodName, modelName } = args;
-
-    // Check cache first (method signatures are static — 24h TTL via setClassInfo)
-    const cacheKey = `xpp:method-sig:${className}:${methodName}`;
-    const cachedResult = await cache.get<any>(cacheKey);
-    if (cachedResult) {
-      return cachedResult;
-    }
 
     // 1. Find the class/table/view — methods live on all three object types
     const OBJECT_TYPES = `('class', 'table', 'view', 'data-entity')`;
@@ -85,7 +78,7 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
       };
     }
 
-    // 2. Find the method in database
+    // 2. Find the method in database (advisory — delegates and SubscribesTo handlers may be absent)
     const methodStmt = rdb.prepare(`
       SELECT name, signature, parent_name, file_path
       FROM symbols
@@ -97,22 +90,18 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
 
     const methodRow = methodStmt.get(methodName, className);
 
-    if (!methodRow) {
-      throw new Error(`Method "${methodName}" not found in ${classRow.type} "${className}".`);
-    }
-
     // 3. C# bridge (IMetadataProvider — live source, always current)
     // Bridge returns full source → parse signature locally + detect obsolete.
     // This is the sole data path — eliminates JSON file I/O and XML parsing.
     const includeCoc = args.includeCocTemplate ?? false;
     const bridgeSignature = await tryBridgeMethodSignature(
-      context.bridge, className, methodName, classRow.model, includeCoc, cache, cacheKey,
+      context.bridge, className, methodName, classRow.model, includeCoc,
     );
     if (bridgeSignature) return bridgeSignature;
 
     // Fallback: parse XML file from disk (same pattern as classInfo.ts)
     const xmlSignature = await tryXmlMethodSignature(
-      parser, classRow.file_path, className, methodName, classRow.model, includeCoc, cache, cacheKey, classRow.type,
+      parser, classRow.file_path, className, methodName, classRow.model, includeCoc, classRow.type,
     );
     if (xmlSignature) return xmlSignature;
 
@@ -125,6 +114,39 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
       output += `\`\`\`xpp\n${sigText}\n\`\`\`\n`;
       output += `\n> ⚠️ CoC template not available without full method source. Start the C# bridge for full functionality.\n`;
       return { content: [{ type: 'text', text: output }] };
+    }
+
+    // classDeclaration is the class header pseudo-member — it has no
+    // parenthesised signature, so the signature path can never parse it even
+    // though its source is retrievable. Give an accurate pointer instead of the
+    // misleading "delegate / SubscribesTo" not-found message below.
+    if (methodName.toLowerCase() === 'classdeclaration') {
+      return {
+        content: [{
+          type: 'text',
+          text: `ℹ️ \`${className}.classDeclaration\` is the class header, not a method — it has no signature.\n\n` +
+            `Use \`get_method(className="${className}", methodName="classDeclaration", include="source")\` to read the declaration source, ` +
+            `or \`get_object_info(objectType="class", name="${className}")\` for the class overview.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Method not in SQLite and not reachable via bridge/XML.
+    // Delegates and SubscribesTo handlers are commonly absent from the index.
+    if (!methodRow) {
+      return {
+        content: [{
+          type: 'text',
+          text: `❌ Method **${className}.${methodName}** not found.\n\n` +
+            `The method is not in the symbol index and could not be retrieved via bridge or XML.\n` +
+            `This is common for:\n` +
+            `- **Delegate methods** (declared with the \`delegate\` keyword)\n` +
+            `- **Event handler subscriptions** (\`[SubscribesTo]\` handlers in extension classes)\n\n` +
+            `Use \`get_object_info(objectType="class", name="${className}")\` to see all indexed methods.`,
+        }],
+        isError: true,
+      };
     }
 
     return {
@@ -161,8 +183,6 @@ async function tryBridgeMethodSignature(
   methodName: string,
   modelName: string,
   includeCoc: boolean,
-  cache: any,
-  cacheKey: string,
 ): Promise<any | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
@@ -175,7 +195,6 @@ async function tryBridgeMethodSignature(
 
     const obsoleteWarning = detectObsolete(ms.source);
     const result = formatOutput(className, methodName, signature, modelName, includeCoc, obsoleteWarning);
-    await cache.setClassInfo(cacheKey, result);
     return result;
   } catch (e) {
     console.error(`[methodSignature] Bridge getMethodSource(${className}, ${methodName}) failed: ${e}`);
@@ -196,8 +215,6 @@ async function tryXmlMethodSignature(
   methodName: string,
   modelName: string,
   includeCoc: boolean,
-  cache: any,
-  cacheKey: string,
   objectType?: string,
 ): Promise<any | null> {
   if (!parser || !filePath) return null;
@@ -220,7 +237,6 @@ async function tryXmlMethodSignature(
 
     const obsoleteWarning = detectObsolete(method.source);
     const result = formatOutput(className, methodName, signature, modelName, includeCoc, obsoleteWarning);
-    await cache.setClassInfo(cacheKey, result);
     return result;
   } catch (e) {
     console.error(`[methodSignature] XML parse for ${className}.${methodName} failed: ${e}`);
@@ -466,8 +482,5 @@ function formatOutput(
   };
 }
 
-export const getMethodSignatureToolDefinition = {
-  name: 'get_method_signature',
-  description: '🔧 Extract exact method signature for Chain of Command (CoC) extensions. Returns method modifiers, return type, parameters with types, and generates ready-to-use CoC template. Essential for creating extensions without signature mismatches.',
-  inputSchema: GetMethodSignatureArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

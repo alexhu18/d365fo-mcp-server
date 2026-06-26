@@ -36,6 +36,32 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
     if (resolvedType !== 'auto') output += ` (${resolvedType})`;
     output += '\n\n';
 
+    // ── Row-level security (OLS) policies constraining this object's table ──
+    // AxSecurityPolicy applies to a primary table; surface any that name this object.
+    let olsSection = '';
+    if (resolvedType === 'table' || resolvedType === 'auto') {
+      try {
+        const policies = db.prepare(
+          `SELECT policy_name, query_name, operation, constrained_table, label
+           FROM security_policies WHERE primary_table = ? ORDER BY policy_name`
+        ).all(objName) as any[];
+        if (policies.length > 0) {
+          olsSection += `Row-level security (OLS) — ${policies.length} policy(ies) constrain table ${objName}:\n`;
+          for (const p of policies) {
+            olsSection += `  🔒 ${p.policy_name}`;
+            olsSection += ` [${p.operation || 'AllOperations'}]`;
+            if (p.query_name) olsSection += ` via query ${p.query_name}`;
+            if (p.constrained_table) olsSection += ` (constrained)`;
+            olsSection += '\n';
+          }
+          olsSection += '\n';
+        }
+      } catch (e) {
+        // security_policies table may not exist in older databases — non-fatal
+        if (process.env.DEBUG_LOGGING === 'true') console.warn('[securityCoverageInfo] security_policies query failed:', e);
+      }
+    }
+
     // ── Step 2: Find menu items targeting this object ──
     // From menu_item_targets table
     let menuItems: any[] = [];
@@ -71,11 +97,14 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
     }
 
     if (menuItems.length === 0) {
+      if (olsSection) output += olsSection;
       output += `No menu items found targeting: ${objName}\n`;
       output += `This object may not be directly exposed via a menu item, or menu item indexing has not been run.\n`;
       output += `\nTip: Security coverage requires both menu item indexing (Phase 1D) and security privilege indexing.\n`;
       return { content: [{ type: 'text', text: output }] };
     }
+
+    if (olsSection) output += olsSection;
 
     output += `Exposed via ${menuItems.length} menu item(s):\n\n`;
 

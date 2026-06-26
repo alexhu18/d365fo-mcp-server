@@ -130,7 +130,9 @@ export interface XppSymbol {
       | 'security-privilege' | 'security-duty' | 'security-role'
       | 'menu-item-display' | 'menu-item-action' | 'menu-item-output'
       | 'table-extension' | 'class-extension' | 'form-extension'
-      | 'enum-extension' | 'edt-extension' | 'data-entity-extension';
+      | 'enum-extension' | 'edt-extension' | 'data-entity-extension'
+      | 'service' | 'service-group'
+      | 'map' | 'configuration-key' | 'license-code' | 'security-policy' | 'macro';
   parentName?: string;
   signature?: string;
   filePath: string;

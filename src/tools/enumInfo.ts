@@ -45,8 +45,5 @@ export async function getEnumInfoTool(request: CallToolRequest, context: XppServ
   }
 }
 
-export const getEnumInfoToolDefinition = {
-  name: 'get_enum_info',
-  description: '🏷️ Extract enum values with labels and numeric values. Essential for understanding available enum options.',
-  inputSchema: GetEnumInfoArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

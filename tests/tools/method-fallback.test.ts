@@ -226,15 +226,14 @@ describe('get_method_signature fallback chain', () => {
     expect(result.content[0].text).toMatch(/obsolete/i);
   });
 
-  it('returns cached result when available', async () => {
-    const cachedResult = { content: [{ type: 'text', text: 'cached: void run()' }] };
-    (ctx.cache.get as any).mockResolvedValueOnce(cachedResult);
-
+  it('falls back to XML when bridge is unavailable', async () => {
+    ctx.bridge = undefined;
     const result = await getMethodSignatureTool(
       req('get_method_signature', { className: 'TestClass', methodName: 'run' }),
       ctx,
     );
-    expect(result).toEqual(cachedResult);
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('run');
   });
 
   it('includes CoC template when includeCocTemplate is true', async () => {

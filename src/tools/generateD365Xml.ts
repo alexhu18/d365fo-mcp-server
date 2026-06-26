@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { getConfigManager } from '../utils/configManager.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../utils/xppDocGen.js';
 import { decodeXmlEntitiesFromXppSource } from './modifyD365File.js';
+import { buildAxSecurityPrivilegeXml } from './securityPrivilegeXml.js';
 
 const GenerateD365XmlArgsSchema = z.object({
   objectType: z
@@ -274,10 +275,6 @@ class XmlTemplateGenerator {
     const implementsAttr = properties?.implements
       ? `\t<Implements>${properties.implements}</Implements>\n`
       : '';
-    const isFinalAttr = properties?.isFinal ? `\t<IsFinal>Yes</IsFinal>\n` : '';
-    const isAbstractAttr = properties?.isAbstract
-      ? `\t<IsAbstract>Yes</IsAbstract>\n`
-      : '';
 
     // D365FO convention: method source is always indented by 4 spaces inside <Source>.
     const indentMethodSource = (src: string): string =>
@@ -296,7 +293,7 @@ class XmlTemplateGenerator {
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 \t<Name>${className}</Name>
-${extendsAttr}${implementsAttr}${isFinalAttr}${isAbstractAttr}\t<SourceCode>
+${extendsAttr}${implementsAttr}\t<SourceCode>
 \t\t<Declaration><![CDATA[
 ${ensureBlankLineBeforeClosingBrace(ensureXppDocComment(declaration))}
 ]]></Declaration>
@@ -1383,31 +1380,10 @@ ${relationsXml}
 </AxMenuExtension>`;
   }
 
+  // Delegates to the shared builder so this mirror and the one in
+  // createD365File.ts cannot drift. @see buildAxSecurityPrivilegeXml.
   static generateAxSecurityPrivilegeXml(name: string, properties?: Record<string, any>): string {
-    const label = properties?.label || '@TODO:LabelId';
-    const targetObject: string | undefined = properties?.targetObject;
-    const objType: string = properties?.objectType || 'MenuItemDisplay';
-
-    let entryPointsXml: string;
-    if (targetObject) {
-      const al = (properties?.accessLevel || 'view').toLowerCase();
-      const grantXml = al === 'maintain'
-        ? '\t\t\t\t<Read>Allow</Read>\n\t\t\t\t<Update>Allow</Update>\n\t\t\t\t<Create>Allow</Create>\n\t\t\t\t<Delete>Allow</Delete>'
-        : '\t\t\t\t<Read>Allow</Read>';
-      entryPointsXml = `\n\t\t<AxSecurityEntryPointReference>\n\t\t\t<Name>${targetObject}</Name>\n\t\t\t<Grant>\n${grantXml}\n\t\t\t</Grant>\n\t\t\t<ObjectName>${targetObject}</ObjectName>\n\t\t\t<ObjectType>${objType}</ObjectType>\n\t\t\t<Forms />\n\t\t</AxSecurityEntryPointReference>\n\t`;
-    } else {
-      entryPointsXml = '';
-    }
-
-    return `<?xml version="1.0" encoding="utf-8"?>
-<AxSecurityPrivilege xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-\t<Name>${name}</Name>
-\t<Label>${label}</Label>
-\t<DataEntityPermissions />
-\t<DirectAccessPermissions />
-\t<EntryPoints>${entryPointsXml}</EntryPoints>
-\t<FormControlOverrides />
-</AxSecurityPrivilege>`;
+    return buildAxSecurityPrivilegeXml(name, properties);
   }
 
   static generateAxSecurityDutyXml(name: string, properties?: Record<string, any>): string {
@@ -1537,7 +1513,7 @@ export async function handleGenerateD365Xml(
 2. **If you see encoding errors**, manually add UTF-8 BOM:
    - Open file in hex editor
    - Ensure first 3 bytes are: EF BB BF (UTF-8 BOM)
-   - Or use create_d365fo_file tool instead (if MCP server runs on local Windows)
+   - Or use d365fo_file(action="create") tool instead (if MCP server runs on local Windows)
 
 3. **Add to Visual Studio project** (.rnrproj):
    <Content Include="${recommendedPath.replace(/\\/g, '\\\\')}" />
@@ -1554,7 +1530,7 @@ ${xmlContent}
 
 ---
 
-💡 **Alternative:** If MCP server runs on local Windows, use \`create_d365fo_file\` tool instead - it handles UTF-8 BOM automatically and adds to VS project.`;
+💡 **Alternative:** If MCP server runs on local Windows, use \`d365fo_file(action="create")\` tool instead - it handles UTF-8 BOM automatically and adds to VS project.`;
 
     return {
       content: [

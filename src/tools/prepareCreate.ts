@@ -2,7 +2,7 @@
  * prepare_create — single-round context aggregator for NEW D365FO objects.
  *
  * Mirror of prepare_change for object creation: one call replaces the
- * search → validate_object_naming → suggest_edt → search_labels → patterns
+ * search → validate_object_naming → suggest_edt → labels → patterns
  * sequence (4–6 agentic rounds) with a single parallel query bundle:
  *   - name collision check (exact + prefix variants) against the symbol index
  *   - naming validation incl. the prefix the write tool will actually apply
@@ -18,6 +18,7 @@ import type { XppServerContext } from '../types/context.js';
 import { createProvenanceToken } from '../utils/provenanceStore.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { resolveObjectPrefix, applyObjectPrefix } from '../utils/modelClassifier.js';
+import { rankContext, renderRankedContext } from '../workspace/contextRanker.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -28,7 +29,7 @@ export const prepareCreateArgsSchema = z.object({
   ),
   objectName: z.string().describe(
     'Proposed BASE name of the new object WITHOUT model prefix ' +
-    '(the same value you would pass to create_d365fo_file). Example: "ImportParameters".',
+    '(the same value you would pass to d365fo_file(action="create")). Example: "ImportParameters".',
   ),
   objectType: z.enum([
     'class', 'table', 'form', 'enum', 'edt', 'query', 'view',
@@ -82,7 +83,7 @@ function validateNaming(baseName: string, finalName: string, modelName: string |
   }
   const lines = [
     `Base name   : ${baseName}`,
-    `Final name  : ${finalName}${finalName !== baseName ? ' _(prefix auto-applied by create_d365fo_file)_' : ''}`,
+    `Final name  : ${finalName}${finalName !== baseName ? ' _(prefix auto-applied by d365fo_file(action="create"))_' : ''}`,
     `Model       : ${modelName ?? '(not configured — set modelName or .mcp.json)'}`,
   ];
   if (issues.length > 0) lines.push(...issues);
@@ -108,7 +109,7 @@ function findSimilarObjects(
     ).all(objectType, `%${needle}%`) as Array<{ name: string; model: string }>;
     if (rows.length > 0) {
       return rows.map(r => `  ${r.name} (${r.model})`).join('\n') +
-        `\n_Use get_${objectType === 'table' ? 'table' : 'class'}_info or copyFrom in generate_smart_* to reuse their structure._`;
+        `\n_Use get_${objectType === 'table' ? 'table' : 'class'}_info or copyFrom in generate_object(mode="scaffold") to reuse their structure._`;
     }
   } catch {
     // ignore
@@ -152,12 +153,12 @@ function findReusableLabels(baseName: string, context: XppServerContext): string
     if (rows.length > 0) {
       return rows
         .map(r => `  @${r.labelFileId}:${r.labelId} = "${r.text}" (${r.model})`)
-        .join('\n') + '\n_Reuse instead of creating duplicates (rule: search_labels before create_label)._';
+        .join('\n') + '\n_Reuse instead of creating duplicates (rule: labels before labels)._';
     }
   } catch {
     // ignore
   }
-  return '(no matching labels — create new ones via create_label)';
+  return '(no matching labels — create new ones via labels)';
 }
 
 /** Mined property defaults for the object type (tables only for now). */
@@ -224,7 +225,7 @@ export async function prepareCreateTool(request: any, context: XppServerContext)
   });
 
   const lines: string[] = [
-    `# prepare_create — ${objectType} \`${finalName}\``,
+    `# prepare(mode="create") — ${objectType} \`${finalName}\``,
     '',
     `**Goal:** ${goal}`,
     '',
@@ -245,12 +246,25 @@ export async function prepareCreateTool(request: any, context: XppServerContext)
   if (propertyDefaults) {
     lines.push('### Property defaults _(mined from standard models)_', propertyDefaults, '');
   }
+
+  // Ranked neighborhood: surface existing code relevant to the goal so the new
+  // object reuses real types/patterns instead of invented ones. Best-effort.
+  try {
+    const ranked = rankContext(context, {
+      intent: `${goal} ${objectName} ${(fieldsHint ?? []).join(' ')}`,
+      activeObject: { name: objectName, type: objectType },
+    });
+    lines.push(...renderRankedContext(ranked), '');
+  } catch {
+    // Additive — omit on failure.
+  }
+
   lines.push('---');
   lines.push(`**Grounding token:** \`${token}\``);
   lines.push('');
   lines.push(
-    'Next: generate the object, run `resolve_references` + `validate_xpp` on the result, ' +
-    `then call \`create_d365fo_file(objectType="${objectType}", objectName="${objectName}", groundingToken=...)\`. ` +
+    'Next: generate the object, run `validate_code(mode="references")` + `validate_code(mode="syntax")` on the result, ' +
+    `then call \`d365fo_file(action="create", objectType="${objectType}", objectName="${objectName}", groundingToken=...)\`. ` +
     'The token is bound to this object and expires in 30 minutes.',
   );
 
@@ -259,14 +273,5 @@ export async function prepareCreateTool(request: any, context: XppServerContext)
   };
 }
 
-export const prepareCreateToolDefinition = {
-  name: 'prepare_create',
-  description:
-    'Single-round context aggregator for creating NEW D365FO objects (mirror of prepare_change). ' +
-    'Returns in ONE call: name collision check, naming validation with the auto-applied prefix, ' +
-    'similar existing objects to copy patterns from, EDT suggestions for planned fields, ' +
-    'reusable labels, mined property defaults (standard-model statistics), and a grounding token. ' +
-    'Replaces the search → validate_object_naming → suggest_edt → search_labels sequence with one call. ' +
-    'Call BEFORE generating any new object.',
-  inputSchema: prepareCreateArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

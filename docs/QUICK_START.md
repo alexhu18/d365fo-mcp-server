@@ -1,24 +1,23 @@
-# Quick Start Guide
+# Quick Start
 
 Get the D365 F&O MCP Server running with GitHub Copilot in 5 steps.
 
-> **Already deployed by your team on Azure?** Skip to [Step 3](#step-3--connect-copilot) —
-> you only need a `.mcp.json` file.
+> **Server already deployed on Azure by your team?** Skip to [Step 3](#step-3--connect-copilot) — you only need a `.mcp.json` file.
+>
+> **Using Claude Code instead of Copilot?** See [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md).
 
 ---
 
-## Step 1 — Install prerequisites
+## Step 1 — Prerequisites
 
-| Requirement | Where to get it |
-|------------|----------------|
-| Visual Studio 2022 ≥ 17.14 (or 2026) | Visual Studio Installer |
-| GitHub Copilot extension | VS → Extensions → Manage Extensions |
-| Node.js 24.x LTS | [nodejs.org](https://nodejs.org) or `Install-D365SupportingSoftware -Name node.js` |
-| Python 3.x | Needed by `node-gyp` for native SQLite — bundled with Node.js installer if checked |
-| .NET Framework 4.8 Developer Pack | Pre-installed on D365FO VMs; or via VS Installer ".NET desktop" workload |
-| Git | [git-scm.com](https://git-scm.com) or `Install-D365SupportingSoftware -Name git` |
-
-> Node.js, Python, and Git are NOT needed if your team uses the Azure-hosted server only (Scenario A).
+| Requirement | Where to get it | Needed for |
+|------------|----------------|------------|
+| Visual Studio 2022 ≥ 17.14 (or 2026) | Visual Studio Installer | all scenarios |
+| GitHub Copilot extension | VS → Extensions | all scenarios |
+| Node.js 24.x LTS | [nodejs.org](https://nodejs.org) or `Install-D365SupportingSoftware -Name node.js` | local / hybrid |
+| Python 3.x | bundled with Node.js installer (check the option) | local / hybrid |
+| .NET Framework 4.8 Dev Pack | pre-installed on D365FO VMs | C# bridge (writes) |
+| Git | [git-scm.com](https://git-scm.com) | local / hybrid |
 
 ---
 
@@ -28,115 +27,84 @@ Get the D365 F&O MCP Server running with GitHub Copilot in 5 steps.
 git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
 cd K:\d365fo-mcp-server
 npm install
+cd bridge\D365MetadataBridge; dotnet build -c Release; cd ..\..   # C# bridge — required for writes
+npm run build
+```
 
-# Build the C# bridge (required for file create/modify on Windows VMs)
-cd bridge\D365MetadataBridge
-dotnet build -c Release
-cd ..\..
+**Local index** (skip for hybrid — the index lives in Azure):
 
-# Copy and edit environment config
-copy .env.example .env
-# Edit .env — set PACKAGES_PATH, CUSTOM_MODELS, LABEL_LANGUAGES
-
-# Extract metadata and build search index
+```powershell
+copy .env.example .env           # set PACKAGES_PATH, CUSTOM_MODELS, LABEL_LANGUAGES
 npm run extract-metadata
 npm run build-database
-
-# Compile TypeScript
-npm run build
 ```
 
 > **UDE / Power Platform Tools?** Run `npm run select-config` instead of setting `PACKAGES_PATH` manually.
 
-> **Hybrid setup?** Skip `extract-metadata` and `build-database` — the index lives in Azure.
-> You only need `npm install` + bridge build + `npm run build`.
-
 ---
-
-> **Using Claude Code CLI instead of GitHub Copilot?** See [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) — different config format (`"mcpServers"` key, `alwaysLoad: true`) and `CLAUDE.md` placement.
 
 ## Step 3 — Connect Copilot
 
-### 3a. Enable MCP in GitHub and Visual Studio
+1. [github.com/settings/copilot/features](https://github.com/settings/copilot/features) → enable **MCP servers in Copilot**
+2. Visual Studio: **Tools → Options → GitHub → Copilot** → enable **MCP server integration in agent mode**
+3. Copilot Chat → switch to **Agent Mode**
+4. Create `.mcp.json` — either `%USERPROFILE%\.mcp.json` (all solutions, recommended) or next to a specific `.sln`
 
-1. Go to **github.com/settings/copilot/features** → enable **MCP servers in Copilot**
-2. In Visual Studio: **Tools → Options → GitHub → Copilot** → enable **"Enable MCP server integration in agent mode"**
-3. Open Copilot Chat → switch to **Agent Mode** (not Ask or Edit)
+Pick your scenario:
 
-### 3b. Create .mcp.json
+| Scenario | What runs where | Best for |
+|----------|----------------|----------|
+| [**A** — Azure client](#a--azure-client) | everything on Azure, read-only | team members |
+| [**B** — Hybrid](#b--hybrid-azure--local-writes) | Azure search + local writes | **teams (recommended)** |
+| [**C** — Local HTTP](#c--local-http) | `npm run dev` on the VM | single developer |
+| [**D** — Local stdio](#d--local-stdio) | VS spawns the process | single developer, zero-config |
+| **E** — UDE | stdio + XPP config auto-detection | UDE / Power Platform Tools — [SETUP.md](SETUP.md#scenario-d-ude-unified-developer-experience) |
+| **F** — Multi-instance | one machine, several clients | agencies — [SETUP.md](SETUP.md#scenario-f-multiple-instances--one-machine-multiple-d365fo-environments) |
 
-Place the file in one of these locations:
-- `%USERPROFILE%\.mcp.json` — covers all solutions on the machine (recommended)
-- Next to a specific `.sln` file — covers only that solution
-
-Pick the scenario that matches your setup:
-
----
-
-#### Scenario A: Azure read-only (most teams)
-
-Your team runs the MCP server on Azure. You only connect as a client — no local server needed.
+### A — Azure client
 
 ```json
 {
   "servers": {
-    "d365fo-mcp-tools": {
-      "url": "https://your-server.azurewebsites.net/mcp/"
-    }
+    "d365fo-mcp-tools": { "url": "https://your-server.azurewebsites.net/mcp/" }
   }
 }
 ```
 
-> Read-only. Cannot create/modify files on your local VM. Use Scenario B if you need writes.
+> Read-only — cannot write files on your VM. Use **B** for writes.
 
----
-
-#### Scenario B: Hybrid — Azure search + local writes (recommended for teams)
-
-Azure handles metadata search. A local companion handles file creation/modification.
+### B — Hybrid (Azure + local writes)
 
 ```json
 {
   "servers": {
-    "d365fo-azure": {
-      "url": "https://your-server.azurewebsites.net/mcp/"
-    },
+    "d365fo-azure": { "url": "https://your-server.azurewebsites.net/mcp/" },
     "d365fo-local": {
       "command": "node",
       "args": ["K:\\d365fo-mcp-server\\dist\\index.js"],
       "env": {
         "MCP_SERVER_MODE": "write-only",
         "D365FO_SOLUTIONS_PATH": "K:\\repos\\MySolution\\projects",
-        "D365FO_WORKSPACE_PATH": "K:\\AosService\\PackagesLocalDirectory\\YourPackageName\\YourModelName"
+        "D365FO_WORKSPACE_PATH": "K:\\AosService\\PackagesLocalDirectory\\YourPackage\\YourModel"
       }
     }
   }
 }
 ```
 
----
-
-#### Scenario C: Local server only (single developer)
-
-Everything runs on your development VM — both search and writes.
+### C — Local HTTP
 
 ```json
 {
   "servers": {
-    "d365fo-mcp-tools": {
-      "url": "http://localhost:8080/mcp/"
-    }
+    "d365fo-mcp-tools": { "url": "http://localhost:8080/mcp/" }
   }
 }
 ```
 
-Start the server: `cd K:\d365fo-mcp-server && npm run dev`
+Start with `cd K:\d365fo-mcp-server && npm run dev`.
 
----
-
-#### Scenario D: Local stdio — zero-config (single developer)
-
-No HTTP server — Copilot spawns the process directly. Requires a pre-built database.
+### D — Local stdio
 
 ```json
 {
@@ -145,244 +113,78 @@ No HTTP server — Copilot spawns the process directly. Requires a pre-built dat
       "command": "node",
       "args": ["K:\\d365fo-mcp-server\\dist\\index.js"],
       "env": {
+        "MCP_SERVER_MODE": "full",
         "DB_PATH": "K:\\d365fo-mcp-server\\data\\xpp-metadata.db",
         "LABELS_DB_PATH": "K:\\d365fo-mcp-server\\data\\xpp-metadata-labels.db",
         "D365FO_SOLUTIONS_PATH": "K:\\repos\\MySolution\\projects",
-        "D365FO_WORKSPACE_PATH": "K:\\AosService\\PackagesLocalDirectory\\YourPackageName\\YourModelName"
+        "D365FO_PACKAGE_PATH": "K:\\AosService\\PackagesLocalDirectory"
       }
     }
   }
 }
 ```
 
-> **UDE?** Replace `D365FO_WORKSPACE_PATH` with `D365FO_MODEL_NAME` + `D365FO_DEV_ENVIRONMENT_TYPE=ude`. See [Scenario D in SETUP.md](SETUP.md#scenario-d-ude-unified-developer-experience).
-
----
-
-#### Scenario F: Multiple instances (one machine, multiple clients)
-
-Running several D365FO environments from a single installation?
-Use the `instances\add-instance.ps1` / `instances\rebuild-instance.ps1` / `instances\run-instance.ps1` scripts — each
-instance gets its own `.env`, own database, and own port. Point a per-solution `.mcp.json`
-at the correct port for seamless per-project Copilot context.
-See [Scenario F in SETUP.md](SETUP.md#scenario-f-multiple-instances--one-machine-multiple-d365fo-environments) for the full walkthrough.
+> Complete parameter reference (every env var, per-scenario matrix): [MCP_CONFIG.md](MCP_CONFIG.md)
 
 ---
 
 ## Step 4 — Place copilot-instructions.md
 
-Copy the bootstrap instruction file so Copilot has minimal D365FO context even before
-the MCP server connects:
-
 ```powershell
-# Place .github in a parent folder shared by all D365FO solutions:
+# One copy in a common parent folder covers all solutions beneath it
 Copy-Item -Path ".github" -Destination "C:\source\repos\" -Recurse
 ```
 
-VS 2022 searches for `.github\copilot-instructions.md` upward from the `.sln` folder —
-one copy in a common parent covers all solutions underneath.
-
-> **Note:** This file is intentionally small (~50 lines). The complete X++ rules, query
-> grammar, and workflow details are delivered at runtime via the MCP prompt
-> `xpp_system_instructions`. The bootstrap file only ensures correct tool routing if the
-> MCP server hasn't connected yet.
+VS 2022 searches for `.github\copilot-instructions.md` upward from the solution folder. **This step is not optional** — it delivers the workflow rules (tool routing, confirm-before-write, terminal prohibition) that the agent relies on.
 
 ---
 
 ## Step 5 — Verify
 
-Open Copilot Chat in Agent Mode and type:
+| Test | Prompt | Confirms |
+|------|--------|----------|
+| Search | `What tables contain "CustAccount" field?` | index + connection |
+| Write | `Create a class TestHelper with a static method hello()` | C# bridge |
+| Forms | `Which form pattern should I use for a setup table with 5 fields?` | pattern advisor |
 
-```
-What tables contain "CustAccount" field?
-```
-
-Copilot should call the `search` tool and return results from your D365FO codebase.
-If it works, the MCP server is connected and operational.
-
-For file operations, try:
-
-```
-Create a new class called TestHelper with a static method hello() that returns "Hello"
-```
-
-If this creates a file on disk, the C# bridge is working.
-
----
-
-## Complete .mcp.json Reference
-
-All available parameters in one block with comments:
-
-```jsonc
-{
-  "servers": {
-    // ── HTTP server entry (Azure or local npm run dev) ──────────────
-    "d365fo-azure": {
-      "url": "https://your-server.azurewebsites.net/mcp/"
-      // Used in: Scenario A, B
-    },
-
-    // ── stdio / write-only companion ─────────────────────────────────
-    "d365fo-local": {
-      "command": "node",
-      "args": ["K:\\d365fo-mcp-server\\dist\\index.js"],
-      "env": {
-        // ── Server mode ──────────────────────────────────────────────
-        // "full"       — All 58 tools (default for local)
-        // "read-only"  — search/analysis tools only (Azure deployment)
-        // "write-only" — file operations only (local companion in hybrid)
-        "MCP_SERVER_MODE": "write-only",
-
-        // ── Database paths (not needed for write-only) ──────────────
-        "DB_PATH": "K:\\d365fo-mcp-server\\data\\xpp-metadata.db",
-        "LABELS_DB_PATH": "K:\\d365fo-mcp-server\\data\\xpp-metadata-labels.db",
-
-        // ── Solutions auto-scan ─────────────────────────────────────
-        // Path to folder containing your .sln/.rnrproj files.
-        // Server scans this to auto-detect projectPath and modelName.
-        "D365FO_SOLUTIONS_PATH": "K:\\repos\\MySolution\\projects",
-
-        // ── Logging ─────────────────────────────────────────────────
-        // "DEBUG_LOGGING": "true",               // verbose JSON-RPC trace
-        // "LOG_FILE": "C:\\Temp\\d365fo-mcp.log" // tee all output to file
-
-        // ── Label options ───────────────────────────────────────────
-        // "LABEL_SORT_ORDER": "append"            // "alphabetical" (default) or "append"
-
-        // ── HTTP port (only for npm run dev, not stdio) ─────────────
-        // "PORT": "8080",
-
-        // ── D365FO context (replaces old "context" block) ───────────
-        // Required: Two-level path PackagesLocalDirectory\Package\Model
-        // Server auto-derives packagePath, packageName, modelName.
-        "D365FO_WORKSPACE_PATH": "K:\\AosService\\PackagesLocalDirectory\\YourPackageName\\YourModelName",
-
-        // Optional overrides:
-        // "D365FO_PACKAGE_PATH": "K:\\AosService\\PackagesLocalDirectory",
-        // "D365FO_MODEL_NAME": "YourModelName",
-        // "D365FO_PROJECT_PATH": "K:\\repos\\MySolution\\YourModel\\YourModel.rnrproj",
-        // "D365FO_SOLUTION_PATH": "K:\\repos\\MySolution\\MySolution.sln",
-
-        // UDE (Power Platform Tools):
-        // "D365FO_DEV_ENVIRONMENT_TYPE": "auto",
-        // "D365FO_CUSTOM_PACKAGES_PATH": "C:\\Users\\you\\AppData\\Local\\...\\CustomPackages",
-        // "D365FO_MICROSOFT_PACKAGES_PATH": "C:\\Users\\you\\AppData\\Local\\...\\PackagesLocalDirectory",
-
-        // Bridge diagnostics:
-        // "D365FO_BRIDGE_LOG_FILE": "C:\\Temp\\d365fo-bridge.log"
-      }
-    }
-  }
-}
-```
-
-### Parameters by scenario
-
-| Parameter | A (Azure) | B (Hybrid) | C (Local HTTP) | D (Local stdio) |
-|-----------|:---------:|:----------:|:--------------:|:---------------:|
-| `url` | **required** | **required** (Azure) | **required** | — |
-| `command` + `args` | — | **required** (local) | — | **required** |
-| `MCP_SERVER_MODE` | — | `write-only` | `full` (default) | `full` (default) |
-| `D365FO_WORKSPACE_PATH` | — | **required** | **required** | **required** |
-| `D365FO_PACKAGE_PATH` | — | optional | optional | optional |
-| `D365FO_MODEL_NAME` | — | optional | optional | optional |
-| `D365FO_PROJECT_PATH` | — | recommended | optional | optional |
-| `D365FO_SOLUTION_PATH` | — | optional | optional | optional |
-| `D365FO_SOLUTIONS_PATH` | — | recommended | optional | optional |
-| `DB_PATH` | — | optional | auto | auto |
-| `LABELS_DB_PATH` | — | optional | auto | auto |
-| `D365FO_DEV_ENVIRONMENT_TYPE` | — | optional | optional | optional |
-| `D365FO_CUSTOM_PACKAGES_PATH` | — | — | UDE only | UDE only |
-| `D365FO_MICROSOFT_PACKAGES_PATH` | — | — | UDE only | UDE only |
-| `D365FO_BRIDGE_LOG_FILE` | — | optional | optional | optional |
-| `DEBUG_LOGGING` | — | optional | optional | optional |
-| `LOG_FILE` | — | optional | optional | optional |
-| `LABEL_SORT_ORDER` | — | optional | optional | optional |
+If the first prompt triggers a `search` tool call with results from your codebase, you are connected.
 
 ---
 
 ## Logging & Diagnostics
 
-When something isn't working, enable logging to see what the server is doing.
-
-### Node.js server logging
-
-Add these environment variables to the `env` block in `.mcp.json`:
+Add to the `env` block in `.mcp.json` when something isn't working:
 
 | Variable | Effect |
 |----------|--------|
-| `DEBUG_LOGGING=true` | Enables verbose output: JSON-RPC request/response trace, bridge communication details, tool routing decisions |
-| `LOG_FILE=C:\Temp\d365fo-mcp.log` | Tees all server output (stderr) to a file in append mode. Useful when VS Output window is truncated or noisy |
-
-Example:
-
-```json
-"env": {
-  "MCP_SERVER_MODE": "write-only",
-  "DEBUG_LOGGING": "true",
-  "LOG_FILE": "C:\\Temp\\d365fo-mcp.log"
-}
-```
-
-Watch the log live:
+| `DEBUG_LOGGING=true` | Verbose JSON-RPC trace, bridge communication, tool routing |
+| `LOG_FILE=C:\Temp\d365fo-mcp.log` | Tee all server output to a file |
+| `D365FO_BRIDGE_LOG_FILE=C:\Temp\d365fo-bridge.log` | Full C# bridge diagnostics (DLL loading, write tracing) |
 
 ```powershell
-Get-Content "C:\Temp\d365fo-mcp.log" -Encoding UTF8 -Wait
+Get-Content "C:\Temp\d365fo-mcp.log" -Encoding UTF8 -Wait    # watch live
 ```
 
-### C# bridge logging
-
-The bridge writes diagnostics to stderr. By default, only `[ERROR]` and `[WARN]` lines
-are forwarded to the Node.js server. To capture everything (including `[DEBUG]`, `[INFO]`,
-write tracing, form control traversal, etc.), set `D365FO_BRIDGE_LOG_FILE` in the `env` block:
-
-```json
-"env": {
-  "D365FO_WORKSPACE_PATH": "K:\\AosService\\PackagesLocalDirectory\\...",
-  "D365FO_BRIDGE_LOG_FILE": "C:\\Temp\\d365fo-bridge.log"
-}
-```
-
-When set, the bridge tees all stderr to the log file (append mode) and the Node.js server
-forwards all bridge lines (not just errors/warnings).
-
-Bridge log levels: `[DEBUG]`, `[INFO]`, `[WARN]`, `[ERROR]`, `[FATAL]`, `[ASSEMBLY]`
-
-Watch the log live:
-
-```powershell
-Get-Content "C:\Temp\d365fo-bridge.log" -Encoding UTF8 -Wait -Tail 50
-```
-
-### Verifying bridge health
-
-After starting, check the server log for:
+Healthy startup log:
 
 ```
 ✅ C# bridge initialized (metadataAvailable: true, xrefAvailable: true)
 ```
 
-| What you see | Meaning |
-|---|---|
-| `metadataAvailable: true` | Bridge loaded D365FO DLLs — all tools work |
-| `metadataAvailable: false` | DLL loading failed — check `packagePath` and `.NET 4.8` |
-| `xrefAvailable: true` | SQL Server + `DYNAMICSXREFDB` accessible — cross-references work |
-| `xrefAvailable: false` | SQL not available — non-critical, tools fall back to SQLite FTS |
+| Flag | Meaning |
+|------|---------|
+| `metadataAvailable: false` | D365FO DLLs not loaded — check `packagePath` and .NET 4.8 |
+| `xrefAvailable: false` | `DYNAMICSXREFDB` unreachable — non-critical, tools fall back to SQLite |
 
 ---
 
-## What's next?
+## What's next
 
 | Topic | Documentation |
 |-------|--------------|
-| All 58 tools with parameters | [MCP_TOOLS.md](MCP_TOOLS.md) |
-| Practical usage examples (CoC, reports, security) | [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) |
-| Complete `.mcp.json` reference (all properties) | [MCP_CONFIG.md](MCP_CONFIG.md) |
-| Server deployment to Azure | [SETUP.md](SETUP.md) / [SETUP_AZURE.md](SETUP_AZURE.md) |
-| Multiple instances on one machine | [SETUP.md — Scenario F](SETUP.md#scenario-f-multiple-instances--one-machine-multiple-d365fo-environments) |
-| C# Bridge internals | [BRIDGE.md](BRIDGE.md) |
-| Architecture overview | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| ISV / custom model configuration | [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) |
-| Azure DevOps pipelines | [PIPELINES.md](PIPELINES.md) |
-| **Claude Code CLI setup** | [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) |
+| All 26 tools | [MCP_TOOLS.md](MCP_TOOLS.md) |
+| Real-world tool chains (CoC, forms, security, reports) | [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) |
+| Full `.mcp.json` reference | [MCP_CONFIG.md](MCP_CONFIG.md) |
+| Detailed setup scenarios A–F | [SETUP.md](SETUP.md) |
+| Azure deployment | [SETUP_AZURE.md](SETUP_AZURE.md) |
+| Claude Code CLI | [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) |

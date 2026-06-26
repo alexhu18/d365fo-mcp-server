@@ -128,10 +128,10 @@ Strategies:
 - additionalDatasets: extra TmpTables + DP getters for multi-dataset reports
 
 Examples:
-- generate_smart_report(name="InventByZones", fieldsHint="ItemId, ItemName, Qty, Zone", caption="Inventory by Zones")
-- generate_smart_report(name="CustBalance", fieldsHint="CustAccount, Name, Balance", contractParams=[{name:"FromDate",type:"TransDate",mandatory:true},{name:"ToDate",type:"TransDate"}])
-- generate_smart_report(name="SalesReport", copyFrom="SalesInvoice", designStyle="GroupedWithTotals")
-- generate_smart_report(name="CustOpenItems", fieldsHint="CustAccount, Amount, DueDate", callerTableName="CustTable", aotQuery="CustOpenTrans")`,
+- generate_object(mode="scaffold", objectType="report", name="InventByZones", fieldsHint="ItemId, ItemName, Qty, Zone", caption="Inventory by Zones")
+- generate_object(mode="scaffold", objectType="report", name="CustBalance", fieldsHint="CustAccount, Name, Balance", contractParams=[{name:"FromDate",type:"TransDate",mandatory:true},{name:"ToDate",type:"TransDate"}])
+- generate_object(mode="scaffold", objectType="report", name="SalesReport", copyFrom="SalesInvoice", designStyle="GroupedWithTotals")
+- generate_object(mode="scaffold", objectType="report", name="CustOpenItems", fieldsHint="CustAccount, Amount, DueDate", callerTableName="CustTable", aotQuery="CustOpenTrans")`,
   inputSchema: {
     type: 'object',
     properties: {
@@ -428,7 +428,7 @@ export async function handleGenerateSmartReport(
           `- \`fields=[{name:"ItemId", edt:"ItemId"}, ...]\` — structured specs`,
           `- \`copyFrom="ExistingReport"\` — copy from another report's TmpTable`,
           ``,
-          `⛔ No XML has been generated. Call \`generate_smart_report\` again with fields.`,
+          `⛔ No XML has been generated. Call \`generate_object(mode="scaffold", objectType="report")\` again with fields.`,
         ].join('\n'),
       }],
       isError: true,
@@ -488,7 +488,7 @@ export async function handleGenerateSmartReport(
     type: resolveFieldType(f.edt, rdb),
   }));
 
-  const builder = new SmartXmlBuilder();
+  const builder = new SmartXmlBuilder(symbolIndex);
   const tmpTableXml = builder.buildTableXml({
     name: tmpTableName,
     label: `${reportCaption} (temp)`,
@@ -999,7 +999,7 @@ export async function handleGenerateSmartReport(
     const createCalls = generatedObjects.map(o => {
       return [
         `\`\`\``,
-        `create_d365fo_file(`,
+        `d365fo_file(action="create", `,
         `  objectType="${o.objectType}",`,
         `  objectName="${o.objectName}",`,
         `  xmlContent="<XML block #${generatedObjects.indexOf(o) + 1} below>",`,
@@ -1028,7 +1028,7 @@ export async function handleGenerateSmartReport(
           ``,
           `ℹ️ MCP server is running on Azure/Linux — file writing is handled by the local Windows companion.`,
           ``,
-          `**✅ MANDATORY NEXT STEPS — call \`create_d365fo_file\` for EACH object below, in this order:**`,
+          `**✅ MANDATORY NEXT STEPS — call \`d365fo_file(action="create")\` for EACH object below, in this order:**`,
           ``,
           createCalls,
           ``,
@@ -1072,7 +1072,7 @@ export async function handleGenerateSmartReport(
 
     // Guard: refuse to overwrite existing table files (would destroy existing methods, fields, etc.)
     if (obj.objectType === 'table' && fs.existsSync(normalizedPath)) {
-      results.push(`⚠️ ${obj.objectType}: ${normalizedPath} — SKIPPED (file already exists, would destroy existing content). Use \`modify_d365fo_file\` to modify existing tables.`);
+      results.push(`⚠️ ${obj.objectType}: ${normalizedPath} — SKIPPED (file already exists, would destroy existing content). Use \`d365fo_file(action="modify")\` to modify existing tables.`);
       log(`Skipped existing table: ${normalizedPath}`);
       continue;
     }
@@ -1108,8 +1108,8 @@ export async function handleGenerateSmartReport(
         `📦 Model: ${resolvedModel}`,
         results.join('\n'),
         ``,
-        `⛔ DO NOT call \`create_d365fo_file\` — all files are already written to disk.`,
-        `⛔ DO NOT call \`generate_smart_report\` again — task is COMPLETE.`,
+        `⛔ DO NOT call \`d365fo_file(action="create")\` — all files are already written to disk.`,
+        `⛔ DO NOT call \`generate\` again — task is COMPLETE.`,
         ``,
         `Next steps:`,
         `1. Open Visual Studio and reload the project (close/reopen solution)`,

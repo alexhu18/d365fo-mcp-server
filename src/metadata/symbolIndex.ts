@@ -487,6 +487,29 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_form_datasources_model ON form_datasources(model);
     `);
 
+    // Form Patterns — mined Pattern/PatternVersion per Design node and
+    // sub-patterned container (node_path 'Design' = the form's top-level pattern).
+    // Grounds pattern recommendations ("real forms using pattern X") and
+    // cross-checks the curated catalog against actual metadata.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS form_patterns (
+        form_name TEXT NOT NULL,
+        model TEXT NOT NULL,
+        node_path TEXT NOT NULL,
+        control_name TEXT NOT NULL DEFAULT '',
+        control_type TEXT NOT NULL DEFAULT '',
+        pattern TEXT NOT NULL,
+        pattern_version TEXT,
+        child_sequence TEXT,
+        PRIMARY KEY (form_name, node_path)
+      );
+    `);
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_form_patterns_pattern ON form_patterns(pattern, pattern_version);
+      CREATE INDEX IF NOT EXISTS idx_form_patterns_model ON form_patterns(model);
+    `);
+
     // EDT Metadata - for EDT suggestion and validation
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS edt_metadata (
@@ -497,11 +520,22 @@ export class XppSymbolIndex {
         reference_table TEXT,
         relation_type TEXT,
         string_size TEXT,
+        database_string_size TEXT,
         display_length TEXT,
         label TEXT,
         model TEXT NOT NULL
       );
     `);
+
+    // Migrate existing edt_metadata table: add database_string_size column when missing
+    {
+      const existingCols = new Set(
+        (this.db.pragma('table_info(edt_metadata)') as Array<{ name: string }>).map(r => r.name)
+      );
+      if (!existingCols.has('database_string_size')) {
+        this.db.exec(`ALTER TABLE edt_metadata ADD COLUMN database_string_size TEXT;`);
+      }
+    }
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_edt_metadata_name ON edt_metadata(edt_name);
@@ -622,6 +656,84 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_em_type ON extension_metadata(extension_type);
       CREATE INDEX IF NOT EXISTS idx_em_name ON extension_metadata(extension_name);
       CREATE INDEX IF NOT EXISTS idx_em_model ON extension_metadata(model);
+    `);
+
+    // ── Service Operations & Service Group Membership ─────────────────────────
+    // AxService → exposed operations (each maps to a public method on the class).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS service_operations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        service_name TEXT NOT NULL,
+        operation_name TEXT NOT NULL,
+        method_name TEXT NOT NULL,
+        idempotent INTEGER NOT NULL DEFAULT 0,
+        model TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_so_service ON service_operations(service_name);
+      CREATE INDEX IF NOT EXISTS idx_so_model ON service_operations(model);
+    `);
+
+    // AxServiceGroup → member services. Enables the service→group reverse lookup
+    // used to compute the /api/services/<group>/<service>/<operation> endpoint.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS service_group_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_name TEXT NOT NULL,
+        service_name TEXT NOT NULL,
+        model TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sgm_group ON service_group_members(group_name);
+      CREATE INDEX IF NOT EXISTS idx_sgm_service ON service_group_members(service_name);
+      CREATE INDEX IF NOT EXISTS idx_sgm_model ON service_group_members(model);
+    `);
+
+    // ── Map Mappings ──────────────────────────────────────────────────────────
+    // AxMap → tables it maps onto (with field-connection counts).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS map_mappings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        map_name TEXT NOT NULL,
+        mapping_table TEXT NOT NULL,
+        field_connections INTEGER NOT NULL DEFAULT 0,
+        model TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mm_map ON map_mappings(map_name);
+      CREATE INDEX IF NOT EXISTS idx_mm_table ON map_mappings(mapping_table);
+      CREATE INDEX IF NOT EXISTS idx_mm_model ON map_mappings(model);
+    `);
+
+    // ── Security Policies (row-level / OLS) ───────────────────────────────────
+    // Indexed by primary table so get_security_coverage_for_object can report
+    // which OLS policies constrain a given table.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS security_policies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        policy_name TEXT NOT NULL,
+        primary_table TEXT,
+        query_name TEXT,
+        operation TEXT,
+        constrained_table INTEGER NOT NULL DEFAULT 0,
+        label TEXT,
+        model TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sp_policy ON security_policies(policy_name);
+      CREATE INDEX IF NOT EXISTS idx_sp_table ON security_policies(primary_table);
+      CREATE INDEX IF NOT EXISTS idx_sp_model ON security_policies(model);
+    `);
+
+    // ── Macro Defines ─────────────────────────────────────────────────────────
+    // AxMacroDictionary → its #define entries.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS macro_defines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        macro_name TEXT NOT NULL,
+        define_name TEXT NOT NULL,
+        define_value TEXT,
+        model TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_md_macro ON macro_defines(macro_name);
+      CREATE INDEX IF NOT EXISTS idx_md_define ON macro_defines(define_name);
+      CREATE INDEX IF NOT EXISTS idx_md_model ON macro_defines(model);
     `);
   }
 
@@ -1180,6 +1292,29 @@ export class XppSymbolIndex {
         const deExtPath = path.join(modelPath, 'data-entity-extensions');
         if (fs.existsSync(deExtPath)) this.indexExtensions(deExtPath, model, 'data-entity-extension');
 
+        // Services + service groups
+        const servicesPath = path.join(modelPath, 'services');
+        if (fs.existsSync(servicesPath)) this.indexServices(servicesPath, model);
+
+        const serviceGroupsPath = path.join(modelPath, 'service-groups');
+        if (fs.existsSync(serviceGroupsPath)) this.indexServiceGroups(serviceGroupsPath, model);
+
+        // Maps, feature gating, security policies, macros
+        const mapsPath = path.join(modelPath, 'maps');
+        if (fs.existsSync(mapsPath)) this.indexMaps(mapsPath, model);
+
+        const configKeysPath = path.join(modelPath, 'configuration-keys');
+        if (fs.existsSync(configKeysPath)) this.indexConfigurationKeys(configKeysPath, model);
+
+        const licenseCodesPath = path.join(modelPath, 'license-codes');
+        if (fs.existsSync(licenseCodesPath)) this.indexLicenseCodes(licenseCodesPath, model);
+
+        const securityPoliciesPath = path.join(modelPath, 'security-policies');
+        if (fs.existsSync(securityPoliciesPath)) this.indexSecurityPolicies(securityPoliciesPath, model);
+
+        const macrosPath = path.join(modelPath, 'macros');
+        if (fs.existsSync(macrosPath)) this.indexMacros(macrosPath, model);
+
         // Flush buffered property_stats observations (batch write — much faster than
         // per-field upserts scattered across the transaction)
         this.flushPropertyStats();
@@ -1526,12 +1661,13 @@ export class XppSymbolIndex {
 
         // Add extended EDT metadata to new table — always insert when any property is present
         if (edtData.extends || edtData.enumType || edtData.referenceTable ||
-            edtData.stringSize || edtData.displayLength || edtData.label) {
+            edtData.stringSize || edtData.displayLength || edtData.label ||
+            edtData.databaseStringSize) {
           const stmt = this.db.prepare(`
             INSERT OR REPLACE INTO edt_metadata (
               edt_name, extends, enum_type, reference_table, relation_type,
-              string_size, display_length, label, model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              string_size, database_string_size, display_length, label, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `);
           
           stmt.run(
@@ -1541,6 +1677,7 @@ export class XppSymbolIndex {
             edtData.referenceTable || null,
             edtData.relationType || null,
             edtData.stringSize || null,
+            edtData.databaseStringSize || null,
             edtData.displayLength || null,
             edtData.label || null,
             model
@@ -1598,6 +1735,39 @@ export class XppSymbolIndex {
           model,
           description: formData.caption || formData.label,
         });
+
+        // Index mined pattern nodes (Design + sub-patterned containers) and
+        // record pattern distribution stats for the advisor/cross-check.
+        if (formData.patternNodes && Array.isArray(formData.patternNodes)) {
+          const patternStmt = this.db.prepare(`
+            INSERT OR REPLACE INTO form_patterns (
+              form_name, model, node_path, control_name, control_type,
+              pattern, pattern_version, child_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+          for (const node of formData.patternNodes) {
+            if (!node?.pattern || !node?.nodePath) continue;
+            patternStmt.run(
+              formName,
+              model,
+              node.nodePath,
+              node.controlName ?? '',
+              node.controlType ?? '',
+              node.pattern,
+              node.patternVersion ?? null,
+              JSON.stringify(node.childSequence ?? []),
+            );
+            if (node.nodePath === 'Design') {
+              this.recordPropertyStat('AxFormDesign', 'Pattern', node.pattern, model);
+              this.recordPropertyStat(
+                'AxFormDesign',
+                `PatternVersion:${node.pattern}`,
+                node.patternVersion ?? '(absent)',
+                model,
+              );
+            }
+          }
+        }
 
         // Index form datasources to new table
         if (formData.dataSources && Array.isArray(formData.dataSources)) {
@@ -1878,6 +2048,217 @@ export class XppSymbolIndex {
         );
       } catch (error) {
         console.error(`      ⚠️  Skipped menu-item-${menuItemType} ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexServices(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    const insertOp = this.db.prepare(`
+      INSERT INTO service_operations
+        (service_name, operation_name, method_name, idempotent, model)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const sourceFilePath = data.sourcePath || filePath;
+        const name = data.name || path.basename(file, '.json');
+
+        // signature carries the backing class; description carries the external name
+        // so both surface in search/FTS without an extra lookup.
+        this.addSymbol({
+          name,
+          type: 'service',
+          filePath: sourceFilePath,
+          model,
+          signature: data.serviceClass || undefined,
+          description: data.externalName || undefined,
+        });
+
+        if (Array.isArray(data.operations)) {
+          for (const op of data.operations) {
+            if (!op?.name) continue;
+            insertOp.run(name, op.name, op.method || op.name, op.idempotent ? 1 : 0, model);
+          }
+        }
+      } catch (error) {
+        console.error(`      ⚠️  Skipped service ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexServiceGroups(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    const insertMember = this.db.prepare(`
+      INSERT INTO service_group_members (group_name, service_name, model)
+      VALUES (?, ?, ?)
+    `);
+
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const sourceFilePath = data.sourcePath || filePath;
+        const name = data.name || path.basename(file, '.json');
+
+        this.addSymbol({
+          name,
+          type: 'service-group',
+          filePath: sourceFilePath,
+          model,
+          description: data.description || undefined,
+        });
+
+        if (Array.isArray(data.services)) {
+          for (const svc of data.services) {
+            if (!svc) continue;
+            insertMember.run(name, svc, model);
+          }
+        }
+      } catch (error) {
+        console.error(`      ⚠️  Skipped service-group ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexMaps(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    const insertMapping = this.db.prepare(`
+      INSERT INTO map_mappings (map_name, mapping_table, field_connections, model)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const name = data.name || path.basename(file, '.json');
+        this.addSymbol({
+          name,
+          type: 'map',
+          filePath: data.sourcePath || filePath,
+          model,
+          extendsClass: data.extends || undefined,
+        });
+        if (Array.isArray(data.mappings)) {
+          for (const m of data.mappings) {
+            if (!m?.table) continue;
+            insertMapping.run(name, m.table, m.fieldConnections || 0, model);
+          }
+        }
+      } catch (error) {
+        console.error(`      ⚠️  Skipped map ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexConfigurationKeys(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const name = data.name || path.basename(file, '.json');
+        // signature carries the parent key so the gating tree is queryable from search.
+        this.addSymbol({
+          name,
+          type: 'configuration-key',
+          filePath: data.sourcePath || filePath,
+          model,
+          description: data.label || undefined,
+          signature: data.parentKey || undefined,
+        });
+      } catch (error) {
+        console.error(`      ⚠️  Skipped configuration-key ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexLicenseCodes(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const name = data.name || path.basename(file, '.json');
+        // signature: "Group/Type" compact descriptor for search hits.
+        const sig = [data.group, data.type].filter(Boolean).join(' / ') || undefined;
+        this.addSymbol({
+          name,
+          type: 'license-code',
+          filePath: data.sourcePath || filePath,
+          model,
+          description: data.label || undefined,
+          signature: sig,
+        });
+      } catch (error) {
+        console.error(`      ⚠️  Skipped license-code ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexSecurityPolicies(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    const insertPolicy = this.db.prepare(`
+      INSERT INTO security_policies
+        (policy_name, primary_table, query_name, operation, constrained_table, label, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const name = data.name || path.basename(file, '.json');
+        this.addSymbol({
+          name,
+          type: 'security-policy',
+          filePath: data.sourcePath || filePath,
+          model,
+          description: data.label || undefined,
+          signature: data.primaryTable || undefined,
+        });
+        insertPolicy.run(
+          name,
+          data.primaryTable || null,
+          data.query || null,
+          data.operation || null,
+          data.constrainedTable ? 1 : 0,
+          data.label || null,
+          model,
+        );
+      } catch (error) {
+        console.error(`      ⚠️  Skipped security-policy ${file}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  private indexMacros(dirPath: string, model: string): void {
+    const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
+    const insertDefine = this.db.prepare(`
+      INSERT INTO macro_defines (macro_name, define_name, define_value, model)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const file of files) {
+      try {
+        const filePath = path.join(dirPath, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const name = data.name || path.basename(file, '.json');
+        this.addSymbol({
+          name,
+          type: 'macro',
+          filePath: data.sourcePath || filePath,
+          model,
+        });
+        if (Array.isArray(data.defines)) {
+          for (const d of data.defines) {
+            if (!d?.name) continue;
+            insertDefine.run(name, d.name, d.value ?? '', model);
+          }
+        }
+      } catch (error) {
+        console.error(`      ⚠️  Skipped macro ${file}: ${error instanceof Error ? error.message : error}`);
       }
     }
   }
@@ -2506,12 +2887,18 @@ export class XppSymbolIndex {
     this.db.exec('DELETE FROM symbols');
     this.db.exec('DELETE FROM table_relations');
     this.db.exec('DELETE FROM form_datasources');
+    this.db.exec('DELETE FROM form_patterns');
     this.db.exec('DELETE FROM edt_metadata');
     this.db.exec('DELETE FROM security_privilege_entries');
     this.db.exec('DELETE FROM security_duty_privileges');
     this.db.exec('DELETE FROM security_role_duties');
     this.db.exec('DELETE FROM menu_item_targets');
     this.db.exec('DELETE FROM extension_metadata');
+    this.db.exec('DELETE FROM service_operations');
+    this.db.exec('DELETE FROM service_group_members');
+    this.db.exec('DELETE FROM map_mappings');
+    this.db.exec('DELETE FROM security_policies');
+    this.db.exec('DELETE FROM macro_defines');
     this.db.exec('DELETE FROM property_stats');
     this.vacuum();
   }
@@ -2535,12 +2922,18 @@ export class XppSymbolIndex {
       this.db.prepare(`DELETE FROM symbols WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM table_relations WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM form_datasources WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM form_patterns WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM edt_metadata WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM security_privilege_entries WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM security_duty_privileges WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM security_role_duties WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM menu_item_targets WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM extension_metadata WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM service_operations WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM service_group_members WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM map_mappings WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM security_policies WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM macro_defines WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM property_stats WHERE model IN (${placeholders})`).run(...modelNames);
     });
     deleteAll();
@@ -2958,6 +3351,26 @@ export class XppSymbolIndex {
       GROUP BY label_file_id, model
       ORDER BY label_file_id
     `).all() as any[];
+  }
+
+  /**
+   * Get the physical .label.txt file path for each language of a label file.
+   * Used by labels(action="info", labelFileId=…) so callers get the on-disk
+   * location per language instead of having to shell out to find it.
+   */
+  getLabelFilePaths(
+    labelFileId: string,
+    model?: string,
+  ): Array<{ language: string; filePath: string; model: string }> {
+    const params: any[] = [labelFileId];
+    let sql = `
+      SELECT DISTINCT language, file_path AS filePath, model
+      FROM labels
+      WHERE label_file_id = ? AND file_path IS NOT NULL AND file_path != ''
+    `;
+    if (model) { sql += ` AND model = ?`; params.push(model); }
+    sql += ` ORDER BY language`;
+    return this.labelsDb.prepare(sql).all(...params) as any[];
   }
 
   /**

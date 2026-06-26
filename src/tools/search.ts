@@ -37,7 +37,7 @@ const SearchArgsSchema = z.object({
 export async function searchTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = SearchArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
+    const { symbolIndex } = context;
     // Hybrid search if workspace is specified
     if (args.includeWorkspace && args.workspacePath) {
       return await performHybridSearch(args, context);
@@ -48,7 +48,7 @@ export async function searchTool(request: CallToolRequest, context: XppServerCon
     if (bridgeResult) return bridgeResult;
 
     // Standard external metadata search
-    return await performExternalSearch(args, symbolIndex, cache);
+    return await performExternalSearch(args, symbolIndex);
   } catch (error) {
     return {
       content: [
@@ -219,26 +219,11 @@ async function performHybridSearch(
 async function performExternalSearch(
   args: z.infer<typeof SearchArgsSchema>,
   symbolIndex: any,
-  cache: any
 ) {
   try {
-    // Check cache first with fuzzy matching
-    const cacheKey = cache.generateSearchKey(args.query, args.limit, args.type);
-    const cachedResults = (await cache.getFuzzy(cacheKey)) as any[] | null;
-    
-    let results: any[] = cachedResults || [];
-    let fromCache = !!cachedResults;
-    
-    if (cachedResults === null) {
-      // Query database with type filter
-      const types = args.type === 'all' ? undefined : [args.type];
-      results = symbolIndex.searchSymbols(args.query, args.limit, types) || [];
-      
-      // Cache results
-      if (results.length > 0) {
-        await cache.set(cacheKey, results);
-      }
-    }
+    // Query database with type filter
+    const types = args.type === 'all' ? undefined : [args.type];
+    const results: any[] = symbolIndex.searchSymbols(args.query, args.limit, types) || [];
 
     // Ensure results is not null
     if (!results || results.length === 0) {
@@ -287,8 +272,7 @@ async function performExternalSearch(
     const tips = generateContextualTips(args.query, results, args.type);
 
     // Format output with rich context
-    const cacheIndicator = fromCache ? ' (cached)' : '';
-    let output = `Found ${results.length} matches${cacheIndicator}:\n`;
+    let output = `Found ${results.length} matches:\n`;
     
     output += formatRichContext(args.query, results, {
       relatedSearches,

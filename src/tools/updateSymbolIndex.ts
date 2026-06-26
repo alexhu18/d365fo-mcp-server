@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { XppMetadataParser } from '../metadata/xmlParser.js';
@@ -7,15 +6,8 @@ import type { XppServerContext } from '../types/context.js';
 import type { XppSymbol } from '../metadata/types.js';
 import { bridgeRefreshProvider } from '../bridge/index.js';
 
-export const updateSymbolIndexToolDefinition = {
-  name: 'update_symbol_index',
-  description:
-    'Index a newly generated or modified D365FO XML/label file immediately so references to it work without restarting the server. ' +
-    'Also handles file DELETIONS: if the file no longer exists on disk, stale symbols + labels + Redis cache entries are cleaned up.',
-  parameters: z.object({
-    filePath: z.string().describe('The absolute path to the modified, created, or DELETED XML file')
-  })
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 /** Map AOT folder names to symbol types */
 const AOT_FOLDER_TYPE_MAP: Record<string, XppSymbol['type']> = {
@@ -92,7 +84,41 @@ function parseLabelFileName(filePath: string): { labelFileId: string; language: 
 export const updateSymbolIndexTool = async (params: any, context: XppServerContext) => {
   const { filePath } = params;
   try {
-    const { symbolIndex, cache } = context;
+    const { symbolIndex } = context;
+
+    // ── REFRESH MODE: no filePath ───────────────────────────────────────────
+    // Pick up objects created this session that the caller can't point a file at
+    // (e.g. bridge createObject results) by refreshing the C# bridge provider and
+    // dropping workspace caches. Lighter than a full reindex; per-object SQLite
+    // indexing still needs an explicit filePath.
+    if (!filePath || (typeof filePath === 'string' && filePath.trim().length === 0)) {
+      context.workspaceScanner?.invalidate?.();
+      let bridgeNote = 'Bridge provider not available (skipped).';
+      try {
+        const refreshResult = await bridgeRefreshProvider(context.bridge);
+        if (refreshResult) {
+          bridgeNote = `Bridge provider refreshed in ${refreshResult.elapsedMs}ms — newly created objects are now resolvable by bridge-backed operations.`;
+        }
+      } catch (e: any) {
+        bridgeNote = `Bridge refresh skipped: ${e?.message ?? e}`;
+      }
+      symbolIndex.touchLastIndexed?.();
+      return {
+        content: [{
+          type: 'text',
+          text:
+            `🔄 **Index refresh** (no filePath supplied).\n\n` +
+            `${bridgeNote}\n` +
+            `Workspace scan cache invalidated.\n\n` +
+            `ℹ️ To fully index a specific new object into the searchable symbol DB (so scaffolding ` +
+            `resolves its EDTs/enums and references work), call this tool again with \`filePath\` ` +
+            `pointing at the created \`.xml\` (e.g. the new AxEnum/AxEdt/AxTable file).`,
+        }],
+      };
+    }
+    // A file just changed on disk — drop the workspace scan cache so the
+    // context pipeline (recently-edited / active object) reflects it at once.
+    context.workspaceScanner?.invalidate?.();
     const pathParts = filePath.split(/[\\/]/);
     const fileName = pathParts[pathParts.length - 1] ?? filePath;
     const objectName = fileName.replace(/\.[^.]+$/, '');
@@ -104,16 +130,13 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
     if (!fs.existsSync(filePath)) {
       console.error(`[update_symbol_index] File deleted — cleaning up stale entries for "${objectName}"`);
 
-      // 1. Remove symbols from SQLite (returns names for cache invalidation)
-      const { deletedCount, objectNames } = symbolIndex.removeSymbolsByFile(filePath);
+      // 1. Remove symbols from SQLite
+      const { deletedCount } = symbolIndex.removeSymbolsByFile(filePath);
 
       // 2. Remove labels from labels DB (label files live alongside XML)
       const labelCount = symbolIndex.removeLabelsByFile(filePath);
 
-      // 3. Invalidate Redis cache for affected objects
-      await invalidateCache(cache, objectName, objectType, objectNames);
-
-      // 4. Refresh bridge so it no longer sees the deleted file
+      // 3. Refresh bridge so it no longer sees the deleted file
       try {
         await bridgeRefreshProvider(context.bridge);
       } catch { /* bridge not available */ }
@@ -129,7 +152,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
         content: [{
           type: 'text',
           text: `🗑️ File deleted — cleaned up ${summary} for **${objectName}** (${objectType}).\n` +
-            `Redis cache invalidated. Bridge refreshed.`
+            `Bridge refreshed.`
         }]
       };
     }
@@ -176,7 +199,6 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
         };
       }
 
-      await invalidateCache(cache, labelFileId, 'label', [labelFileId]);
       symbolIndex.touchLastIndexed?.();
 
       return {
@@ -184,8 +206,8 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
           type: 'text',
           text: `✅ Label index updated for **${path.basename(filePath)}** (model: ${model}, language: ${language}).\n\n` +
             `Removed: ${removedCount} stale entr${removedCount === 1 ? 'y' : 'ies'}\n` +
-            `Inserted: ${insertedCount} label${insertedCount !== 1 ? 's' : ''}\n` +
-            `Redis cache invalidated.`,
+            `Inserted: ${insertedCount} label${insertedCount !== 1 ? 's' : ''}`,
+
         }],
       };
     }
@@ -291,14 +313,43 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
       const result = await parser.parseEdtFile(filePath, model);
       if (result.success && result.data) {
         const edtData = result.data as any;
+        const edtName = edtData.name ?? objectName;
         symbolIndex.addSymbol({
-          name: edtData.name ?? objectName,
+          name: edtName,
           type: 'edt',
           signature: edtData.extends ?? undefined,
           filePath,
           model,
         });
         insertedCount++;
+        // Also populate edt_metadata so scaffolding (resolveEdtBaseType / resolveBestEdt)
+        // can resolve this EDT's base type and relation. The single-file indexer
+        // previously skipped this table, so a same-session EDT never resolved its base
+        // type and its fields defaulted to AxTableFieldString.
+        try {
+          symbolIndex.db
+            .prepare(`DELETE FROM edt_metadata WHERE edt_name = ? AND model = ?`)
+            .run(edtName, model);
+          symbolIndex.db.prepare(`
+            INSERT OR REPLACE INTO edt_metadata (
+              edt_name, extends, enum_type, reference_table, relation_type,
+              string_size, database_string_size, display_length, label, model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            edtName,
+            edtData.extends ?? null,
+            edtData.enumType ?? null,
+            edtData.referenceTable ?? null,
+            edtData.relationType ?? null,
+            edtData.stringSize ?? null,
+            edtData.databaseStringSize ?? null,
+            edtData.displayLength ?? null,
+            edtData.label ?? null,
+            model,
+          );
+        } catch (e) {
+          console.error(`[update_symbol_index] edt_metadata upsert skipped for ${edtName}: ${e}`);
+        }
       } else {
         tx();
       }
@@ -320,8 +371,6 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
       tx();
     }
 
-    // ── Invalidate Redis cache for the re-indexed object ────────────────────
-    await invalidateCache(cache, objectName, objectType, [objectName]);
     symbolIndex.touchLastIndexed?.();
 
     return {
@@ -329,8 +378,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
         type: 'text',
         text: `✅ Symbol index updated for **${objectName}** (${objectType}, model: ${model}).\n\n` +
           `Removed: ${deletedCount} stale entr${deletedCount === 1 ? 'y' : 'ies'}\n` +
-          `Inserted: ${insertedCount} symbol${insertedCount !== 1 ? 's' : ''}\n` +
-          `Redis cache invalidated.`
+          `Inserted: ${insertedCount} symbol${insertedCount !== 1 ? 's' : ''}`
       }]
     };
   } catch (error: any) {
@@ -341,41 +389,3 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
     };
   }
 };
-
-// ── Shared cache invalidation helper ───────────────────────────────────────
-
-/**
- * Invalidate Redis cache entries that might reference the given object.
- * Clears:
- * - Direct class/table key (xpp:class:Name, xpp:table:Name)
- * - Method signature keys (xpp:method-sig:Name:*)
- * - Search results that might include the object (xpp:search:*)
- * - Code completion cache (xpp:complete:Name:*)
- *
- * Exported so create_d365fo_file and modify_d365fo_file can auto-invalidate
- * without requiring an explicit update_symbol_index call.
- */
-export async function invalidateCache(
-  cache: XppServerContext['cache'],
-  primaryName: string,
-  _objectType: string,
-  allObjectNames: string[],
-): Promise<void> {
-  try {
-    // Direct object keys
-    for (const name of allObjectNames) {
-      await cache.delete(cache.generateClassKey(name));
-      await cache.delete(cache.generateTableKey(name));
-    }
-    // Method signature cache (pattern: xpp:method-sig:ClassName:*)
-    await cache.deletePattern(`xpp:method-sig:${primaryName}:*`);
-    // Code completion cache
-    await cache.deletePattern(`xpp:complete:${primaryName}:*`);
-    // Search results are impossible to selectively invalidate (query-based keys),
-    // so we clear all search cache. This is fast and search TTL is only 30 min anyway.
-    await cache.deletePattern('xpp:search:*');
-  } catch (e) {
-    // Redis not available — silently ignore
-    console.error(`[update_symbol_index] Redis cache invalidation failed (non-fatal): ${e}`);
-  }
-}

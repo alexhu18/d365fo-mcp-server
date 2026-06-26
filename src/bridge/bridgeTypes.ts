@@ -151,6 +151,8 @@ export interface BridgeEdtInfo {
   enumType?: string;
   referenceTable?: string;
   model?: string;
+  /** True when the base EDT is marked IsExtensible = Yes — required for AxEdtExtension. */
+  isExtensible?: boolean;
   // Gap-fill properties
   formHelp?: string;
   configurationKey?: string;
@@ -333,6 +335,8 @@ export interface BridgeReferenceResult {
   objectPath: string;
   count: number;
   references: BridgeReferenceInfo[];
+  /** Set by the C# bridge when the xref query failed in-band (e.g. SQL error) — count is 0 but this is NOT an authoritative "no references". */
+  error?: string;
 }
 
 export interface BridgeReferenceInfo {

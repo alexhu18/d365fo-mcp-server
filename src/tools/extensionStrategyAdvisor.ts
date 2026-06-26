@@ -13,6 +13,7 @@ import type { XppServerContext } from '../types/context.js';
 const scenarioTypes = [
   'data-validation',
   'field-defaulting',
+  'field-change-reaction',
   'business-logic-change',
   'outbound-integration',
   'inbound-data',
@@ -38,15 +39,8 @@ const ExtensionStrategyArgsSchema = z.object({
   ),
 });
 
-export const extensionStrategyToolDefinition = {
-  name: 'recommend_extension_strategy',
-  description:
-    'Recommends the best D365FO extensibility mechanism for a given scenario. ' +
-    'Prevents common design mistakes (e.g. using CoC where a Business Event or delegate is appropriate). ' +
-    'Returns: recommended mechanism, reasoning, risks, alternatives, and next MCP tool calls. ' +
-    'Use BEFORE writing extension code to ensure the right approach.',
-  inputSchema: ExtensionStrategyArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 // ─── Decision Rules ─────────────────────────────────────────────────────────
 
@@ -122,11 +116,52 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
     nextSteps: [
       'analyze_extension_points("TableName") — check initValue availability',
-      'get_method_signature("TableName", "initValue", includeCocTemplate: true) — get CoC template',
+      'get_method(include="signature", "TableName", "initValue", includeCocTemplate: true) — get CoC template',
     ],
     antiPatterns: [
       { wrong: 'Overriding insert()', why: 'insert() is for persistence — defaults belong in initValue()' },
       { wrong: 'Form init()', why: 'Form init runs once at form open, not per new record' },
+    ],
+  },
+
+  // ── Reacting to a user/field value change ─────────────────────────────
+  {
+    id: 'field-change-reaction',
+    scenarios: ['field-change-reaction'],
+    goalKeywords: [
+      'when the user changes', 'when a user changes', 'when user changes', 'user changes',
+      'react to', 'react when', 'respond when', 'on field change', 'field is changed',
+      'field changes', 'changes a field', 'when a field', 'recalculate when', 'update when',
+      'modifiedfield', 'modified field', 'onmodifiedfield', 'cascade', 'depends on',
+      'clear when', 'reset when',
+    ],
+    mechanism: 'CoC on table.modifiedField() (or form data source modifiedField / onModifiedField event)',
+    reasoning:
+      'modifiedField() fires every time a field value changes on an EXISTING or new record — including ' +
+      'edits made by the user in the UI and changes made in X++. It is the correct entry point for ' +
+      'reacting to a value change (recalculating dependent fields, clearing related values, cascading ' +
+      'defaults). Do NOT use initValue() for this — initValue() runs ONCE when the record is first ' +
+      'created and never fires again when the user later edits a field.',
+    risks: [
+      'modifiedField receives a FieldId — switch on fieldNum(Table, Field) so the logic only runs for the field you care about',
+      'When using CoC, call next() first so the kernel applies its own modifiedField logic before yours',
+      'modifiedField runs per keystroke-commit on the form — keep the logic cheap and avoid heavy queries',
+      'It does NOT fire for set-based data updates (update_recordset / DMF import) — add table-level logic if those paths matter',
+    ],
+    alternatives: [
+      { mechanism: 'CoC on table.modifiedField()', when: 'The reaction must apply everywhere the field changes (UI, X++, services)' },
+      { mechanism: 'Form data source field modified() / onModified event', when: 'The reaction is UI-specific and should NOT apply to service/entity writes' },
+      { mechanism: 'CoC on table.modifiedFieldValue()', when: 'You also need the previous value to decide what to do' },
+    ],
+    nextSteps: [
+      'analyze_extension_points("TableName") — confirm modifiedField is CoC-eligible and see existing extensions',
+      'get_method(include="signature", "TableName", "modifiedField", includeCocTemplate: true) — get the CoC skeleton',
+      'find_coc_extensions("TableName", "modifiedField") — check for existing wrappers',
+    ],
+    antiPatterns: [
+      { wrong: 'CoC on initValue()', why: 'initValue fires only at record creation — it will NOT run when the user later changes the field' },
+      { wrong: 'Overriding the field on the form only', why: 'Misses X++ and service writes — table-level modifiedField is safer unless the reaction is purely cosmetic' },
+      { wrong: 'validateField for side effects', why: 'validateField is for accept/reject decisions, not for mutating other fields' },
     ],
   },
 
@@ -153,7 +188,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
     nextSteps: [
       'analyze_extension_points("ClassName") — see CoC-eligible methods and delegates',
-      'get_method_signature("ClassName", "methodName", includeCocTemplate: true) — get exact CoC skeleton',
+      'get_method(include="signature", "ClassName", "methodName", includeCocTemplate: true) — get exact CoC skeleton',
       'find_coc_extensions("ClassName", "methodName") — check for existing CoC wrappers',
     ],
     antiPatterns: [
@@ -185,7 +220,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'Dual-write', when: 'Real-time bidirectional sync with Dataverse is needed' },
     ],
     nextSteps: [
-      'get_xpp_knowledge("business events") — learn the pattern',
+      'get_knowledge(kind="knowledge", "business events") — learn the pattern',
       'generate_code(pattern="business-event", name="MyEvent") — generate skeleton',
     ],
     antiPatterns: [
@@ -218,7 +253,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'Composite entity', when: 'Header + lines structure needs to be imported as a document' },
     ],
     nextSteps: [
-      'get_xpp_knowledge("data-management-framework") — learn DMF patterns',
+      'get_knowledge(kind="knowledge", "data-management-framework") — learn DMF patterns',
       'search("MyTable", "data-entity") — check if an entity already exists',
       'generate_code(pattern="data-entity", name="MyEntity") — generate entity skeleton',
     ],
@@ -250,9 +285,9 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'New standalone form', when: 'The change is too large for an extension (new document type, new workspace)' },
     ],
     nextSteps: [
-      'get_form_info("FormName", searchControl="General") — find exact control names and hierarchy',
+      'get_object_info(objectType="form", name="FormName", options={searchControl:"General"}) — find exact control names and hierarchy',
       'analyze_extension_points("FormName") — check form extension points',
-      'create_d365fo_file(objectType="form-extension") — create the extension',
+      'd365fo_file(action="create", objectType="form-extension") — create the extension',
     ],
     antiPatterns: [
       { wrong: 'Overlayering the base form', why: 'Overlayering is not supported in D365FO — use extensions only' },
@@ -283,9 +318,9 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'Report DP extension', when: 'Adding fields to an existing SSRS temp table via table extension + DP CoC' },
     ],
     nextSteps: [
-      'get_report_info("ReportName") — inspect existing report structure',
-      'get_xpp_knowledge("ssrs-reports") — patterns for SSRS',
-      'generate_smart_report(name="MyReport") — generate full SSRS stack',
+      'get_object_info(objectType="report", name="ReportName") — inspect existing report structure',
+      'get_knowledge(kind="knowledge", "ssrs-reports") — patterns for SSRS',
+      'generate_smart(objectType="report", name="MyReport") — generate full SSRS stack',
     ],
     antiPatterns: [
       { wrong: 'Business Event for document delivery', why: 'Business Events send notifications, not formatted documents' },
@@ -311,7 +346,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'Custom counter table', when: 'Simple auto-increment without legal entity scope or configurable format (rare — prefer the framework)' },
     ],
     nextSteps: [
-      'get_xpp_knowledge("number-sequences") — full pattern reference',
+      'get_knowledge(kind="knowledge", "number-sequences") — full pattern reference',
       'generate_code(pattern="number-seq-handler") — generate skeleton',
     ],
     antiPatterns: [
@@ -334,16 +369,16 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     risks: [
       'Privileges are per-entry-point (menu item, web content, service) — not per table or field directly',
       'Table permissions inherit via menu item → privilege chain — broken chain = no access',
-      'Extensible enums for duty/privilege discovery: use get_security_coverage_for_object to verify the chain',
+      'Extensible enums for duty/privilege discovery: use security_info(mode="coverage") to verify the chain',
     ],
     alternatives: [
       { mechanism: 'Security policy (XDS)', when: 'Row-level security is needed (e.g. filter CustTable by user\'s allowed customers)' },
       { mechanism: 'Table permission framework override', when: 'Granting DML access without a menu item entry point (rare)' },
     ],
     nextSteps: [
-      'get_xpp_knowledge("security-privileges-duties") — security pattern reference',
-      'get_security_coverage_for_object("ObjectName") — check existing security chain',
-      'create_d365fo_file(objectType="security-privilege") — create privilege',
+      'get_knowledge(kind="knowledge", "security-privileges-duties") — security pattern reference',
+      'security_info(mode="coverage", "ObjectName") — check existing security chain',
+      'd365fo_file(action="create", objectType="security-privilege") — create privilege',
     ],
     antiPatterns: [
       { wrong: 'Hardcoded hasPermission() checks', why: 'Use the declarative security model — privilege chain enforced by the kernel' },
@@ -371,7 +406,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
       { mechanism: 'Business Event + external processor', when: 'Processing should happen outside D365FO (e.g. Azure Function)' },
     ],
     nextSteps: [
-      'get_xpp_knowledge("sysoperation") — SysOperation patterns',
+      'get_knowledge(kind="knowledge", "sysoperation") — SysOperation patterns',
       'generate_code(pattern="sysoperation", name="MyProcess") — generate SysOperation skeleton',
       'generate_code(pattern="batch-job", name="MyBatch") — generate RunBaseBatch skeleton',
     ],
@@ -390,6 +425,7 @@ function detectScenario(goal: string): typeof scenarioTypes[number] | undefined 
   const scenarioKeywordMap: { scenario: typeof scenarioTypes[number]; keywords: string[] }[] = [
     { scenario: 'data-validation', keywords: ['validat', 'check', 'verify', 'must be', 'cannot be', 'not allowed', 'mandatory', 'required field', 'constraint'] },
     { scenario: 'field-defaulting', keywords: ['default', 'init value', 'auto-fill', 'prefill', 'auto-populate', 'initvalue'] },
+    { scenario: 'field-change-reaction', keywords: ['when the user changes', 'when user changes', 'user changes', 'react to', 'react when', 'field is changed', 'field changes', 'changes a field', 'recalculate when', 'modifiedfield', 'modified field', 'on field change', 'cascade', 'clear when', 'reset when'] },
     { scenario: 'outbound-integration', keywords: ['send to', 'notify external', 'push to', 'outbound', 'power automate', 'service bus', 'webhook', 'event grid', 'publish event'] },
     { scenario: 'inbound-data', keywords: ['import', 'inbound', 'data entity', 'odata', 'dmf', 'dixf', 'data migration', 'bulk load', 'rest api'] },
     { scenario: 'ui-modification', keywords: ['form', 'add field', 'add button', 'add tab', 'hide control', 'lookup', 'display method', 'dialog', 'action pane'] },
@@ -515,7 +551,8 @@ function formatNoMatch(goal: string, objectName?: string): string {
   out += `\n**General guidance:**\n\n`;
   out += `| Goal | Mechanism |\n|------|----------|\n`;
   out += `| Validate data | Table event (onValidatedWrite) or CoC on validateWrite() |\n`;
-  out += `| Default field values | Table event (onInitValue) or CoC on initValue() |\n`;
+  out += `| Default field values (on new record) | Table event (onInitValue) or CoC on initValue() |\n`;
+  out += `| React when a user changes a field | CoC on modifiedField() (NOT initValue) |\n`;
   out += `| Modify business logic | Chain of Command (CoC) |\n`;
   out += `| Send notification to external system | Business Event |\n`;
   out += `| Receive/import external data | Data Entity (OData/DMF) |\n`;

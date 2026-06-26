@@ -16,22 +16,10 @@ const AnalyzeCodePatternsArgsSchema = z.object({
 export async function analyzeCodePatternsTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = AnalyzeCodePatternsArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
-    // Check cache first
-    const cacheKey = `pattern:${args.scenario}:${args.classPattern || 'all'}:${args.limit}`;
-    const cachedResults = await cache.get<any>(cacheKey);
-    
-    if (cachedResults) {
-      return {
-        content: [{ type: 'text', text: formatPatternAnalysis(cachedResults) }],
-      };
-    }
+    const { symbolIndex } = context;
 
     // Analyze patterns
     const analysis = symbolIndex.analyzeCodePatterns(args.scenario, args.classPattern, args.limit);
-    
-    // Cache results
-    await cache.set(cacheKey, analysis, 300); // Cache for 5 minutes
     
     const formatted = formatPatternAnalysis(analysis);
     
@@ -88,7 +76,7 @@ function formatPatternAnalysis(analysis: any): string {
       output += `- ${cls}\n`;
     }
     output += '\n';
-    output += `**Tip:** Use \`get_class_info\` on these classes to see their implementation details.\n`;
+    output += `**Tip:** Use \`get_object_info(objectType="class", name=...)\` on these classes to see their implementation details.\n`;
   }
   
   return output;

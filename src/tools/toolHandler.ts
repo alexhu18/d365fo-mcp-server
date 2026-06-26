@@ -3,47 +3,20 @@ import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { SERVER_MODE, LOCAL_TOOLS } from '../server/serverMode.js';
-import { searchTool } from './search.js';
-import { batchSearchTool } from './batchSearch.js';
-import { classInfoTool } from './classInfo.js';
-import { tableInfoTool } from './tableInfo.js';
-import { completionTool } from './completion.js';
-import { codeGenTool } from './codeGen.js';
-import { extensionSearchTool } from './extensionSearch.js';
-import { analyzeCodePatternsTool } from './analyzePatterns.js';
-import { suggestMethodImplementationTool } from './suggestImplementation.js';
-import { analyzeClassCompletenessTool } from './analyzeCompleteness.js';
-import { getApiUsagePatternsTool } from './apiUsagePatterns.js';
-import { handleGenerateD365Xml } from './generateD365Xml.js';
-import { handleCreateD365File } from './createD365File.js';
+import { searchUnifiedTool } from './searchUnified.js';
+import { batchGetInfoTool } from './batchGetInfo.js';
+import { getObjectInfoTool } from './getObjectInfo.js';
 import { findReferencesTool } from './findReferences.js';
-import { modifyD365FileTool } from './modifyD365File.js';
-import { getMethodSignatureTool } from './methodSignature.js';
-import { getMethodSourceTool } from './getMethodSource.js';
-import { getFormInfoTool } from './formInfo.js';
-import { getQueryInfoTool } from './queryInfo.js';
-import { getViewInfoTool } from './viewInfo.js';
-import { getEnumInfoTool } from './enumInfo.js';
-import { getEdtInfoTool } from './edtInfo.js';
-import { getReportInfoTool } from './reportInfo.js';
-import { searchLabelsTool } from './searchLabels.js';
-import { getLabelInfoTool } from './getLabelInfo.js';
-import { createLabelTool } from './createLabel.js';
-import { renameLabelTool } from './renameLabel.js';
-import { handleGetTablePatterns } from './getTablePatterns.js';
-import { handleGetFormPatterns } from './getFormPatterns.js';
-import { handleGenerateSmartTable } from './generateSmartTable.js';
-import { handleGenerateSmartForm } from './generateSmartForm.js';
-import { handleGenerateSmartReport } from './generateSmartReport.js';
+import { getMethodTool } from './getMethod.js';
+import { analyzeCodeTool } from './analyzeCode.js';
+import { d365foFileTool } from './d365foFile.js';
+import { labelsTool } from './labels.js';
+import { objectPatternsTool } from './objectPatterns.js';
+import { generateObjectTool } from './generateObject.js';
 import { handleSuggestEdt } from './suggestEdt.js';
-import { securityArtifactInfoTool } from './securityArtifactInfo.js';
-import { menuItemInfoTool } from './menuItemInfo.js';
-import { findCocExtensionsTool } from './findCocExtensions.js';
-import { tableExtensionInfoTool } from './tableExtensionInfo.js';
-import { dataEntityInfoTool } from './dataEntityInfo.js';
-import { findEventHandlersTool } from './findEventHandlers.js';
-import { securityCoverageInfoTool } from './securityCoverageInfo.js';
-import { analyzeExtensionPointsTool } from './analyzeExtensionPoints.js';
+import { securityInfoTool } from './securityInfo.js';
+import { extensionInfoTool } from './extensionInfo.js';
+import { getKnowledgeTool } from './getKnowledge.js';
 import { validateObjectNamingTool } from './validateObjectNaming.js';
 import { verifyD365ProjectTool } from './verifyD365Project.js';
 import { resolveObjectPrefix, isCustomModel, getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix } from '../utils/modelClassifier.js';
@@ -54,20 +27,17 @@ import { dbSyncTool } from './dbSync.js';
 import { runBpCheckTool } from './runBpCheck.js';
 import { sysTestRunnerTool } from './sysTestRunner.js';
 import { reviewWorkspaceChangesTool } from './reviewWorkspaceChanges.js';
-import { extensionStrategyAdvisorTool } from './extensionStrategyAdvisor.js';
 import { undoLastModificationTool } from './undoLastModification.js';
-import { xppKnowledgeTool } from './xppKnowledge.js';
-import { d365foErrorHelpTool } from './d365foErrorHelp.js';
-import { validateXppTool } from './validateXpp.js';
-import { resolveReferencesTool } from './resolveReferences.js';
-import { prepareChangeTool } from './prepareChange.js';
-import { prepareCreateTool } from './prepareCreate.js';
+import { validateCodeTool } from './validateCode.js';
+import { prepareTool } from './prepare.js';
 import { recordToolStart, startMetricsLogging, recordCallSequence } from '../utils/toolMetrics.js';
 import {
   DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
   dedupKey, getDedupedResult, storeDedupResult, appendNote,
+  getInFlight, registerInFlight, clearInFlight,
 } from '../utils/callDedup.js';
 import { checkIndexStaleness } from '../utils/indexStaleness.js';
+import { buildContextSnapshot, renderContextSnapshotSection } from '../workspace/contextSnapshot.js';
 import * as nodePath from 'path';
 import { buildProgressMessage } from '../utils/toolProgressMessage.js';
 
@@ -122,26 +92,21 @@ function extractWorkspaceFromMeta(meta: any): string | null {
 /** Per-tool response cap sizes. 'uncapped' = no truncation. */
 const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
   // Uncapped — XML generation, file writes, or long structured output
-  generate_smart_table:             'uncapped',
-  generate_smart_form:              'uncapped',
-  generate_smart_report:            'uncapped',
-  create_d365fo_file:               'uncapped',
-  generate_d365fo_xml:              'uncapped',
-  get_report_info:                  'uncapped',
+  generate_object:                  'uncapped',
+  d365fo_file:                      'uncapped',
+  // get_object_info can return reports (RDL) and full class bodies — never truncate
+  get_object_info:                  'uncapped',
   // Method source must never be truncated — partial code is useless
-  get_method_source:                'uncapped',
+  get_method:                       'uncapped',
+  // Build output must never be truncated — compiler errors appear at the end of
+  // long phase-timing logs and would be lost. The structured diagnostics section
+  // already caps at 25 items; readFullLog now focuses on diagnostic lines only.
+  build_d365fo_project:             'uncapped',
   // New tools with longer output
-  get_security_artifact_info:       8000,
-  get_security_coverage_for_object: 8000,
-  get_table_extension_info:         6000,
-  analyze_extension_points:         6000,
-  recommend_extension_strategy:     6000,
-  find_coc_extensions:              5000,
-  find_event_handlers:              5000,
-  get_data_entity_info:             5000,
-  get_class_info:                   6000,
-  get_table_info:                   6000,
-  get_form_info:                    5000,
+  security_info:                    8000,
+  // extensibility merges the former table-extension/extension-point/strategy/
+  // coc/event-handler tools — keep the most generous of their old caps
+  extension_info:                   6000,
   // Default for everything else
   default:                          5000,
 };
@@ -230,7 +195,23 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           `the result above is identical. Use the data you already have instead of re-querying.`,
         );
       }
+      // In-flight dedup: if the same call is already executing, coalesce onto it
+      // rather than starting a redundant parallel execution.
+      const inFlight = getInFlight(callKey);
+      if (inFlight) {
+        console.error(`[toolHandler] ⏳ ${toolName}: identical call already in-flight — coalescing`);
+        const inFlightResult = await inFlight;
+        return appendNote(
+          inFlightResult,
+          `> ♻️ Parallel duplicate — coalesced with a concurrent identical call.`,
+        );
+      }
     }
+
+    // Register this call as in-flight so concurrent duplicates can coalesce.
+    const inFlightHandle = !DEDUP_EXCLUDED_TOOLS.has(toolName)
+      ? registerInFlight(callKey)
+      : null;
 
     const finishMetrics = recordToolStart(toolName);
     let result: any;
@@ -278,95 +259,23 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
       return (async () => { switch (toolName) {
       case 'search':
-        return searchTool(request, context);
-      case 'batch_search':
-        return batchSearchTool(request, context);
-      case 'search_extensions':
-        return extensionSearchTool(request, context);
-      case 'get_class_info':
-        return classInfoTool(request, context);
-      case 'get_table_info':
-        return tableInfoTool(request, context);
-      case 'code_completion':
-        return completionTool(request, context);
-      case 'generate_code':
-        return codeGenTool(request);
-      case 'analyze_code_patterns':
-        return analyzeCodePatternsTool(request, context);
-      case 'suggest_method_implementation':
-        return suggestMethodImplementationTool(request, context);
-      case 'analyze_class_completeness':
-        return analyzeClassCompletenessTool(request, context);
-      case 'get_api_usage_patterns':
-        return getApiUsagePatternsTool(request, context);
-      case 'generate_d365fo_xml':
-        return handleGenerateD365Xml(request);
-      case 'create_d365fo_file':
-        return handleCreateD365File(request, context);
+        return searchUnifiedTool(request, context);
+      case 'batch_get_info':
+        return batchGetInfoTool(request, context);
+      case 'get_object_info':
+        return getObjectInfoTool(request, context);
+      case 'generate_object':        return generateObjectTool(request, context);
+      case 'analyze_code':
+        return analyzeCodeTool(request, context);
+      case 'd365fo_file':
+        return d365foFileTool(request, context);
       case 'find_references':
         return findReferencesTool(request, context);
-      case 'modify_d365fo_file':
-        return modifyD365FileTool(request, context);
-      case 'get_method_signature':
-        return getMethodSignatureTool(request, context);
-      case 'get_method_source':
-        return getMethodSourceTool(request, context);
-      case 'get_form_info':
-        return getFormInfoTool(request, context);
-      case 'get_query_info':
-        return getQueryInfoTool(request, context);
-      case 'get_view_info':
-        return getViewInfoTool(request, context);
-      case 'get_enum_info':
-        return getEnumInfoTool(request, context);
-      case 'get_edt_info':
-        return getEdtInfoTool(request, context);
-      case 'get_report_info':
-        return getReportInfoTool(request, context);
-      case 'search_labels':
-        return searchLabelsTool(request, context);
-      case 'get_label_info':
-        return getLabelInfoTool(request, context);
-      case 'create_label':
-        return createLabelTool(request, context);
-      case 'rename_label':
-        return renameLabelTool(request, context);
-      case 'get_table_patterns': {
-        const r = await handleGetTablePatterns(
-          request.params.arguments as any,
-          context.symbolIndex
-        );
-        return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
-      }
-      case 'get_form_patterns': {
-        const r = await handleGetFormPatterns(
-          request.params.arguments as any,
-          context.symbolIndex
-        );
-        return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
-      }
-      case 'generate_smart_table': {
-        const r = await handleGenerateSmartTable(
-          request.params.arguments as any,
-          context.symbolIndex,
-          context.bridge,
-        );
-        return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
-      }
-      case 'generate_smart_form': {
-        const r = await handleGenerateSmartForm(
-          request.params.arguments as any,
-          context.symbolIndex
-        );
-        return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
-      }
-      case 'generate_smart_report': {
-        const r = await handleGenerateSmartReport(
-          request.params.arguments as any,
-          context.symbolIndex
-        );
-        return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
-      }
+      case 'get_method':
+        return getMethodTool(request, context);
+      case 'labels':
+        return labelsTool(request, context);
+      case 'object_patterns':        return objectPatternsTool(request, context);
       case 'suggest_edt': {
         const r = await handleSuggestEdt(
           request.params.arguments as any,
@@ -374,24 +283,9 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         );
         return { content: r?.content ?? [{ type: 'text', text: 'No results returned' }] };
       }
-      case 'get_security_artifact_info':
-        return securityArtifactInfoTool(request, context);
-      case 'get_menu_item_info':
-        return menuItemInfoTool(request, context);
-      case 'find_coc_extensions':
-        return findCocExtensionsTool(request, context);
-      case 'get_table_extension_info':
-        return tableExtensionInfoTool(request, context);
-      case 'get_data_entity_info':
-        return dataEntityInfoTool(request, context);
-      case 'find_event_handlers':
-        return findEventHandlersTool(request, context);
-      case 'get_security_coverage_for_object':
-        return securityCoverageInfoTool(request, context);
-      case 'analyze_extension_points':
-        return analyzeExtensionPointsTool(request, context);
-      case 'recommend_extension_strategy':
-        return extensionStrategyAdvisorTool(request, context);
+      case 'security_info':
+        return securityInfoTool(request, context);
+      case 'extension_info':        return extensionInfoTool(request, context);
       case 'validate_object_naming':
         return validateObjectNamingTool(request, context);
       case 'verify_d365fo_project':
@@ -410,18 +304,11 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         return await reviewWorkspaceChangesTool(request.params.arguments as any, context);
       case 'undo_last_modification':
         return await undoLastModificationTool(request.params.arguments as any, context);
-      case 'get_d365fo_error_help':
-        return d365foErrorHelpTool(request);
-      case 'get_xpp_knowledge':
-        return xppKnowledgeTool(request);
-      case 'validate_xpp':
-        return validateXppTool(request, context);
-      case 'resolve_references':
-        return resolveReferencesTool(request, context);
-      case 'prepare_change':
-        return prepareChangeTool(request, context);
-      case 'prepare_create':
-        return prepareCreateTool(request, context);
+      case 'get_knowledge':
+        return getKnowledgeTool(request);
+      case 'validate_code':        return validateCodeTool(request, context);
+      case 'prepare':
+        return prepareTool(request, context);
       case 'get_workspace_info': {
         const args = (request as any).params?.arguments || {};
 
@@ -452,8 +339,12 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           }
         }
 
-        const { modelName, modelSource, isModelSourceAutoDetected, projectPath, projectSource, packagePath, packageSource } =
-          await configManager.getWorkspaceInfoDiagnostics();
+        const {
+          modelName, modelSource, isModelSourceAutoDetected,
+          projectPath, projectSource,
+          packagePath, packageSource,
+          customPackagesPath, customPackagesSource,
+        } = await configManager.getWorkspaceInfoDiagnostics();
         const envType = await configManager.getDevEnvironmentType();
         const frameworkDirectory = await configManager.getMicrosoftPackagesPath();
 
@@ -488,12 +379,22 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           ? !isCustomModel(modelName) && !isPlaceholder && isAutoDetectedSource
           : false;
 
+        // Determine the effective custom write root for display and freshness check.
+        // Precedence: D365FO_CUSTOM_PACKAGES_PATH > D365FO_PACKAGE_PATH (read-only MS root).
+        const effectiveWritePath = customPackagesPath ?? packagePath;
+        const effectiveWriteSource = customPackagesPath ? customPackagesSource : packageSource;
+
+        // The MS framework path shown in diagnostics: prefer the explicit
+        // D365FO_MICROSOFT_PACKAGES_PATH; fall back to the bridge frameworkDirectory;
+        // in a single-root traditional setup neither is set so omit the line.
+        const msFrameworkPath = frameworkDirectory ?? (!customPackagesPath ? null : packagePath);
+
         const lines: string[] = [
           `## D365FO Workspace Configuration`,
           ``,
           `Model name      : ${modelName ?? '(not configured)'}  (source: ${modelSource})`,
-          `Package path    : ${packagePath ?? '(not configured)'}  (custom metadata, source: ${packageSource})`,
-          `Framework dir   : ${frameworkDirectory ?? '(not applicable — single-root setup)'}  (Microsoft metadata, read-only)`,
+          `Custom write path: ${effectiveWritePath ?? '(not configured)'}  (custom metadata, source: ${effectiveWriteSource})`,
+          `Framework dir   : ${msFrameworkPath ?? '(not applicable — single-root setup)'}  (Microsoft metadata, read-only)`,
           `Project path    : ${projectPath ?? '(not detected)'}  (source: ${projectSource})`,
           `Env type        : ${envType}`,
           ``,
@@ -538,7 +439,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
             : `ℹ️  prefix style (default) — extension token is the EXTENSION_PREFIX infix.`,
           `  • Extension class  → ${sampleClassExt}`,
           `  • Element extension → ${sampleElemExt}`,
-          `  ⚠️  Pass the BASE object name (e.g. "CustTable") to create_d365fo_file and let the tool apply the token — any infix you embed will be normalised to the above.`,
+          `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,
           ``,
         );
 
@@ -614,8 +515,8 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         // -----------------------------------------------------------------------
         try {
           const lastIndexedAt = context.symbolIndex.getLastIndexedAt?.() ?? null;
-          const modelMetadataDir = packagePath && modelName
-            ? nodePath.join(packagePath, modelName)
+          const modelMetadataDir = effectiveWritePath && modelName
+            ? nodePath.join(effectiveWritePath, modelName)
             : null;
           const staleness = checkIndexStaleness(lastIndexedAt, modelMetadataDir);
           lines.push('', ...staleness.lines);
@@ -663,6 +564,17 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           }
         }
 
+        // -----------------------------------------------------------------------
+        // Context Snapshot — curated "what am I working on" view: recently edited
+        // objects + uncommitted X++ changes. Best-effort; never breaks the tool.
+        // -----------------------------------------------------------------------
+        try {
+          const snapshot = await buildContextSnapshot(context);
+          lines.push('', ...renderContextSnapshotSection(snapshot));
+        } catch {
+          // Snapshot is additive — omit silently on failure.
+        }
+
         return { content: [{ type: 'text', text: lines.join('\n') }] };
       }
       default:
@@ -700,6 +612,9 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
     if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
       storeDedupResult(callKey, capped);
+      // Resolve the in-flight promise so any coalesced waiters get the result.
+      inFlightHandle?.resolve(capped);
+      clearInFlight(callKey);
       // Loop hint: 3+ identical calls in the recent window means the model is
       // cycling (cache misses only happen when calls are >60 s apart).
       if (occurrences >= 3) {

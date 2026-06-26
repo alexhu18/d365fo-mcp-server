@@ -17,6 +17,7 @@ const __dirname = path.dirname(__filename);
 import { isCustomModel, isStandardModel, getCustomModels } from '../src/utils/modelClassifier.js';
 import { indexAllLabels } from '../src/metadata/labelParser.js';
 import { XppConfigProvider } from '../src/utils/xppConfigProvider.js';
+import { crossCheckPatternCatalog, formatCrossCheckReport } from '../src/knowledge/formPatterns/crossCheck.js';
 
 const INPUT_PATH = process.env.METADATA_PATH || './extracted-metadata';
 const OUTPUT_DB = process.env.DB_PATH || './data/xpp-metadata.db';
@@ -169,6 +170,18 @@ async function buildDatabase() {
   const count = symbolIndex.getSymbolCount();
   console.log(`✅ Database built successfully in ${duration}s!`);
   console.log(`📊 Total symbols: ${count}`);
+
+  // Cross-check the curated form pattern catalog against mined pattern usage
+  try {
+    const crossCheck = crossCheckPatternCatalog(symbolIndex.getReadDb());
+    if (crossCheck) {
+      console.log('\n' + formatCrossCheckReport(crossCheck));
+    } else {
+      console.log('\n🧭 Form pattern cross-check skipped — no mined pattern data (re-extract metadata to enable).');
+    }
+  } catch (e) {
+    console.warn(`⚠️ Form pattern cross-check failed (non-fatal): ${e instanceof Error ? e.message : e}`);
+  }
 
   // ── Label Indexing ─────────────────────────────────────────────────────────
   if (SKIP_FTS) {

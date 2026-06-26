@@ -59,7 +59,7 @@ export async function getMethodSourceTool(request: CallToolRequest, context: Xpp
     return {
       content: [{
         type: 'text',
-        text: `❌ Method **${className}.${methodName}** not found.${hint}\n\nUse \`get_class_info\` to see all available methods.`,
+        text: `❌ Method **${className}.${methodName}** not found.${hint}\n\nUse \`get_object_info(objectType="class", name="${className}")\` to see all available methods.`,
       }],
       isError: true,
     };

@@ -252,7 +252,7 @@ export async function readViewMetadata(
  *
  * We extract the relative part after "PackagesLocalDirectory" and combine it with
  * the locally configured packagePath (from .mcp.json / env).  This allows
- * get_form_info and other tools to read standard Microsoft model XML on a local
+ * get_object_info and other tools to read standard Microsoft model XML on a local
  * D365FO installation even though the DB path points to a non-existent CI machine.
  *
  * Returns null when the path cannot be remapped or the remapped file does not exist.
@@ -351,24 +351,59 @@ export function buildObjectTypeMismatchMessage(
   for (const entry of uniqueTypes) {
     switch (entry.type) {
       case 'form':
-        section += `- \`get_form_info(formName="${name}")\` — inspect form datasources, controls, and methods\n`;
+        section += `- \`get_object_info(objectType="form", name="${name}")\` — inspect form datasources, controls, and methods\n`;
         break;
       case 'table':
-        section += `- \`get_table_info(tableName="${name}")\` — inspect table fields and methods\n`;
+        section += `- \`get_object_info(objectType="table", name="${name}")\` — inspect table fields and methods\n`;
         break;
       case 'view':
-        section += `- \`get_view_info(viewName="${name}")\` — inspect view fields and methods\n`;
+        section += `- \`get_object_info(objectType="view", name="${name}")\` — inspect view fields and methods\n`;
         break;
       case 'query':
-        section += `- \`get_query_info(queryName="${name}")\` — inspect query datasources\n`;
+        section += `- \`get_object_info(objectType="query", name="${name}")\` — inspect query datasources\n`;
         break;
       case 'enum':
-        section += `- \`get_enum_info(enumName="${name}")\` — inspect enum values\n`;
+        section += `- \`get_object_info(objectType="enum", name="${name}")\` — inspect enum values\n`;
         break;
     }
   }
 
   return section;
+}
+
+/**
+ * Heuristic: does a reader result's text indicate an object-resolution ("not found")
+ * failure, as opposed to a genuine operation error (parse failure, timeout, etc.)?
+ * Used to decide whether to append the not-found guidance below.
+ */
+export function isNotFoundResultText(text: string | undefined): boolean {
+  if (!text) return false;
+  return /\bnot found\b|could not resolve|does not exist/i.test(text);
+}
+
+/**
+ * Actionable guidance appended to a reader's "object not found" result.
+ *
+ * Steers the agent to the right MCP tools (search / update_symbol_index) and the
+ * config knob for custom packages — and explicitly AWAY from filesystem scanning
+ * (Get-ChildItem / Select-String / dir / ls / find). Raw disk scanning is the
+ * anti-pattern that turns one missing object into dozens of PowerShell calls: it is
+ * slow (350+ model folders), can hang the VS 2022 MCP integration, and bypasses
+ * metadata resolution. The "not found" message alone left a guidance vacuum that
+ * nudged agents straight into it — this fills the vacuum with the correct next steps.
+ */
+export function buildNotFoundGuidance(name: string, objectType: string): string {
+  return (
+    `\n\n---\n` +
+    `🔎 **Resolve \`${name}\` (${objectType}) with the right tool — do not guess or grep the disk:**\n` +
+    `1. \`search\` / \`batch_search\` for \`${name}\` — the exact name may differ (model prefix, casing, suffix).\n` +
+    `2. Real object in a custom package that isn't indexed yet? Run ` +
+    `\`update_symbol_index({ filePath: "<absolute path to ${name}.xml>" })\`, and confirm ` +
+    `\`D365FO_CUSTOM_PACKAGES_PATH\` includes that package so the bridge + symbol index can see it.\n` +
+    `3. Just created it this session? The bridge may not have it yet — pass the file path, or it will be picked up after a refresh.\n\n` +
+    `⛔ Do NOT scan the filesystem (Get-ChildItem / Select-String / dir / ls / find) to locate D365FO objects — ` +
+    `it is slow, can hang the VS 2022 MCP integration, and bypasses metadata resolution. Use the tools above.`
+  );
 }
 
 /**

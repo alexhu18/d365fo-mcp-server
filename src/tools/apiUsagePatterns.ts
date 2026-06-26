@@ -16,7 +16,7 @@ const GetApiUsagePatternsArgsSchema = z.object({
 export async function getApiUsagePatternsTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = GetApiUsagePatternsArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
+    const { symbolIndex } = context;
 
     // ── Bridge fast-path (DYNAMICSXREFDB cross-references) ──
     // Returns compiler-resolved callers grouped by class
@@ -24,20 +24,7 @@ export async function getApiUsagePatternsTool(request: CallToolRequest, context:
     if (bridgeResult) return bridgeResult;
 
     // ── Fallback: SQLite symbol index patterns ──
-    // Check cache first
-    const cacheKey = `api-patterns:${args.apiName}:${args.context || 'general'}`;
-    const cachedResults = await cache.get<any>(cacheKey);
-    
-    if (cachedResults) {
-      return {
-        content: [{ type: 'text', text: formatPatterns(cachedResults, args.apiName) }],
-      };
-    }
-
     const patterns = symbolIndex.getApiUsagePatterns(args.apiName);
-    
-    // Cache results
-    await cache.set(cacheKey, patterns, 1800); // Cache for 30 minutes
     
     const formatted = formatPatterns(patterns, args.apiName);
     
@@ -166,8 +153,8 @@ function formatPatterns(patterns: any[], apiName: string): string {
   output += `4. Consider using related APIs for complete functionality\n\n`;
   
   output += `**Next Steps:**\n`;
-  output += `- Use \`get_class_info("${apiName}")\` to see all available methods\n`;
-  output += `- Use \`code_completion\` to discover method signatures\n`;
+  output += `- Use \`get_object_info(objectType="class", name="${apiName}")\` to see all available methods\n`;
+  output += `- Use \`get_object_info(objectType="class", name=..., options={members:"names"})\` to list member names\n`;
   output += `- Use \`search\` to find example implementations\n`;
   
   return output;

@@ -21,38 +21,10 @@ const TableInfoArgsSchema = z.object({
 export async function tableInfoTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = TableInfoArgsSchema.parse(request.params.arguments);
-    const { cache } = context;
-
-    // Check cache first
-    const cacheKey = cache.generateTableKey(args.tableName);
-    const cachedTable = await cache.get<any>(cacheKey);
-
-    if (cachedTable) {
-      const fields = cachedTable.fields
-        .map((f: any) => {
-          const typeInfo = f.extendedDataType
-            ? `EDT: ${f.extendedDataType}${f.type ? ` (base: ${f.type})` : ''}`
-            : f.type;
-          return `  ${f.name}: ${typeInfo}${f.isMandatory ? ' (mandatory)' : ''}${f.label ? ` - ${f.label}` : ''}`;
-        })
-        .join('\n');
-
-      const extendsInfo = cachedTable.extendsTable ? `\nExtends: ${cachedTable.extendsTable}` : '';
-      const labelInfo = cachedTable.label ? `\nLabel: ${cachedTable.label}` : '';
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Table: ${cachedTable.name}${labelInfo}${extendsInfo}\n\nFields:\n${fields} (cached)`,
-        }],
-      };
-    }
-
     // Read-path priority: Bridge → DB (symbol index) → Disk (last resort).
     // 1. Bridge — live D365FO metadata, always up-to-date when available.
     const bridgeResult = await tryBridgeTable(context.bridge, args.tableName, args.methodOffset);
     if (bridgeResult) {
-      await cache.setClassInfo(cacheKey, bridgeResult).catch(() => {});
       return bridgeResult;
     }
 

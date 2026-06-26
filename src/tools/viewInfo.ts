@@ -47,8 +47,5 @@ export async function getViewInfoTool(request: CallToolRequest, context: XppServ
   }
 }
 
-export const getViewInfoToolDefinition = {
-  name: 'get_view_info',
-  description: '🗂️ Extract data entity view structure: computed columns, relations, methods. Returns view metadata with field mappings (DataSource.DataField), computed columns (DataMethod), and relations. Essential for understanding view logic and OData entity structure.',
-  inputSchema: GetViewInfoArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

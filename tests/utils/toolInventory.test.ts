@@ -30,8 +30,8 @@ describe('tool inventory contract', () => {
   });
 
   it('exposes the expected total tool count', () => {
-    expect(mcpServerToolNames).toHaveLength(58);
-    expect(startupCatalogToolNames).toHaveLength(58);
+    expect(mcpServerToolNames).toHaveLength(26);
+    expect(startupCatalogToolNames).toHaveLength(26);
   });
 
   it('keeps local-only tool set aligned with the published tool inventory', () => {
@@ -40,8 +40,8 @@ describe('tool inventory contract', () => {
       expect(publishedTools.has(toolName)).toBe(true);
     }
 
-    expect(LOCAL_TOOLS.size).toBe(25);
-    expect(mcpServerToolNames.filter(name => !LOCAL_TOOLS.has(name))).toHaveLength(33);
+    expect(LOCAL_TOOLS.size).toBe(10);
+    expect(mcpServerToolNames.filter(name => !LOCAL_TOOLS.has(name))).toHaveLength(16);
   });
 
   it('has a tool annotation (title + hints) for every published tool', () => {
@@ -62,9 +62,9 @@ describe('tool inventory contract', () => {
 
   it('marks write tools as non-read-only in annotations', () => {
     const writeTools = [
-      'create_d365fo_file', 'modify_d365fo_file', 'create_label', 'rename_label',
-      'undo_last_modification', 'generate_smart_table', 'generate_smart_form',
-      'generate_smart_report', 'update_symbol_index', 'build_d365fo_project',
+      'd365fo_file', 'labels',
+      'undo_last_modification', 'generate_object',
+      'update_symbol_index', 'build_d365fo_project',
       'trigger_db_sync', 'run_systest_class',
     ];
     for (const toolName of writeTools) {
@@ -72,10 +72,44 @@ describe('tool inventory contract', () => {
     }
   });
 
+  it('advertises modify-operation params in the d365fo_file inputSchema', () => {
+    // Regression guard: the advertised inputSchema is the only param surface the
+    // model sees. If an operation's params are handled in modifyD365File.ts but not
+    // exposed here, the model cannot pass them and the op fails with "returned null".
+    const requiredModifyParams = [
+      // add-table-method / add-display-method
+      'tableMethodType', 'tableKeyField', 'displayMethodReturnEdt',
+      // add-index / remove-index
+      'indexName', 'indexFields', 'indexAllowDuplicates', 'indexAlternateKey',
+      // add-relation
+      'relationName', 'relatedTable', 'relationConstraints',
+      // field groups
+      'fieldGroupName', 'fieldGroupFields', 'extendBaseFieldGroup',
+      // add-data-source
+      'dataSourceName', 'dataSourceTable', 'joinSource', 'linkType',
+      // modify-field extras
+      'fieldHelpText', 'fieldEnumType', 'fieldStringSize',
+      // add-control label
+      'controlLabel',
+      // enum values
+      'enumValueName', 'enumValueLabel', 'enumValueInt', 'enumValueCountryRegionCodes',
+      // add-menu-item-to-menu
+      'menuItemToAdd', 'menuItemToAddType',
+      // aliases / lookup
+      'methodCode', 'sourceCode', 'baseFormName', 'filePath',
+    ];
+    for (const param of requiredModifyParams) {
+      expect(
+        new RegExp(`\\b${param}:\\s*\\{`).test(mcpServerSource),
+        `d365fo_file inputSchema is missing advertised modify param '${param}'`,
+      ).toBe(true);
+    }
+  });
+
   it('includes critical diagnostics and SDLC tools in both inventories', () => {
     const criticalTools = [
       'get_workspace_info',
-      'get_d365fo_error_help',
+      'get_knowledge',
       'update_symbol_index',
       'build_d365fo_project',
       'run_bp_check',

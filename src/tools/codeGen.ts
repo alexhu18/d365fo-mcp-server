@@ -49,7 +49,7 @@ const CodeGenArgsSchema = z.object({
     ),
   groundingToken: z.string().optional()
     .describe(
-      'Provenance token from prepare_change(). Required for extension patterns when ' +
+      'Provenance token from prepare(mode="change"). Required for extension patterns when ' +
       'GROUNDING_ENFORCE=true. Proves the AI queried the real D365FO codebase before generating code.'
     ),
 });
@@ -122,7 +122,7 @@ internal final class ${name}
 //   }
 //
 // Workflow:
-//   1. get_data_entity_info("similar entity")  → study structure
+//   1. get_object_info(objectType="data-entity", name="similar entity")  → study structure
 //   2. generate_d365fo_xml(objectType="data-entity", ...)  → preview XML
 //   3. create_d365fo_file(objectType="view", ...)  → create file
 //   4. After deployment: refresh entity list in Data Management workspace
@@ -396,7 +396,7 @@ function formControlExtensionTemplate(formName: string, prefix: string, controlN
 /// Form control extension class for ${formName}.${ctrlName} (prefix: ${prefix})
 /// Naming: {FormName}_{ControlName}{Prefix}Ctrl_Extension per MS naming guidelines
 /// Use this to wrap a specific control's methods (modified, validate, lookup, gotFocus, …).
-/// IMPORTANT: Use get_form_info("${formName}", searchControl="${ctrlName}") first to verify the exact control name.
+/// IMPORTANT: Use get_object_info(objectType="form", name="${formName}", options={searchControl:"${ctrlName}"}) first to verify the exact control name.
 /// </summary>
 [ExtensionOf(formControlStr(${formName}, ${ctrlName}))]
 final class ${className}
@@ -679,7 +679,7 @@ function ssrsReportFullTemplate(name: string): string {
 //   2. ${name}Contract  — DataContract class (below)
 //   3. ${name}DP        — Data Provider class (below)
 //   4. ${name}Controller — Report controller (below)
-//   5. ${name}.xml      — AxReport with RDL design (use generate_smart_report)
+//   5. ${name}.xml      — AxReport with RDL design (use generate_smart)
 // ══════════════════════════════════════════════════════════════════
 
 // ── 1. DataContract ─────────────────────────────────────────────────────────
@@ -948,14 +948,14 @@ public class ${name}DimensionController
 function numberSeqHandlerTemplate(name: string): string {
   return `/// <summary>
 /// Integrates number sequence auto-generation into the ${name} form.
-/// This class handles the NumberSequenceFormHandler setup in the form.
+/// This class handles the NumberSeqFormHandler setup in the form.
 /// Add init() call to form init(), and numSeqFormHandler reference to classDeclaration.
 /// </summary>
 // ── Step 1: Form classDeclaration ───────────────────────────────────────
 // [Form]
 // public class ${name}Form extends FormRun
 // {
-//     NumberSequenceFormHandler numSeqFormHandler;
+//     NumberSeqFormHandler numSeqFormHandler;
 // }
 
 // ── Step 2: Form init() ─────────────────────────────────────────────────
@@ -963,8 +963,8 @@ function numberSeqHandlerTemplate(name: string): string {
 // {
 //     super();
 //     // Hook number sequence handler to the ${name}Id field
-//     numSeqFormHandler = NumberSequenceFormHandler::newForm(
-//         ${name}Parameters::numRef${name}Id().NumberSequence,  // number sequence reference
+//     numSeqFormHandler = NumberSeqFormHandler::newForm(
+//         ${name}Parameters::numRef${name}Id().NumberSequenceId,  // number sequence reference (RefRecId)
 //         element,                                              // FormRun
 //         tableNum(${name}),                                    // table
 //         fieldNum(${name}, ${name}Id));                        // field to fill
@@ -987,29 +987,32 @@ function numberSeqHandlerTemplate(name: string): string {
 //     numSeqFormHandler.formMethodDataSourceDelete();
 // }
 
-// ── Step 4: NumberSeqApplicationModule extension (loadModule CoC) ────────
+// ── Step 4: NumberSeqApplicationModule subclass (the module class) ────────
 /// <summary>
-/// Extends NumberSeqApplicationModule to register the ${name}Id number sequence reference.
-/// Apply CoC on NumberSeqApplicationModule.loadModule() in your model.
+/// Subclass of NumberSeqApplicationModule that registers the ${name}Id number sequence.
+/// Add a NumberSeqModule enum value for ${name} and register this class via an event
+/// handler on NumberSeqGlobal.initModules() so loadModule() is called at startup.
 /// </summary>
-[ExtensionOf(classStr(NumberSeqApplicationModule${name}))]
-final class NumberSeqApplicationModule${name}_Extension
+public class NumberSeqModule${name} extends NumberSeqApplicationModule
 {
-    public void loadModule()
+    protected void loadModule()
     {
-        next loadModule();
+        NumberSeqDatatype datatype = NumberSeqDatatype::construct();
+        datatype.parmDatatypeId(extendedTypeNum(${name}Id));
+        datatype.parmReferenceHelp(literalStr("${name} identifier"));
+        datatype.parmWizardIsContinuous(false);
+        datatype.parmWizardIsManual(NoYes::No);
+        datatype.parmWizardIsChangeDownAllowed(NoYes::Yes);
+        datatype.parmWizardIsChangeUpAllowed(NoYes::Yes);
+        datatype.parmWizardHighest(0);
+        datatype.parmSortField(1);
+        datatype.addParameterType(NumberSeqParameterType::DataArea, true, false);
+        this.create(datatype);
+    }
 
-        // Add number sequence scope for ${name}Id
-        NumberSeqScopeFactory scopeFactory;
-        NumberSeqScope        scope = NumberSeqScopeFactory::createDataAreaScope();
-
-        NumberSeqReference numSeqRef;
-        numSeqRef.AllowManual         = NoYes::Yes;
-        numSeqRef.Continuous          = NoYes::No;
-        numSeqRef.DataTypeId          = extendedTypeNum(${name}Id);
-        numSeqRef.NumberSequenceModule = extendedTypeNum(${name}Id); // use your module enum
-
-        this.addModuleEntry(numSeqRef, scope, true, "${name} identifier");
+    public NumberSeqModule numberSeqModule()
+    {
+        return NumberSeqModule::${name};
     }
 }
 
@@ -1683,7 +1686,7 @@ public class ${name}Service
         catch (Exception::Error)
         {
             response.parmSuccess(false);
-            response.parmMessage(infologLine(infologLine()));
+            response.parmMessage(infolog.text());
         }
 
         return response;
@@ -1700,31 +1703,41 @@ public class ${name}Service
 }
 
 // ── 3. AOT objects (create via create_d365fo_file) ──────────────────────
-// a) AxService XML:
-//    <AxService>
+// Verify the result afterwards with get_object_info(objectType="service", name="${name}Service").
+// a) AxService XML (real schema: ServiceOperations / AxServiceOperation / Method):
+//    <AxService xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 //      <Name>${name}Service</Name>
 //      <Class>${name}Service</Class>
-//      <Operations>
+//      <ExternalName>${name}Service</ExternalName>
+//      <Namespace>http://schemas.microsoft.com/dynamics/2011/01/services</Namespace>
+//      <ServiceOperations>
 //        <AxServiceOperation>
 //          <Name>processRequest</Name>
-//          <Enabled>Yes</Enabled>
+//          <EnableIdempotence>Yes</EnableIdempotence>
+//          <Method>processRequest</Method>
 //        </AxServiceOperation>
 //        <AxServiceOperation>
 //          <Name>ping</Name>
-//          <Enabled>Yes</Enabled>
+//          <EnableIdempotence>Yes</EnableIdempotence>
+//          <Method>ping</Method>
 //        </AxServiceOperation>
-//      </Operations>
+//      </ServiceOperations>
 //    </AxService>
 //
-// b) AxServiceGroup XML:
-//    <AxServiceGroup>
+// b) AxServiceGroup XML (real schema: Services / AxServiceGroupService):
+//    <AxServiceGroup xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 //      <Name>${name}ServiceGroup</Name>
 //      <AutoDeploy>Yes</AutoDeploy>
 //      <Services>
-//        <Name>${name}Service</Name>
+//        <AxServiceGroupService>
+//          <Name>${name}Service</Name>
+//          <Service>${name}Service</Service>
+//        </AxServiceGroupService>
 //      </Services>
 //    </AxServiceGroup>
 //
+// JSON request body wraps the payload in the operation parameter name (_request):
+//   { "_request": { "RecordId": "...", "Operation": "..." } }
 // Endpoint URL after deploy:
 //   https://{env}.operations.dynamics.com/api/services/${name}ServiceGroup/${name}Service/processRequest`;
 }
@@ -1909,7 +1922,7 @@ export async function codeGenTool(request: CallToolRequest) {
             : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` argument.\n  Generated bare name without prefix infix (e.g. \`${baseName}_Extension\`) which is **not MS-compliant**.`;
           namingNote = namingLine + '\n\n' +
             `🚨 **REQUIRED before adding CoC methods:**\n` +
-            `   Call \`get_method_signature("${baseName}", "methodName")\` for EACH method you want to wrap.\n` +
+            `   Call \`get_method(include="signature", "${baseName}", "methodName")\` for EACH method you want to wrap.\n` +
             `   X++ does NOT support method overloading — adding both \`public boolean foo()\` and \`public static boolean foo()\`\n` +
             `   in the same class will always cause a compile error.\n` +
             `   The signature tool tells you whether the original is \`static\` or instance, so you generate exactly ONE CoC method.`;
@@ -1966,16 +1979,16 @@ export async function codeGenTool(request: CallToolRequest) {
             `${namingNote}\n\n` +
             (args.pattern === 'class-extension'
               ? `💡 **Next Steps (class-extension CoC workflow):**\n\n` +
-                `1. 🚨 Use \`get_method_signature("${displayName}", "<methodName>")\` — **REQUIRED** to get the exact signature (static vs instance, return type, parameters) before writing any CoC method\n` +
+                `1. 🚨 Use \`get_method(include="signature", "${displayName}", "<methodName>")\` — **REQUIRED** to get the exact signature (static vs instance, return type, parameters) before writing any CoC method\n` +
                 `2. ✅ Use \`find_coc_extensions("${displayName}", "<methodName>")\` - See existing CoC wrappers for reference\n` +
-                `3. ✅ Use \`suggest_method_implementation("${displayName}", "<methodName>")\` - Get real implementation examples\n` +
-                `4. ✅ Use \`get_api_usage_patterns("<ClassName>")\` - See how to use D365FO APIs correctly\n\n` +
-                `⚠️ Never guess static vs instance — always use get_method_signature first.`
+                `3. ✅ Use \`analyze_code(mode="implementations", "${displayName}", "<methodName>")\` - Get real implementation examples\n` +
+                `4. ✅ Use \`analyze_code(mode="api-usage", "<ClassName>")\` - See how to use D365FO APIs correctly\n\n` +
+                `⚠️ Never guess static vs instance — always use get_method(include="signature") first.`
               : `💡 **Next Steps for Better Code Quality:**\n\n` +
-                `1. ✅ Use \`analyze_code_patterns("<scenario>")\` - Learn what D365FO classes are commonly used together\n` +
-                `2. ✅ Use \`suggest_method_implementation("${displayName}", "<methodName>")\` - Get real implementation examples\n` +
-                `3. ✅ Use \`analyze_class_completeness("${displayName}")\` - Check for missing common methods\n` +
-                `4. ✅ Use \`get_api_usage_patterns("<ClassName>")\` - See how to use D365FO APIs correctly\n\n` +
+                `1. ✅ Use \`analyze_code(mode="patterns", "<scenario>")\` - Learn what D365FO classes are commonly used together\n` +
+                `2. ✅ Use \`analyze_code(mode="implementations", "${displayName}", "<methodName>")\` - Get real implementation examples\n` +
+                `3. ✅ Use \`analyze_code(mode="completeness", "${displayName}")\` - Check for missing common methods\n` +
+                `4. ✅ Use \`analyze_code(mode="api-usage", "<ClassName>")\` - See how to use D365FO APIs correctly\n\n` +
                 `These tools provide patterns from the actual codebase, not generic templates.`),
         },
       ],

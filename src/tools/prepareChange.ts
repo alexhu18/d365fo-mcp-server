@@ -15,7 +15,7 @@
  * the real codebase before writing code.
  *
  * Fail-closed enforcement: when GROUNDING_ENFORCE=true, extension patterns
- * in generate_code and create_d365fo_file require this token.
+ * in generate_object(mode="pattern") and d365fo_file(action="create") require this token.
  */
 
 import { z } from 'zod';
@@ -23,6 +23,7 @@ import type { XppServerContext } from '../types/context.js';
 import { createProvenanceToken } from '../utils/provenanceStore.js';
 import { tryBridgeCocExtensions } from '../bridge/bridgeAdapter.js';
 import { getConfigManager } from '../utils/configManager.js';
+import { rankContext, renderRankedContext } from '../workspace/contextRanker.js';
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -292,7 +293,7 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
 
   // Format output
   const lines: string[] = [];
-  lines.push(`## prepare_change: context for \`${objectName}\`${methodName ? `::${methodName}` : ''}`);
+  lines.push(`## prepare(mode="change"): context for \`${objectName}\`${methodName ? `::${methodName}` : ''}`);
   lines.push('');
   lines.push(`**Goal:** ${goal}`);
   if (resolvedType) lines.push(`**Object type (resolved):** ${resolvedType}`);
@@ -322,6 +323,18 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
   lines.push(patternText);
   lines.push('');
 
+  // Ranked neighborhood: goal-driven, anchored on the target object. Best-effort.
+  try {
+    const ranked = rankContext(context, {
+      intent: `${goal} ${objectName} ${methodName ?? ''}`,
+      activeObject: { name: objectName, type: resolvedType },
+    });
+    lines.push(...renderRankedContext(ranked));
+    lines.push('');
+  } catch {
+    // Ranked context is additive — omit on failure.
+  }
+
   if (namingText !== null) {
     lines.push(`### Naming validation for \`${proposedName}\``);
     lines.push(namingText);
@@ -333,11 +346,11 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
   lines.push('');
   lines.push(
     process.env.GROUNDING_ENFORCE === 'true'
-      ? '⚠️  **GROUNDING_ENFORCE=true** — pass `groundingToken` to `generate_code` ' +
-        '(extension patterns), `create_d365fo_file` and `modify_d365fo_file` (extension objectTypes). ' +
+      ? '⚠️  **GROUNDING_ENFORCE=true** — pass `groundingToken` to `generate_object(mode="pattern")` ' +
+        '(extension patterns), `d365fo_file(action="create")` and `d365fo_file(action="modify")` (extension objectTypes). ' +
         `The token is bound to \`${objectName}\` — it does not authorize writes to other objects. ` +
         'Token expires in 30 minutes.'
-      : 'ℹ️  Pass `groundingToken` to `generate_code`, `create_d365fo_file` or `modify_d365fo_file` ' +
+      : 'ℹ️  Pass `groundingToken` to `generate_object(mode="pattern")`, `d365fo_file(action="create")` or `d365fo_file(action="modify")` ' +
         'to confirm this context was used. Set `GROUNDING_ENFORCE=true` to require it.',
   );
 
@@ -346,14 +359,5 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
   };
 }
 
-export const prepareChangeToolDefinition = {
-  name: 'prepare_change',
-  description:
-    'Single-round context aggregator for D365FO extension work. ' +
-    'Returns in ONE call: exact method signature, existing CoC wrappers, CoC eligibility, ' +
-    'recommended extension strategy, naming validation, and code patterns from the index. ' +
-    'Replaces the 4-step analyze→search→info→generate sequence with a single call. ' +
-    'Returns a grounding token (30-min TTL) that proves the AI used real codebase data. ' +
-    'When GROUNDING_ENFORCE=true the token is required for extension write operations.',
-  inputSchema: prepareChangeArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

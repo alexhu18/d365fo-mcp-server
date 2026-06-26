@@ -131,8 +131,5 @@ function getEdtHierarchy(db: any, edtName: string, modelName?: string) {
   return { content: [{ type: 'text', text: output }] };
 }
 
-export const getEdtInfoToolDefinition = {
-  name: 'get_edt_info',
-  description: '📊 Get complete Extended Data Type (EDT) definition including base type, labels, reference table, string/number settings, and EDT properties from AxEdt metadata.',
-  inputSchema: GetEdtInfoArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

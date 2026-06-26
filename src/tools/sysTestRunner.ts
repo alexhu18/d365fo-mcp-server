@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { execFile } from 'child_process';
 import util from 'util';
 import path from 'path';
@@ -21,16 +20,8 @@ function assertSafePath(value: string, label: string): void {
   }
 }
 
-export const sysTestRunnerToolDefinition = {
-  name: 'run_systest_class',
-  description: 'Invoke D365FO SysTest framework against a specific test class.',
-  parameters: z.object({
-    className: z.string().describe('The name of the SysTest class to run'),
-    modelName: z.string().optional().describe('The model containing the test class. Auto-detected from .mcp.json if omitted.'),
-    packagePath: z.string().optional().describe('PackagesLocalDirectory root. Auto-detected if omitted.'),
-    testMethod: z.string().optional().describe('Optional: run only this specific test method within the class.')
-  })
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 export const sysTestRunnerTool = async (params: any, _context: any) => {
   const { className, testMethod } = params;

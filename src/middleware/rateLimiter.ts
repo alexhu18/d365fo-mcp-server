@@ -56,7 +56,7 @@ function generateKey(req: Request): string {
 /**
  * General API rate limiter
  * Default: 500 requests per 15 minutes per user token (or IP as fallback).
- * GitHub Copilot is chatty: a single interaction (e.g. get_class_info + search
+ * GitHub Copilot is chatty: a single interaction (e.g. get_object_info + search
  * + batch_search) can easily consume 10–20 requests. With 10 developers the old
  * default of 100 / 15 min was hit within 1–2 minutes per user.
  * Override via RATE_LIMIT_MAX_REQUESTS env var.

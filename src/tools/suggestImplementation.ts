@@ -20,22 +20,10 @@ const SuggestMethodImplementationArgsSchema = z.object({
 export async function suggestMethodImplementationTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = SuggestMethodImplementationArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
-    // Check cache first
-    const cacheKey = `suggest:${args.className}:${args.methodName}`;
-    const cachedResults = await cache.get<any>(cacheKey);
-    
-    if (cachedResults) {
-      return {
-        content: [{ type: 'text', text: formatSuggestion(cachedResults, args) }],
-      };
-    }
+    const { symbolIndex } = context;
 
     // Find similar methods
     const similarMethods = symbolIndex.findSimilarMethods(args.methodName, args.className, 5);
-    
-    // Cache results
-    await cache.set(cacheKey, similarMethods, 300); // Cache for 5 minutes
     
     if (similarMethods.length === 0) {
       return {
@@ -162,7 +150,7 @@ function formatSuggestion(similarMethods: any[], args: any): string {
   
   output += `**Next Steps:**\n`;
   output += `1. Review the similar implementations above\n`;
-  output += `2. Use \`get_class_info\` on example classes to see full context\n`;
+  output += `2. Use \`get_object_info(objectType="class", name=...)\` on example classes to see full context\n`;
   output += `3. Adapt the patterns to your specific needs\n`;
   
   return output;

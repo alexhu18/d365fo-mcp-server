@@ -14,19 +14,7 @@ const AnalyzeClassCompletenessArgsSchema = z.object({
 export async function analyzeClassCompletenessTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = AnalyzeClassCompletenessArgsSchema.parse(request.params.arguments);
-    const { symbolIndex, cache } = context;
-
-    // Check cache first — avoid unnecessary DB lookup on cache hit
-    const cacheKey = `completeness:${args.className}`;
-    const cachedResults = await cache.get<any>(cacheKey);
-
-    if (cachedResults) {
-      // classSymbol still needed for model/path display in formatAnalysis
-      const classSymbol = symbolIndex.getSymbolByName(args.className, 'class');
-      return {
-        content: [{ type: 'text', text: formatAnalysis(cachedResults, classSymbol) }],
-      };
-    }
+    const { symbolIndex } = context;
 
     const classSymbol = symbolIndex.getSymbolByName(args.className, 'class');
     
@@ -51,9 +39,6 @@ export async function analyzeClassCompletenessTool(request: CallToolRequest, con
       existingMethods,
       suggestedMethods
     };
-    
-    // Cache results
-    await cache.set(cacheKey, analysis, 600); // Cache for 10 minutes
     
     const formatted = formatAnalysis(analysis, classSymbol);
     
@@ -115,9 +100,9 @@ function formatAnalysis(analysis: any, classSymbol: any): string {
     output += `**Recommendation:** Consider implementing the 🔴 and 🟠 methods to follow common patterns in your codebase.\n\n`;
     
     output += `**Next Steps:**\n`;
-    output += `1. Use \`suggest_method_implementation\` for specific methods to get implementation examples\n`;
+    output += `1. Use \`analyze_code(mode="implementations")\` for specific methods to get implementation examples\n`;
     output += `2. Use \`search\` to find classes that implement these methods\n`;
-    output += `3. Use \`get_class_info\` to study similar classes\n`;
+    output += `3. Use \`get_object_info(objectType="class", name=...)\` to study similar classes\n`;
   } else {
     output += `## ✅ Analysis Result\n\n`;
     output += `No commonly missing methods detected. Class appears complete for its ${classSymbol.patternType || 'pattern'} type.\n\n`;

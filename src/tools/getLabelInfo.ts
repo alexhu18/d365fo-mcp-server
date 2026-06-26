@@ -31,14 +31,25 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
 
     // ── Mode A: no labelId → list available AxLabelFile IDs ─────────────────
     if (!labelId) {
-      const files = symbolIndex.getLabelFileIds(model);
+      let files = symbolIndex.getLabelFileIds(model);
+
+      // When a specific labelFileId is requested, narrow the listing to it and
+      // additionally surface the physical .label.txt path for each language so
+      // the caller never has to shell out to locate the file on disk.
+      if (labelFileId) {
+        files = files.filter(f => f.labelFileId.toLowerCase() === labelFileId.toLowerCase());
+      }
+
       if (files.length === 0) {
         return {
           content: [
             {
               type: 'text',
               text:
-                `No label files found${model ? ` for model "${model}"` : ''}.\n` +
+                `No label files found` +
+                (labelFileId ? ` matching labelFileId "${labelFileId}"` : '') +
+                (model ? ` for model "${model}"` : '') +
+                `.\n` +
                 `Make sure labels are indexed (run build-database with INCLUDE_LABELS=true).`,
             },
           ],
@@ -46,17 +57,36 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
       }
 
       const lines: string[] = [
-        `Available AxLabelFile IDs${model ? ` in model "${model}"` : ''}:`,
+        labelFileId
+          ? `Label file "${labelFileId}"${model ? ` in model "${model}"` : ''}:`
+          : `Available AxLabelFile IDs${model ? ` in model "${model}"` : ''}:`,
         '',
       ];
       for (const f of files) {
         lines.push(`  LabelFileId : ${f.labelFileId}`);
         lines.push(`  Model       : ${f.model}`);
         lines.push(`  Languages   : ${f.languages}`);
+
+        // Physical file paths per language (only when a specific file was asked for,
+        // so the generic "list everything" view stays compact).
+        if (labelFileId) {
+          const paths = symbolIndex.getLabelFilePaths(f.labelFileId, model);
+          if (paths.length > 0) {
+            lines.push(`  Files       :`);
+            for (const p of paths) {
+              lines.push(`    [${p.language.padEnd(6)}] ${p.filePath}`);
+            }
+          } else {
+            lines.push(
+              `  Files       : (no physical path indexed — label rows may predate path tracking; ` +
+              `re-run build-database with INCLUDE_LABELS=true to populate file paths)`,
+            );
+          }
+        }
         lines.push('');
       }
       lines.push(
-        `💡 Use search_labels to find a label by text, or get_label_info with labelId to see all translations.`,
+        `💡 Use labels(action="search") to find a label by text, or labels(action="info") with labelId to see all translations.`,
       );
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -74,7 +104,7 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
               (labelFileId ? ` in label file "${labelFileId}"` : '') +
               (model ? ` in model "${model}"` : '') +
               '.\n\n' +
-              `💡 Try search_labels to find labels by text, or omit labelId to list available label files.`,
+              `💡 Try labels(action="search") to find labels by text, or omit labelId to list available label files.`,
           },
         ],
         isError: true,
@@ -127,28 +157,5 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
   }
 }
 
-export const getLabelInfoToolDefinition = {
-  name: 'get_label_info',
-  description:
-    'Get all language translations for a specific D365FO label ID, or list available AxLabelFile IDs for a model. ' +
-    'Returns the X++ reference syntax (@LabelFileId:LabelId) and usage examples.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      labelId: {
-        type: 'string',
-        description:
-          'Exact label ID (e.g. MyFeature). Omit to list available label files.',
-      },
-      labelFileId: {
-        type: 'string',
-        description: 'Label file ID (e.g. ContosoExt, SYS)',
-      },
-      model: {
-        type: 'string',
-        description: 'Model to filter by (e.g. ContosoExt)',
-      },
-    },
-    required: [],
-  },
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

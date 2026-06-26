@@ -20,6 +20,7 @@ import type {
   XppViewRelationInfo,
 } from './types.js';
 import { EnhancedXppParser } from './enhancedParser.js';
+import { walkFormDesign, collectPatternNodes } from './formPatternMiner.js';
 
 export class XppMetadataParser {
   private parser: Parser;
@@ -530,26 +531,33 @@ export class XppMetadataParser {
         label: axForm.Label || undefined,
         caption: axForm.Caption || axForm.TitleDatasource || undefined,
         formPattern: undefined, // Will be detected from Design
+        formPatternVersion: undefined,
         dataSources: [],
         design: [],
+        patternNodes: [],
         methods: [],
       };
 
-      // Extract data sources
-      if (axForm.DataSources && axForm.DataSources.length > 0) {
-        formInfo.dataSources = this.extractFormDataSources(axForm.DataSources[0]);
+      // Extract data sources (top-level <DataSources>, not the SourceCode one)
+      // xml2js with explicitArray:false yields a plain object here, never an array.
+      if (axForm.DataSources && typeof axForm.DataSources === 'object') {
+        formInfo.dataSources = this.extractFormDataSources(axForm.DataSources);
       }
 
-      // Extract design (controls)
-      if (axForm.Design && axForm.Design.length > 0) {
-        const designInfo = this.extractFormDesign(axForm.Design[0]);
+      // Extract design (controls) — Design > Controls > AxFormControl tree,
+      // including Pattern/PatternVersion on Design and on container controls.
+      if (axForm.Design && typeof axForm.Design === 'object') {
+        const designInfo = walkFormDesign(axForm.Design);
         formInfo.design = designInfo.controls;
-        formInfo.formPattern = designInfo.pattern;
+        formInfo.formPattern = designInfo.pattern || designInfo.style;
+        formInfo.formPatternVersion = designInfo.patternVersion;
+        formInfo.patternNodes = collectPatternNodes(designInfo);
       }
 
-      // Extract methods
-      if (axForm.Methods && axForm.Methods.length > 0) {
-        formInfo.methods = this.extractFormMethods(axForm.Methods[0], formName);
+      // Extract methods — form methods live under SourceCode > Methods > Method
+      const methodsNode = axForm.SourceCode?.Methods ?? axForm.Methods;
+      if (methodsNode && typeof methodsNode === 'object') {
+        formInfo.methods = this.extractFormMethods(methodsNode, formName);
       }
 
       return { success: true, data: formInfo };
@@ -567,11 +575,13 @@ export class XppMetadataParser {
   private extractFormDataSources(dataSourcesNode: any): any[] {
     const dataSources: any[] = [];
 
-    if (!dataSourcesNode.AxFormDataSourceRoot) {
+    // Form XML uses <AxFormDataSource>; AxFormDataSourceRoot kept as legacy fallback
+    const dsData = dataSourcesNode.AxFormDataSource || dataSourcesNode.AxFormDataSourceRoot;
+    if (!dsData) {
       return dataSources;
     }
 
-    const dsRoots = this.ensureArray(dataSourcesNode.AxFormDataSourceRoot);
+    const dsRoots = this.ensureArray(dsData);
 
     for (const dsNode of dsRoots) {
       const ds: any = {
@@ -608,94 +618,6 @@ export class XppMetadataParser {
     }
 
     return dataSources;
-  }
-
-  /**
-   * Extract form design (controls)
-   */
-  private extractFormDesign(designNode: any): { controls: any[]; pattern?: string } {
-    const controls: any[] = [];
-    let pattern: string | undefined = undefined;
-
-    // Detect form pattern from Design properties
-    if (designNode.Pattern) {
-      pattern = designNode.Pattern;
-    } else if (designNode.Style) {
-      // Some forms use Style instead of Pattern
-      pattern = designNode.Style;
-    }
-
-    // Find root containers
-    const rootKeys = Object.keys(designNode).filter(k => k.startsWith('AxForm'));
-
-    for (const key of rootKeys) {
-      const nodes = this.ensureArray(designNode[key]);
-      for (const node of nodes) {
-        const control = this.extractFormControl(node, key);
-        if (control) {
-          controls.push(control);
-        }
-      }
-    }
-
-    return { controls, pattern };
-  }
-
-  /**
-   * Extract single form control recursively
-   */
-  private extractFormControl(node: any, nodeType: string): any | null {
-    if (!node) return null;
-
-    const control: any = {
-      name: node.Name || 'Unknown',
-      type: nodeType.replace('AxForm', ''),
-      properties: {},
-      children: [],
-    };
-
-    // Extract common properties
-    const propertiesToExtract = [
-      'Caption',
-      'Visible',
-      'Enabled',
-      'AutoDeclaration',
-      'DataSource',
-      'DataField',
-      'DataMethod',
-      'HelpText',
-      'Label',
-      'Width',
-      'Height',
-      'AllowEdit',
-      'Mandatory',
-      'Style',
-      'Pattern',
-    ];
-
-    for (const prop of propertiesToExtract) {
-      if (node[prop]) {
-        const value = Array.isArray(node[prop]) ? node[prop][0] : node[prop];
-        if (value) {
-          control.properties[prop] = value;
-        }
-      }
-    }
-
-    // Recursively extract child controls
-    const childKeys = Object.keys(node).filter(k => k.startsWith('AxForm') && k !== nodeType);
-
-    for (const childKey of childKeys) {
-      const childNodes = this.ensureArray(node[childKey]);
-      for (const childNode of childNodes) {
-        const childControl = this.extractFormControl(childNode, childKey);
-        if (childControl) {
-          control.children.push(childControl);
-        }
-      }
-    }
-
-    return control;
   }
 
   /**
@@ -762,6 +684,7 @@ export class XppMetadataParser {
         referenceTable: getValue('ReferenceTable'),
         relationType: getValue('RelationType'),
         stringSize: getValue('StringSize'),
+        databaseStringSize: getValue('DatabaseStringSize'),
         displayLength: getValue('DisplayLength'),
         label: getValue('Label'),
         helpText: getValue('HelpText'),
@@ -777,6 +700,7 @@ export class XppMetadataParser {
       // Extract additional properties
       const knownProperties = new Set([
         'Name', 'Extends', 'EnumType', 'ReferenceTable', 'RelationType', 'StringSize', 'DisplayLength',
+        'DatabaseStringSize',
         'Label', 'HelpText', 'FormHelp', 'ConfigurationKey', 'Alignment', 'DecimalSeparator',
         'SignDisplay', 'NoOfDecimals', 'ArrayElements', 'Relations', 'TableReferences'
       ]);
@@ -1032,6 +956,238 @@ export class XppMetadataParser {
           addedIndexes,
           cocMethods,
           eventSubscriptions,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Parse an AxService file: backing class, external name, namespace, and the
+   * exposed service operations (each maps to a public method on the class).
+   */
+  async parseServiceFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    serviceClass?: string;
+    externalName?: string;
+    namespace?: string;
+    sourcePath: string;
+    operations: { name: string; method: string; idempotent: boolean }[];
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxService;
+      if (!root) return { success: false, error: 'Not an AxService file' };
+
+      const rawOps = root.ServiceOperations?.AxServiceOperation;
+      const opArr = Array.isArray(rawOps) ? rawOps : rawOps ? [rawOps] : [];
+      const operations = opArr
+        .map((o: any) => ({
+          name: o.Name || '',
+          method: o.Method || o.Name || '',
+          idempotent: String(o.EnableIdempotence || '').toLowerCase() === 'yes',
+        }))
+        .filter((o: { name: string }) => o.name);
+
+      return {
+        success: true,
+        data: {
+          name: root.Name || '',
+          serviceClass: root.Class || undefined,
+          externalName: root.ExternalName || undefined,
+          namespace: root.Namespace || undefined,
+          sourcePath: filePath,
+          operations,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Parse an AxMap file: the X++ map class (methods) and its table mappings
+   * (each mapping binds the map to a table via field connections).
+   */
+  async parseMapFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    extends?: string;
+    sourcePath: string;
+    methods: string[];
+    mappings: { table: string; fieldConnections: number }[];
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxMap;
+      if (!root) return { success: false, error: 'Not an AxMap file' };
+
+      const decl: string = root.SourceCode?.Declaration || '';
+      const extendsMatch = decl.match(/\bextends\s+(\w+)/i);
+
+      const rawMethods = root.SourceCode?.Methods?.Method;
+      const methodArr = Array.isArray(rawMethods) ? rawMethods : rawMethods ? [rawMethods] : [];
+      const methods: string[] = methodArr.map((m: any) => m.Name || '').filter(Boolean);
+
+      const rawMappings = root.Mappings?.AxTableMapping;
+      const mapArr = Array.isArray(rawMappings) ? rawMappings : rawMappings ? [rawMappings] : [];
+      const mappings = mapArr.map((m: any) => {
+        const rawConn = m.Connections?.AxTableMappingConnection;
+        const connArr = Array.isArray(rawConn) ? rawConn : rawConn ? [rawConn] : [];
+        return { table: m.MappingTable || '', fieldConnections: connArr.length };
+      }).filter((m: { table: string }) => m.table);
+
+      return {
+        success: true,
+        data: { name: root.Name || '', extends: extendsMatch?.[1], sourcePath: filePath, methods, mappings },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Parse an AxConfigurationKey file: label + parent key (feature gating tree). */
+  async parseConfigurationKeyFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    label?: string;
+    parentKey?: string;
+    sourcePath: string;
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxConfigurationKey;
+      if (!root) return { success: false, error: 'Not an AxConfigurationKey file' };
+      return {
+        success: true,
+        data: { name: root.Name || '', label: root.Label || undefined, parentKey: root.ParentKey || undefined, sourcePath: filePath },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Parse an AxLicenseCode file: group, package, type (license-based feature gating). */
+  async parseLicenseCodeFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    label?: string;
+    group?: string;
+    licensePackage?: string;
+    type?: string;
+    sourcePath: string;
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxLicenseCode;
+      if (!root) return { success: false, error: 'Not an AxLicenseCode file' };
+      return {
+        success: true,
+        data: {
+          name: root.Name || '',
+          label: root.Label || undefined,
+          group: root.Group || undefined,
+          licensePackage: root.Package || undefined,
+          type: root.Type || undefined,
+          sourcePath: filePath,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Parse an AxSecurityPolicy file: row-level (OLS) policy on a primary table. */
+  async parseSecurityPolicyFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    label?: string;
+    primaryTable?: string;
+    query?: string;
+    operation?: string;
+    constrainedTable: boolean;
+    sourcePath: string;
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxSecurityPolicy;
+      if (!root) return { success: false, error: 'Not an AxSecurityPolicy file' };
+      return {
+        success: true,
+        data: {
+          name: root.Name || '',
+          label: root.Label || undefined,
+          primaryTable: root.PrimaryTable || undefined,
+          query: root.Query || undefined,
+          operation: root.Operation || undefined,
+          constrainedTable: String(root.ConstrainedTable || '').toLowerCase() === 'yes',
+          sourcePath: filePath,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** Parse an AxMacroDictionary file: the #define entries of a shared macro library. */
+  async parseMacroFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    sourcePath: string;
+    defines: { name: string; value: string }[];
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxMacroDictionary;
+      if (!root) return { success: false, error: 'Not an AxMacroDictionary file' };
+
+      const source: string = typeof root.Source === 'string' ? root.Source : (root.Source?._ || '');
+      const defines: { name: string; value: string }[] = [];
+      // #define.Name(value) and #define.Name  (no value)
+      const re = /#define\.(\w+)\s*(?:\(([^)]*)\))?/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(source)) !== null) {
+        defines.push({ name: m[1], value: (m[2] ?? '').trim() });
+      }
+
+      return { success: true, data: { name: root.Name || '', sourcePath: filePath, defines } };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Parse an AxServiceGroup file: member services and deployment flag.
+   */
+  async parseServiceGroupFile(filePath: string): Promise<XppParseResult<{
+    name: string;
+    autoDeploy: boolean;
+    description?: string;
+    sourcePath: string;
+    services: string[];
+  }>> {
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      const parsed = await this.parser.parseStringPromise(content);
+      const root = parsed?.AxServiceGroup;
+      if (!root) return { success: false, error: 'Not an AxServiceGroup file' };
+
+      const rawSvc = root.Services?.AxServiceGroupService;
+      const svcArr = Array.isArray(rawSvc) ? rawSvc : rawSvc ? [rawSvc] : [];
+      const services: string[] = svcArr
+        .map((s: any) => s.Service || s.Name || '')
+        .filter(Boolean);
+
+      return {
+        success: true,
+        data: {
+          name: root.Name || '',
+          autoDeploy: String(root.AutoDeploy || '').toLowerCase() === 'yes',
+          description: root.Description || undefined,
+          sourcePath: filePath,
+          services,
         },
       };
     } catch (error) {

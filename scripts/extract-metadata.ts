@@ -96,6 +96,13 @@ interface ExtractionStats {
   enumExtensions: number;
   edtExtensions: number;
   dataEntityExtensions: number;
+  services: number;
+  serviceGroups: number;
+  maps: number;
+  configurationKeys: number;
+  licenseCodes: number;
+  securityPolicies: number;
+  macros: number;
   errors: number;
 }
 
@@ -243,6 +250,13 @@ async function extractMetadata() {
     enumExtensions: 0,
     edtExtensions: 0,
     dataEntityExtensions: 0,
+    services: 0,
+    serviceGroups: 0,
+    maps: 0,
+    configurationKeys: 0,
+    licenseCodes: 0,
+    securityPolicies: 0,
+    macros: 0,
     errors: 0,
   };
 
@@ -472,6 +486,17 @@ async function extractMetadata() {
     await extractExtensions(parser, modelPath, modelName, 'edt-extension', 'AxEdtExtension', stats, isCustom);
     await extractExtensions(parser, modelPath, modelName, 'data-entity-extension', 'AxDataEntityViewExtension', stats, isCustom);
 
+    // Extract services + service groups
+    await extractServices(parser, modelPath, modelName, stats, isCustom);
+    await extractServiceGroups(parser, modelPath, modelName, stats, isCustom);
+
+    // Extract maps, feature gating, security policies, macros
+    await extractMaps(parser, modelPath, modelName, stats, isCustom);
+    await extractConfigurationKeys(parser, modelPath, modelName, stats, isCustom);
+    await extractLicenseCodes(parser, modelPath, modelName, stats, isCustom);
+    await extractSecurityPolicies(parser, modelPath, modelName, stats, isCustom);
+    await extractMacros(parser, modelPath, modelName, stats, isCustom);
+
     const modelDuration = Date.now() - modelStart;
     cumulativeModelDuration += modelDuration;
     processedModels++;
@@ -512,6 +537,13 @@ async function extractMetadata() {
   console.log(`   Enum extensions: ${formatCount(stats.enumExtensions)}`);
   console.log(`   EDT extensions: ${formatCount(stats.edtExtensions)}`);
   console.log(`   Data entity extensions: ${formatCount(stats.dataEntityExtensions)}`);
+  console.log(`   Services: ${formatCount(stats.services)}`);
+  console.log(`   Service groups: ${formatCount(stats.serviceGroups)}`);
+  console.log(`   Maps: ${formatCount(stats.maps)}`);
+  console.log(`   Configuration keys: ${formatCount(stats.configurationKeys)}`);
+  console.log(`   License codes: ${formatCount(stats.licenseCodes)}`);
+  console.log(`   Security policies: ${formatCount(stats.securityPolicies)}`);
+  console.log(`   Macros: ${formatCount(stats.macros)}`);
   console.log(`   Errors: ${formatCount(stats.errors)}`);
 }
 
@@ -905,7 +937,7 @@ async function extractEdts(
 /**
  * Extract AxReport metadata.
  * Reports are stored as lightweight stubs — just name + file_path.
- * The get_report_info tool reads the live XML on demand rather than
+ * The get_object_info(report) reader loads the live XML on demand rather than
  * caching a full parse, so we only need enough for the symbol DB entry.
  */
 async function extractReports(
@@ -1146,6 +1178,139 @@ async function extractExtensions(
       stats.errors++;
     }
   }
+}
+
+async function extractServices(
+  parser: XppMetadataParser,
+  modelPath: string,
+  modelName: string,
+  stats: ExtractionStats,
+  isCustom = false
+) {
+  let dirPath = path.join(modelPath, 'AxService');
+  try { await fs.access(dirPath); } catch {
+    dirPath = path.join(modelPath, 'axservice');
+    try { await fs.access(dirPath); } catch { return; }
+  }
+  const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
+  if (files.length === 0) return;
+  console.log(`   Services: ${formatCount(files.length)} files`);
+  const outputDir = path.join(OUTPUT_PATH, modelName, 'services');
+  await fs.mkdir(outputDir, { recursive: true });
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    stats.totalFiles++;
+    try {
+      const result = await parser.parseServiceFile(filePath);
+      if (!result.success || !result.data) { stats.errors++; continue; }
+      const outputFile = path.join(outputDir, `${result.data.name}.json`);
+      await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'service' }, isCustom ? sourcePathReplacer : undefined, 2));
+      stats.services++;
+    } catch (error) {
+      console.error(`   ❌ Error extracting service ${file}:`, error);
+      stats.errors++;
+    }
+  }
+}
+
+async function extractServiceGroups(
+  parser: XppMetadataParser,
+  modelPath: string,
+  modelName: string,
+  stats: ExtractionStats,
+  isCustom = false
+) {
+  let dirPath = path.join(modelPath, 'AxServiceGroup');
+  try { await fs.access(dirPath); } catch {
+    dirPath = path.join(modelPath, 'axservicegroup');
+    try { await fs.access(dirPath); } catch { return; }
+  }
+  const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
+  if (files.length === 0) return;
+  console.log(`   Service groups: ${formatCount(files.length)} files`);
+  const outputDir = path.join(OUTPUT_PATH, modelName, 'service-groups');
+  await fs.mkdir(outputDir, { recursive: true });
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    stats.totalFiles++;
+    try {
+      const result = await parser.parseServiceGroupFile(filePath);
+      if (!result.success || !result.data) { stats.errors++; continue; }
+      const outputFile = path.join(outputDir, `${result.data.name}.json`);
+      await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'service-group' }, isCustom ? sourcePathReplacer : undefined, 2));
+      stats.serviceGroups++;
+    } catch (error) {
+      console.error(`   ❌ Error extracting service group ${file}:`, error);
+      stats.errors++;
+    }
+  }
+}
+
+/**
+ * Generic single-type extractor: reads <AxDir>/*.xml, parses each via `parseFn`,
+ * writes JSON metadata with the given `type`, and bumps `statKey`.
+ */
+async function extractSimpleType(
+  modelPath: string,
+  modelName: string,
+  axDirName: string,
+  outDirName: string,
+  type: string,
+  statKey: keyof ExtractionStats,
+  parseFn: (filePath: string) => Promise<{ success: boolean; data?: any; error?: string }>,
+  stats: ExtractionStats,
+  isCustom: boolean,
+  label: string,
+) {
+  let dirPath = path.join(modelPath, axDirName);
+  try { await fs.access(dirPath); } catch {
+    dirPath = path.join(modelPath, axDirName.toLowerCase());
+    try { await fs.access(dirPath); } catch { return; }
+  }
+  const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
+  if (files.length === 0) return;
+  console.log(`   ${label}: ${formatCount(files.length)} files`);
+  const outputDir = path.join(OUTPUT_PATH, modelName, outDirName);
+  await fs.mkdir(outputDir, { recursive: true });
+  for (const file of files) {
+    const filePath = path.join(dirPath, file);
+    stats.totalFiles++;
+    try {
+      const result = await parseFn(filePath);
+      if (!result.success || !result.data) { stats.errors++; continue; }
+      const outputFile = path.join(outputDir, `${result.data.name}.json`);
+      await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type }, isCustom ? sourcePathReplacer : undefined, 2));
+      (stats as any)[statKey]++;
+    } catch (error) {
+      console.error(`   ❌ Error extracting ${label} ${file}:`, error);
+      stats.errors++;
+    }
+  }
+}
+
+async function extractMaps(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(modelPath, modelName, 'AxMap', 'maps', 'map', 'maps',
+    (f) => parser.parseMapFile(f), stats, isCustom, 'Maps');
+}
+
+async function extractConfigurationKeys(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(modelPath, modelName, 'AxConfigurationKey', 'configuration-keys', 'configuration-key', 'configurationKeys',
+    (f) => parser.parseConfigurationKeyFile(f), stats, isCustom, 'Configuration keys');
+}
+
+async function extractLicenseCodes(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(modelPath, modelName, 'AxLicenseCode', 'license-codes', 'license-code', 'licenseCodes',
+    (f) => parser.parseLicenseCodeFile(f), stats, isCustom, 'License codes');
+}
+
+async function extractSecurityPolicies(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(modelPath, modelName, 'AxSecurityPolicy', 'security-policies', 'security-policy', 'securityPolicies',
+    (f) => parser.parseSecurityPolicyFile(f), stats, isCustom, 'Security policies');
+}
+
+async function extractMacros(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(modelPath, modelName, 'AxMacroDictionary', 'macros', 'macro', 'macros',
+    (f) => parser.parseMacroFile(f), stats, isCustom, 'Macros');
 }
 
 // Run extraction

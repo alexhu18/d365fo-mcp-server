@@ -66,7 +66,7 @@ switch ($Action) {
     
     'class' {
         Write-Host "[CLASS] Getting class info: $Query" -ForegroundColor Yellow
-        $result = Invoke-MCPTool -ToolName "get_class_info" -Arguments @{ className = $Query }
+        $result = Invoke-MCPTool -ToolName "get_object_info" -Arguments @{ objectType = "class"; name = $Query }
         if ($result.content) {
             $data = $result.content[0].text | ConvertFrom-Json
             Write-Host "Class: $($data.name)" -ForegroundColor Green
@@ -80,7 +80,7 @@ switch ($Action) {
     
     'table' {
         Write-Host "[TABLE] Getting table info: $Query" -ForegroundColor Yellow
-        $result = Invoke-MCPTool -ToolName "get_table_info" -Arguments @{ tableName = $Query }
+        $result = Invoke-MCPTool -ToolName "get_object_info" -Arguments @{ objectType = "table"; name = $Query }
         if ($result.content) {
             $data = $result.content[0].text | ConvertFrom-Json
             Write-Host "Table: $($data.name)" -ForegroundColor Green

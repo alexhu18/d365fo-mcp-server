@@ -15,6 +15,7 @@ import type { XppServerContext } from '../types/context.js';
 import { promises as fs } from 'fs';
 import { parseStringPromise } from 'xml2js';
 import { tryBridgeReport } from '../bridge/bridgeAdapter.js';
+import { assertWritePathAllowed } from '../utils/pathContainment.js';
 
 const GetReportInfoArgsSchema = z.object({
   reportName: z.string().describe('Name of the AxReport object (without .xml extension)'),
@@ -79,6 +80,16 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
 
     // 2. Explicit file path fallback for newly-created reports
     if (explicitFilePath) {
+      // Security: validate that the supplied path falls within a configured D365FO
+      // package root before reading any file content.  Without this check a
+      // prompt-injection attack could read arbitrary local files via this parameter.
+      const containment = await assertWritePathAllowed(explicitFilePath);
+      if (!containment.ok) {
+        return {
+          content: [{ type: 'text', text: `❌ get_object_info(report): filePath rejected — ${containment.reason}` }],
+          isError: true,
+        };
+      }
       let xmlContent: string | null = null;
       try {
         const raw = await fs.readFile(explicitFilePath, 'utf-8');
@@ -86,6 +97,14 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
         if (trimmed.startsWith('{')) {
           const meta = JSON.parse(raw);
           if (meta.sourcePath) {
+            // Validate indirect sourcePath as well before reading it.
+            const srcContainment = await assertWritePathAllowed(meta.sourcePath);
+            if (!srcContainment.ok) {
+              return {
+                content: [{ type: 'text', text: `❌ get_object_info(report): sourcePath rejected — ${srcContainment.reason}` }],
+                isError: true,
+              };
+            }
             try { xmlContent = await fs.readFile(meta.sourcePath, 'utf-8'); } catch { /* not accessible */ }
           }
         } else {
@@ -128,7 +147,7 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
         type: 'text',
         text: `❌ Report "${reportName}" not found via bridge.\n\n` +
           `If this is a newly-created report, pass the explicit \`filePath\` parameter:\n` +
-          `  get_report_info(reportName="${reportName}", filePath="<absolute path to .xml>")`,
+          `  get_object_info(objectType="report", name="${reportName}", options={filePath:"<absolute path to .xml>"})`,
       }],
       isError: true,
     };

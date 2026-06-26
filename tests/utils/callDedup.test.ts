@@ -6,11 +6,13 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import {
   dedupKey, getDedupedResult, storeDedupResult, clearDedupCache,
   appendNote, DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
+  getInFlight, registerInFlight, clearInFlight, clearAllInFlight,
 } from '../../src/utils/callDedup';
 import { recordCallSequence, resetCallSequence, getMetricsSnapshot } from '../../src/utils/toolMetrics';
 
 beforeEach(() => {
   clearDedupCache();
+  clearAllInFlight();
   resetCallSequence();
 });
 
@@ -46,7 +48,7 @@ describe('dedup cache', () => {
   });
 
   it('excludes stateful tools from dedup', () => {
-    for (const tool of ['build_d365fo_project', 'modify_d365fo_file', 'prepare_change', 'get_workspace_info']) {
+    for (const tool of ['build_d365fo_project', 'd365fo_file', 'prepare', 'get_workspace_info']) {
       expect(DEDUP_EXCLUDED_TOOLS.has(tool)).toBe(true);
     }
     expect(DEDUP_EXCLUDED_TOOLS.has('search')).toBe(false);
@@ -67,6 +69,51 @@ describe('appendNote', () => {
   it('returns the input unchanged when there is no content', () => {
     const r = { content: [] };
     expect(appendNote(r, 'x')).toBe(r);
+  });
+});
+
+describe('in-flight dedup', () => {
+  it('getInFlight returns undefined before registration', () => {
+    expect(getInFlight('k1')).toBeUndefined();
+  });
+
+  it('registerInFlight makes the promise available via getInFlight', () => {
+    registerInFlight('k1');
+    expect(getInFlight('k1')).toBeInstanceOf(Promise);
+  });
+
+  it('resolving the handle settles the promise', async () => {
+    const handle = registerInFlight('k1');
+    const result = { content: [{ type: 'text', text: 'done' }] };
+    handle.resolve(result);
+    await expect(getInFlight('k1')).resolves.toBe(result);
+  });
+
+  it('clearInFlight removes the entry', () => {
+    registerInFlight('k1');
+    clearInFlight('k1');
+    expect(getInFlight('k1')).toBeUndefined();
+  });
+
+  it('coalesces two parallel identical calls (integration)', async () => {
+    // Simulate two concurrent calls: both check in-flight, neither finds a
+    // cached result. The first registers; the second should coalesce onto it.
+    const key = dedupKey('object_patterns', { domain: 'form', action: 'analyze' });
+
+    // --- caller A: registers and will resolve after a tick ---
+    const handle = registerInFlight(key);
+    const result = { content: [{ type: 'text', text: 'patterns' }] };
+
+    // --- caller B: finds the in-flight promise ---
+    const inFlight = getInFlight(key);
+    expect(inFlight).toBeInstanceOf(Promise);
+
+    // Simulate A completing
+    handle.resolve(result);
+    clearInFlight(key);
+
+    // B should receive the same result
+    expect(await inFlight).toBe(result);
   });
 });
 

@@ -102,7 +102,7 @@ describe('enforceGrounding', () => {
     process.env.GROUNDING_ENFORCE = 'true';
     const result = enforceGrounding(undefined, 'create_d365fo_file(...)');
     expect(result?.isError).toBe(true);
-    expect(result?.content[0].text).toContain('prepare_change');
+    expect(result?.content[0].text).toContain('prepare(mode="change"');
   });
 
   it('fails with an invalid token', () => {

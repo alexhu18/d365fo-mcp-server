@@ -1,250 +1,400 @@
 # Usage Examples
 
-Five real-world scenarios that show how GitHub Copilot chains multiple MCP tools together
-to complete complex D365FO tasks in a single conversation.
+Five **end-to-end, full-stack** scenarios — each a complete feature you would actually ship in a D365FO project, not a happy-path snippet. Every scenario spans the whole AOT stack: **EDTs / enums → tables → forms → business logic → menu items → menu → security**, with labels in three languages. The diagrams show the real MCP tool chain the AI agent runs; you only write the prompt in the grey box.
+
+Each scenario ends with an **indicative cost & model box** so you can plan token budget and pick the right model before you start. The numbers are *ballpark ranges measured on a mid-size CU-level environment* (≈580K symbols, 20M label rows) — treat them as a starting point and verify against your own metadata, which is exactly what these scenarios are designed to let you do.
+
+> **Reading the cost boxes**
+> - **Tool calls** — number of MCP round-trips the agent makes.
+> - **New context** — fresh tokens the tools pour into the conversation (metadata, generated XML/X++). Tool results dominate input cost.
+> - **Output** — assistant reasoning + generated code.
+> - **Billed total (cached)** — realistic end-to-end input+output *with* prompt caching on. Without caching, multiply input by 2–4× because each agent turn re-sends the growing transcript.
+> - **Model** — the tier that gives the best quality-per-token for that scenario (see the matrix at the bottom).
 
 ---
 
-## Scenario 1 — Implement a Safe Chain of Command Extension
+## Model selection at a glance
 
-**Goal:** Safely extend `SalesFormLetter.run()` to write an audit record after every sales
-posting — without breaking other ISV extensions or producing a duplicate wrapper.
-Includes creating a dedicated audit table with correct EDTs and the CoC extension class.
+| Work shape | Recommended | Why |
+|------------|-------------|-----|
+| Pure discovery — `search`, `get_object_info`, `labels` lookups, "where is X used" | **Haiku 4.5** | Lookups need recall, not reasoning. 5–10× cheaper, sub-second. |
+| Standard generation — one table, a cloned form, a single CoC class, an SSRS report | **Sonnet 4.6** | Best value. Handles the grounding chain and pattern validation reliably. **Default.** |
+| Architecture-heavy — greenfield modules, financial posting logic, cross-cutting CoC, anything where one wrong type cascades | **Opus 4.8** | Multi-object reasoning, signature juggling, and "what breaks downstream" thinking pay for themselves in fewer compile-fix loops. |
 
-**Prompt:**
-```
-I need to extend SalesFormLetter.run() in my MyPackage\MyModel model.
-Before writing anything:
-1. Check if CoC extensions already exist for this method
-2. Show me what other extension points SalesFormLetter has
-3. Get the exact method signature I need to match
-Then create an audit table MySalesFormLetterAuditLog
-(fields: SalesId, PostingType, PostedAt, PostedBy, Success)
-with correct labels and EDTs, and generate the CoC extension class that inserts
-an audit record after the base call completes.
-```
-
-**Tools Copilot chains:**
-1. `get_workspace_info` — workspace config check (model name, prefix, paths); mandatory first call
-2. `find_coc_extensions` + `analyze_extension_points` — parallel: checks whether `run()` is already CoC-wrapped; lists all eligible methods, delegates, and blocked members on `SalesFormLetter`
-3. `get_method_signature` ×2 — first call returns the exact signature (return type, parameters, modifiers); second call with `includeCocTemplate: true` returned only the signature (CoC template not supported in this server version) — skeleton written manually from the first call's output
-4. `analyze_code_patterns` + `search_extensions` ×2 + `search` — parallel research: audit log insert patterns in existing code; all custom `SalesFormLetter` extensions (prefix/model context); existence check for an audit table in the symbol index
-5. `get_label_info` + `search_labels` — parallel pre-label checks: resolves the correct `labelFileId`; confirms none of the planned label IDs already exist
-6. `create_label` ×6 — creates `SalesFormLetterAuditLog`, `PostingType`, `SalesId`, `PostedAt`, `PostedBy`, `Success` in en-US, cs, and de
-7. `generate_smart_table` + `get_table_info` — generates and writes `MySalesFormLetterAuditLog` to disk; immediately reads it back to verify what fields and EDTs were actually written
-8. `batch_search` + `search` + `get_enum_info` ×2 — parallel: resolves EDT `SalesId`, `TransDateTime`, `UserId`, enum `NoYes`; checks `SalesUpdate` (too narrow — missing Confirmation/Invoice); confirms `DocumentStatus` covers all posting types
-9. `modify_d365fo_file` ×2 + `create_d365fo_file` — `replace-all-fields` rewrites all fields with correct EDTs (`SalesId`, `DocumentStatus`, `TransDateTime`, `UserId`, `NoYes`); `modify-property` sets `TitleField1 = SalesId`; creates CoC extension class `SalesFormLetterMy_Extension` with `run()` and registers it in the `.rnrproj`
-10. `verify_d365fo_project` — confirms both objects (`MySalesFormLetterAuditLog` table and `SalesFormLetterMy_Extension` class) are on disk and in the project  ✅
-
-**Why this matters:**
-- `find_coc_extensions` and `analyze_extension_points` (step 2) run in parallel — they answer different questions but neither depends on the other's output, so there is no reason to sequence them.
-- `get_method_signature` ×2 (step 3): the second call with `includeCocTemplate: true` is worth trying even if support is uncertain — if it fails, the first call's output is already sufficient to write the skeleton manually.
-- `get_table_info` immediately after `generate_smart_table` (step 7) is a critical verification step: the generator may write different EDTs than requested; reading back the actual table before searching for correct types saves a redundant fix-up round.
-- `replace-all-fields` (step 9) is more reliable than individual `remove-field` + `add-field` calls when multiple fields are wrong — it rewrites the entire `<Fields>` block atomically, avoiding FieldGroup reference errors from partial intermediate states.
-- The enum investigation in step 8 shows why `search` + `get_enum_info` is needed before committing — `SalesUpdate` looked correct by name but lacked `Confirmation` and `Invoice` values, making `DocumentStatus` the right choice.
+Rule of thumb: **discover on Haiku, build on Sonnet, architect on Opus.** Switching mid-conversation is fine — do the noisy lookups cheaply, then upgrade for the generation turns.
 
 ---
 
-## Scenario 2 — Design and Build a Complete SysOperation Batch Job
+## 1 — Greenfield module: Equipment Rental
 
-**Goal:** Create a full batch job from scratch, following the exact patterns already used in the codebase — including correct labels and EDT types.
+**The most demanding shape: building a functional area from nothing.** A new `EquipRental` model with a master, a header/lines document, posting logic, number sequences, navigation, and a security role — the kind of slice an ISV ships as v1.0.
 
-**Prompt:**
 ```
-I need to create a SysOperation batch job that recalculates vendor payment terms
-for all active vendors. The job should:
-- Run nightly as a recurring batch
-- Report progress and write errors to the infolog
-- Use labelled parameters in the DataContract dialog
-- Follow the same patterns as existing batch jobs in the codebase
+Build the foundation of an Equipment Rental module in model EquipRental.
+I need an equipment master and a rental agreement (header + lines).
 
-Analyse the existing patterns first, look up the right EDT types for the
-parameters, resolve labels, then generate the DataContract, Controller,
-and Service classes, and create all three files in my project.
+Equipment: RentEquipmentId (number-sequence keyed), Name, Category enum
+(Vehicle, PowerTool, Scaffolding, Generator, Other), Status enum
+(Available, Reserved, OnRent, Maintenance, Retired), DailyRate, AcquiredDate.
+
+Agreement header: RentAgreementId (number sequence), CustAccount, FromDate, ToDate,
+Status (Open, Confirmed, Returned, Cancelled). Lines: RentEquipmentId, Qty,
+DailyRate (default from equipment), LineAmount.
+
+Use the right form patterns, wire number sequences the way this codebase does it,
+add display menu items + a submenu, and a maintenance + a view security role.
+Label everything in en-US, cs and de.
 ```
 
-**Tools Copilot chains:**
-1. `get_workspace_info` — workspace config check (model name, prefix, paths); mandatory first call
-2. `analyze_code_patterns` ×2 + `search_extensions` ×2 + `search` — parallel research: SysOperation DataContract/Controller/Service patterns in the codebase; existing batch extensions in custom models; broader VendPaymTerms and related class candidates
-3. `batch_search` (7 parallel queries) — resolves `SysOperationServiceController`, `SysOperationServiceBase`, `VendTable`, `PaymTerm`, `PaymTermId`, `VendAccount`, `DimensionStructureSynchronization` in one round-trip
-4. `get_class_info` + `get_api_usage_patterns` + `analyze_code_patterns` — deep-dive into `SysOperationServiceController` API; typical DataContract/Controller/Service wiring sequence; parm method and attribute conventions
-5. `generate_code` with `pattern: sysoperation` — generates DataContract/Controller/Service skeleton for `VendPaymTermsRecalculate` following the discovered patterns
-6. `get_table_info` + `batch_search` (4 parallel) + `get_edt_info` ×2 — `VendTable` field overview; resolves `VendPaymTermId`, `VendAccount`, `Blocked`, `NoYesId` EDTs; confirms base types and lookup constraints for each DataContract parm
-7. `search_extensions` ×4 + `get_class_info` + `get_method_signature` + `suggest_method_implementation` — finds existing My* DataContract class as a structural template; reads an exact `parm` method body; gets a `processOperation` implementation suggestion derived from the codebase
-8. `get_class_info` + `get_table_info` + `batch_search` (2 parallel) — `SysOperationServiceBase` method overview (base calls to replicate); `PaymTerm` table structure; resolves `VendGroup` and `PaymTermId` EDTs for remaining parms
-9. `search_labels` ×10 — exhaustive search across model label file, SYS global labels, and all scopes using 10 different phrasings to ensure no reusable label is missed before creating new ones
-10. `create_label` ×2 — creates `VendPaymTermRecalcParmVendGroup` and `VendPaymTermRecalcParmNewPaymTerm` in en-US, cs, and de
-11. `create_d365fo_file` ×3 — DataContract, Controller, and Service classes; each registered in the `.rnrproj`
-12. `verify_d365fo_project` — confirms all three objects are on disk and in the project  ✅
+The diagram below is the **actual tool chain from a recorded run** of this prompt (object names normalized to the generic `EquipRental` model / `Rent` prefix used above). It is busier than an idealized plan because real metadata pushes back: the number-sequence delegate had to be reverse-engineered from the platform, and a couple of form generations were retried. See the cost box for the measured numbers.
 
-**Why this matters:**
-- The two `batch_search` rounds (steps 3 and 8) reflect a real discovery dependency: the first round identifies the framework classes to study; the second fills in the gaps that only became apparent after reading the `generate_code` skeleton and the `VendTable` structure.
-- `search_extensions` ×4 (step 7) is the most efficient way to find an existing My* DataContract as a structural template — a real class from the same model gives exact attribute placement and parm boilerplate that no documentation can match.
-- 10 `search_labels` queries (step 9) before two `create_label` calls reflects real label hygiene: D365FO has thousands of SYS labels that overlap with custom domains, and a single search rarely covers all phrasings. Running all variants up front is cheaper than discovering a duplicate after writing code that references a new label ID.
-- `generate_code` (step 5) produces a compilable skeleton but not a finished service — EDT types, base class calls, and `processOperation` logic all require the subsequent research in steps 6–8 before the files can be written.
+```mermaid
+flowchart TB
+    A["get_workspace_info<br/>model EquipRental, paths, staleness"] --> B["get_knowledge x4<br/>number sequences / form patterns / security / object patterns"]
+    B --> C["object_patterns domain=form action=analyze x2<br/>master + header/lines transaction"]
+    C --> D["analyze_code mode=patterns + search x2<br/>how this codebase wires NumberSeqModule"]
+    D --> E["generate_object mode=pattern<br/>pattern=number-seq-handler (Rent)"]
+    E --> F["verify_d365fo_project<br/>early scaffold sanity check"]
+    F --> G["list_dir + run_in_terminal<br/>locate label-file shape in metadata"]
+    G --> H["labels action=create<br/>Rent label file, 42 entries (en-US/cs/de)"]
+    H --> I["d365fo_file action=create<br/>2 EDTs + 3 enums + NumberSeqModule enum-extension"]
+    I --> J["d365fo_file action=create x4<br/>tables: Equipment / AgreementHeader / Line / Parameters"]
+    J --> K["d365fo_file action=modify<br/>add-index x4 + add-relation x3"]
+    K --> L["d365fo_file action=modify<br/>table methods: numRef* + numberSeqModule()"]
+    L --> M["d365fo_file action=create<br/>NumberSeqModuleRent class + NumberSeqGlobal class-extension"]
+    M --> N["search + run_in_terminal x~10<br/>find NumberSeqGlobal buildModulesMapDelegate pattern"]
+    N --> O["d365fo_file action=modify class-extension<br/>SubscribesTo buildModulesMapDelegate"]
+    O --> P["update_symbol_index"]
+    P --> Q["generate_object objectType=form cloneFrom (+retries)<br/>Equipment←PaymTerm, Agreement←SalesTable"]
+    Q --> R["d365fo_file action=modify form<br/>add lines data source + number-seq form handler methods"]
+    R --> S["generate_object form Parameters TableOfContents<br/>(retried) + update_symbol_index"]
+    S --> T["d365fo_file action=create<br/>3 display menu items + menu RentModule + add items"]
+    T --> U["d365fo_file action=create<br/>4 privileges + 2 duties + 2 roles"]
+    U --> V["verify_d365fo_project<br/>final, full object list"]
+```
+
+**What gets created (≈22 objects)**
+
+| Layer | Objects |
+|-------|---------|
+| EDTs | `RentEquipmentId` (Num), `RentRate` (extends `AmountMST`), `RentAgreementId` (Num) |
+| Enums | `RentEquipmentCategory` (5 values), `RentEquipmentStatus` (5), `RentAgreementStatus` (4) |
+| Tables | `RentEquipmentTable`, `RentAgreementHeader`, `RentAgreementLine`, `RentParameters` |
+| Number seq | `RentParameters.numberSeqModule()`, `NumberSeqModuleRent` class, 2 references |
+| Forms | `RentEquipmentTable` (Details Master w/ Standard Tabs), `RentAgreement` (Details Master + lines grid) |
+| Navigation | `RentEquipmentTable` + `RentAgreement` display menu items, submenu under **Inventory management** |
+| Security | `RentEquipmentMaintain` / `RentAgreementMaintain` privileges, `RentManagement` duty, `RentClerk` + `RentViewer` roles |
+| Labels | 14 label IDs × 3 languages = 42 entries |
+
+**Key takeaways / gotchas**
+- **Creation order is enforced by dependencies, not preference.** EDTs and enums must exist before the tables that reference them; tables before forms (the clone re-binds the datasource); menu items before the menu that points at them. The agent sequences this for you — but if you split it across sessions, follow the same order.
+- **Number sequences are codebase-specific.** `analyze_code(mode=patterns)` finds how *your* model wires `NumberSeqModule` (the AX2012-style module class vs. a parameters-only approach) instead of pasting a generic snippet that won't load data.
+- **`RentRate extends AmountMST`** inherits currency formatting and the right `extendedDataType` size — `suggest_edt` proposes it; never type `Real`.
+- Run `build_d365fo_project` at the end: a greenfield slice is where a single missing `tableStr` reference surfaces, and the structured xppc diagnostics point at the exact object.
+
+> **Measured cost & model** *(one recorded end-to-end run — not an estimate)*
+> **Models actually used:** **Claude Sonnet 4.6** as the agent (`panel/editAgent`, 76 turns — all reasoning and every tool call) + **GPT-4o-mini** as a background helper (`backgroundTodoAgent`, 8 calls — todo-list upkeep only, ~$0.006). No Opus, no Haiku.
+> Tool calls **126** (78 MCP + 48 host: terminal / list_dir / todo) · New context **~182K** · Output **~38K** · Total input incl. cached prefix **~5.33M** (cached **~5.15M**) · **Billed ≈ 280 AI credits ≈ $2.80**
+> **Model used: Sonnet 4.6** — it completed the full greenfield slice without an Opus upgrade. The run came in mid-range of the original Opus estimate (200–450 credits) *on the cheaper tier*, the upside being offset by retries: the `NumberSeqGlobal` delegate pattern took ~10 terminal probes to pin down and two form generations were retried. Opus is still the safer pick when the number-sequence/posting reasoning has to land first-try; do the opening `get_workspace_info` / `get_knowledge` / label-discovery turns on Haiku to trim either way.
 
 ---
 
-## Scenario 3 — New Feature with Labels, Table Extension, and Form Extension
+## 2 — Extending standard posting: sales credit review + audit
 
-**Goal:** Add a custom field to an existing table, label it in all supported languages,
-and expose it on the standard form.
+**The most common real-world shape: safely changing Microsoft code.** Add a mandatory credit-review gate to sales confirmation and write a tamper-proof audit trail — without breaking ISV layers or duplicating an existing CoC wrapper.
 
-**Prompt:**
 ```
-I want to add a "Customer priority tier" field (enum: Standard, Silver, Gold, Platinum)
-to CustTable in my MyPackage\MyModel model. Steps:
-1. Check if a label for "Customer priority tier" already exists in my model
-2. If not, create it in en-US, cs, and de
-3. Create the enum AxEnum CustPriorityTier
-4. Create a table extension CustTable.MyModel_Extension with the new field using the label
-5. Show me the CustTable form structure, then create a form extension that adds
-   the field to the General tab
-6. Verify everything is in place
+Before SalesFormLetter_Confirm posts, enforce a credit-review check and log every
+attempt. First check whether SalesFormLetter.run is already wrapped by CoC and get
+the exact signature. Add CreditReviewDate + CreditReviewedBy to CustTable (table
+extension). Create audit table SalesPostingAuditLog (SalesId, PostingType, Attempted,
+Posted, FailReason, PostedBy, PostedAt) with proper EDTs. Generate the CoC class that
+blocks posting when the customer needs review and inserts an audit row either way.
+Add an audit inquiry form + menu item under Accounts receivable > Inquiries, and a
+duty extension so the AR clerk role sees it.
 ```
 
-**Tools Copilot chains:**
-1. `get_workspace_info` — reads model name, package path, effective object prefix, and EXTENSION_PREFIX; mandatory first call
-2. `search_labels` — checks if a label matching "Customer priority tier" already exists in the model's label file
-3. `get_label_info` — inspects the label file to confirm which languages are already covered and what the label file ID is
-4. `batch_search` — parallel lookup of `CustPriorityTier` (enum candidate), `CustTable` (table info), and existing table extensions in one call
-5. `get_form_info` — reads `CustTable` form datasources, tab hierarchy, and control names to confirm the exact name of the General tab before touching the form extension
-6. `search_labels` — second search for any closely related labels that could be reused for the enum value captions
-7. `create_label` — creates the missing `CustPriorityTier` label in en-US, cs, and de
-8. `search_labels` — confirms the newly created label is resolvable before referencing it in XML
-9. `create_d365fo_file` — creates the `AxEnum` XML with value labels
-10. `create_d365fo_file` — creates the table extension `CustTable.MyModel_Extension` with the new field bound to the label
-11. `create_d365fo_file` — creates the empty form extension `CustTable.MyModel_Extension` (controls are added in the next step)
-12. `modify_d365fo_file` with `operation: add-control` — adds the `MyCustPriorityTier` field control inside the `TabGeneral` group in the form extension (no PowerShell needed)
-13. `verify_d365fo_project` — confirms all objects (enum, table extension, form extension) are on disk and registered in the `.rnrproj`
+```mermaid
+flowchart TB
+    A["get_workspace_info"] --> B["extension_info mode=coc<br/>SalesFormLetter.run already wrapped?"]
+    B --> C["extension_info mode=points<br/>CoC-eligible methods + delegates"]
+    C --> D["prepare mode=change<br/>signature + grounding token"]
+    D --> E["labels action=search then action=create x7"]
+    E --> F["suggest_edt + d365fo_file action=create<br/>audit EDTs"]
+    F --> G["generate_object objectType=table<br/>SalesPostingAuditLog"]
+    G --> H["d365fo_file action=create table<br/>then action=modify CustTable extension"]
+    H --> I["get_object_info table SalesPostingAuditLog<br/>verify what was actually written"]
+    I --> J["analyze_code mode=api-usage<br/>how SalesFormLetter_Confirm is invoked"]
+    J --> K["validate_code mode=references then mode=syntax"]
+    K --> L["d365fo_file action=create<br/>CoC class"]
+    L --> M["object_patterns domain=form action=analyze<br/>SimpleList inquiry"]
+    M --> N["generate_object objectType=form cloneFrom + validate"]
+    N --> O["d365fo_file action=create<br/>form + display menu item"]
+    O --> P["security_info mode=coverage<br/>AR clerk reach to the inquiry"]
+    P --> Q["d365fo_file action=create<br/>privilege + duty extension"]
+    Q --> R["verify_d365fo_project"]
+```
 
-**Why this matters:** Calling `get_form_info` before touching the form extension — and using
-`modify_d365fo_file add-control` instead of PowerShell — ensures the control is added with
-the correct parent tab name and proper XML structure, without risk of corrupting the extension file.
-The double `search_labels` pattern (before and after `create_label`) catches the edge case
-where the label already existed under a slightly different ID.
+**What gets created**
+
+| Layer | Objects |
+|-------|---------|
+| Extensions | `CustTable.Extension` (+`CreditReviewDate`, `CreditReviewedBy`), `SalesFormLetter` CoC class |
+| EDTs | `SalesAuditFailReason` (extends `Description255`) |
+| Tables | `SalesPostingAuditLog` (7 fields, index on `SalesId`+`PostedAt`) |
+| Forms | `SalesPostingAuditLog` inquiry (SimpleList) |
+| Navigation | display menu item under **Accounts receivable → Inquiries and reports** |
+| Security | `SalesPostingAuditView` privilege + extension of the AR clerk duty |
+
+**Key takeaways / gotchas**
+- **`extension_info(mode=coc)` first, always.** Silently adding a second wrapper around `SalesFormLetter.run` is the #1 CoC defect — two `next` calls, double posting side-effects. The check is < 50 ms and shows you the existing wrappers before you write.
+- **The grounding token from `prepare(mode=change)` is bound to the method.** You can't reuse a token issued for a different object; the write tools reject it. That's the gate that stops the AI from confidently wrapping a method that doesn't exist with that signature.
+- **`get_object_info(table)` *after* generation** verifies the audit table as actually written — the agent may have picked a different EDT than you pictured (e.g. `SalesIdBase` vs `SalesId`); catch it before the form binds to it.
+- **A table extension (`action=modify`) is not a new table.** Adding `CreditReviewDate` to `CustTable` goes through the bridge's `IMetadataProvider`, producing a clean `CustTable.YourModelExtension` delta — no risk of corrupting the 200-field standard table.
+
+> **Indicative cost & model**
+> Tool calls **~30–42** · New context **~70–110K** · Output **~18–28K** · Billed total (cached) **~140–230K**
+> **Model: Opus 4.8** (Sonnet 4.6 is viable if the posting logic is simple). Anything touching financial posting order and `next` semantics rewards the stronger reasoner.
 
 ---
 
-## Scenario 4 — Security Audit and Minimal-Privilege Extension
+## 3 — Operational feature: vendor certificate compliance
 
-**Goal:** Before releasing a new feature, understand who already has access and create
-a correctly scoped privilege without duplicating existing ones.
+**Setup + automation + reporting in one slice.** Track vendor certifications, auto-flag expiring ones with a nightly batch, and produce a compliance report — the classic "table + SysOperation batch + SSRS" trio.
 
-**Prompt:**
 ```
-I'm adding a new "Vendor Payment Terms" maintenance page in my model.
-Before I create security objects:
-1. Show me how the existing VendPaymTerms form is secured —
-   which roles and duties already grant access
-2. Check if a privilege for VendPaymTerms maintenance already exists
-3. Validate that "MY_VendPaymTermsMaintain" is a valid privilege name
-   that won't clash with anything in the symbol index
-Then create the privilege, add it to the VendPaymentTermsMaintain duty,
-and verify the objects are in place.
+Create vendor certificate compliance in model VendCompliance. Table VendCertificate:
+VendAccount, CertType enum (ISO9001, ISO14001, ISO45001, IATF16949, Other), CertNumber,
+IssuingBody, IssueDate, ExpiryDate, Status enum (Valid, ExpiringSoon, Expired, Revoked).
+SimpleListDetails form. A SysOperation nightly batch VendCertExpiryCheck that sets
+Status to ExpiringSoon within 30 days and Expired past ExpiryDate, with a labelled
+DataContract threshold parameter and infolog progress. An SSRS report
+VendCertComplianceReport grouped by CertType. Menu items for the form, the batch and
+the report under Procurement > Inquiries. A maintenance privilege + role.
 ```
 
-**Tools Copilot chains:**
-1. `get_workspace_info` ×2 — workspace config check (called twice: once at start, once after user fixed `.mcp.json` mid-session)
-2. `get_security_coverage_for_object` ×3 — full chain for `VendPaymTerms` form and `PaymTerm` menu item (form → menu items → privileges → duties → roles); repeated after each discovery round to confirm no `MY_` collision
-3. `search` + `batch_search` ×9 — parallel searches across name variants (`VendPaymTerms`, `VendPaymentTerms`, `PaymTerm*`, `MY_VendPaymTermsMaintain`) for privileges, duties, and menu items
-4. `get_menu_item_info` ×2 — `VendPaymTerms` menu item detail (target form, security chain); called again for display-type variant
-5. `get_security_artifact_info` ×8 — reads full entry lists for candidate duties: `VendPaymentTermsMaintain`, `VendPaymTermsMaintain`, `LedgerPaymTermsMaintain`, `PaymTermsMaintain`, `VendVendorMasterMaintain`, `VendInvoiceVendorMaintain`, and privileges `PaymTermMaintain`, `PaymTermView`
-6. `validate_object_naming` ×2 — confirms `MY_VendPaymTermsMaintain` follows D365FO conventions and has no collision across the indexed symbols
-   (prefix separator `MY_` is valid — `{Prefix}_{Name}` is a supported D365FO naming pattern)  ✅
-7. `generate_code` — generates security-privilege XML skeleton for `VendPaymTerms`
-8. `search_labels` ×2 — label lookup for "vendor payment terms maintain" (with and without model filter)
-9. `create_d365fo_file` ×2 — creates `MY_VendPaymTermsMaintain` (`security-privilege`) and `MY_VendPaymentTermsMaintain` (`security-duty`)
-10. `verify_d365fo_project` — confirms both objects exist on disk and in `.rnrproj`  ✅
+```mermaid
+flowchart TB
+    A["get_workspace_info"] --> B["object_patterns domain=table<br/>compliance/transaction pattern"]
+    B --> C["labels action=search then create x9 (3 langs)"]
+    C --> D["suggest_edt + d365fo_file action=create<br/>CertNumber EDT + 2 enums"]
+    D --> E["generate_object objectType=table<br/>VendCertificate + VendAccount relation"]
+    E --> F["d365fo_file action=create table"]
+    F --> G["object_patterns domain=form action=analyze<br/>SimpleListDetails"]
+    G --> H["generate_object objectType=form cloneFrom + validate + create"]
+    H --> I["analyze_code mode=patterns scope=extensions<br/>existing SysOperation in this model"]
+    I --> J["generate_object mode=pattern pattern=sysoperation"]
+    J --> K["get_object_info edt + enum<br/>contract parameter types"]
+    K --> L["validate_code references + syntax"]
+    L --> M["d365fo_file action=create x3<br/>Contract / Controller / Service"]
+    M --> N["generate_object objectType=report<br/>VendCertComplianceReport full stack"]
+    N --> O["d365fo_file action=create x5<br/>Tmp / Contract / DP / Controller / Report"]
+    O --> P["d365fo_file action=modify<br/>processReport() query body"]
+    P --> Q["d365fo_file action=create<br/>3 menu items + submenu"]
+    Q --> R["d365fo_file action=create<br/>privilege + role; verify_d365fo_project"]
+```
 
-**Why this matters:**
-- Running `get_security_coverage_for_object` first often reveals an existing privilege already grants the right access — no new security object needed.
-- The dense search phase (steps 3–6) reflects a real-world security audit: standard duties have overlapping names, and Copilot must exhaustively verify no collision exists before committing to a name.
-- `validate_object_naming` confirms the `{Prefix}_{Name}` underscore separator is valid and checks for symbol-index collisions.
-- `get_workspace_info` is called twice because the workspace `.mcp.json` had a placeholder model name that the user fixed mid-session.
+**What gets created**
+
+| Layer | Objects |
+|-------|---------|
+| EDT / enums | `VendCertNumber`, `VendCertType` (5), `VendCertStatus` (4) |
+| Table | `VendCertificate` (8 fields, `VendAccount` FK relation) |
+| Form | `VendCertificate` (SimpleListDetails) |
+| Logic | `VendCertExpiryContract` / `Controller` / `Service` (SysOperation, recurring) |
+| Report | `VendCertComplianceReport` + TmpTable + DP + Controller |
+| Navigation | display + action + output menu items under **Procurement → Inquiries** |
+| Security | `VendCertMaintain` privilege, `VendComplianceOfficer` role |
+
+**Key takeaways / gotchas**
+- **Clone the SysOperation shape from your own model.** `analyze_code(mode=patterns, scope=extensions)` finds an existing `My*Controller`/`Service` so the new batch matches your conventions (how the controller registers the menu item, whether `RunOn` is set) — not a textbook skeleton.
+- **Report creation order is load-bearing.** `generate_object(objectType=report)` emits TmpTable → Contract → DP → Controller → AxReport; the TmpTable must land first so the DP's `tableStr` resolves. The single call replaces 15+ manual steps.
+- **`processReport()` is intentionally a TODO.** The agent fills the query body *after* `get_object_info` on the source tables — the alternative is a guessed `select` that compiles but returns the wrong grouping.
+- **One enum value drives two things.** `Status` is set by the batch *and* grouped in the report — keep the enum the single source of truth; don't let the report hardcode "ExpiringSoon".
+
+> **Indicative cost & model**
+> Tool calls **~35–48** · New context **~80–120K** · Output **~22–32K** · Billed total (cached) **~150–260K**
+> **Model: Sonnet 4.6.** The report scaffold + SysOperation pattern are well-trodden; Sonnet handles them at a fraction of Opus cost. Upgrade only if the batch logic gets genuinely intricate.
 
 ---
 
-## Scenario 5 — Understand and Port a Financial Process
+## 4 — Cross-stack enhancement: customer priority-tier discounts
 
-**Goal:** Understand how a complex standard process works, then replicate its pattern
-for a custom business requirement.
+**The lightweight full-stack path — small surface, every layer touched.** A four-tier loyalty scheme that drives an automatic line discount. Shows that "small" features still cross enum → extension → setup table → CoC → security, and where you can run cheaper.
 
-**Prompt:**
 ```
-I need to create a process that posts custom adjustment journal entries
-for inventory revaluation. I've never worked with ledger journals before.
-
-1. Show me the structure of LedgerJournalTable and LedgerJournalTrans
-   (fields, relations, relevant methods)
-2. Find how LedgerJournalCheckPost is used in the codebase —
-   what parameters it needs and how existing code calls it
-3. Analyse ledger journal creation patterns in my MyPackage model
-4. Generate a service class LedgerInventAdjustmentService with methods to:
-   - Create the journal header
-   - Add lines with the correct dimension defaulting from InventTable
-   - Post using LedgerJournalCheckPost
-5. Show how financial dimensions are copied from InventTable to the journal line
-6. Create the service class file in my project
+Add a customer priority tier discount in model CustLoyalty. Enum CustPriorityTier
+(Standard, Silver, Gold, Platinum). Add the tier field to CustTable and surface it on
+the General tab of the CustTable form and on CustTableListPage. Setup table
+CustTierDiscount mapping tier to a discount percent, with its own SimpleList form and a
+menu item under Accounts receivable > Setup. Then a CoC extension on the sales line
+price/discount calc that applies the tier percent. Security: a setup-maintenance
+privilege wired into the AR setup duty. Labels in en-US, cs, de.
 ```
 
-**Tools Copilot chains:**
-1. `get_workspace_info` — workspace config check, model and prefix detection
-2. `get_table_info` ×3 — `LedgerJournalTable`, `LedgerJournalTrans`, `InventTable` (fields, relations; `InventTable` specifically for `DefaultDimension` field)
-3. `get_api_usage_patterns` ×3 — typical call sequences for `LedgerJournalCheckPost`, `LedgerJournalEngine`, `DimensionAttributeValueSetStorage`; `DimensionDefaultingService` returned no results
-4. `analyze_code_patterns` ×2 — journal creation patterns in the codebase; dimension defaulting patterns from `InventTable.DefaultDimension` to `LedgerJournalTrans`
-5. `get_class_info` ×3 — full method overview for `LedgerJournalCheckPost`, `JournalTableData`, `JournalTransData`
-6. `get_method_signature` ×6 — exact signatures for: `LedgerJournalCheckPost.newLedgerJournalTable`, `.parmJournalNum`, `.processOperation`; `LedgerDimensionFacade.serviceCreateLedgerDimension`, `.createLedgerDimension`; `JournalTransData.create`; `JournalTableData.construct`; `MyBankSett_LedgerJournalTransAutoSettleService.run` (as a pattern reference)
-7. `get_class_info("LedgerDimensionFacade")` — dimension facade methods for merging ledger dimensions
-8. `search_extensions` ×4 — existing custom journal extensions and `My*` service class patterns; `MyBankSett_LedgerJournalTransAutoSettleService` found and studied as a structural template
-9. `search_labels` ×4 + `get_label_info` — label lookup for journal/adjustment/error strings; confirmed 4 existing labels in the model and available languages (en-US, cs, de)
-10. `batch_search` ×1 (3 parallel) — `JournalTableData`, `JournalTransData`, `InventItemSalesSetup DefaultDimension`
-11. `create_label` ×3 — `MyInventAdjItemNotFound`, `MyInventAdjMainAccountMissing`, `MyInventAdjPostFailed`
-12. `create_d365fo_file` — creates `MyLedgerInventAdjustmentService` class and registers it in the project
-13. `verify_d365fo_project` — confirms the file exists on disk and in `.rnrproj`  ✅
+```mermaid
+flowchart LR
+    A["labels action=search then create x4"] --> B["d365fo_file action=create<br/>enum CustPriorityTier"]
+    B --> C["d365fo_file action=modify<br/>CustTable extension + field"]
+    C --> D["get_object_info form<br/>exact TabGeneral control name"]
+    D --> E["d365fo_file action=modify x2<br/>CustTable form + CustTableListPage"]
+    E --> F["generate_object objectType=table<br/>CustTierDiscount"]
+    F --> G["object_patterns domain=form action=analyze<br/>SimpleList + create + menu item"]
+    G --> H["extension_info mode=coc + mode=points<br/>sales price/disc method"]
+    H --> I["prepare mode=change + validate_code"]
+    I --> J["d365fo_file action=create<br/>CoC class"]
+    J --> K["security_info mode=coverage<br/>AR setup duty"]
+    K --> L["d365fo_file action=create<br/>privilege + duty extension; verify"]
+```
 
-**Why this matters:**
-- `get_method_signature` is called 7× (steps 6–7) because Copilot must know the exact parameter order for `JournalTransData.create(doInsert, initVoucherList)` and `LedgerDimensionFacade.createLedgerDimension` before writing a single line of service code — guessing these produces uncompilable X++.
-- Studying an existing `My*` service class (`MyBankSett_LedgerJournalTransAutoSettleService`) via `get_class_info` + `get_method_signature` gives a proven structural template in the same model, avoiding the need to invent a pattern from scratch.
-- `search_labels` before `create_label` ensures no duplicate label IDs are created — the 4 found labels guided the naming of the 3 new ones.
+**What gets created**
+
+| Layer | Objects |
+|-------|---------|
+| Enum | `CustPriorityTier` (4 values) |
+| Extensions | `CustTable.Extension` (+`PriorityTier`), `CustTable` form ext, `CustTableListPage` ext, sales price/disc CoC class |
+| Table | `CustTierDiscount` (`PriorityTier`, `DiscPercent`) + SimpleList form |
+| Navigation | setup display menu item under **Accounts receivable → Setup** |
+| Security | `CustTierDiscountMaintain` privilege + AR setup duty extension |
+
+**Key takeaways / gotchas**
+- **`get_object_info(form, {searchControl})` resolves the *exact* parent control** before `add-control`. Guessing `TabGeneral` vs `Tab_General` is how form XML gets corrupted; the tool gives you the real name from the live form.
+- **`add-control` is pattern-aware.** Dropping the tier field into a `FieldsAndFieldGroups` sub-pattern is allowed; dropping static text there is rejected — the form stays valid by construction.
+- **This is the scenario to mix models.** The opening label/enum/extension turns are mechanical → **Haiku**. Switch to **Sonnet** for the CoC turn, where price/discount `next` ordering actually matters.
+- **One CoC class, two readers.** The discount logic reads `CustTierDiscount` keyed by `CustTable.PriorityTier` — keep the lookup in the CoC, not duplicated in the form, so the percent lives in one place.
+
+> **Indicative cost & model**
+> Tool calls **~22–32** · New context **~45–75K** · Output **~12–20K** · Billed total (cached) **~90–160K**
+> **Model: Sonnet 4.6** for the build, **Haiku 4.5** for the discovery/extension turns. The cheapest full-stack scenario here — a good first one to run when you're calibrating your own token numbers.
 
 ---
 
-## Scenario 6 — Create a Complete SSRS Report from Scratch
+## 5 — Integration & analytics: inventory aging entity + report
 
-**Goal:** Create a full SSRS report for inventory by storage zones — including TmpTable,
-Contract, DP, Controller, and AxReport XML — in a single conversation.
+**The data-out shape: surface existing data for OData, Excel and SSRS.** No new business entity — a view, an OData data entity, a report, and a workspace tile over standard inventory data. Shows the read/aggregate side of the toolset.
 
-**Prompt:**
 ```
-Create an SSRS report "InventByZones" that shows inventory by warehouse zones.
-Fields: ItemId, ItemName, InventLocationId, WHSZoneId, OnHandQty, ReservedQty, AvailableQty.
-Dialog parameters: InventLocationId (mandatory), FromDate, ToDate.
-The report should have a Controller class so we can attach a menu item.
+Build inventory aging analytics in model InventAnalytics. A view InventAgingView over
+InventSum / InventTrans bucketing on-hand value into 0-30 / 31-60 / 61-90 / 90+ day
+buckets by ItemId + InventLocationId. A data entity InventAgingEntity (public
+collection, OData) over that view. An SSRS report InventAgingReport with a dialog
+(InventLocationId mandatory, AsOfDate). Display + output menu items under Inventory
+management > Inquiries and a view-only security role InventAnalyticsViewer. Walk me
+through InventSum/InventTrans structure first so the buckets are correct.
 ```
 
-**Tools Copilot chains:**
-1. `get_workspace_info` — workspace config check (model name, prefix, paths); mandatory first call
-2. `get_report_info("InventOnHand")` — study an existing inventory report to understand the DP/TmpTable/Contract naming conventions and dataset structure used in this codebase
-3. `search_labels` ×2 — check whether labels for "Inventory by zones", "Warehouse", "Zone" already exist; re-use to avoid duplicates
-4. `create_label` ×3 — create labels for caption, InventLocationId prompt, and report header
-5. `generate_smart_report` — one call generates all 5 objects:
-   - `InventByZonesTmp` (TempDB table, 7 fields with auto-suggested EDTs: `ItemId`, `Name`, `InventLocationId`, `WHSZoneId`, `InventQty` ×3)
-   - `ContosoInventByZonesContract` (`[DataContractAttribute]` with `parmInventLocationId`, `parmFromDate`, `parmToDate` — `InventLocationId` marked mandatory)
-   - `ContosoInventByZonesDP` (`extends SrsReportDataProviderBase`, `processReport()` skeleton, `getContosoInventByZonesTmp()` getter)
-   - `ContosoInventByZonesController` (`main(Args)`, `prePromptModifyContract()`)
-   - `ContosoInventByZones.xml` (AxReport + full RDL with Tablix for 7 fields, all AX system hidden parameters, DynamicParameter)
-6. `create_d365fo_file` ×5 — one call per returned XML block: TmpTable → Contract → DP → Controller → Report (in this order, Azure/Linux path)
-7. `verify_d365fo_project` — confirms all 5 files exist on disk and are in the `.rnrproj`  ✅
+```mermaid
+flowchart TB
+    A["get_workspace_info"] --> B["get_object_info table x2<br/>InventSum + InventTrans structure"]
+    B --> C["analyze_code mode=api-usage<br/>how aging/dating is computed in std code"]
+    C --> D["object_patterns domain=table<br/>view + computed-column patterns"]
+    D --> E["labels action=search then create x6"]
+    E --> F["generate_object + d365fo_file action=create<br/>InventAgingView (ranges + computed buckets)"]
+    F --> G["get_object_info view<br/>verify fields exposed"]
+    G --> H["d365fo_file action=create<br/>data entity InventAgingEntity (OData, public)"]
+    H --> I["generate_object objectType=report<br/>InventAgingReport full stack"]
+    I --> J["d365fo_file action=create x5<br/>Tmp / Contract / DP / Controller / Report"]
+    J --> K["d365fo_file action=modify<br/>processReport() bucket query"]
+    K --> L["d365fo_file action=create<br/>display + output menu items + submenu"]
+    L --> M["validate_object_naming + d365fo_file action=create<br/>view privilege + role"]
+    M --> N["verify_d365fo_project + build_d365fo_project"]
+```
 
-**After generation — implement the DP logic:**
-8. `get_table_info("InventSum")` — check fields and relations on InventSum (on-hand quantities)
-9. `get_table_info("WHSZone")` — check WHSZone fields and join conditions
-10. `modify_d365fo_file` — add the actual `processReport()` body to the DP class using a `join` query on `InventSum`, `WHSLocation`, `WHSZone`
+**What gets created**
 
-**Why this matters:**
-- `generate_smart_report` replaces what previously required 15+ tool calls (separate table, 3 class creations, report XML assembly, RDL generation) with a single call that returns all 5 object blocks.
-- The order in step 6 matters: TmpTable must be created before the DP class so the `[SRSReportDataSetAttribute(tableStr(...))]` reference resolves at build time.
-- `processReport()` is intentionally a skeleton — the actual query logic (join InventSum + WHSLocation + WHSZone) requires understanding the source tables first (steps 8–9), which is why the tool generates a `// TODO` placeholder rather than guessing the query.
-- On a Windows VM, step 6 is skipped entirely — `generate_smart_report` writes all files directly; Copilot only needs to confirm with `verify_d365fo_project`.
+| Layer | Objects |
+|-------|---------|
+| View | `InventAgingView` (4 computed bucket columns over `InventSum`/`InventTrans`) |
+| Data entity | `InventAgingEntity` (public, OData-enabled, staging off) |
+| Report | `InventAgingReport` + TmpTable + Contract + DP + Controller |
+| Navigation | display + output menu items under **Inventory management → Inquiries** |
+| Security | `InventAgingView` privilege (read), `InventAnalyticsViewer` role |
+| Labels | 6 IDs × 3 languages |
 
+**Key takeaways / gotchas**
+- **Understand the source before bucketing.** `get_object_info(table)` on `InventSum`/`InventTrans` plus `analyze_code(mode=api-usage)` shows how standard code computes financial vs physical dates — get that wrong and every bucket is off by the posting lag.
+- **A data entity over a view, not over tables.** Pointing the entity at `InventAgingView` keeps the bucket logic in one place and exposed identically to OData *and* the report.
+- **Public collection + OData = integration surface.** The agent sets `IsPublic` and the public collection name; verify it with `get_object_info(data-entity)` before consumers bind to it — renaming a public entity later is a breaking change.
+- **Read-only role.** `InventAnalyticsViewer` grants only the view privilege — no maintain entry points — so analytics users can't mutate inventory.
+
+> **Indicative cost & model**
+> Tool calls **~28–40** · New context **~60–100K** · Output **~16–26K** · Billed total (cached) **~120–210K**
+> **Model: Sonnet 4.6.** Lots of metadata reading (cheap on Haiku if you split the discovery turns), modest generation. Bump to Opus only if the bucket SQL/computed-column logic gets hairy.
+
+---
+
+## Cost & model summary
+
+| # | Scenario | Shape | Tool calls | Billed total (cached) | Model | Est. cost* |
+|---|----------|-------|-----------:|----------------------:|-------|-----------:|
+| 1 | Equipment Rental | Greenfield module | **126**‡ | **~220K**‡ | **Sonnet 4.6**‡ | **~$2.80**‡ |
+| 2 | Sales credit review + audit | Extend standard posting | 30–42 | 140–230K | **Opus 4.8** | ~$1.3–3.0 |
+| 3 | Vendor certificate compliance | Setup + batch + report | 35–48 | 150–260K | **Sonnet 4.6** | ~$0.9–2.0 |
+| 4 | Customer priority tiers | Lightweight cross-stack | 22–32 | 90–160K | **Sonnet 4.6** / Haiku | ~$0.5–1.1 |
+| 5 | Inventory aging analytics | Data-out / integration | 28–40 | 120–210K | **Sonnet 4.6** | ~$0.7–1.5 |
+
+<sub>* End-to-end token cost at the recommended model, prompt caching on (see [What it costs on GitHub Copilot](#what-it-costs-on-github-copilot-pro--business) for the per-model rates and the Copilot AI-Credits breakdown). Ranges are indicative — verify on your own metadata.</sub>
+<sub>‡ Scenario 1 is **measured from one recorded run** (Sonnet 4.6, 126 tool calls, ~182K new + ~38K output context over ~5.15M cached prefix, ≈280 AI credits ≈ $2.80). "~220K" is new context + output for apples-to-apples with the estimate rows. All other rows remain estimates.</sub>
+
+**How to drive these numbers down**
+- **Turn on prompt caching** (default in Copilot/Claude Code). It is the single biggest lever — the indexed metadata and instruction files get cached across turns.
+- **Discover cheap, build strong.** Run the opening `get_workspace_info` / `search` / `labels` turns on Haiku, then switch the model for the generation turns.
+- **Let the gates fail closed.** `GROUNDING_ENFORCE` and `FORM_PATTERN_ENFORCE` rejecting a bad write costs a few hundred tokens; a corrupted form that compiles wrong costs a debugging session.
+- **Verify in one call.** `verify_d365fo_project` + `build_d365fo_project` at the end catch dependency-order mistakes far cheaper than re-reading everything.
+
+> These are estimates by design — measuring your *actual* tokens and model fit on your own metadata is the point. Run scenario 4 first (cheapest), record the numbers your client reports, and extrapolate.
+
+---
+
+## What it costs on GitHub Copilot (Pro / Business)
+
+Since **1 June 2026, GitHub Copilot bills on usage-based [AI Credits](https://github.com/features/copilot/plans)** — credits are consumed by **actual token usage** (input + output + cached tokens) at each model's published API rate. **1 credit = $0.01**, so a credit balance is effectively a dollar balance. The older "premium request" counting (1 request per prompt × a model multiplier) is now legacy.
+
+Each paid plan includes a monthly credit allowance; usage beyond it is billed as additional credits.
+
+| Plan | Price | Included AI Credits / mo | Notes |
+|------|------:|------------------------:|-------|
+| **Pro** | $10 / user | **$15** (1 500 credits) | Unlimited base-model completions + chat; credits cover premium models |
+| **Pro+** | $39 / user | **$70** (7 000 credits) | Adds the **Opus-class** models |
+| **Business** | $19 / user | **$19** (1 900 credits) | Org-pooled credits · promo **$30/user** through Aug 2026 |
+| **Enterprise** | $39 / user | **$39** (3 900 credits) | promo **$70/user** through Aug 2026 |
+
+> ⚠️ **Model availability is gated by plan.** Opus-class models (scenarios 1 & 2's recommendation) are exposed on **Pro+ / Max / Enterprise**, *not* base Pro. On **Pro** and many **Business** policies you'll have Sonnet-class + included base models only. Check your plan's model picker before assuming Opus is available — if it isn't, run scenarios 1 & 2 on **Sonnet 4.6** (roughly the cheaper column below; quality is still good, you just trade some first-try accuracy on the heavy architecture/posting logic).
+
+### Per-model token rates (published API rates Copilot bills against)
+
+| Model | Input /1M | Output /1M | Cache write /1M (5-min) | Cache read /1M |
+|-------|----------:|-----------:|------------------------:|---------------:|
+| **Opus 4.8** | $5.00 | $25.00 | $6.25 | $0.50 |
+| **Sonnet 4.6** | $3.00 | $15.00 | $3.75 | $0.30 |
+| **Haiku 4.5** | $1.00 | $5.00 | $1.25 | $0.10 |
+
+Output tokens dominate the bill; cached input (the re-sent conversation prefix every turn) is ~10× cheaper than fresh input, which is why caching matters so much.
+
+### Cost per scenario, in dollars and credits
+
+| # | Scenario | Model | Est. cost | ≈ Credits | Pro $15 budget covers | Business $19 budget covers |
+|---|----------|-------|----------:|----------:|----------------------:|---------------------------:|
+| 1 | Equipment Rental | Sonnet 4.6‡ | **~$2.80**‡ | **~280**‡ | **~5×/mo** | **~7×/mo** |
+| 2 | Sales credit review | Opus 4.8† | ~$1.3–3.0 | 130–300 | ~5–11×/mo | ~6–14×/mo |
+| 3 | Vendor certificate compliance | Sonnet 4.6 | ~$0.9–2.0 | 90–200 | ~7–16×/mo | ~9–21×/mo |
+| 4 | Customer priority tiers | Sonnet 4.6 | ~$0.5–1.1 | 50–110 | ~13–30×/mo | ~17–38×/mo |
+| 5 | Inventory aging analytics | Sonnet 4.6 | ~$0.7–1.5 | 70–150 | ~10–21×/mo | ~12–27×/mo |
+
+<sub>† Opus needs **Pro+** ($70 credits/mo) or higher — not base Pro. On Pro/Business run these on Sonnet instead (≈ 0.55× the cost; recompute against the Sonnet rate). "Budget covers" = included monthly credits ÷ midpoint scenario cost, one developer.</sub>
+<sub>‡ Scenario 1 row is **measured from one recorded Sonnet 4.6 run** (≈280 AI credits): "Budget covers" = $15 Pro ÷ 280 ≈ 5×/mo, $19 Business ÷ 280 ≈ 7×/mo. Running it on Opus would land in the original ~200–450-credit band.</sub>
+
+**What this means in practice**
+- A **base Pro** seat ($10, $15 credits) comfortably handles **~10–25 Sonnet-class full-stack features a month** before any overage — plenty for one developer's steady custom-dev work.
+- A **Business** seat ($19, $19 credits, $30 promo) gives a bit more headroom per developer, pooled across the org so heavy and light users average out.
+- **Opus-heavy months** (greenfield modules, posting logic) burn credits ~2× faster *and* require **Pro+** — budget those scenarios on the $70 Pro+ allowance, or do the discovery turns on Haiku/Sonnet and reserve Opus for the final generation turns.
+- Overage past the included credits is billed as usage — predictable, since you can read live consumption in the Copilot billing dashboard. **Measure your first few features there and recalibrate** these estimates against your own prompts and metadata size.
+
+---
+
+## See also
+
+- [MCP_TOOLS.md](MCP_TOOLS.md) — what each of the 26 tools does
+- [QUICK_START.md](QUICK_START.md) — get connected first
+- [MCP_CONFIG.md](MCP_CONFIG.md) — configuration & server modes
+- [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) — indexing your ISV / custom models

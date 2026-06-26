@@ -245,6 +245,31 @@ describe('XML property rules — static defaults (no stats)', () => {
   });
 });
 
+describe('TTS001 / BP004 + comment-string masking', () => {
+  it('flags unbalanced ttsbegin/ttscommit (TTS001)', async () => {
+    const code = `void run()\n{\n    ttsbegin;\n    this.doWork();\n}`;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).toContain('TTS001');
+  });
+
+  it('does not flag balanced ttsbegin/ttscommit', async () => {
+    const code = `void run()\n{\n    ttsbegin;\n    this.doWork();\n    ttscommit;\n}`;
+    expect(getText(await validateXppTool(req({ code, codeType: 'xpp' })))).not.toContain('TTS001');
+  });
+
+  it('flags developer-only print/pause statements (BP004)', async () => {
+    const code = `void run()\n{\n    print "x";\n}`;
+    expect(getText(await validateXppTool(req({ code, codeType: 'xpp' })))).toContain('BP004');
+  });
+
+  it('does not flag keywords that appear only inside comments or strings', async () => {
+    const code = `void run()\n{\n    // ttsbegin here is just a comment\n    str s = "remember to print this";\n}`;
+    const text = getText(await validateXppTool(req({ code, codeType: 'xpp' })));
+    expect(text).not.toContain('TTS001');
+    expect(text).not.toContain('BP004');
+  });
+});
+
 describe('XML property rules — mined statistics', () => {
   it('includes mined evidence and value distribution in violations', async () => {
     const context = {

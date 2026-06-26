@@ -24,16 +24,8 @@ const D365foErrorHelpArgsSchema = z.object({
   ),
 });
 
-export const d365foErrorHelpToolDefinition = {
-  name: 'get_d365fo_error_help',
-  description:
-    'Diagnose D365FO X++ compilation errors, BP warnings, and runtime exceptions. ' +
-    'Returns a plain-language explanation and corrective action. ' +
-    'Use when the compiler Output window, Error List, or runtime infolog shows an unfamiliar error. ' +
-    'Covers: CSUV*/CSU*, SYS*, BP* warnings, TTS level errors, OCC (UpdateConflict), ' +
-    'type-cast errors, "must call next", "not valid metadata element", and more.',
-  inputSchema: D365foErrorHelpArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.
 
 // ─── Error Entry Type ────────────────────────────────────────────────────────
 
@@ -143,7 +135,7 @@ while (!done && retryCount < 5)
       'Add "next methodName(_params);" inside the CoC method — before, after, or replacing surrounding logic',
       'Store the return value: "ReturnType ret = next methodName(_params);"',
       'Only omit next in extremely rare cases where you intentionally replace (not extend) the method — document this explicitly',
-      'Verify the exact method signature with get_method_signature() first',
+      'Verify the exact method signature with get_method(include="signature") first',
     ],
     example: `[ExtensionOf(tableStr(CustTable))]
 final class CustTable_MyModel_Extension
@@ -168,7 +160,7 @@ final class CustTable_MyModel_Extension
       'This usually means: wrong file location, missing xmlns attribute on root element, ' +
       'CDATA section missing on <Declaration> or <Source>, or XML written with wrong encoding.',
     fix: [
-      'Always use create_d365fo_file (never copy/paste raw files)',
+      'Always use d365fo_file(action="create") (never copy/paste raw files)',
       'Ensure the file has UTF-8 BOM (D365FO XML requires BOM)',
       'Verify root element has correct xmlns:i="http://www.w3.org/2001/XMLSchema-instance"',
       '<Declaration> and <Source> blocks MUST use <![CDATA[...]]> — not entity-encoded content',
@@ -258,10 +250,10 @@ ttscommit;`,
       'Referencing a field that does not exist on the table. ' +
       'Common when guessing field names or using AX2012 field names that were renamed in D365FO.',
     fix: [
-      'Call get_table_info("TableName") to see the exact field list',
+      'Call get_object_info(objectType="table", name="TableName") to see the exact field list',
       'Search for the field: search("balance", types=["field"]) to find the exact name',
       'Use fieldNum(TableName, FieldName) only — it compiles to a constant at build time',
-      'If the field is on an extension table: use get_table_extension_info() to check',
+      'If the field is on an extension table: use extension_info(mode="table-merge", target=...) to check',
     ],
     related: [],
   },
@@ -272,8 +264,8 @@ ttscommit;`,
       'A label reference (e.g. "@MyModel:LabelId") points to a label ID that does not exist in the label file. ' +
       'D365FO will show the raw label ID in the UI at runtime.',
     fix: [
-      'Use search_labels("text") to find an existing label that fits',
-      'Use create_label() to create a new label in the model\'s label file',
+      'Use labels(action="search", "text") to find an existing label that fits',
+      'Use labels(action="create") to create a new label in the model\'s label file',
       'Verify the label file ID prefix matches (e.g. "@ContosoExt:LabelId" requires a ContosoExt.en-US.label.txt file)',
       'Never use hardcoded strings — always use label references in X++ attributes and XML properties',
     ],
@@ -373,7 +365,7 @@ function formatEntry(entry: ErrorEntry, context?: string): string {
     lines.push('```');
   }
   if (entry.related && entry.related.length > 0) {
-    lines.push(`\n_Related topics (use get_xpp_knowledge): ${entry.related.join(', ')}_`);
+    lines.push(`\n_Related topics (use get_knowledge(kind="knowledge")): ${entry.related.join(', ')}_`);
   }
   return lines.join('\n');
 }
@@ -413,7 +405,7 @@ export function d365foErrorHelpTool(request: CallToolRequest) {
             `❌ No matching error pattern found for:\n\n> ${errorText}\n\n` +
             `**Suggestions:**\n` +
             `- Try searching the error code in Microsoft docs: https://learn.microsoft.com/en-us/dynamics365/fin-ops-core/dev-itpro/\n` +
-            `- Use get_xpp_knowledge() with the relevant topic (e.g. "transactions", "coc", "query-patterns")\n` +
+            `- Use get_knowledge(kind="knowledge") with the relevant topic (e.g. "transactions", "coc", "query-patterns")\n` +
             `- Check the full stack trace in the infolog for the root cause class/method`,
         }],
       };

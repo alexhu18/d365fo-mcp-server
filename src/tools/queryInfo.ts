@@ -47,8 +47,5 @@ export async function getQueryInfoTool(request: CallToolRequest, context: XppSer
   }
 }
 
-export const getQueryInfoToolDefinition = {
-  name: 'get_query_info',
-  description: '🔍 Extract query structure: datasources, ranges, joins, fields. Returns datasource hierarchy with range definitions and join configuration. Essential for understanding query logic and adding ranges or joins.',
-  inputSchema: GetQueryInfoArgsSchema,
-};
+// Tool registration (name, description, inputSchema) lives inline in
+// src/server/mcpServer.ts - the single source of truth for tool instructions.

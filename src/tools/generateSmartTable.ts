@@ -105,7 +105,10 @@ export const generateSmartTableTool: Tool = {
           '"platnost do" or "ValidTo" or "to date" → "ValidTo", ' +
           '"active" or "active flag" → "Active", ' +
           '"customer" or "customer account" → "CustAccount". ' +
-          'Example call: fieldsHint="AccountNum, Name, Description, ValidFrom, ValidTo"',
+          'Example call: fieldsHint="AccountNum, Name, Description, ValidFrom, ValidTo". ' +
+          '⚠️ EDT auto-suggestion is index-based: custom EDTs/enums created in the SAME SESSION are not yet in the ' +
+          'index and those fields will fall back to String255. Call update_symbol_index BEFORE scaffolding to ensure ' +
+          'the new custom EDTs are resolved correctly.',
       },
       primaryKeyFields: {
         type: 'array',
@@ -146,8 +149,8 @@ export const generateSmartTableTool: Tool = {
           'ALWAYS pass ["find", "exist"] when the user asks for those methods. ' +
           'Methods are embedded directly in the generated XML. ' +
           'Supported values: "find", "exist". ' +
-          '⛔ NEVER omit this and then call modify_d365fo_file to add methods afterwards — ' +
-          'modify_d365fo_file CANNOT write files on Azure/Linux.',
+          '⛔ NEVER omit this and then call d365fo_file(action="modify") to add methods afterwards — ' +
+          'd365fo_file(action="modify") CANNOT write files on Azure/Linux.',
       },
     },
     required: ['name'],
@@ -202,9 +205,10 @@ export async function handleGenerateSmartTable(
           `  Reference       — shared reference/lookup data across modules`,
           `  Framework       — internal Microsoft framework/infrastructure tables`,
           ``,
-          `🔄 **Call generate_smart_table again** with the corrected parameters:`,
+          `🔄 **Call generate again** with the corrected parameters:`,
           `\`\`\``,
-          `generate_smart_table(`,
+          `generate_object(mode="scaffold", `,
+          `  objectType="table",`,
           `  name="${name}",`,
           `  tableType="${tableGroup}",       ← move here`,
           `  tableGroup="Main",               ← use a valid TableGroup value`,
@@ -218,7 +222,7 @@ export async function handleGenerateSmartTable(
   }
 
   console.log(`[generateSmartTable] Generating table: ${name}, tableGroup=${tableGroup}, tableType=${tableType ?? 'Regular'}, copyFrom=${copyFrom}`);
-  const builder = new SmartXmlBuilder();
+  const builder = new SmartXmlBuilder(symbolIndex);
   let fields: TableFieldSpec[] = [];
   let indexes: TableIndexSpec[] = [];
   let relations: TableRelationSpec[] = [];
@@ -265,8 +269,9 @@ export async function handleGenerateSmartTable(
     }
   }
 
-  // Strategy 2: Generate common fields based on table group patterns
-  if (generateCommonFields && !copyFrom) {
+  // Strategy 2: Generate common fields based on table group patterns.
+  // Skipped when explicit fieldsHint is given (the caller stated the fields).
+  if (generateCommonFields && !copyFrom && !fieldsHint) {
     console.log(`[generateSmartTable] Analyzing patterns for table group: ${tableGroup}`);
     try {
       const db = symbolIndex.getReadDb();
@@ -307,10 +312,10 @@ export async function handleGenerateSmartTable(
           }
         }
 
-        // Add fields appearing in 30%+ of sample tables
+        // Add fields appearing in 30%+ of sample tables, excluding infrastructure fields.
         const threshold = Math.max(1, Math.floor(sampleTables.length * 0.3));
         const commonFields = Array.from(fieldFrequency.entries())
-          .filter(([, data]) => data.count >= threshold)
+          .filter(([key, data]) => data.count >= threshold && !isInfrastructureField(key.split(':')[0]))
           .sort((a, b) => b[1].count - a[1].count)
           .slice(0, 10);
 
@@ -333,15 +338,21 @@ export async function handleGenerateSmartTable(
   if (fieldsHint && !copyFrom) {
     console.log(`[generateSmartTable] Parsing field hints: ${fieldsHint}`);
     const hintFields = fieldsHint.split(',').map(s => s.trim()).filter(s => s.length > 0);
-    
+    const hintDb = symbolIndex.getReadDb();
+
     for (const hint of hintFields) {
-      // Check if field already exists
-      if (fields.find(f => f.name === hint)) {
-        continue;
+      // Duplicate field name in hint list (e.g. agent passed the EDT name twice: "AmountMST, AmountMST"
+      // instead of distinct field names like "DailyRate, LineAmount"). Preserve both by suffixing the
+      // second occurrence rather than silently dropping it — the caller wanted two separate fields.
+      let fieldName = hint;
+      if (fields.find(f => f.name === fieldName)) {
+        let suffix = 2;
+        while (fields.find(f => f.name === `${hint}${suffix}`)) suffix++;
+        fieldName = `${hint}${suffix}`;
+        console.warn(`[generateSmartTable] Duplicate hint "${hint}" → renamed to "${fieldName}"`);
       }
 
-      // Try to suggest EDT based on name
-      const edt = suggestEdtFromFieldName(hint);
+      const edt = resolveBestEdt(hint, hintDb);
       const hintLower = hint.toLowerCase();
       // Mark as mandatory only when the field name IS an identifier (ends with 'Id',
       // equals 'RecId', or exactly 'AccountNum'/'CustAccount' patterns).
@@ -354,7 +365,7 @@ export async function handleGenerateSmartTable(
         hintLower === 'num' ||
         hintLower === 'code';
       fields.push({
-        name: hint,
+        name: fieldName,
         edt,
         mandatory: isMandatory,
       });
@@ -393,14 +404,32 @@ export async function handleGenerateSmartTable(
   {
     const db = symbolIndex.getReadDb();
     for (const f of fields) {
+      // The resolved "EDT" may actually be an enum (e.g. a custom RentStatus enum
+      // or a field that resolveBestEdt echoed back as a same-session custom type).
+      // An enum-backed field must be AxTableFieldEnum + EnumType, not String + EDT.
+      if (f.edt && !f.enumType && isEnumName(f.edt, db)) {
+        f.enumType = f.edt;
+        f.type = 'Enum';
+        f.edt = undefined;
+        continue;
+      }
       if (f.edt && !f.type) {
-        f.type = resolveEdtBaseType(f.edt, db);
+        // Authoritative base type from the C# bridge (live IMetadataProvider) when
+        // available. The symbol index stores extends=null for ROOT Date/Real/Int64
+        // EDTs (e.g. TransDate→Date, Qty→Real), so resolveEdtBaseType wrongly
+        // defaulted them to String — the #1 source of "scaffold made my date/amount
+        // field a string". The bridge reads the real AxEdt element type and resolves
+        // it correctly. Fall back to the index + name heuristic only when the bridge
+        // is unavailable (Azure/Linux) or doesn't know the EDT.
+        f.type = await bridgeEdtBaseType(bridge, f.edt)
+              ?? resolveEdtBaseType(f.edt, db)
+              ?? heuristicEdtBaseType(f.edt);
       }
       // Validate EDT exists in the symbol index
       if (f.edt) {
         const edtExists = validateEdtExists(f.edt, db);
         if (!edtExists) {
-          edtWarnings.push(`⚠️ Field "${f.name}": EDT "${f.edt}" not found in indexed metadata — will cause build error 'EdtDoesNotExist'. Change to an existing EDT.`);
+          edtWarnings.push(`⚠️ Field "${f.name}": "${f.edt}" not found in indexed metadata as an EDT or enum — if it is a same-session custom type, call update_symbol_index on its file first, then regenerate. Otherwise this will cause a build error.`);
         }
       }
     }
@@ -471,7 +500,12 @@ export async function handleGenerateSmartTable(
   // and may miss packagePath from config if ensureLoaded() was not yet called.
   const configManager = getConfigManager();
   await configManager.ensureLoaded();
-  const resolvedPackagePath = argPackagePath || configManager.getPackagePath();
+  // Prefer the bridge's custom packages root (where bridge-backed writes actually land,
+  // e.g. a repo metadata checkout like K:\repos\…\metadata) so the exists-guard, the
+  // fallback write target, and the reported path all match the real write location.
+  // Falls back to the standard PackagesLocalDirectory for traditional environments.
+  const customPackagesRoot = await configManager.getCustomPackagesPath();
+  const resolvedPackagePath = argPackagePath || customPackagesRoot || configManager.getPackagePath();
   // getPackagePath() already probes C:\ and K:\ well-known locations before returning null,
   // so reaching here with null means neither location exists on this machine.
   if (!resolvedPackagePath && process.platform === 'win32') {
@@ -636,10 +670,11 @@ export async function handleGenerateSmartTable(
           `The user described specific fields but you did NOT pass \`fieldsHint\`. Without it the table`,
           `will be empty (no fields, no indexes, no methods). No XML has been generated.`,
           ``,
-          `🔄 **YOU MUST call \`generate_smart_table\` AGAIN** with ALL fields extracted from the user's description:`,
+          `🔄 **YOU MUST call \`generate\` AGAIN** with ALL fields extracted from the user's description:`,
           ``,
           `\`\`\``,
-          `generate_smart_table(`,
+          `generate_object(mode="scaffold", `,
+          `  objectType="table",`,
           `  name="${name}",                           ← base name WITHOUT model prefix`,
           `  fieldsHint="Field1, Field2, Field3",      ← REQUIRED: extract ALL fields from the user`,
           `  primaryKeyFields=["Field1", "Field2"],    ← ALL PK fields (omit for single-field PK)`,
@@ -658,8 +693,8 @@ export async function handleGenerateSmartTable(
           `| "platnost do" / "to date" / "valid to" | \`ValidTo\` |`,
           `| "active" / "aktivní" / "flag" | \`Active\` |`,
           ``,
-          `⛔ NEVER call \`create_d365fo_file\` without first regenerating — there is no XML to use.`,
-          `⛔ NEVER call \`modify_d365fo_file\` to add missing fields — it CANNOT write on Azure/Linux.`,
+          `⛔ NEVER call \`d365fo_file(action="create")\` without first regenerating — there is no XML to use.`,
+          `⛔ NEVER call \`d365fo_file(action="modify")\` to add missing fields — it CANNOT write on Azure/Linux.`,
         ].join('\n'),
       }],
       isError: true,
@@ -687,9 +722,9 @@ export async function handleGenerateSmartTable(
       : `\n> ⚠️  No model resolved — XML generated without prefix. Pass \`modelName\` with the actual model name from .mcp.json (e.g. \`"ContosoExt"\`) for correct object naming.\n> 🚨 **IMPORTANT**: Do NOT add a prefix to the \`name\` parameter when calling this tool — the tool applies the prefix automatically from \`modelName\`. Passing a name that already includes the prefix will result in double-prefixing.`;
     const nextStep = [
       ``,
-      `**✅ MANDATORY NEXT STEP — immediately call \`create_d365fo_file\` with the XML below:**`,
+      `**✅ MANDATORY NEXT STEP — immediately call \`d365fo_file(action="create")\` with the XML below:**`,
       `\`\`\``,
-      `create_d365fo_file(`,
+      `d365fo_file(action="create", `,
       `  objectType="table",`,
       `  objectName="${finalName}",`,
       `  xmlContent="<copy the full XML block below>",`,
@@ -697,8 +732,8 @@ export async function handleGenerateSmartTable(
       `)`,
       `\`\`\``,
       `⛔ NEVER use \`create_file\`, PowerShell scripts, or any built-in file tool — they corrupt D365FO metadata and break VS project integration.`,
-      `⛔ NEVER call \`modify_d365fo_file\` to add methods — the \`methods\` parameter in \`generate_smart_table\` already embedded them in the XML above.`,
-      `⛔ NEVER call \`suggest_method_implementation\` or \`get_api_usage_patterns\` between this step and \`create_d365fo_file\` — those tools are expensive and their result is not needed for file creation. Call them AFTER the file is created if the user explicitly asks.`,
+      `⛔ NEVER call \`d365fo_file(action="modify")\` to add methods — the \`methods\` parameter in \`generate\` already embedded them in the XML above.`,
+      `⛔ NEVER call \`analyze_code(mode="implementations")\` or \`analyze_code(mode="api-usage")\` between this step and \`d365fo_file(action="create")\` — those tools are expensive and their result is not needed for file creation. Call them AFTER the file is created if the user explicitly asks.`,
     ].join('\n');
     const edtWarningBlock = edtWarnings.length > 0
       ? `\n### ⚠️ EDT Validation Warnings\n${edtWarnings.join('\n')}\n`
@@ -734,9 +769,9 @@ export async function handleGenerateSmartTable(
     if (fs.existsSync(bridgeTargetPath)) {
       throw new Error(
         `⚠️ Table "${finalName}" already exists at:\n${bridgeTargetPath}\n\n` +
-        `\`generate_smart_table\` is for **NEW** tables only.\n` +
-        `Use \`modify_d365fo_file\` to add fields, methods, or indexes to an existing table.\n` +
-        `Use \`get_table_info("${finalName}")\` to inspect the current structure.`
+        `\`generate_object(mode="scaffold", objectType="table")\` is for **NEW** tables only.\n` +
+        `Use \`d365fo_file(action="modify")\` to add fields, methods, or indexes to an existing table.\n` +
+        `Use \`get_object_info(objectType="table", name="${finalName}")\` to inspect the current structure.`
       );
     }
   }
@@ -753,6 +788,7 @@ export async function handleGenerateSmartTable(
         name: f.name,
         fieldType: f.type || undefined,
         edt: f.edt || undefined,
+        enumType: f.enumType || undefined,
         mandatory: f.mandatory || false,
         label: f.label || undefined,
       })),
@@ -830,8 +866,8 @@ export async function handleGenerateSmartTable(
               edtWarningBlock,
               projectMessage,
               ``,
-              `⛔ DO NOT call \`create_d365fo_file\` — the file is already written to disk.`,
-              `⛔ DO NOT call \`generate_smart_table\` again — task is COMPLETE.`,
+              `⛔ DO NOT call \`d365fo_file(action="create")\` — the file is already written to disk at the path above. Calling d365fo_file would create a DUPLICATE at a different path which causes build conflicts.`,
+              `⛔ DO NOT call \`generate\` again — task is COMPLETE.`,
               ``,
               `Next steps for the user:`,
               `1. Reload the project in Visual Studio (or close/reopen solution)`,
@@ -874,7 +910,7 @@ export async function handleGenerateSmartTable(
       `❌ Cannot create D365FO file on non-Windows system!\n\n` +
       `Attempting to create: ${normalizedPath}\n` +
       `Running on: ${process.platform}\n\n` +
-      `The generate_smart_table tool requires direct access to the D365FO Windows VM.\n` +
+      `The generate tool (objectType="table") requires direct access to the D365FO Windows VM.\n` +
       `Run the MCP server locally on the D365FO Windows VM.`
     );
   }
@@ -899,9 +935,9 @@ export async function handleGenerateSmartTable(
   if (fs.existsSync(normalizedPath)) {
     throw new Error(
       `⚠️ Table "${finalName}" already exists at:\n${normalizedPath}\n\n` +
-      `\`generate_smart_table\` is for **NEW** tables only.\n` +
-      `Use \`modify_d365fo_file\` to add fields, methods, or indexes to an existing table.\n` +
-      `Use \`get_table_info("${finalName}")\` to inspect the current structure.`
+      `\`generate_object(mode="scaffold", objectType="table")\` is for **NEW** tables only.\n` +
+      `Use \`d365fo_file(action="modify")\` to add fields, methods, or indexes to an existing table.\n` +
+      `Use \`get_object_info(objectType="table", name="${finalName}")\` to inspect the current structure.`
     );
   }
 
@@ -953,8 +989,8 @@ export async function handleGenerateSmartTable(
           edtWarningBlock,
           projectMessage,
           ``,
-          `⛔ DO NOT call \`create_d365fo_file\` — the file is already written to disk.`,
-          `⛔ DO NOT call \`generate_smart_table\` again — task is COMPLETE.`,
+          `⛔ DO NOT call \`d365fo_file(action="create")\` — the file is already written to disk at the path above. Calling d365fo_file would create a DUPLICATE at a different path which causes build conflicts.`,
+          `⛔ DO NOT call \`generate\` again — task is COMPLETE.`,
           ``,
           `Next steps for the user:`,
           `1. Reload the project in Visual Studio (or close/reopen solution)`,
@@ -967,15 +1003,43 @@ export async function handleGenerateSmartTable(
 }
 
 /**
+ * Resolve an EDT's primitive base type via the C# bridge (live IMetadataProvider).
+ *
+ * The bridge reads the real AxEdt element type (AxEdtDate/AxEdtReal/AxEdtInt64/…),
+ * so it correctly distinguishes a ROOT Date/Real EDT from a String one — which the
+ * symbol index CANNOT, because it stores extends=null for root EDTs regardless of
+ * their primitive. Returns a token compatible with resolveEdtBaseType
+ * (String/Integer/Real/Date/Int64/Guid/…), or undefined when the bridge is
+ * unavailable, doesn't know the EDT, or reports it as Enum (enum-backed EDTs are
+ * handled separately via the enumType path, so we must not emit a bare "Enum" here).
+ */
+async function bridgeEdtBaseType(bridge: BridgeClient | undefined, edtName: string): Promise<string | undefined> {
+  if (!bridge?.isReady) return undefined;
+  try {
+    const info = await bridge.readEdt(edtName);
+    const bt = (info as any)?.baseType;
+    if (typeof bt !== 'string' || bt.length === 0 || bt === 'Enum') return undefined;
+    return bt;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve the primitive base type for a D365FO EDT by walking the edt_metadata chain.
  * The `extends` column in edt_metadata stores either a primitive type name
  * (String, Real, Int64, Date, UtcDateTime, Enum, Container, Guid, Integer) or
  * another EDT name. We follow the chain until we reach a primitive type.
  *
+ * ⚠️ Index limitation: ROOT EDTs that extend a primitive store extends=null, so this
+ * cannot tell a Date/Real root EDT from a String one and defaults such cases to
+ * String. Prefer bridgeEdtBaseType() when a bridge is available; this is the
+ * offline (Azure/Linux) fallback.
+ *
  * Returns a base type string compatible with fieldTypeToAxType(), e.g.:
  *   "Qty" → "Real", "TransDate" → "Date", "ItemId" → "String"
  */
-function resolveEdtBaseType(edtName: string, db: any, depth = 0): string {
+export function resolveEdtBaseType(edtName: string, db: any, depth = 0): string | undefined {
   // D365FO primitive types − these map directly to AxTableField types
   const PRIMITIVES = new Set([
     'String', 'Integer', 'Int64', 'Real', 'Date', 'UtcDateTime', 'DateTime',
@@ -988,19 +1052,65 @@ function resolveEdtBaseType(edtName: string, db: any, depth = 0): string {
 
   try {
     const row = db.prepare(
-      `SELECT extends, enum_type FROM edt_metadata WHERE edt_name = ? LIMIT 1`
-    ).get(edtName) as { extends: string | null; enum_type: string | null } | undefined;
+      `SELECT extends, enum_type, string_size FROM edt_metadata WHERE edt_name = ? LIMIT 1`
+    ).get(edtName) as { extends: string | null; enum_type: string | null; string_size: string | number | null } | undefined;
 
-    if (!row) return 'String';
+    // EDT not found in the index (e.g. a custom EDT not yet indexed, or a standard OOB EDT
+    // whose index wasn't loaded). Return undefined so callers fall back to EDT-name heuristics
+    // in getAxTableFieldType() instead of blindly defaulting to AxTableFieldString.
+    if (!row) return undefined;
     // Enum-based EDT: extends is null but enum_type is set (e.g. SalesStatus, PurchStatus)
     if (row.enum_type && !row.extends) return 'Enum';
-    if (!row.extends) return 'String';
+    if (!row.extends) {
+      // ROOT EDT: the index does NOT record the primitive (AxEdtDate/Real/Int64/String all
+      // store extends=null). A real string EDT carries a string_size; without one we genuinely
+      // CANNOT tell String from Date/Real/Int64 — so return undefined and let the caller's
+      // name heuristic (or the bridge) decide, instead of mislabeling e.g. TransDate/Qty as
+      // String. This is the #1 "scaffold turned my date/amount field into a string" bug.
+      return row.string_size != null ? 'String' : undefined;
+    }
     if (PRIMITIVES.has(row.extends)) return row.extends;
 
     // Follow chain to the parent EDT
     return resolveEdtBaseType(row.extends, db, depth + 1);
   } catch {
-    return 'String';
+    return undefined;
+  }
+}
+
+/**
+ * Heuristic base type from an EDT/field name when the EDT is not in the index
+ * (e.g. a standard EDT whose edt_metadata wasn't loaded, or a same-session EDT).
+ * Mirrors SmartXmlBuilder.getAxTableFieldType's name heuristics but returns the
+ * primitive base type so it can be passed explicitly to the C# bridge (which
+ * otherwise defaults unknown EDTs to AxTableFieldString).
+ * Returns undefined for genuinely unrecognizable names (caller keeps EDT-as-string).
+ */
+export function heuristicEdtBaseType(edtName: string): string | undefined {
+  const e = edtName.toLowerCase();
+  if (e === 'recid' || e.endsWith('recid') || e.includes('refrecid')) return 'Int64';
+  if (e.includes('utcdatetime') || (e.includes('datetime') && !e.includes('transdate'))) return 'UtcDateTime';
+  if (e.includes('date') && !e.includes('time') && !e.includes('update')) return 'Date';
+  if (e.includes('amount') || e.includes('price') || e.includes('qty') || e.includes('quantity')
+      || e.includes('percent') || e.includes('rate') || e === 'real' || e.endsWith('mst')) return 'Real';
+  if ((e.endsWith('int') || e.includes('count') || e.includes('level'))
+      && !e.includes('account') && !e.includes('name')) return 'Integer';
+  return undefined;
+}
+
+/**
+ * Check whether a name refers to an indexed ENUM (not an EDT). Used to emit
+ * AxTableFieldEnum + EnumType instead of AxTableFieldString + ExtendedDataType
+ * for fields whose "EDT" is actually a base enum (e.g. a custom RentStatus enum).
+ */
+export function isEnumName(name: string, db: any): boolean {
+  try {
+    const row = db.prepare(
+      `SELECT 1 FROM symbols WHERE name = ? COLLATE NOCASE AND type IN ('enum', 'enum-extension') LIMIT 1`
+    ).get(name);
+    return !!row;
+  } catch {
+    return false;
   }
 }
 
@@ -1038,7 +1148,95 @@ function validateEdtExists(edtName: string, db: any): boolean {
 /**
  * Suggest EDT based on field name heuristics
  */
-function suggestEdtFromFieldName(fieldName: string): string {
+/** Framework/audit fields that should never be auto-injected from frequency mining. */
+export function isInfrastructureField(fieldName: string): boolean {
+  const INFRA = new Set([
+    'mcrholdcode', 'mcrholduserid', 'mcrholddatetime',
+    'sortorder', 'displayorder',
+    'createdby', 'createddatetime', 'modifiedby', 'modifieddatetime',
+    'createdtransactionid', 'modifiedtransactionid',
+    'recid', 'recversion', 'dataareaid', 'partition', 'tableid', 'instancerelationtype',
+  ]);
+  return INFRA.has(fieldName.toLowerCase());
+}
+
+/**
+ * Single common field words that, on their own, don't pin down a domain EDT.
+ * A fuzzy EDT that merely prepends a domain prefix to one of these
+ * (e.g. "Status" → "CovStatus", "Type" → "LedgerPostingType") scores high on
+ * containment but is the wrong concept, so for these names we accept only an
+ * exact EDT match and otherwise fall through to the name heuristic / string
+ * default. Multi-word field names like "RentEquipmentId" are specific enough
+ * that a prefixed EDT ("ContosoRentEquipmentId") is a genuinely good match.
+ */
+const GENERIC_FIELD_WORDS = new Set([
+  'status', 'type', 'category', 'group', 'code', 'class', 'state', 'kind',
+  'level', 'priority', 'value', 'key', 'order', 'sequence', 'version',
+  'mode', 'role', 'reason', 'method', 'action', 'source', 'target', 'color',
+  'size', 'unit', 'parent', 'child', 'owner', 'number', 'line',
+]);
+
+/** True when a field name is a single generic word (see GENERIC_FIELD_WORDS). */
+function isGenericFieldWord(fieldName: string): boolean {
+  return GENERIC_FIELD_WORDS.has(fieldName.toLowerCase());
+}
+
+/** Confidence (0–1) that an EDT name matches a field name, by containment. */
+function edtNameConfidence(field: string, edt: string): number {
+  const f = field.toLowerCase();
+  const e = edt.toLowerCase();
+  if (f === e) return 1.0;
+  if (e.includes(f)) return 0.9 - (e.length - f.length) * 0.01;
+  if (f.includes(e)) return 0.8 - (f.length - e.length) * 0.01;
+  return 0;
+}
+
+/**
+ * Resolve the best EDT for a field name, preferring real indexed EDTs over name
+ * heuristics. Order: exact EDT-name match → strong fuzzy match (≥0.8) → heuristic
+ * that exists in this environment → weaker fuzzy match (≥0.6) → raw heuristic.
+ */
+export function resolveBestEdt(fieldName: string, db: any): string {
+  try {
+    const exact = db.prepare(
+      `SELECT edt_name FROM edt_metadata WHERE edt_name = ? COLLATE NOCASE LIMIT 1`
+    ).get(fieldName) as { edt_name: string } | undefined;
+    if (exact) return exact.edt_name;
+
+    // Generic single-word fields don't accept fuzzy matches — a prefixed EDT
+    // (CovStatus for "Status") is a different concept. Only their exact match
+    // above counts; otherwise fall through to the heuristic / string default.
+    const acceptFuzzy = !isGenericFieldWord(fieldName);
+
+    const candidates = db.prepare(
+      `SELECT edt_name FROM edt_metadata WHERE edt_name LIKE ? COLLATE NOCASE ORDER BY LENGTH(edt_name) ASC LIMIT 30`
+    ).all(`%${fieldName}%`) as Array<{ edt_name: string }>;
+    let best = '';
+    let bestConf = 0;
+    for (const c of candidates) {
+      const conf = edtNameConfidence(fieldName, c.edt_name);
+      if (conf > bestConf) { bestConf = conf; best = c.edt_name; }
+    }
+    if (acceptFuzzy && best && bestConf >= 0.8) return best;
+
+    const heuristic = suggestEdtFromFieldName(fieldName);
+    // If the heuristic only fell back to the generic String255, and the fieldName itself
+    // looks like a PascalCase custom EDT (starts uppercase, ≥5 chars, non-generic), return
+    // the fieldName directly — it's likely a custom EDT not yet in the index.
+    // The edtWarnings system will validate it later and warn if it truly doesn't exist.
+    if (heuristic === 'String255' && acceptFuzzy && /^[A-Z]/.test(fieldName) && fieldName.length >= 5) {
+      return fieldName;
+    }
+    if (validateEdtExists(heuristic, db)) return heuristic;
+
+    if (acceptFuzzy && best && bestConf >= 0.6) return best;
+  } catch {
+    /* DB unavailable — fall back to the pure heuristic below */
+  }
+  return suggestEdtFromFieldName(fieldName);
+}
+
+export function suggestEdtFromFieldName(fieldName: string): string {
   const nameLower = fieldName.toLowerCase();
 
   // Common patterns
@@ -1051,23 +1249,24 @@ function suggestEdtFromFieldName(fieldName: string): string {
   if (nameLower === 'description') return 'Description';
   if (nameLower.includes('description') || nameLower === 'desc') return 'Description';
   if (nameLower.includes('amount')) return 'AmountMST';
+  if (nameLower.includes('rate')) return 'AmountMST';
   if (nameLower.includes('quantity') || nameLower.includes('qty')) return 'Qty';
   if (nameLower.includes('price')) return 'PriceUnit';
-  // ValidFrom / ValidTo — D365FO date effectivity pattern
-  if (nameLower === 'validfrom' || nameLower === 'fromdate' || nameLower === 'datefrom' || nameLower === 'platnostod') return 'ValidFromDateTime';
-  if (nameLower === 'validto' || nameLower === 'todate' || nameLower === 'dateto' || nameLower === 'platnostdo') return 'ValidToDateTime';
-  if (nameLower.includes('validfrom') || nameLower.includes('fromdate')) return 'ValidFromDateTime';
-  if (nameLower.includes('validto') || nameLower.includes('todate')) return 'ValidToDateTime';
+  // Only the bare effectivity names map to the *DateTime EDTs; other "*date" → TransDate.
+  if (nameLower === 'validfrom') return 'ValidFromDateTime';
+  if (nameLower === 'validto') return 'ValidToDateTime';
+  if (nameLower.includes('datetime') || nameLower.includes('time')) return 'TransDateTime';
   if (nameLower.includes('date')) return 'TransDate';
-  if (nameLower.includes('time') || nameLower.includes('datetime')) return 'TransDateTime';
   if (nameLower.includes('account')) return 'LedgerAccount';
   if (nameLower.includes('customer') || nameLower.includes('cust')) return 'CustAccount';
   if (nameLower.includes('vendor') || nameLower.includes('vend')) return 'VendAccount';
   if (nameLower.includes('item')) return 'ItemId';
   if (nameLower.includes('percent') || nameLower.includes('pct')) return 'Percent';
-  if (nameLower.includes('status')) return 'NoYesId';
   if (nameLower.includes('enabled') || nameLower.includes('active') || nameLower.includes('flag')) return 'NoYesId';
-  if (nameLower.includes('id') && !nameLower.includes('recid')) return 'RefRecId';
+
+  // No blanket "*id → RefRecId" / "status → NoYesId" rule: those force the wrong
+  // base type. Such fields fall through to the string default unless resolveBestEdt
+  // matches a real EDT.
 
   // Default to string
   return 'String255';

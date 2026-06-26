@@ -27,7 +27,7 @@ export function registerCodeReviewPrompt(server: Server, context: XppServerConte
         getSystemInstructionsPromptDefinition(),
         {
           name: 'xpp_create_file',
-          description: '🔥 USE THIS WHEN CREATING D365FO FILES: Mandatory workflow for creating D365FO classes, tables, forms, enums. ALWAYS use create_d365fo_file tool FIRST.',
+          description: '🔥 USE THIS WHEN CREATING D365FO FILES: Mandatory workflow for creating D365FO classes, tables, forms, enums. ALWAYS use d365fo_file(action="create") tool FIRST.',
           arguments: [],
         },
         {
@@ -117,25 +117,26 @@ When user asks to CREATE any D365FO object (class, table, form, enum, query, vie
 
 MANDATORY STEPS (NO EXCEPTIONS):
 
-1. ALWAYS call create_d365fo_file FIRST:
+1. ALWAYS call d365fo_file(action="create") FIRST:
    - objectType: class/table/form/enum/query/view
    - objectName: from user request
    - modelName: auto-detected from .mcp.json (NEVER ask user)
    - addToProject: true
    - sourceCode: generated X++ code
 
-2. IF create_d365fo_file fails:
+2. IF d365fo_file(action="create") fails:
    THEN STOP and report the error to the user.
    NEVER fall back to create_file or PowerShell.
 
 FORBIDDEN:
-❌ NEVER use generate_d365fo_xml + create_file as a fallback
+❌ NEVER use d365fo_file(action="generate") + create_file as a fallback
 ❌ NEVER use create_file directly for D365FO objects
-❌ NEVER skip create_d365fo_file
+❌ NEVER skip d365fo_file(action="create")
 
 Example:
 User: "Create class MyHelper"
-You: create_d365fo_file({
+You: d365fo_file({
+  action: "create",
   objectType: "class",
   objectName: "MyHelper", 
   modelName: "CustomCore",
@@ -236,9 +237,9 @@ ${classSource}
 Use CoC when you need to wrap or augment an existing method's logic.
 
 ### Prerequisites
-1. Call \`get_method_signature\` to get exact parameter types and return type
-2. Call \`find_coc_extensions\` to check if the method is already wrapped
-3. Call \`analyze_extension_points\` to verify the method is CoC-eligible (not \`final\` / \`[Hookable(false)]\`)
+1. Call \`get_method(include="signature")\` to get exact parameter types and return type
+2. Call \`extension_info(mode="coc")\` to check if the method is already wrapped
+3. Call \`extension_info(mode="points")\` to verify the method is CoC-eligible (not \`final\` / \`[Hookable(false)]\`)
 
 ### Class rule
 \`\`\`xpp
@@ -261,7 +262,7 @@ final class SalesFormLetterWHS_Extension
 ### Rules
 - ALWAYS call \`next methodName(...)\` with ALL original parameters preserved
 - Place \`next\` at the START for pre-processing, END for post-processing, or BOTH for wrapping
-- Use \`generate_code pattern='table-extension'\` or \`'form-handler'\` for the skeleton
+- Use \`generate_object(mode="pattern") pattern='table-extension'\` or \`'form-handler'\` for the skeleton
 
 ---
 
@@ -274,9 +275,9 @@ Use event handlers for loosely-coupled reactions to table/class/form events.
 - Avoid tight coupling — no need to wrap a method
 
 ### Workflow
-1. Call \`analyze_extension_points\` with the target class/table to see available events
-2. Call \`find_event_handlers\` to check if the event already has handlers (avoid duplicates)
-3. Use \`generate_code pattern='event-handler' name='{BaseName}EventHandler' baseName='{BaseName}'\`
+1. Call \`extension_info(mode="points")\` with the target class/table to see available events
+2. Call \`extension_info(mode="events")\` to check if the event already has handlers (avoid duplicates)
+3. Use \`generate_object(mode="pattern") pattern='event-handler' name='{BaseName}EventHandler' baseName='{BaseName}'\`
 
 ### Template
 \`\`\`xpp
@@ -337,17 +338,17 @@ Role (e.g. AccountsReceivableClerk)
 
 ### 1. Check existing coverage first
 \`\`\`
-get_security_coverage_for_object(objectName: "CustTable", objectType: "form")
+security_info(mode="coverage", objectName: "CustTable", objectType: "form")
 \`\`\`
 
 ### 2. Create menu item XML
 \`\`\`
-generate_code(pattern: "menu-item", name: "MyFeature", menuItemType: "display", targetObject: "MyFeatureForm")
+generate_object(mode="pattern", pattern: "menu-item", name: "MyFeature", menuItemType: "display", targetObject: "MyFeatureForm")
 \`\`\`
 
 ### 3. Create privilege XML (always create BOTH View + Maintain)
 \`\`\`
-generate_code(pattern: "security-privilege", name: "MyFeature", targetObject: "MyFeature")
+generate_object(mode="pattern", pattern: "security-privilege", name: "MyFeature", targetObject: "MyFeature")
 \`\`\`
 
 This generates:
@@ -368,7 +369,7 @@ This generates:
 
 ### 5. Assign duty to an existing role
 \`\`\`
-get_security_artifact_info(name: "AccountsReceivableClerk", artifactType: "role")
+security_info(mode="artifact", name: "AccountsReceivableClerk", artifactType: "role")
 \`\`\`
 Then add the duty to that role's XML.
 
@@ -384,7 +385,7 @@ Then add the duty to that role's XML.
 ## Segregation of Duties
 - View and Maintain privileges should be in SEPARATE duties when SoD rules apply
 - Never grant Delete access in the same privilege as Create without business justification
-- Use \`get_security_artifact_info\` to verify existing duty assignments before creating new ones
+- Use \`security_info(mode="artifact")\` to verify existing duty assignments before creating new ones
 `,
             },
           },
@@ -404,7 +405,7 @@ Then add the duty to that role's XML.
 
 ## Overview
 SysOperation is the **modern replacement for RunBaseBatch**. Always use SysOperation for new batch/dialog operations.
-Generate the full scaffold with: \`generate_code(pattern: "sysoperation", name: "MyOperation")\`
+Generate the full scaffold with: \`generate_object(mode="pattern", pattern: "sysoperation", name: "MyOperation")\`
 
 ## Three Classes
 
@@ -570,7 +571,7 @@ MyOperationController::main(new Args());
 
 ## Checking Existing Entities
 \`\`\`
-get_data_entity_info(entityName: "CustCustomerV3Entity")
+get_object_info(objectType: "data-entity", name: "CustCustomerV3Entity")
 \`\`\`
 
 ## Structure Pattern
@@ -619,12 +620,12 @@ private static server str computePartyName()
 - After adding fields, run **Refresh entity list** in Data Management workspace
 - Computed columns must return a valid SQL expression string, not an X++ value
 - Mandatory fields on staging table must have defaults or be mapped from source
-- Use \`get_view_info\` to inspect the current entity's data sources and fields
+- Use \`get_object_info(objectType: "view", name: ...)\` to inspect the current entity's data sources and fields
 
 ## Workflow
-1. \`get_data_entity_info(entityName: "...")\` — check if entity already exists
-2. \`generate_smart_table\` — for the staging table if needed
-3. \`create_d365fo_file(objectType: "view", ...)\` — create the entity file
+1. \`get_object_info(objectType: "data-entity", name: "...")\` — check if entity already exists
+2. \`generate\` — for the staging table if needed
+3. \`d365fo_file(action: "create", objectType: "view", ...)\` — create the entity file
 4. After deployment: refresh entity list in Data Management
 `,
             },

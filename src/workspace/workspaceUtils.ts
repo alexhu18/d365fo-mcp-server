@@ -5,28 +5,40 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { assertReadRootAllowed } from '../utils/pathContainment.js';
 
 /**
  * Validate workspace path
- * Ensures path is safe and accessible
+ * Ensures path is safe and accessible, and that it is contained within the
+ * configured D365FO package roots.
+ *
+ * Security: the previous implementation only checked for the literal substring
+ * ".." — absolute paths such as "/etc" or "C:\Windows" bypassed it entirely.
+ * This version resolves the path to an absolute form and then verifies it falls
+ * under one of the operator-configured package roots before any fs operation.
  */
 export async function validateWorkspacePath(workspacePath: string): Promise<{
   valid: boolean;
   error?: string;
 }> {
   try {
-    // Check for path traversal attempts
-    const normalizedPath = path.normalize(workspacePath);
-    if (normalizedPath.includes('..')) {
+    // Resolve to absolute, eliminating any relative segments.
+    const resolved = path.resolve(workspacePath);
+
+    // Root-containment check: reject any path that does not resolve under a
+    // configured D365FO package root (replaces the old ".." substring test,
+    // which was bypassable with absolute paths such as "/etc" or "C:\Windows").
+    const containment = await assertReadRootAllowed(resolved);
+    if (!containment.ok) {
       return {
         valid: false,
-        error: 'Path traversal detected - workspace path cannot contain ".."',
+        error: containment.reason ?? 'workspacePath escapes configured workspace roots',
       };
     }
 
-    // Check if path exists
+    // Check if path exists and is a directory.
     try {
-      const stats = await fs.stat(workspacePath);
+      const stats = await fs.stat(resolved);
       if (!stats.isDirectory()) {
         return {
           valid: false,
@@ -36,21 +48,12 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
     } catch (error) {
       return {
         valid: false,
-        error: `Workspace path does not exist or is not accessible: ${workspacePath}`,
-      };
-    }
-
-    // Check if path is too deep (security limit)
-    const depth = workspacePath.split(path.sep).length;
-    if (depth > 20) {
-      return {
-        valid: false,
-        error: 'Workspace path is too deep (max 20 levels)',
+        error: `Workspace path does not exist or is not accessible: ${resolved}`,
       };
     }
 
     // Check if path contains too many files (prevent DoS)
-    const files = await fs.readdir(workspacePath);
+    const files = await fs.readdir(resolved);
     if (files.length > 50000) {
       return {
         valid: false,

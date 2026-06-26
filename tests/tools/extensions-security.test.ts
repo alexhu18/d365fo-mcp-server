@@ -2,8 +2,9 @@
  * Extensions & Security Tools Tests
  * Covers: find_coc_extensions, find_event_handlers, get_table_extension_info,
  *         get_security_artifact_info, get_security_coverage_for_object,
- *         analyze_extension_points, get_menu_item_info, get_data_entity_info,
- *         recommend_extension_strategy
+ *         analyze_extension_points, recommend_extension_strategy,
+ *         and the menu-item / data-entity readers (now reached via get_object_info,
+ *         exercised here directly against their handler functions).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';

@@ -70,9 +70,55 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+/** Like envInt but accepts 0 (used by knobs where 0 means "disabled"). */
+function envIntZero(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 // Configurable via env so large installations / slow VMs can raise the limits.
 const READY_TIMEOUT_MS = envInt('BRIDGE_READY_TIMEOUT_MS', 30_000); // 30s for metadata provider init
 const CALL_TIMEOUT_MS = envInt('BRIDGE_CALL_TIMEOUT_MS', 60_000);   // 60s per call (large searches can take time)
+const MAX_RETRIES = envIntZero('BRIDGE_MAX_RETRIES', 2);            // retries for READ calls only (0 = disabled)
+const HEALTHCHECK_MS = envIntZero('BRIDGE_HEALTHCHECK_MS', 0);      // idle ping interval (0 = disabled)
+const MAX_RESTARTS = envInt('BRIDGE_MAX_RESTARTS', 3);              // max child respawns per minute
+const RESTART_WINDOW_MS = 60_000;
+const PING_TIMEOUT_MS = 5_000;
+const RETRY_BASE_DELAY_MS = 250;
+
+/**
+ * Methods safe to auto-retry on timeout/pipe error: idempotent READS only.
+ * Writes (create/modify/delete/batch/refresh) must NEVER be retried — the
+ * operation may have already applied on the bridge side before the timeout fired.
+ */
+const RETRYABLE_METHODS = new Set([
+  'ping', 'getInfo', 'getCapabilities',
+  'readTable', 'readClass', 'readEnum', 'readEdt', 'readForm', 'readQuery',
+  'readView', 'readDataEntity', 'readReport', 'readSecurityPrivilege',
+  'readSecurityDuty', 'readSecurityRole', 'readMenuItem', 'readTableExtensions',
+  'getMethodSource', 'searchObjects', 'listObjects', 'findReferences',
+  'getCompletionMembers', 'findExtensionClasses', 'findEventSubscribers',
+  'findApiUsageCallers', 'resolveObjectInfo', 'validateObject', 'discoverFormPatterns',
+]);
+
+/** Errors that indicate a transient transport problem (vs. a deterministic bridge error). */
+function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('timed out') ||
+    msg.includes('Bridge is not ready') ||
+    msg.includes('exited unexpectedly') ||
+    msg.includes('Bridge process error') ||
+    msg.includes('Failed to write to bridge stdin') ||
+    msg.includes('Bridge restarting')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export interface BridgeClientOptions {
   /** Path to the D365MetadataBridge.exe (auto-detected if omitted) */
@@ -103,6 +149,12 @@ export interface BridgeClientOptions {
   callTimeoutMs?: number;
   /** Path to a log file for bridge diagnostics (append mode) */
   logFile?: string;
+  /** Max automatic retries for READ calls on timeout/pipe error (default: BRIDGE_MAX_RETRIES env or 2) */
+  maxRetries?: number;
+  /** Idle ping interval in ms, 0 = disabled (default: BRIDGE_HEALTHCHECK_MS env or 0) */
+  healthcheckMs?: number;
+  /** Max child respawns per 60s before giving up (default: BRIDGE_MAX_RESTARTS env or 3) */
+  maxRestarts?: number;
 }
 
 interface PendingRequest {
@@ -119,6 +171,9 @@ export class BridgeClient extends EventEmitter {
   private readyPayload: BridgeReadyPayload | null = null;
   private _isReady = false;
   private _disposed = false;
+  private restartPromise: Promise<void> | null = null;
+  private restartTimestamps: number[] = [];
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
 
   public readonly options: BridgeClientOptions;
 
@@ -152,6 +207,13 @@ export class BridgeClient extends EventEmitter {
     if (this._disposed) throw new Error('BridgeClient has been disposed');
     if (this._isReady) return this.readyPayload!;
 
+    const payload = await this.spawnAndWaitReady();
+    this.startHealthcheck();
+    return payload;
+  }
+
+  /** Spawn the child process and wait for its "ready" message. Used by initialize() and restart(). */
+  private async spawnAndWaitReady(): Promise<BridgeReadyPayload> {
     const exePath = this.resolveBridgeExe();
     const args = [
       '--packages-path', this.options.packagesPath,
@@ -176,7 +238,9 @@ export class BridgeClient extends EventEmitter {
 
     return new Promise<BridgeReadyPayload>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.dispose();
+        // Kill only the child — the client itself stays usable so a later
+        // restart() attempt (or dispose() by the owner) can still proceed.
+        this.killChild();
         reject(new Error(`Bridge process did not become ready within ${this.options.readyTimeoutMs ?? READY_TIMEOUT_MS}ms`));
       }, this.options.readyTimeoutMs ?? READY_TIMEOUT_MS);
 
@@ -191,8 +255,27 @@ export class BridgeClient extends EventEmitter {
         return;
       }
 
+      // Capture the child so late events from a replaced (restarted) process
+      // cannot corrupt the state of its successor.
+      const child = this.process;
+
+      // Guard the child's stdio streams against unhandled 'error' events. When the
+      // bridge process dies mid-write (e.g. a crash during createSmartTable), Node
+      // can emit EPIPE/ECONNRESET on stdin/stdout/stderr. A stream that emits
+      // 'error' with no listener throws as an uncaughtException and would take the
+      // whole MCP server down ("crashes on the first request"). Recovery is driven
+      // by the 'error'/'exit' handlers on the child below; here we just absorb the
+      // stream-level noise so it never becomes fatal.
+      const onStreamError = (where: string) => (err: Error) => {
+        console.error(`[BridgeClient] ${where} stream error: ${err.message}`);
+      };
+      child.stdin?.on('error', onStreamError('stdin'));
+      child.stdout?.on('error', onStreamError('stdout'));
+      child.stderr?.on('error', onStreamError('stderr'));
+
       // Handle stdout — newline-delimited JSON
-      this.process.stdout!.on('data', (chunk: Buffer) => {
+      child.stdout!.on('data', (chunk: Buffer) => {
+        if (this.process !== child) return;
         this.buffer += chunk.toString('utf8');
         let newlineIdx: number;
         while ((newlineIdx = this.buffer.indexOf('\n')) !== -1) {
@@ -220,7 +303,16 @@ export class BridgeClient extends EventEmitter {
               this.pending.delete(msg.id);
               clearTimeout(pending.timer);
               if (msg.error) {
-                pending.reject(new Error(`Bridge error [${msg.error.code}]: ${msg.error.message}`));
+                // A read "object not found" (-32001 from the metadata read path) is a
+                // normal negative result, not an error — resolve null so read methods
+                // (typed T | null) return cleanly and callers don't log it as a failure.
+                // The write path's -32001 ("Write operation returned null") keeps a
+                // distinct message and still rejects.
+                if (msg.error.code === -32001 && /not found/i.test(msg.error.message ?? '')) {
+                  pending.resolve(null);
+                } else {
+                  pending.reject(new Error(`Bridge error [${msg.error.code}]: ${msg.error.message}`));
+                }
               } else {
                 pending.resolve(msg.result);
               }
@@ -232,7 +324,7 @@ export class BridgeClient extends EventEmitter {
       });
 
       // Forward stderr for diagnostics
-      this.process.stderr!.on('data', (chunk: Buffer) => {
+      child.stderr!.on('data', (chunk: Buffer) => {
         const text = chunk.toString('utf8').trim();
         if (text) {
           for (const line of text.split('\n')) {
@@ -249,7 +341,8 @@ export class BridgeClient extends EventEmitter {
         }
       });
 
-      this.process.on('error', (err) => {
+      child.on('error', (err) => {
+        if (this.process !== child) return;
         clearTimeout(timeout);
         this._isReady = false;
         console.error(`[BridgeClient] Process error: ${err.message}`);
@@ -257,10 +350,14 @@ export class BridgeClient extends EventEmitter {
         reject(err);
       });
 
-      this.process.on('exit', (code, signal) => {
+      child.on('exit', (code, signal) => {
+        if (this.process !== child) return;
+        clearTimeout(timeout);
         this._isReady = false;
         console.error(`[BridgeClient] Process exited: code=${code}, signal=${signal}`);
-        this.rejectAllPending(new Error(`Bridge process exited unexpectedly: code=${code}`));
+        const exitErr = new Error(`Bridge process exited before becoming ready: code=${code}, signal=${signal}`);
+        this.rejectAllPending(exitErr);
+        reject(exitErr);
       });
     });
   }
@@ -268,17 +365,46 @@ export class BridgeClient extends EventEmitter {
   /**
    * Send a JSON-RPC call to the bridge and return the result.
    * Rejects if bridge is not ready, the call times out, or the bridge returns an error.
+   *
+   * READ methods (RETRYABLE_METHODS) are transparently retried on transient
+   * transport failures — timeout, dead pipe, child exit — with jittered
+   * exponential backoff and a health-checked restart of the child in between.
+   * Write methods are never retried: a timed-out write may have already
+   * applied on the bridge side, and replaying it could duplicate the operation.
    */
   async call<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+    const maxRetries = RETRYABLE_METHODS.has(method) ? (this.options.maxRetries ?? MAX_RETRIES) : 0;
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (this.restartPromise) await this.restartPromise;
+        return await this.callOnce<T>(method, params);
+      } catch (err) {
+        if (attempt >= maxRetries || this._disposed || !isTransientError(err)) {
+          throw err;
+        }
+        const delay = RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 100);
+        console.error(
+          `[BridgeClient] Read call '${method}' failed (${err instanceof Error ? err.message : err}) — ` +
+          `retry ${attempt + 1}/${maxRetries} in ${delay}ms`
+        );
+        await sleep(delay);
+        await this.ensureHealthy();
+      }
+    }
+  }
+
+  /** Single-shot RPC send with no retry. */
+  private callOnce<T>(method: string, params: Record<string, unknown>, timeoutOverrideMs?: number): Promise<T> {
     if (!this._isReady || this._disposed || !this.process?.stdin?.writable) {
-      throw new Error('Bridge is not ready');
+      return Promise.reject(new Error('Bridge is not ready'));
     }
 
     const id = String(++this.requestId);
     const request = JSON.stringify({ id, method, params }) + '\n';
 
     return new Promise<T>((resolve, reject) => {
-      const timeoutMs = this.options.callTimeoutMs ?? CALL_TIMEOUT_MS;
+      const timeoutMs = timeoutOverrideMs ?? this.options.callTimeoutMs ?? CALL_TIMEOUT_MS;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Bridge call '${method}' timed out after ${timeoutMs}ms`));
@@ -300,14 +426,103 @@ export class BridgeClient extends EventEmitter {
     });
   }
 
+  /**
+   * Verify the child is alive and responding; respawn it if not.
+   * Called between read-retry attempts and from the idle health-check.
+   */
+  private async ensureHealthy(): Promise<void> {
+    if (this._disposed) throw new Error('BridgeClient disposed');
+
+    if (this.processAlive()) {
+      try {
+        await this.callOnce<string>('ping', {}, PING_TIMEOUT_MS);
+        return;
+      } catch {
+        // alive but wedged — fall through to restart
+      }
+    }
+    await this.restart();
+  }
+
+  private processAlive(): boolean {
+    return this._isReady && this.process !== null && this.process.exitCode === null;
+  }
+
+  /**
+   * Tear down the current child and spawn a fresh one. Concurrent callers
+   * share a single in-flight restart. Capped at maxRestarts per 60s to avoid
+   * crash loops — past the cap the error tells the user where to look.
+   */
+  async restart(): Promise<BridgeReadyPayload> {
+    if (this._disposed) throw new Error('BridgeClient disposed');
+
+    if (this.restartPromise) {
+      await this.restartPromise;
+      return this.readyPayload!;
+    }
+
+    const now = Date.now();
+    const maxRestarts = this.options.maxRestarts ?? MAX_RESTARTS;
+    this.restartTimestamps = this.restartTimestamps.filter(t => now - t < RESTART_WINDOW_MS);
+    if (this.restartTimestamps.length >= maxRestarts) {
+      throw new Error(
+        `Bridge child restarted ${maxRestarts}x within ${RESTART_WINDOW_MS / 1000}s and keeps failing — giving up. ` +
+        `Check the bridge log (D365FO_BRIDGE_LOG_FILE) for the underlying crash.`
+      );
+    }
+    this.restartTimestamps.push(now);
+
+    this.restartPromise = (async () => {
+      console.error('[BridgeClient] Restarting bridge child process…');
+      this.rejectAllPending(new Error('Bridge restarting'));
+      this.killChild();
+      this._isReady = false;
+      this.readyPayload = null;
+      this.buffer = '';
+      await this.spawnAndWaitReady();
+      console.error('[BridgeClient] Bridge child restarted successfully');
+    })();
+
+    try {
+      await this.restartPromise;
+    } finally {
+      this.restartPromise = null;
+    }
+    return this.readyPayload!;
+  }
+
+  /** Periodic idle ping (BRIDGE_HEALTHCHECK_MS > 0) — proactively respawns a dead/wedged child. */
+  private startHealthcheck(): void {
+    const intervalMs = this.options.healthcheckMs ?? HEALTHCHECK_MS;
+    if (!intervalMs || this.healthTimer) return;
+
+    this.healthTimer = setInterval(() => {
+      if (this._disposed || this.restartPromise) return;
+      // Skip when calls are in flight — they detect failures themselves.
+      if (this.pending.size > 0) return;
+      void this.ensureHealthy().catch((err) => {
+        console.error(`[BridgeClient] Health-check failed: ${err instanceof Error ? err.message : err}`);
+      });
+    }, intervalMs);
+    if (typeof this.healthTimer.unref === 'function') this.healthTimer.unref();
+  }
+
   /** Gracefully shut down the bridge process */
   dispose(): void {
     if (this._disposed) return;
     this._disposed = true;
     this._isReady = false;
 
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
     this.rejectAllPending(new Error('BridgeClient disposed'));
+    this.killChild();
+  }
 
+  /** Kill the current child process (used by dispose and restart). */
+  private killChild(): void {
     // Capture the child reference in a local variable BEFORE clearing this.process.
     // The deferred SIGTERM closure must retain the reference or it kills nothing,
     // leaking the D365MetadataBridge child process across restarts.

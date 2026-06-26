@@ -20,16 +20,12 @@ Fallback chain when `roots/list` is not available:
 - `VSCODE_WORKSPACE_FOLDER_PATHS` environment variable (VS Code / VS 2026 set this)
 - `process.cwd()` — used only when it is **not** a Node.js project directory
 
-```
-Open D365FO solution in Visual Studio 2022
-           ↓
-Server receives roots via MCP protocol (file:/// URI)
-           ↓
-Server finds MyProject.rnrproj
-           ↓
-Model name extracted: "MyModel"
-           ↓
-New files created in K:\AosService\PackagesLocalDirectory\MyPackage\MyModel\...
+```mermaid
+flowchart LR
+    A[Open solution<br/>in VS 2022/2026] --> B["roots/list<br/>(file:/// URI)"]
+    B --> C[find MyProject.rnrproj<br/>≤ 6 levels deep]
+    C --> D["read &lt;Model&gt;<br/>→ MyModel"]
+    D --> E["writes target<br/>...\PackagesLocalDirectory\MyPackage\MyModel\..."]
 ```
 
 ### HTTP transport (Azure-hosted server)
@@ -130,7 +126,7 @@ persists for all subsequent tool calls in the same session.
 | Priority | Source | Notes |
 |----------|--------|-------|
 | 1st | Explicit `D365FO_MODEL_NAME` env var | Always wins |
-| 2nd | Last segment of `D365FO_WORKSPACE_PATH` | Only used when path contains `PackagesLocalDirectory` — avoids returning repo names like `ASL` |
+| 2nd | Last segment of `D365FO_WORKSPACE_PATH` | Only used when path contains `PackagesLocalDirectory` — avoids returning repo folder names like `MyMetadataRepo` |
 | 3rd | Auto-detected from `.rnrproj` scan | Triggered by roots protocol, `D365FO_SOLUTIONS_PATH`, or workspace seed |
 
 Each value's detection source is shown in `get_workspace_info` output:
