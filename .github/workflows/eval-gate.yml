@@ -1,0 +1,43 @@
+name: eval-gate
+
+# Regression gate for the agent eval loop (docs/AGENT_EVAL_LOOP.md Phase 3) plus
+# the full unit suite. VM-free: builds the server, runs every test (including the
+# golden-integrity gate tests/eval/goldens.test.ts and the oracle/improver units),
+# so a malformed golden commit or a normalizer regression fails here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24.x'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check / build
+        run: npm run build
+
+      # `npm test` is vitest in watch mode — use the one-shot runner for CI.
+      - name: Unit tests + golden regression gate
+        run: npx vitest run
+
+      - name: Eval scoreboard (informational)
+        if: always()
+        run: npm run eval:report || true

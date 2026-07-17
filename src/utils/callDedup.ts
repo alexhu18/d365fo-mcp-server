@@ -20,6 +20,11 @@ export const DEDUP_EXCLUDED_TOOLS = new Set([
   'run_bp_check', 'run_systest_class', 'review_workspace_changes',
   'verify_d365fo_project', 'get_workspace_info',
   'prepare', // issues fresh grounding tokens
+  // generate_object(mode="scaffold") writes directly to disk (like d365fo_file) and
+  // reads live, mutable index state via cloneFrom/tableMapping/fieldsHint, so caching
+  // by input args alone is unsound: a retry after update_symbol_index() must re-read
+  // the now-current index rather than replay a stale cached result.
+  'generate_object',
 ]);
 
 interface DedupEntry {

@@ -19,6 +19,9 @@
  *     menu-extension           → AxMenuExtension
  *     security-duty-extension  → AxSecurityDutyExtension
  *     security-role-extension  → AxSecurityRoleExtension
+ *     menu-item-display-extension → AxMenuItemDisplayExtension
+ *     menu-item-action-extension  → AxMenuItemActionExtension
+ *     menu-item-output-extension  → AxMenuItemOutputExtension
  *
  *   Class-style (ObjectName_Extension.xml in AxClass/):
  *     class-extension          → AxClass  (filename ends with _Extension)
@@ -27,8 +30,6 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { parseStringPromise } from 'xml2js';
-
-// ── Public interface ─────────────────────────────────────────────────────────
 
 export interface FsExtensionScanResult {
   /** Extension object name (from <Name> element) */
@@ -53,8 +54,6 @@ export interface FsExtensionScanResult {
   addedDataSources: string[];
 }
 
-// ── Folder config ────────────────────────────────────────────────────────────
-
 interface ExtensionTypeConfig {
   axFolder: string;
   /**
@@ -77,10 +76,11 @@ export const EXTENSION_FOLDER_CONFIG: Readonly<Record<string, ExtensionTypeConfi
   'menu-extension':            { axFolder: 'AxMenuExtension' },
   'security-duty-extension':   { axFolder: 'AxSecurityDutyExtension' },
   'security-role-extension':   { axFolder: 'AxSecurityRoleExtension' },
+  'menu-item-display-extension': { axFolder: 'AxMenuItemDisplayExtension' },
+  'menu-item-action-extension':  { axFolder: 'AxMenuItemActionExtension' },
+  'menu-item-output-extension':  { axFolder: 'AxMenuItemOutputExtension' },
   'class-extension':           { axFolder: 'AxClass', isClassStyle: true },
 } as const;
-
-// ── Core scanner ─────────────────────────────────────────────────────────────
 
 /**
  * Hard budget (ms) for a single scan. The scanner walks every package and every
@@ -176,16 +176,16 @@ export async function scanFsExtensions(
 
       for (const xmlFile of xmlFiles) {
         if (timeBudgetExceeded()) break outer;
-        // ── Fast-path: filename filter (avoids reading files unnecessarily) ──
+        // Filename filter avoids reading files unnecessarily.
         const baseName = path.basename(xmlFile, '.xml');
         const lowerBase = baseName.toLowerCase();
 
         if (config.isClassStyle) {
-          // Class extensions: BaseName_Extension.xml  or  BaseName_ModelExtension.xml
+          // BaseName_Extension.xml or BaseName_ModelExtension.xml
           if (!lowerBase.startsWith(lowerObjName + '_')) continue;
           if (!lowerBase.endsWith('_extension')) continue;
         } else {
-          // Standard: BaseName.ModelName.xml
+          // BaseName.ModelName.xml
           if (!lowerBase.startsWith(lowerObjName + '.')) continue;
         }
 
@@ -205,12 +205,9 @@ export async function scanFsExtensions(
   return results;
 }
 
-// ── XML parsing ──────────────────────────────────────────────────────────────
-
-/** Derive the xml2js root-element key from the AOT folder name */
+/** Derive the xml2js root-element key from the AOT folder name (e.g. 'AxTableExtension', 'AxClass'). */
 function rootKeyFor(config: ExtensionTypeConfig): string {
-  // class-extension lives in AxClass folder but root element is AxClass
-  return config.axFolder; // e.g. 'AxTableExtension', 'AxClass'
+  return config.axFolder;
 }
 
 async function parseExtensionFile(
@@ -241,7 +238,7 @@ async function parseExtensionFile(
   const addedControls: string[] = [];
   const addedDataSources: string[] = [];
 
-  // ── Methods — common to class, table, form, view, etc. ──────────────────
+  // Methods — common to class, table, form, view, etc.
   const sourceCode = root.SourceCode?.[0];
   if (sourceCode) {
     const methodsNode = sourceCode.Methods?.[0];
@@ -260,7 +257,7 @@ async function parseExtensionFile(
     }
   }
 
-  // ── Type-specific data extraction ────────────────────────────────────────
+  // Type-specific data extraction
   switch (extensionType) {
 
     case 'table-extension': {

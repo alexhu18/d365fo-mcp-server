@@ -28,9 +28,9 @@ export function levenshteinDistance(str1: string, str2: string): number {
     for (let j = 1; j <= len2; j++) {
       const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
       matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1,      // deletion
-        matrix[i][j - 1] + 1,      // insertion
-        matrix[i - 1][j - 1] + cost // substitution
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
       );
     }
   }
@@ -80,9 +80,9 @@ export function findFuzzyMatches(
   return matches
     .sort((a, b) => {
       if (Math.abs(a.score - b.score) > 0.01) {
-        return b.score - a.score; // Higher score first
+        return b.score - a.score;
       }
-      return a.distance - b.distance; // Lower distance first
+      return a.distance - b.distance;
     })
     .slice(0, maxResults);
 }
@@ -91,15 +91,9 @@ export function findFuzzyMatches(
  * Check if query might be a typo based on common patterns
  */
 export function isProbableTypo(query: string, bestMatch: string, score: number): boolean {
-  // High similarity suggests typo
   if (score >= 0.85) return true;
-  
-  // Adjacent key typos (keyboard proximity)
   if (score >= 0.75 && hasSingleCharDifference(query, bestMatch)) return true;
-  
-  // Common transposition (swapped adjacent letters)
   if (hasTransposition(query, bestMatch)) return true;
-  
   return false;
 }
 
@@ -120,8 +114,7 @@ function hasSingleCharDifference(str1: string, str2: string): boolean {
     if (s1[i] !== s2[j]) {
       differences++;
       if (differences > 1) return false;
-      
-      // Handle insertion/deletion
+
       if (s1.length !== s2.length) {
         if (s1.length > s2.length) i++;
         else j++;
@@ -151,13 +144,12 @@ function hasTransposition(str1: string, str2: string): boolean {
   
   for (let i = 0; i < s1.length - 1; i++) {
     if (s1[i] !== s2[i]) {
-      // Check if next chars are swapped
       if (s1[i] === s2[i + 1] && s1[i + 1] === s2[i]) {
-        if (foundTransposition) return false; // More than one transposition
+        if (foundTransposition) return false;
         foundTransposition = true;
-        i++; // Skip next char (already checked)
+        i++;
       } else {
-        return false; // Not a simple transposition
+        return false;
       }
     }
   }
@@ -183,12 +175,11 @@ export function generateBroaderSearches(query: string): string[] {
     }
   }
   
-  // Try wildcard pattern
   if (query.length >= 3) {
     suggestions.push(`${query}*`);
   }
-  
-  return [...new Set(suggestions)]; // Remove duplicates
+
+  return [...new Set(suggestions)];
 }
 
 /**
@@ -201,11 +192,9 @@ export function generateNarrowerSearches(query: string): string[] {
     'Contract', 'Builder', 'DP', 'Form', 'Query'
   ];
   
-  // Don't add suffixes if query already has one
   const hasSuffix = commonSuffixes.some(s => query.endsWith(s));
   if (hasSuffix) return suggestions;
-  
-  // Add common suffixes
+
   for (const suffix of commonSuffixes) {
     suggestions.push(`${query}${suffix}`);
   }

@@ -111,7 +111,7 @@ export class SmartXmlBuilder {
     xml += `<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">\n`;
     xml += `\t<Name>${name}</Name>\n`;
 
-    // <SourceCode> MUST be first child of <AxTable> — D365FO AOT requirement
+    // <SourceCode> must be the first child of <AxTable> (D365FO AOT requirement)
     xml += `\t<SourceCode>\n`;
     xml += `\t\t<Declaration><![CDATA[\n/// <summary>\n/// The <c>${name}</c> table.\n/// </summary>\npublic class ${name} extends common\n{\n}\n]]></Declaration>\n`;
     if (methods && methods.length > 0) {
@@ -125,16 +125,15 @@ export class SmartXmlBuilder {
     }
     xml += `\t</SourceCode>\n`;
 
-    // Table metadata (after SourceCode)
     if (label) {
       xml += `\t<Label>${this.escapeXml(label)}</Label>\n`;
     }
 
-    // Normalise tableType — 'RegularTable' is the default and is omitted from XML.
+    // 'RegularTable' is the default and is omitted from XML.
     const normalizedTableType = tableType && tableType.toLowerCase() !== 'regulartable' ? tableType : '';
     const isTempTable = normalizedTableType === 'TempDB' || normalizedTableType === 'InMemory';
 
-    // Guard: 'TempDB' and 'InMemory' are NOT valid TableGroup values — they belong to TableType.
+    // 'TempDB'/'InMemory' are TableType values, not valid TableGroup values.
     if (tableGroup === 'TempDB' || tableGroup === 'InMemory') {
       throw new Error(
         `❌ Invalid TableGroup value "${tableGroup}". ` +
@@ -145,26 +144,17 @@ export class SmartXmlBuilder {
       );
     }
 
-    // Valid TableGroup values — system enum TableGroup (source: MSDN / D365FO AOT):
-    //   Miscellaneous   — DEFAULT for new tables; does not fit any other category (e.g. TableExpImpDef)
-    //   Main            — principal master table for a central business object (static base data)
-    //   Transaction     — transaction/journal data, typically not edited directly
-    //   Parameter       — setup/parameter data for a Main table (usually 1 record per company)
-    //   Group           — categorisation for a Main table (one-to-many: Group → Main)
-    //   WorksheetHeader — worksheet header rows; one-to-many with WorksheetLine
-    //   WorksheetLine   — lines to validate → transactions; may be deleted without affecting stability
-    //   Reference       — shared reference/lookup data across modules
-    //   Framework       — internal Microsoft framework / infrastructure tables
-    // For TempDB/InMemory tables the group is typically 'Main' (matches real D365FO Tmp tables).
-    // Regular tables without an explicit group default to the majority value mined from
-    // the indexed standard models (property_stats); 'Main' is the static fallback.
+    // System enum TableGroup values (source: MSDN / D365FO AOT):
+    //   Miscellaneous (default), Main, Transaction, Parameter, Group,
+    //   WorksheetHeader, WorksheetLine, Reference, Framework.
+    // TempDB/InMemory tables default to 'Main'; regular tables default to the
+    // majority value mined from the indexed standard models, else 'Main'.
     const effectiveTableGroup = tableGroup
       || (isTempTable ? 'Main' : this.minedMajority('AxTable', 'TableGroup'))
       || 'Main';
 
-    // BP rule: CacheLookup — set based on TableGroup to avoid BP warning "CacheLookup should be set".
-    // TempDB tables reside in SQL TempDB and are session-scoped → CacheLookup=None (never cache).
-    // InMemory tables are ISAM files on AOS tier, not in SQL Server → CacheLookup=None.
+    // BP rule: CacheLookup must be set to avoid the "CacheLookup should be set" BP warning.
+    // TempDB/InMemory tables are session-scoped, not in SQL Server → never cached.
     if (isTempTable) {
       xml += `\t<CacheLookup>None</CacheLookup>\n`;
     } else {
@@ -182,37 +172,32 @@ export class SmartXmlBuilder {
       xml += `\t<CacheLookup>${cacheLookup}</CacheLookup>\n`;
     }
 
-    // BP rule: SaveDataPerCompany — TempDB/InMemory tables are session-scoped, not company-scoped.
+    // BP rule: TempDB/InMemory tables are session-scoped, not company-scoped.
     xml += `\t<SaveDataPerCompany>${isTempTable ? 'No' : 'Yes'}</SaveDataPerCompany>\n`;
 
     xml += `\t<TableGroup>${effectiveTableGroup}</TableGroup>\n`;
 
-    // Inject TableType element for non-regular tables (TempDB / InMemory).
     if (normalizedTableType) {
       xml += `\t<TableType>${normalizedTableType}</TableType>\n`;
     }
 
-    // TitleField1/TitleField2: first two non-RecId fields
     const titleCandidates = fields.filter(f => f.name !== 'RecId').slice(0, 2);
     if (titleCandidates[0]) xml += `\t<TitleField1>${titleCandidates[0].name}</TitleField1>\n`;
     if (titleCandidates[1]) xml += `\t<TitleField2>${titleCandidates[1].name}</TitleField2>\n`;
 
-    // PrimaryIndex and ReplacementKey reference the unique index name
     const uniqueIdx = indexes?.find(i => i.unique);
     if (uniqueIdx) {
       xml += `\t<PrimaryIndex>${uniqueIdx.name}</PrimaryIndex>\n`;
       xml += `\t<ReplacementKey>${uniqueIdx.name}</ReplacementKey>\n`;
     }
 
-    // BP rule: ClusteredIndex — prevents "Table has no clustered index" warning
-    // Use the explicitly marked clustered index, or fall back to the primary unique index
+    // BP rule: a table needs a ClusteredIndex to avoid the "no clustered index" warning.
     const clusteredIdx = indexes?.find(i => i.clustered) || uniqueIdx;
     if (clusteredIdx) {
       xml += `\t<ClusteredIndex>${clusteredIdx.name}</ClusteredIndex>\n`;
     }
 
-    // BP rule: DeleteActions — generate Cascade actions for each relation target
-    // Prevents BP warning "Table has relations but no corresponding DeleteActions"
+    // BP rule: relations require matching DeleteActions to avoid a BP warning.
     if (relations && relations.length > 0) {
       xml += `\t<DeleteActions>\n`;
       for (const rel of relations) {
@@ -227,13 +212,12 @@ export class SmartXmlBuilder {
       xml += `\t<DeleteActions />\n`;
     }
 
-    // 5 standard FieldGroups required by VS D365FO project system
-    // Order matches real D365FO AOT: AutoReport, AutoLookup, AutoIdentification, AutoSummary, AutoBrowse
-    // BP rule: AutoReport field group must not be empty — populate with first 5 non-RecId fields
+    // 5 standard FieldGroups required by the D365FO project system, in AOT order:
+    // AutoReport, AutoLookup, AutoIdentification, AutoSummary, AutoBrowse.
+    // BP rule: AutoReport must not be empty.
     const autoReportFields = fields.filter(f => f.name !== 'RecId').slice(0, 5);
     xml += `\t<FieldGroups>\n`;
 
-    // AutoReport — BP requires at least one field
     xml += `\t\t<AxTableFieldGroup>\n`;
     xml += `\t\t\t<Name>AutoReport</Name>\n`;
     if (autoReportFields.length > 0) {
@@ -249,7 +233,6 @@ export class SmartXmlBuilder {
     }
     xml += `\t\t</AxTableFieldGroup>\n`;
 
-    // AutoLookup — populate with first 3 fields (key identifier fields)
     const autoLookupFields = fields.filter(f => f.name !== 'RecId').slice(0, 3);
     xml += `\t\t<AxTableFieldGroup>\n`;
     xml += `\t\t\t<Name>AutoLookup</Name>\n`;
@@ -265,7 +248,7 @@ export class SmartXmlBuilder {
       xml += `\t\t\t<Fields />\n`;
     }
     xml += `\t\t</AxTableFieldGroup>\n`;
-    // AutoIdentification is 3rd (requires AutoPopulate=Yes)
+    // AutoIdentification requires AutoPopulate=Yes.
     xml += `\t\t<AxTableFieldGroup>\n`;
     xml += `\t\t\t<Name>AutoIdentification</Name>\n`;
     xml += `\t\t\t<AutoPopulate>Yes</AutoPopulate>\n`;
@@ -279,7 +262,6 @@ export class SmartXmlBuilder {
     }
     xml += `\t</FieldGroups>\n`;
 
-    // Fields
     if (fields.length > 0) {
       xml += `\t<Fields>\n`;
       for (const field of fields) {
@@ -292,7 +274,6 @@ export class SmartXmlBuilder {
 
     xml += `\t<FullTextIndexes />\n`;
 
-    // Indexes
     if (indexes && indexes.length > 0) {
       xml += `\t<Indexes>\n`;
       for (const index of indexes) {
@@ -305,7 +286,6 @@ export class SmartXmlBuilder {
 
     xml += `\t<Mappings />\n`;
 
-    // Relations
     if (relations && relations.length > 0) {
       xml += `\t<Relations>\n`;
       for (const relation of relations) {
@@ -321,10 +301,6 @@ export class SmartXmlBuilder {
     return xml;
   }
 
-  /**
-   * Build AxForm XML with datasources and controls.
-   * Structure validated against real D365FO AOT XML (K:\AosService\PackagesLocalDirectory).
-   */
   /**
    * Build AxForm XML by delegating to the pattern-specific template builder.
    *
@@ -410,7 +386,6 @@ export class SmartXmlBuilder {
     // Enum-backed fields use AxTableFieldEnum + <EnumType>, never <ExtendedDataType>.
     const iType = enumType ? 'AxTableFieldEnum' : this.getAxTableFieldType(edt, type);
 
-    // D365FO field format: <AxTableField xmlns="" i:type="AxTableFieldString">
     let xml = `\t\t<AxTableField xmlns=""\n\t\t\t\ti:type="${iType}">\n`;
     xml += `\t\t\t<Name>${name}</Name>\n`;
     if (enumType) {
@@ -437,7 +412,6 @@ export class SmartXmlBuilder {
    *  2. EDT name heuristics — fallback when type is not known
    */
   private getAxTableFieldType(edt?: string, type?: string): string {
-    // 1. Explicit primitive type takes priority (may be DB-resolved via resolveEdtBaseType)
     if (type) {
       const typeMap: Record<string, string> = {
         String:      'AxTableFieldString',
@@ -456,7 +430,7 @@ export class SmartXmlBuilder {
       if (mapped) return mapped;
     }
 
-    // 2. Fall back to EDT name heuristics
+    // Fall back to EDT name heuristics
     if (edt) {
       const e = edt.toLowerCase();
       if (e === 'recid' || e.endsWith('recid') || e.includes('refrecid')) return 'AxTableFieldInt64';
@@ -482,9 +456,8 @@ export class SmartXmlBuilder {
     let xml = `\t\t<AxTableIndex>\n`;
     xml += `\t\t\t<Name>${name}</Name>\n`;
     if (unique) {
-      // AlternateKey=Yes marks the index as a unique surrogate/alternate key
       xml += `\t\t\t<AlternateKey>Yes</AlternateKey>\n`;
-      // BP rule: AllowDuplicates must be No for unique indexes (prevents BP warning)
+      // BP rule: AllowDuplicates must be No for unique indexes.
       xml += `\t\t\t<AllowDuplicates>No</AllowDuplicates>\n`;
     }
     xml += `\t\t\t<Fields>\n`;
@@ -513,7 +486,6 @@ export class SmartXmlBuilder {
     xml += `\t\t\t<RelationshipType>Association</RelationshipType>\n`;
     xml += `\t\t\t<Constraints>\n`;
     for (const constraint of constraints) {
-      // Constraints require xmlns="" and i:type to override the default XML namespace
       xml += `\t\t\t\t<AxTableRelationConstraint xmlns=""\n\t\t\t\t\t\ti:type="AxTableRelationConstraintField">\n`;
       xml += `\t\t\t\t\t<Name>${constraint.field}</Name>\n`;
       xml += `\t\t\t\t\t<Field>${constraint.field}</Field>\n`;
@@ -532,14 +504,13 @@ export class SmartXmlBuilder {
   public buildFormDataSource(ds: FormDataSourceSpec): string {
     const { name, table, allowEdit, allowCreate, allowDelete } = ds;
 
-    // xmlns="" resets the default namespace (AxForm root has xmlns="Microsoft.Dynamics.AX.Metadata.V6")
     let xml = `\t\t<AxFormDataSource xmlns="">\n`;
     xml += `\t\t\t<Name>${name}</Name>\n`;
     xml += `\t\t\t<Table>${table}</Table>\n`;
-    // Empty <Fields /> = all table fields available in the datasource (explicit list not required)
+    // Empty <Fields /> means all table fields are available in the datasource.
     xml += `\t\t\t<Fields />\n`;
     xml += `\t\t\t<ReferencedDataSources />\n`;
-    // AllowCreate/Edit/Delete come AFTER ReferencedDataSources — matches real D365FO AOT XML order
+    // AllowCreate/Edit/Delete must come after ReferencedDataSources to match AOT XML order.
     if (allowCreate === false) xml += `\t\t\t<AllowCreate>No</AllowCreate>\n`;
     if (allowEdit === false)   xml += `\t\t\t<AllowEdit>No</AllowEdit>\n`;
     if (allowDelete === false)  xml += `\t\t\t<AllowDelete>No</AllowDelete>\n`;
@@ -559,7 +530,6 @@ export class SmartXmlBuilder {
     const indent = '\t'.repeat(indentLevel);
     const i1 = indent + '\t';
 
-    // Map FormControlSpec.type to D365FO i:type attribute and <Type> element value
     const typeMap: Record<string, { iType: string; typeValue: string }> = {
       Grid:       { iType: 'AxFormGridControl',       typeValue: 'Grid' },
       Group:      { iType: 'AxFormGroupControl',      typeValue: 'Group' },
@@ -577,21 +547,18 @@ export class SmartXmlBuilder {
       ? { iType: control.iType, typeValue: control.typeValue }
       : typeMap[type] ?? { iType: 'AxFormStringControl', typeValue: 'String' };
 
-    // All AxFormControl nodes need xmlns="" to override the AxForm default namespace
     let xml = `${indent}<AxFormControl xmlns=""\n${indent}\ti:type="${mapped.iType}">\n`;
     xml += `${i1}<Name>${name}</Name>\n`;
     xml += `${i1}<Type>${mapped.typeValue}</Type>\n`;
-    // FormControlExtension is mandatory on every control
+    // FormControlExtension is mandatory on every control.
     xml += `${i1}<FormControlExtension\n${i1}\ti:nil="true" />\n`;
 
-    // Additional D365FO properties (DataField, DataSource, etc.)
     if (properties) {
       for (const [key, value] of Object.entries(properties)) {
         xml += `${i1}<${key}>${this.escapeXml(value)}</${key}>\n`;
       }
     }
 
-    // Child controls
     if (children && children.length > 0) {
       xml += `${i1}<Controls>\n`;
       for (const child of children) {
@@ -633,17 +600,17 @@ export class SmartXmlBuilder {
    */
   buildGridControl(name: string, dataSource: string, fields: string[], fieldTypes?: FieldControlMap): FormControlSpec {
     const gridChildren: FormControlSpec[] = fields.map(field => {
-      // Resolve the correct control type per field (enum→ComboBox, date→Date, …);
+      // Resolve control type per field (enum -> ComboBox, date -> Date, etc.);
       // unknown fields fall back to a string control.
       const ctl = controlForField(field, fieldTypes);
       return {
-        // Prefix with dataSource to avoid name collisions when multiple grids exist
+        // Prefix with dataSource to avoid name collisions when multiple grids exist.
         name: `${dataSource}_${field}`,
         type: 'String' as const,
         iType: ctl.iType,
         typeValue: ctl.typeValue,
         properties: {
-          // DataField MUST come before DataSource — matches real D365FO AOT XML element order
+          // DataField must come before DataSource to match AOT XML element order.
           DataField: field,
           DataSource: dataSource,
         },
@@ -655,7 +622,6 @@ export class SmartXmlBuilder {
       type: 'Grid',
       properties: {
         DataSource: dataSource,
-        // Tabular style is standard for SimpleList grids (verified from real AOT forms)
         Style: 'Tabular',
       },
       children: gridChildren,
@@ -663,6 +629,6 @@ export class SmartXmlBuilder {
   }
 }
 
-// Re-export pattern types so callers can import from this module without needing a separate import
+// Re-exported so callers can import pattern types from this module directly.
 export { FormPatternTemplates } from './formPatternTemplates.js';
 export type { FormPattern, FormTemplateOptions } from './formPatternTemplates.js';

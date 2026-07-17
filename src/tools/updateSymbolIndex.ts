@@ -17,18 +17,37 @@ const AOT_FOLDER_TYPE_MAP: Record<string, XppSymbol['type']> = {
   'axform': 'form',
   'axformextension': 'form-extension',
   'axenum': 'enum',
-  'axenumsextension': 'enum-extension',
+  'axenumextension': 'enum-extension',
   'axedt': 'edt',
-  'axedtsextension': 'edt-extension',
+  'axedtextension': 'edt-extension',
   'axquery': 'query',
+  'axquerysimpleextension': 'query-extension',
   'axview': 'view',
+  'axviewextension': 'view-extension',
+  // Full builds store data entities as type 'view' (see indexViews) — keep parity.
+  'axdataentityview': 'view',
+  'axdataentityviewextension': 'data-entity-extension',
   'axreport': 'report',
+  'axmap': 'map',
+  'axmapextension': 'map-extension',
+  'axmenuextension': 'menu-extension',
+  'axservice': 'service',
+  'axservicegroup': 'service-group',
+  'axconfigurationkey': 'configuration-key',
+  'axlicensecode': 'license-code',
+  'axsecuritypolicy': 'security-policy',
+  'axmacrodictionary': 'macro',
   'axsecurityprivilege': 'security-privilege',
   'axsecurityduty': 'security-duty',
+  'axsecuritydutyextension': 'security-duty-extension',
   'axsecurityrole': 'security-role',
+  'axsecurityroleextension': 'security-role-extension',
   'axmenuitemaction': 'menu-item-action',
+  'axmenuitemactionextension': 'menu-item-action-extension',
   'axmenuitemdisplay': 'menu-item-display',
+  'axmenuitemdisplayextension': 'menu-item-display-extension',
   'axmenuitemoutput': 'menu-item-output',
+  'axmenuitemoutputextension': 'menu-item-output-extension',
 };
 
 /**
@@ -86,11 +105,8 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
   try {
     const { symbolIndex } = context;
 
-    // ── REFRESH MODE: no filePath ───────────────────────────────────────────
-    // Pick up objects created this session that the caller can't point a file at
-    // (e.g. bridge createObject results) by refreshing the C# bridge provider and
-    // dropping workspace caches. Lighter than a full reindex; per-object SQLite
-    // indexing still needs an explicit filePath.
+    // Refresh mode (no filePath): refreshes the bridge provider and drops workspace
+    // caches, lighter than a full reindex. Per-object SQLite indexing still needs filePath.
     if (!filePath || (typeof filePath === 'string' && filePath.trim().length === 0)) {
       context.workspaceScanner?.invalidate?.();
       let bridgeNote = 'Bridge provider not available (skipped).';
@@ -102,17 +118,20 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
       } catch (e: any) {
         bridgeNote = `Bridge refresh skipped: ${e?.message ?? e}`;
       }
-      symbolIndex.touchLastIndexed?.();
+      // Note: deliberately no touchLastIndexed() here — nothing was reindexed in
+      // SQLite, and bumping the timestamp would make get_workspace_info report a
+      // possibly stale index as fresh (see src/utils/indexStaleness.ts).
       return {
         content: [{
           type: 'text',
           text:
-            `🔄 **Index refresh** (no filePath supplied).\n\n` +
+            `🔄 **Bridge/cache refresh** (no filePath supplied).\n\n` +
             `${bridgeNote}\n` +
             `Workspace scan cache invalidated.\n\n` +
-            `ℹ️ To fully index a specific new object into the searchable symbol DB (so scaffolding ` +
-            `resolves its EDTs/enums and references work), call this tool again with \`filePath\` ` +
-            `pointing at the created \`.xml\` (e.g. the new AxEnum/AxEdt/AxTable file).`,
+            `ℹ️ The SQLite symbol index itself was NOT reindexed. To fully index a specific new ` +
+            `object into the searchable symbol DB (so scaffolding resolves its EDTs/enums and ` +
+            `references work), call this tool again with \`filePath\` pointing at the created ` +
+            `\`.xml\` (e.g. the new AxEnum/AxEdt/AxTable file).`,
         }],
       };
     }
@@ -126,7 +145,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
     const aotFolder = parts.find((p: string) => p.toLowerCase() in AOT_FOLDER_TYPE_MAP) ?? '';
     const objectType: XppSymbol['type'] = AOT_FOLDER_TYPE_MAP[aotFolder.toLowerCase()] ?? 'class';
 
-    // ── FILE DELETED: clean up stale index entries ──────────────────────────
+    // File deleted: clean up stale index entries
     if (!fs.existsSync(filePath)) {
       console.error(`[update_symbol_index] File deleted — cleaning up stale entries for "${objectName}"`);
 
@@ -157,7 +176,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
       };
     }
 
-    // ── FILE EXISTS: re-index ───────────────────────────────────────────────
+    // File exists: re-index
     const model = extractModelFromPath(filePath) ?? 'Unknown';
 
     // Label files are indexed in labels DB (not symbols DB).
@@ -216,11 +235,10 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
 
     console.error(`[update_symbol_index] Re-indexing ${objectType} "${objectName}" (model: ${model})`);
 
-    // 1. Remove all existing symbols for this file so stale entries don't linger
-    const deleted = symbolIndex.db
-      .prepare(`DELETE FROM symbols WHERE file_path = ?`)
-      .run(filePath);
-    const deletedCount = deleted.changes;
+    // 1. Remove all existing symbols for this file so stale entries don't linger.
+    // removeSymbolsByFile matches every stored path form (absolute Windows path
+    // or PackagesLocalDirectory-relative, either slash style) — see symbolIndex.ts.
+    const { deletedCount } = symbolIndex.removeSymbolsByFile(filePath);
 
     // 1b. Refresh C# bridge metadata provider so it picks up the updated file
     try {
@@ -294,13 +312,33 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
           });
           insertedCount++;
           for (const field of tableData.fields ?? []) {
+            // Store the field's EDT/EnumType as its signature, not the bare base type
+            // (String/Real/Enum/...) — consumers like resolveFieldEdt() in
+            // modifyD365File.ts need an X++-usable type name here.
             symbolIndex.addSymbol({
               name: field.name,
               type: 'field',
               parentName: tableData.name,
-              signature: field.type,
+              signature: field.extendedDataType || field.enumType || field.type,
               filePath,
               model,
+            });
+            insertedCount++;
+          }
+          // Re-insert table methods too — the full build (indexTables) indexes
+          // them, and the delete above just removed them; skipping them here
+          // would silently drop a table's methods on every incremental reindex.
+          for (const method of tableData.methods ?? []) {
+            const params = method.parameters?.map((p: any) => `${p.type} ${p.name}`).join(', ') ?? '';
+            symbolIndex.addSymbol({
+              name: method.name,
+              type: 'method',
+              parentName: tableData.name,
+              signature: `${method.returnType} ${method.name}(${params})`,
+              filePath,
+              model,
+              source: method.source,
+              sourceSnippet: method.sourceSnippet,
             });
             insertedCount++;
           }
@@ -323,9 +361,7 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
         });
         insertedCount++;
         // Also populate edt_metadata so scaffolding (resolveEdtBaseType / resolveBestEdt)
-        // can resolve this EDT's base type and relation. The single-file indexer
-        // previously skipped this table, so a same-session EDT never resolved its base
-        // type and its fields defaulted to AxTableFieldString.
+        // can resolve this EDT's base type and relation.
         try {
           symbolIndex.db
             .prepare(`DELETE FROM edt_metadata WHERE edt_name = ? AND model = ?`)
@@ -363,6 +399,129 @@ export const updateSymbolIndexTool = async (params: any, context: XppServerConte
           filePath,
           model,
         });
+        insertedCount++;
+      } else {
+        tx();
+      }
+    } else if (objectType === 'security-privilege') {
+      // Populate security_privilege_entries so security_info(coverage) can see
+      // this privilege's entry points.
+      const result = await parser.parseSecurityPrivilegeFile(filePath);
+      if (result.success && result.data) {
+        const privData = result.data;
+        symbolIndex.addSymbol({
+          name: privData.name ?? objectName,
+          type: 'security-privilege',
+          filePath,
+          model,
+          description: privData.label,
+        });
+        insertedCount++;
+        symbolIndex.db
+          .prepare(`DELETE FROM security_privilege_entries WHERE privilege_name = ? AND model = ?`)
+          .run(privData.name ?? objectName, model);
+        const insertEntry = symbolIndex.db.prepare(`
+          INSERT OR IGNORE INTO security_privilege_entries
+            (privilege_name, entry_point_name, object_type, access_level, model)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        for (const ep of privData.entryPoints ?? []) {
+          if (!ep.name) continue;
+          insertEntry.run(privData.name ?? objectName, ep.name, ep.objectType ?? null, ep.accessLevel ?? null, model);
+          insertedCount++;
+        }
+      } else {
+        tx();
+      }
+    } else if (objectType === 'security-duty') {
+      // Populates security_duty_privileges — see security-privilege branch above.
+      const result = await parser.parseSecurityDutyFile(filePath);
+      if (result.success && result.data) {
+        const dutyData = result.data;
+        symbolIndex.addSymbol({
+          name: dutyData.name ?? objectName,
+          type: 'security-duty',
+          filePath,
+          model,
+          description: dutyData.label,
+        });
+        insertedCount++;
+        symbolIndex.db
+          .prepare(`DELETE FROM security_duty_privileges WHERE duty_name = ? AND model = ?`)
+          .run(dutyData.name ?? objectName, model);
+        const insertPriv = symbolIndex.db.prepare(`
+          INSERT OR IGNORE INTO security_duty_privileges (duty_name, privilege_name, model)
+          VALUES (?, ?, ?)
+        `);
+        for (const priv of dutyData.privileges ?? []) {
+          insertPriv.run(dutyData.name ?? objectName, priv, model);
+          insertedCount++;
+        }
+      } else {
+        tx();
+      }
+    } else if (objectType === 'security-role') {
+      // Populates security_role_duties — see security-privilege branch above.
+      const result = await parser.parseSecurityRoleFile(filePath);
+      if (result.success && result.data) {
+        const roleData = result.data;
+        symbolIndex.addSymbol({
+          name: roleData.name ?? objectName,
+          type: 'security-role',
+          filePath,
+          model,
+          description: roleData.label,
+        });
+        insertedCount++;
+        symbolIndex.db
+          .prepare(`DELETE FROM security_role_duties WHERE role_name = ? AND model = ?`)
+          .run(roleData.name ?? objectName, model);
+        const insertDuty = symbolIndex.db.prepare(`
+          INSERT OR IGNORE INTO security_role_duties (role_name, duty_name, model)
+          VALUES (?, ?, ?)
+        `);
+        for (const duty of roleData.duties ?? []) {
+          insertDuty.run(roleData.name ?? objectName, duty, model);
+          insertedCount++;
+        }
+      } else {
+        tx();
+      }
+    } else if (
+      objectType === 'menu-item-display' ||
+      objectType === 'menu-item-action' ||
+      objectType === 'menu-item-output'
+    ) {
+      // Populate menu_item_targets so security_info(coverage)'s object -> menu
+      // items lookup works for this menu item.
+      const itemType = objectType === 'menu-item-display' ? 'display' : objectType === 'menu-item-action' ? 'action' : 'output';
+      const result = await parser.parseMenuItemFile(filePath, itemType);
+      if (result.success && result.data) {
+        const miData = result.data;
+        symbolIndex.addSymbol({
+          name: miData.name ?? objectName,
+          type: objectType,
+          filePath,
+          model,
+          description: miData.label,
+        });
+        insertedCount++;
+        symbolIndex.db
+          .prepare(`DELETE FROM menu_item_targets WHERE menu_item_name = ? AND model = ?`)
+          .run(miData.name ?? objectName, model);
+        symbolIndex.db.prepare(`
+          INSERT INTO menu_item_targets
+            (menu_item_name, menu_item_type, target_object, target_type, security_privilege, label, model)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          miData.name ?? objectName,
+          objectType,
+          miData.targetObject ?? null,
+          miData.targetType ?? null,
+          miData.securityPrivilege ?? null,
+          miData.label ?? null,
+          model,
+        );
         insertedCount++;
       } else {
         tx();

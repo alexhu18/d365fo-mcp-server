@@ -2,6 +2,10 @@
  * X++ Metadata Type Definitions
  */
 
+import type { XppExtensionOf } from './xppDeclaration.js';
+
+export type { XppExtensionOf };
+
 export interface XppParseResult<T> {
   success: boolean;
   data?: T;
@@ -11,18 +15,23 @@ export interface XppParseResult<T> {
 export interface XppClassInfo {
   name: string;
   model: string;
-  sourcePath: string;  // Path to original XML file
+  sourcePath: string;
   extends?: string;
   implements: string[];
   isAbstract: boolean;
   isFinal: boolean;
   declaration: string;
+  /**
+   * Set when the class carries [ExtensionOf(...)] — i.e. it is a class
+   * extension. Class extensions are plain AxClass files (the AOT has no
+   * AxClassExtension artifact), so this attribute is what distinguishes them.
+   */
+  extensionOf?: XppExtensionOf;
   methods: XppMethodInfo[];
   documentation?: string;
-  // Enhanced metadata for better Copilot integration
-  tags?: string[];              // Semantic tags (controller, utility, etc.)
-  usedTypes?: string[];         // Classes/tables used in class
-  description?: string;         // Generated description from docs/declaration
+  tags?: string[];
+  usedTypes?: string[];
+  description?: string;
 }
 
 export interface XppMethodInfo {
@@ -33,13 +42,13 @@ export interface XppMethodInfo {
   isStatic: boolean;
   source: string;
   documentation?: string;
-  // Enhanced metadata for better Copilot integration
-  sourceSnippet?: string;       // First 10 lines for preview
-  complexity?: number;          // Complexity score (0-100)
-  usedTypes?: string[];         // Classes/tables used in method
-  methodCalls?: string[];       // Methods called within this method
-  tags?: string[];              // Semantic tags (validation, query, etc.)
-  inlineComments?: string;      // Extracted inline comments
+  sourceSnippet?: string;
+  /** Complexity score (0-100). */
+  complexity?: number;
+  usedTypes?: string[];
+  methodCalls?: string[];
+  tags?: string[];
+  inlineComments?: string;
 }
 
 export interface XppParameterInfo {
@@ -50,7 +59,7 @@ export interface XppParameterInfo {
 export interface XppTableInfo {
   name: string;
   model: string;
-  sourcePath: string;  // Path to original XML file
+  sourcePath: string;
   label: string;
   tableGroup: string;
   primaryIndex?: string;
@@ -65,6 +74,7 @@ export interface XppFieldInfo {
   name: string;
   type: string;
   extendedDataType?: string;
+  enumType?: string;
   mandatory: boolean;
   label?: string;
 }
@@ -131,44 +141,52 @@ export interface XppSymbol {
       | 'menu-item-display' | 'menu-item-action' | 'menu-item-output'
       | 'table-extension' | 'class-extension' | 'form-extension'
       | 'enum-extension' | 'edt-extension' | 'data-entity-extension'
+      | 'view-extension' | 'query-extension' | 'map-extension' | 'menu-extension'
+      | 'security-duty-extension' | 'security-role-extension'
+      | 'menu-item-display-extension' | 'menu-item-action-extension'
+      | 'menu-item-output-extension'
       | 'service' | 'service-group'
       | 'map' | 'configuration-key' | 'license-code' | 'security-policy' | 'macro';
   parentName?: string;
   signature?: string;
   filePath: string;
   model: string;
-  packageName?: string;            // Package that contains this model (may differ from model)
-  // Enhanced metadata for better Copilot integration
-  description?: string;         // Human-readable description
-  tags?: string;                // Comma-separated tags (stored as TEXT in SQLite)
-  sourceSnippet?: string;       // First 10 lines for preview
-  source?: string;              // Full method source code
-  complexity?: number;          // Complexity score (0-100)
-  usedTypes?: string;           // Comma-separated types used
-  methodCalls?: string;         // Comma-separated method calls
-  inlineComments?: string;      // Extracted inline comments
-  extendsClass?: string;        // For classes: extends relationship
-  implementsInterfaces?: string;// For classes: comma-separated interfaces
-  usageExample?: string;        // Generated usage example
-  // Pattern analysis metadata
-  usageFrequency?: number;      // How many places use/call this
-  patternType?: string;         // Helper, Service, Repository, Controller, etc.
-  typicalUsages?: string;       // JSON array of typical usage examples
-  calledByCount?: number;       // How many methods call this
-  relatedMethods?: string;      // Comma-separated related methods
-  apiPatterns?: string;         // JSON of common API usage patterns
+  /** Package containing this model; may differ from `model`. */
+  packageName?: string;
+  description?: string;
+  /** Comma-separated tags (stored as TEXT in SQLite). */
+  tags?: string;
+  sourceSnippet?: string;
+  source?: string;
+  complexity?: number;
+  /** Comma-separated types used. */
+  usedTypes?: string;
+  /** Comma-separated method calls. */
+  methodCalls?: string;
+  inlineComments?: string;
+  extendsClass?: string;
+  /** Comma-separated interfaces implemented (classes only). */
+  implementsInterfaces?: string;
+  usageExample?: string;
+  patternType?: string;
+  /** JSON array of typical usage examples. */
+  typicalUsages?: string;
+  usageFrequency?: number;
+  calledByCount?: number;
+  /** Comma-separated related methods. */
+  relatedMethods?: string;
+  /** JSON of common API usage patterns. */
+  apiPatterns?: string;
 }
 
-/**
- * Form metadata types
- */
 export interface XppFormInfo {
   name: string;
   model: string;
   sourcePath: string;
   label?: string;
   caption?: string;
-  formPattern?: string;  // E.g., 'DetailsTransaction', 'ListPage', 'SimpleList'
+  /** E.g. 'DetailsTransaction', 'ListPage', 'SimpleList'. */
+  formPattern?: string;
   dataSources: XppFormDataSource[];
   design: XppFormControl[];
   methods: XppMethodInfo[];
@@ -186,29 +204,27 @@ export interface XppFormDataSource {
 
 export interface XppFormControl {
   name: string;
-  type: string;  // E.g., 'ActionPane', 'Grid', 'Group', 'String', 'Button'
+  /** E.g. 'ActionPane', 'Grid', 'Group', 'String', 'Button'. */
+  type: string;
   properties: Record<string, string>;
   children: XppFormControl[];
 }
 
-/**
- * EDT metadata types
- */
 export interface XppEdtInfo {
   name: string;
   model: string;
   sourcePath: string;
-  extends?: string;        // Base type it extends (e.g., 'String', 'Integer', or another EDT)
-  enumType?: string;       // Associated enum type name
-  referenceTable?: string; // Related table for foreign key lookups
-  relationType?: string;   // Type of relation (e.g., 'OneToMany')
-  stringSize?: string;     // String length (e.g., '20')
-  displayLength?: string;  // Display width
-  label?: string;          // User-facing label
-  helpText?: string;       // Help text
-  formHelp?: string;       // Form help reference
+  extends?: string;
+  enumType?: string;
+  referenceTable?: string;
+  relationType?: string;
+  stringSize?: string;
+  displayLength?: string;
+  label?: string;
+  helpText?: string;
+  formHelp?: string;
   configurationKey?: string;
-  alignment?: string;      // Left, Right, Center
+  alignment?: string;
   decimalSeparator?: string;
   signDisplay?: string;
   noOfDecimals?: string;
@@ -217,22 +233,21 @@ export interface XppEdtInfo {
 
 export interface CodePattern {
   patternName: string;
-  patternType: string;          // Helper, Service, Repository, etc.
-  commonMethods: string[];      // Most frequent methods in this pattern
-  dependencies: string[];       // Common dependencies
-  usageExamples: string[];      // Real implementation examples
-  frequency: number;            // How many classes follow this pattern
-  domain?: string;              // Customer, Inventory, Sales, etc.
-  characteristics?: string[];   // Distinguishing features
+  patternType: string;
+  commonMethods: string[];
+  dependencies: string[];
+  usageExamples: string[];
+  frequency: number;
+  domain?: string;
+  characteristics?: string[];
 }
 
-/**
- * Security artifact types
- */
 export interface XppSecurityEntryPoint {
   name: string;
-  objectType: string;     // MenuItemDisplay / MenuItemAction / MenuItemOutput / WebActionItem
-  accessLevel: string;    // Read / Update / Create / Delete / Correct / Invoke
+  /** MenuItemDisplay / MenuItemAction / MenuItemOutput / WebActionItem. */
+  objectType: string;
+  /** Read / Update / Create / Delete / Correct / Invoke. */
+  accessLevel: string;
 }
 
 export interface XppSecurityPrivilegeInfo {
@@ -248,7 +263,7 @@ export interface XppSecurityDutyInfo {
   model: string;
   sourcePath: string;
   label?: string;
-  privileges: string[];   // Privilege names
+  privileges: string[];
 }
 
 export interface XppSecurityRoleInfo {
@@ -257,12 +272,9 @@ export interface XppSecurityRoleInfo {
   sourcePath: string;
   label?: string;
   description?: string;
-  duties: string[];       // Duty names
+  duties: string[];
 }
 
-/**
- * Menu item types
- */
 export interface XppMenuItemInfo {
   name: string;
   model: string;
@@ -270,22 +282,22 @@ export interface XppMenuItemInfo {
   label?: string;
   menuItemType: 'display' | 'action' | 'output';
   targetObject?: string;
-  targetType?: string;    // Form / Class / Query / Report
+  /** Form / Class / Query / Report. */
+  targetType?: string;
   securityPrivilege?: string;
 }
 
-/**
- * Extension metadata types
- */
 export interface XppExtensionInfo {
   name: string;
   model: string;
   sourcePath: string;
-  extensionType: string;        // table-extension / class-extension / etc.
-  baseObjectName: string;       // The object being extended
-  addedFields?: string[];       // Field names added by this extension
-  addedMethods?: string[];      // Method names added by this extension
-  addedIndexes?: string[];      // Index names added by this extension
-  cocMethods?: string[];        // Methods wrapped via CoC (call next)
-  eventSubscriptions?: string[];// Events subscribed to via [SubscribesTo]
+  extensionType: string;
+  baseObjectName: string;
+  addedFields?: string[];
+  addedMethods?: string[];
+  addedIndexes?: string[];
+  /** Methods wrapped via CoC (call next). */
+  cocMethods?: string[];
+  /** Events subscribed to via [SubscribesTo]. */
+  eventSubscriptions?: string[];
 }

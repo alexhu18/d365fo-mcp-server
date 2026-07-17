@@ -21,6 +21,7 @@ const OBJECT_TYPES = [
   'menu-item-display-extension', 'menu-item-action-extension', 'menu-item-output-extension',
   'menu', 'menu-extension',
   'security-privilege', 'security-duty', 'security-role',
+  'security-duty-extension', 'security-role-extension',
 ] as const;
 
 const objectFolderMap: Record<string, string> = {
@@ -49,6 +50,8 @@ const objectFolderMap: Record<string, string> = {
   'security-privilege':           'AxSecurityPrivilege',
   'security-duty':                'AxSecurityDuty',
   'security-role':                'AxSecurityRole',
+  'security-duty-extension':      'AxSecurityDutyExtension',
+  'security-role-extension':      'AxSecurityRoleExtension',
 };
 
 // Reverse of objectFolderMap: AOT folder name (lowercased) → object type. Used to
@@ -113,7 +116,6 @@ export async function verifyD365ProjectTool(
   try {
     const args = VerifyD365ProjectArgsSchema.parse(request.params.arguments);
 
-    // ── Resolve base path & package/model names ──────────────────────────────
     const configManager = getConfigManager();
     const configPackagePath = configManager.getPackagePath();
     const envType = await configManager.getDevEnvironmentType();
@@ -167,7 +169,6 @@ export async function verifyD365ProjectTool(
       basePath = args.packagePath || configPackagePath || 'K:\\AosService\\PackagesLocalDirectory';
     }
 
-    // ── Load project includes (optional) ─────────────────────────────────────
     let projectIncludes: Set<string> | null = null;
     let projectLoadError: string | null = null;
     if (resolvedProjectPath) {
@@ -178,7 +179,6 @@ export async function verifyD365ProjectTool(
       }
     }
 
-    // ── Resolve the object list ──────────────────────────────────────────────
     // verify-all mode: when no objects are supplied, derive them from the project's
     // Content Includes (e.g. "AxClass\MyClass" → { class, MyClass }).
     type VerifyObject = { objectType: (typeof OBJECT_TYPES)[number]; objectName: string };
@@ -220,7 +220,6 @@ export async function verifyD365ProjectTool(
       }
     }
 
-    // ── Check each object ─────────────────────────────────────────────────────
     type ObjectResult = {
       objectName: string;
       objectType: string;
@@ -271,7 +270,6 @@ export async function verifyD365ProjectTool(
       });
     }
 
-    // ── Format output ─────────────────────────────────────────────────────────
     const hasProject = projectIncludes !== null;
     const header = hasProject
       ? '| Object | Type | Disk | Project |'

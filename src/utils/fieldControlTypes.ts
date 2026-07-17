@@ -12,6 +12,7 @@
  */
 
 import fs from 'fs';
+import { lookupSymbolNocase } from './symbolLookup.js';
 
 export interface ControlTypeInfo {
   /** AxForm control i:type attribute, e.g. 'AxFormComboBoxControl' */
@@ -87,14 +88,17 @@ export function parseTableFieldControls(tableXml: string): FieldControlMap {
  */
 export function getFieldControlMap(db: any, table: string): FieldControlMap {
   try {
+    // Canonicalize first — `parent_name = ? COLLATE NOCASE` cannot use
+    // idx_parent_type_name and scans all 360k field rows (180 s cold).
+    const canonical = lookupSymbolNocase(db, table)?.name ?? table;
     const row = db
       .prepare(
         `SELECT file_path FROM symbols
-         WHERE type = 'field' AND parent_name = ? COLLATE NOCASE
+         WHERE type = 'field' AND parent_name = ?
            AND file_path IS NOT NULL AND file_path != ''
          LIMIT 1`,
       )
-      .get(table) as { file_path?: string } | undefined;
+      .get(canonical) as { file_path?: string } | undefined;
     if (!row?.file_path || !fs.existsSync(row.file_path)) return new Map();
     return parseTableFieldControls(fs.readFileSync(row.file_path, 'utf-8'));
   } catch {

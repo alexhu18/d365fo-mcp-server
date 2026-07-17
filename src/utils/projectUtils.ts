@@ -1,7 +1,5 @@
 /**
- * Shared D365FO Project Utilities
- * Extracted from generateSmartTable.ts and generateSmartForm.ts
- * to avoid code duplication.
+ * Shared D365FO project utilities used by generateSmartTable.ts and generateSmartForm.ts.
  */
 
 import * as fs from 'fs';
@@ -31,7 +29,7 @@ export function extractModelFromProject(projectPath: string): string | null {
 }
 
 /**
- * Find .rnrproj file in solution directory
+ * Find .rnrproj file in solution directory.
  */
 export function findProjectInSolution(solutionPath: string): string | null {
   // Windows paths (K:\...) are not accessible on non-Windows — skip silently

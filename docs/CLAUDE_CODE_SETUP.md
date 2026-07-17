@@ -110,6 +110,8 @@ For HTTP (Azure) in `.mcp.json`:
 
 Claude Code's Tool Search feature defers MCP tool schemas to save context. When tools are deferred, Claude picks whichever tool it finds first during a search step — which may be another connected code intelligence tool or a built-in search tool instead of `d365fo-mcp-tools`. Setting `alwaysLoad: true` loads the d365fo tool list into context at session start, guaranteeing Claude sees them before making any tool choice. Without it, Claude may route D365FO metadata queries to other connected code intelligence tools and get wrong or empty results. Combined with `CLAUDE.md` (Step 3), this eliminates the wrong-tool problem entirely.
 
+> **Token trade-off:** `alwaysLoad: true` puts the full tool list (~17 K tokens in full mode, ~14 K read-only) into every session's context. For sessions that are mostly D365FO work this is the right default. If you use the same Claude Code profile for lots of unrelated work, consider omitting `alwaysLoad` — deferred loading skips that cost in sessions that never touch D365FO, at the risk of the wrong-tool routing described above. `CLAUDE.md` mitigates most of that risk by naming the server explicitly.
+
 ---
 
 ## Step 3 — Place `CLAUDE.md`

@@ -35,7 +35,7 @@ function parseSig(sigLine: string): ParsedSig | null {
 
   const hasParens = sigLine.includes('(');
 
-  // ── Class / struct declaration ────────────────────────────────────────────
+  // Class / struct declaration
   if (!hasParens) {
     const classMatch = sigLine.match(/\bclass\s+(\w+)/);
     if (!classMatch) return null;
@@ -43,7 +43,7 @@ function parseSig(sigLine: string): ParsedSig | null {
     return { isClass: true, name: classMatch[1], returnType: '', params: [], baseClass: baseMatch?.[1] };
   }
 
-  // ── Method signature ──────────────────────────────────────────────────────
+  // Method signature
   const parenIdx    = sigLine.indexOf('(');
   const beforeParen = sigLine.substring(0, parenIdx).trim();
   const tokens      = beforeParen.split(/\s+/).filter(Boolean);
@@ -52,7 +52,7 @@ function parseSig(sigLine: string): ParsedSig | null {
   // typeTokens: [ReturnType, methodName] — second-to-last is return type
   const returnType  = typeTokens.length >= 2 ? typeTokens[typeTokens.length - 2] : '';
 
-  // ── Parameters ────────────────────────────────────────────────────────────
+  // Parameters
   const closeIdx = sigLine.lastIndexOf(')');
   const paramStr  = closeIdx > parenIdx
     ? sigLine.substring(parenIdx + 1, closeIdx).trim()
@@ -145,8 +145,6 @@ function extractSig(lines: string[]): SigExtraction | null {
   return { sig, attributeLines, indent };
 }
 
-// ── Humanization helpers ──────────────────────────────────────────────────────
-
 /**
  * Split camelCase / PascalCase into space-separated lowercase words.
  * "processInventoryLines" → "process inventory lines"
@@ -165,7 +163,6 @@ function humanize(name: string): string {
  * name, base class, and surrounding attributes.
  */
 function inferClassSummary(name: string, baseClass?: string, attributes?: string[]): string {
-  // Check attributes for common patterns
   const attrText = (attributes || []).join(' ');
   if (/ExtensionOf\s*\(\s*classStr\s*\((\w+)\)/i.test(attrText)) {
     const target = attrText.match(/ExtensionOf\s*\(\s*classStr\s*\((\w+)\)/i)?.[1];
@@ -186,7 +183,6 @@ function inferClassSummary(name: string, baseClass?: string, attributes?: string
     return `SSRS report parameter contract for the ${humanize(name.replace(/Contract$|DataContract$/, ''))} report.`;
   }
 
-  // Infer from base class
   if (baseClass) {
     const bc = baseClass.toLowerCase();
     if (bc === 'srsreportdataproviderbase')
@@ -199,7 +195,6 @@ function inferClassSummary(name: string, baseClass?: string, attributes?: string
       return `Batch job class for ${humanize(name.replace(/Batch$|Job$/, ''))} processing.`;
   }
 
-  // Infer from name suffix
   if (name.endsWith('Controller'))    return `Controller class that orchestrates the ${humanize(name.replace(/Controller$/, ''))} operation.`;
   if (name.endsWith('Service'))       return `Service class that implements the business logic for the ${humanize(name.replace(/Service$/, ''))} operation.`;
   if (name.endsWith('DataContract') || name.endsWith('Contract'))
@@ -212,7 +207,6 @@ function inferClassSummary(name: string, baseClass?: string, attributes?: string
   if (name.endsWith('Entity'))        return `Data entity for ${humanize(name.replace(/Entity$/, ''))}.`;
   if (name.endsWith('Provider'))      return `Data provider for ${humanize(name.replace(/Provider$/, ''))}.`;
 
-  // Generic fallback — still better than "ClassName class."
   return `Provides ${humanize(name)} functionality.`;
 }
 
@@ -223,7 +217,7 @@ function inferClassSummary(name: string, baseClass?: string, attributes?: string
 function inferMethodSummary(name: string, returnType: string, params: Array<{ type: string; name: string }>): string {
   const n = name.toLowerCase();
 
-  // ── Well-known D365FO method names ────────────────────────────────────────
+  // Well-known D365FO method names
   if (n === 'main')            return 'Entry point for the class.';
   if (n === 'run')             return 'Executes the main processing logic.';
   if (n === 'construct')       return 'Creates and returns a new instance.';
@@ -247,7 +241,7 @@ function inferMethodSummary(name: string, returnType: string, params: Array<{ ty
   if (n === 'caption')         return 'Returns the caption displayed to the user.';
   if (n === 'defaultcaption')  return 'Returns the default caption for the operation.';
 
-  // ── Prefix-based patterns ─────────────────────────────────────────────────
+  // Prefix-based patterns
   if (n.startsWith('find'))       return `Finds a record matching the specified ${describeParams(params)}.`;
   if (n.startsWith('exist'))      return `Checks whether a record exists for the specified ${describeParams(params)}.`;
   if (n.startsWith('validate'))   return `Validates ${humanize(name.substring(8))}.`;
@@ -267,10 +261,9 @@ function inferMethodSummary(name: string, returnType: string, params: Array<{ ty
     return `Determines whether ${humanize(name)}.`;
   if (n.startsWith('on'))         return `Handles the ${humanize(name.substring(2))} event.`;
 
-  // ── Return-type hint ──────────────────────────────────────────────────────
   if (returnType === 'boolean')    return `${humanize(name)} and returns the result.`;
 
-  // ── Fallback: humanize the method name ────────────────────────────────────
+  // Fallback: humanize the method name
   const h = humanize(name);
   return h.charAt(0).toUpperCase() + h.substring(1) + '.';
 }
@@ -292,21 +285,18 @@ function describeParams(params: Array<{ type: string; name: string }>): string {
 function inferParamDescription(paramName: string, paramType: string): string {
   const n = paramName.replace(/^_+/, '').toLowerCase();
 
-  // Well-known parameter names
   if (n === 'args')           return 'The framework arguments.';
   if (n === 'sender')         return 'The event sender object.';
   if (n === 'e' || n === 'eventargs') return 'The event arguments.';
   if (n === 'insertmode')     return 'Indicates whether the operation is an insert.';
   if (n === 'ret' || n === 'result') return 'The validation result.';
 
-  // Type-based inference
   if (paramType) {
     const t = paramType.toLowerCase();
     if (t === 'boolean') return `A value indicating whether ${humanize(paramName)}.`;
     if (t === 'args')    return 'The framework arguments.';
   }
 
-  // Generic: humanize the parameter name + type
   const h = humanize(paramName);
   return paramType
     ? `The ${h} (${paramType}).`
@@ -350,8 +340,7 @@ function inferReturnDescription(returnType: string, methodName: string): string 
  * unchanged.
  */
 export function ensureBlankLineBeforeClosingBrace(declaration: string): string {
-  // Match a `;`-terminated line followed immediately by the lone closing `}` (no
-  // blank line between them). Only fires when there is NO blank line already.
+  // Matches a `;`-terminated line immediately followed by the closing `}` (no blank line yet).
   return declaration.replace(/;([ \t]*)\n([ \t]*\}[ \t]*)$/, ';\n\n$2');
 }
 
@@ -368,16 +357,13 @@ export function ensureBlankLineBeforeClosingBrace(declaration: string): string {
  * methods are left as-is per D365FO convention.
  */
 export function ensureXppDocComment(source: string): string {
-  // Strip leading blank lines — prevents gap at top of <Declaration>
+  // Strip leading blank lines to avoid a gap at the top of <Declaration>.
   const cleanSource = source.replace(/^\n+/, '');
   const lines = cleanSource.split('\n');
 
-  // Already documented?
   const firstNonEmpty = lines.find(l => l.trim().length > 0);
   if (firstNonEmpty?.trim().startsWith('///')) {
-    // Remove blank lines between /// doc-comment block and the next code line,
-    // then normalise the /// block indentation to match the method signature,
-    // then fill in any <param> / <returns> elements the block is missing.
+    // Already documented: normalize indentation/gaps and fill in any missing elements.
     return completeExistingDocBlock(normalizeDocBlockIndent(stripDocCommentGap(cleanSource)));
   }
 
@@ -389,7 +375,6 @@ export function ensureXppDocComment(source: string): string {
 
   const { attributeLines, indent } = extraction;
 
-  // ── Build doc block with meaningful, AI-quality descriptions ──────────────
   const doc: string[] = [];
 
   if (parsed.isClass) {
@@ -489,15 +474,10 @@ function completeExistingDocBlock(source: string): string {
 /**
  * Re-indent the leading /// doc-comment block so its indentation matches the
  * first non-/// non-blank line (the attribute or method signature).
- *
- * An AI model may generate the /// block at column 0 while the signature is
- * indented (or vice-versa).  This function normalises the mismatch so the
- * first /// line always aligns with the rest of the method source.
  */
 function normalizeDocBlockIndent(source: string): string {
   const lines = source.split('\n');
 
-  // Detect the indentation of the first non-/// non-blank line (signature / attribute)
   let sigIndent = '';
   for (const line of lines) {
     const t = line.trim();
@@ -506,7 +486,6 @@ function normalizeDocBlockIndent(source: string): string {
     break;
   }
 
-  // Re-indent every leading /// line to use sigIndent
   const result: string[] = [];
   let inLeadingDocBlock = true;
   for (const line of lines) {

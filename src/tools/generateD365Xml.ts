@@ -9,8 +9,12 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { getConfigManager } from '../utils/configManager.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../utils/xppDocGen.js';
+import { reindentXppSource } from '../utils/xppFormat.js';
 import { decodeXmlEntitiesFromXppSource } from './modifyD365File.js';
 import { buildAxSecurityPrivilegeXml } from './securityPrivilegeXml.js';
+import { buildAxDataEntityXml } from './dataEntityXml.js';
+import { buildAxQueryXml, buildAxViewXml } from './queryViewXml.js';
+import { buildAxMapXml } from './mapXml.js';
 
 const GenerateD365XmlArgsSchema = z.object({
   objectType: z
@@ -22,6 +26,7 @@ const GenerateD365XmlArgsSchema = z.object({
       'menu-item-display-extension', 'menu-item-action-extension', 'menu-item-output-extension',
       'menu', 'menu-extension',
       'security-privilege', 'security-duty', 'security-role',
+      'security-duty-extension', 'security-role-extension', 'map',
     ])
     .describe('Type of D365FO object'),
   objectName: z
@@ -61,7 +66,6 @@ class XmlTemplateGenerator {
     declaration: string;
     methods: Array<{ name: string; source: string }>;
   } {
-    // Find the '{' that opens the class body
     const firstBrace = fullSource.indexOf('{');
     if (firstBrace === -1) return { declaration: fullSource, methods: [] };
 
@@ -87,7 +91,7 @@ class XmlTemplateGenerator {
       return { declaration, methods: [] };
     }
 
-    // ── FIX: Rescue member-variable declarations that appear OUTSIDE the class {}
+    // Rescue member-variable declarations that appear outside the class {} block
     const nextBraceInRest = rest.indexOf('{');
     if (nextBraceInRest !== -1) {
       const preMethodText = rest.substring(0, nextBraceInRest);
@@ -133,10 +137,7 @@ class XmlTemplateGenerator {
       pos = bodyEnd + 1;
     }
 
-    // ── Fallback: methods inside class {} ─────────────────────────────────────
-    // See the same comment in createD365File.ts for the full rationale.
-    // When methods are inside the class body, extract them so they become proper
-    // <Method> elements separated by blank lines via .join('\n\n').
+    // Fallback: methods declared inside the class {} body rather than after it
     if (methods.length === 0) {
       const innerResult = XmlTemplateGenerator.extractInnerClassMethods(declaration);
       if (innerResult) {
@@ -150,7 +151,6 @@ class XmlTemplateGenerator {
   /**
    * Extract methods defined INSIDE the class body (depth-1 inside {}).
    * Mirror of the same method in createD365File.ts — kept in sync manually.
-   * See createD365File.ts for the full documentation.
    */
   static extractInnerClassMethods(classDeclaration: string): {
     declaration: string;
@@ -276,17 +276,13 @@ class XmlTemplateGenerator {
       ? `\t<Implements>${properties.implements}</Implements>\n`
       : '';
 
-    // D365FO convention: method source is always indented by 4 spaces inside <Source>.
-    const indentMethodSource = (src: string): string =>
-      src.split('\n').map(line => '    ' + line).join('\n');
-
     const methodsXml =
       methods.length === 0
         ? '\t\t<Methods />\n'
         : `\t\t<Methods>\n${methods
             .map(
               m =>
-                `\t\t\t<Method>\n\t\t\t\t<Name>${m.name}</Name>\n\t\t\t\t<Source><![CDATA[\n${indentMethodSource(ensureXppDocComment(m.source))}\n\n]]></Source>\n\t\t\t</Method>`
+                `\t\t\t<Method>\n\t\t\t\t<Name>${m.name}</Name>\n\t\t\t\t<Source><![CDATA[\n${reindentXppSource(ensureXppDocComment(m.source))}\n\n]]></Source>\n\t\t\t</Method>`
             )
             .join('\n\n')}\n\t\t</Methods>\n`;
 
@@ -373,7 +369,13 @@ ${titleField1Xml}${titleField2Xml}\t<DeleteActions />
     properties?: Record<string, any>
   ): string {
     const label = properties?.label || enumName;
-    const useEnumValue = properties?.useEnumValue ? 'Yes' : 'No';
+    // Extensible enums MUST have UseEnumValue=No (xppc hard requirement).
+    // Explicit <Value> elements also force UseEnumValue=Yes at compile time,
+    // so we suppress them when UseEnumValue=No.
+    const useEnumValue = (properties?.isExtensible || properties?.useEnumValue === false)
+      ? 'No'
+      : (properties?.useEnumValue ? 'Yes' : 'No');
+    const suppressExplicitValues = useEnumValue === 'No';
     const configKeyXml = properties?.configurationKey
       ? `\t<ConfigurationKey>${properties.configurationKey}</ConfigurationKey>\n`
       : '';
@@ -404,8 +406,8 @@ ${titleField1Xml}${titleField2Xml}\t<DeleteActions />
         enumValuesXml += `\t\t\t<Name>${v.name}</Name>\n`;
         if (v.label) enumValuesXml += `\t\t\t<Label>${v.label}</Label>\n`;
         if (v.helpText) enumValuesXml += `\t\t\t<HelpText>${v.helpText}</HelpText>\n`;
-        // D365FO convention: omit <Value> for 0 (implicit default)
-        if (intValue !== 0) enumValuesXml += `\t\t\t<Value>${intValue}</Value>\n`;
+        // Omit <Value> when UseEnumValue=No (position-based ordering) or for implicit 0
+        if (intValue !== 0 && !suppressExplicitValues) enumValuesXml += `\t\t\t<Value>${intValue}</Value>\n`;
         enumValuesXml += `\t\t</AxEnumValue>\n`;
       }
       enumValuesXml += '\t</EnumValues>\n';
@@ -463,63 +465,47 @@ ${enumValuesXml}${isExtensibleXml}</AxEnum>
   }
 
   /**
-   * Generate AxQuery XML structure
+   * Generate AxQuery XML structure. Delegates to the shared builder
+   * (queryViewXml.ts) so this cannot drift from createD365File.ts's copy.
    */
   static generateAxQueryXml(
     queryName: string,
     properties?: Record<string, any>
   ): string {
-    const label = properties?.label || queryName;
-
-    return `<?xml version="1.0" encoding="utf-8"?>
-<AxQuery xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-\t<Name>${queryName}</Name>
-\t<Label>${label}</Label>
-\t<DataSources />
-</AxQuery>
-`;
+    return buildAxQueryXml(queryName, properties);
   }
 
   /**
-   * Generate AxView XML structure
+   * Generate AxView XML structure. Delegates to the shared builder
+   * (queryViewXml.ts) so this cannot drift from createD365File.ts's copy.
    */
   static generateAxViewXml(
     viewName: string,
     properties?: Record<string, any>
   ): string {
-    const label = properties?.label || viewName;
-
-    return `<?xml version="1.0" encoding="utf-8"?>
-<AxView xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-\t<Name>${viewName}</Name>
-\t<Label>${label}</Label>
-\t<ViewMetadata />
-\t<Fields />
-</AxView>
-`;
+    return buildAxViewXml(viewName, properties);
   }
 
   /**
-   * Generate AxDataEntityView XML structure
+   * Generate AxMap XML structure. Delegates to the shared builder (mapXml.ts)
+   * so this cannot drift from createD365File.ts's copy.
+   */
+  static generateAxMapXml(
+    mapName: string,
+    properties?: Record<string, any>
+  ): string {
+    return buildAxMapXml(mapName, properties);
+  }
+
+  /**
+   * Generate AxDataEntityView XML structure. Delegates to the shared builder
+   * (dataEntityXml.ts) so this cannot drift from createD365File.ts's copy.
    */
   static generateAxDataEntityXml(
     entityName: string,
     properties?: Record<string, any>
   ): string {
-    const label = properties?.label || entityName;
-    const publicEntityName = properties?.publicEntityName || entityName;
-
-    return `<?xml version="1.0" encoding="utf-8"?>
-<AxDataEntityView xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-\t<Name>${entityName}</Name>
-\t<Label>${label}</Label>
-\t<PublicEntityName>${publicEntityName}</PublicEntityName>
-\t<DataSources />
-\t<Fields />
-\t<Keys />
-\t<Mappings />
-</AxDataEntityView>
-`;
+    return buildAxDataEntityXml(entityName, properties);
   }
 
   /**
@@ -559,7 +545,6 @@ ${enumValuesXml}${isExtensibleXml}</AxEnum>
     reportName: string,
     properties?: Record<string, any>
   ): string {
-    // ── Type helpers ─────────────────────────────────────────────────────────
     type FieldDef = {
       name: string; alias?: string; dataType?: string;
       caption?: string; disableAutoCreate?: boolean;
@@ -570,7 +555,7 @@ ${enumValuesXml}${isExtensibleXml}</AxEnum>
       contractParams?: Array<{ name: string; dataType?: string; label?: string; defaultValue?: string }>;
     };
 
-    // ── Resolve datasets (multi-dataset array OR single-dataset shorthand) ──
+    // Resolve datasets: multi-dataset array or single-dataset shorthand
     let datasets: DatasetDef[];
     if (properties?.datasets && Array.isArray(properties.datasets)) {
       datasets = properties.datasets as DatasetDef[];
@@ -589,7 +574,6 @@ ${enumValuesXml}${isExtensibleXml}</AxEnum>
     }
     const designName = properties?.designName || 'Report';
 
-    // ── RDL .NET type mapping ──
     const rdlType = (dt?: string): string => {
       switch (dt) {
         case 'System.Double':   return 'System.Double';
@@ -601,10 +585,9 @@ ${enumValuesXml}${isExtensibleXml}</AxEnum>
       }
     };
 
-    // ── UUID helper — use Node.js crypto for guaranteed RFC-4122 v4 format ──
+    // Node.js crypto gives a guaranteed RFC-4122 v4 UUID
     const uuid = (): string => crypto.randomUUID();
 
-    // ── Build one AxReportDataSet XML entry ──
     const buildDatasetXml = (ds: DatasetDef): string => {
       const dpParamName = `${ds.dpClassName.toUpperCase()}_DynamicParameter`;
       const contractDatasetParamsXml = (ds.contractParams || []).map(cp => {
@@ -687,7 +670,7 @@ ${contractDatasetParamsXml ? contractDatasetParamsXml + '\n' : ''}\t\t\t\t<AxRep
 
     const datasetsXml = datasets.map(buildDatasetXml).join('\n');
 
-    // ── DefaultParameterGroup (uses first dataset's DP for DynamicParameter) ──
+    // DefaultParameterGroup uses the first dataset's DP for DynamicParameter
     const firstDs      = datasets[0];
     const dpParamName  = `${firstDs.dpClassName.toUpperCase()}_DynamicParameter`;
     const aotQueryLine = firstDs.aotQuery ? `\n\t\t\t\t<AOTQuery>${firstDs.aotQuery}</AOTQuery>` : '';
@@ -772,7 +755,7 @@ ${contractParamsXml}${contractParamsXml ? '\n' : ''}\t\t\t<AxReportParameterBase
 \t\t</ReportParameterBases>
 \t</DefaultParameterGroup>`;
 
-    // ── Auto-generate RDL skeleton (2016 namespace, mirrors real D365FO reports) ──
+    // Auto-generated RDL skeleton (2016 namespace, mirrors real D365FO reports)
     const buildRdlSkeleton = (): string => {
       const ns2016 = 'http://schemas.microsoft.com/sqlserver/reporting/2016/01/reportdefinition';
       const nsRd   = 'http://schemas.microsoft.com/SQLServer/reporting/reportdesigner';
@@ -834,7 +817,7 @@ ${rdlFields}      <rd:DataSetInfo>
 
       const rdlDatasetsXml = `  <DataSets>\n${datasets.map(buildRdlDataset).join('\n')}\n  </DataSets>`;
 
-      // ── Build a simple detail tablix for each dataset so the design is not empty ──
+      // Simple detail tablix per dataset so the design is not empty
       const buildRdlTablix = (ds: DatasetDef): string => {
         if (!ds.fields || ds.fields.length === 0) return '';
         const n      = ds.fields.length;
@@ -976,7 +959,6 @@ ${rdlParamLayoutXml}
 </Report>`;
     };
 
-    // ── Design block ──
     const captionLine = properties?.caption ? `\n\t\t\t<Caption>${properties.caption}</Caption>` : '';
     const styleLine   = properties?.style   ? `\n\t\t\t<Style>${properties.style}</Style>`       : '';
     const rdlContent  = properties?.rdlContent as string | undefined;
@@ -1030,6 +1012,8 @@ ${defaultParamGroupXml}
         return this.generateAxQueryXml(objectName, properties);
       case 'view':
         return this.generateAxViewXml(objectName, properties);
+      case 'map':
+        return this.generateAxMapXml(objectName, properties);
       case 'data-entity':
         return this.generateAxDataEntityXml(objectName, properties);
       case 'report':
@@ -1066,6 +1050,10 @@ ${defaultParamGroupXml}
         return this.generateAxSecurityDutyXml(objectName, properties);
       case 'security-role':
         return this.generateAxSecurityRoleXml(objectName, properties);
+      case 'security-duty-extension':
+        return this.generateAxSecurityDutyExtensionXml(objectName, properties);
+      case 'security-role-extension':
+        return this.generateAxSecurityRoleExtensionXml(objectName, properties);
       default:
         throw new Error(`Unsupported object type: ${objectType}`);
     }
@@ -1149,7 +1137,7 @@ ${enumValuesXml}
   }
 
   static generateAxTableExtensionXml(name: string, properties?: Record<string, any>): string {
-    // ── Fields ───────────────────────────────────────────────────────────────
+    // Fields
     const fieldSpecs: Array<{
       name: string; edt?: string; enumType?: string; label?: string; mandatory?: boolean; fieldType?: string;
     }> = Array.isArray(properties?.fields) ? properties.fields : [];
@@ -1171,7 +1159,7 @@ ${enumValuesXml}
       fieldsXml += '\t</Fields>';
     }
 
-    // ── FieldGroups ──────────────────────────────────────────────────────────
+    // FieldGroups
     const fgSpecs: Array<{ name: string; label?: string; fields?: string[] }> =
       Array.isArray(properties?.fieldGroups) ? properties.fieldGroups : [];
     let fieldGroupsXml: string;
@@ -1195,7 +1183,7 @@ ${enumValuesXml}
       fieldGroupsXml += '\t</FieldGroups>';
     }
 
-    // ── FieldGroupExtensions ─────────────────────────────────────────────────
+    // FieldGroupExtensions
     const fgeSpecs: Array<{ name: string; fields: string[] }> =
       Array.isArray(properties?.fieldGroupExtensions) ? properties.fieldGroupExtensions : [];
     let fieldGroupExtensionsXml: string;
@@ -1218,7 +1206,7 @@ ${enumValuesXml}
       fieldGroupExtensionsXml += '\t</FieldGroupExtensions>';
     }
 
-    // ── Indexes ──────────────────────────────────────────────────────────────
+    // Indexes
     const idxSpecs: Array<{
       name: string; fields: Array<{ fieldName: string; direction?: string }>;
       allowDuplicates?: boolean; alternateKey?: boolean;
@@ -1249,7 +1237,7 @@ ${enumValuesXml}
       indexesXml += '\t</Indexes>';
     }
 
-    // ── Relations ────────────────────────────────────────────────────────────
+    // Relations
     const relSpecs: Array<{
       name: string; relatedTable: string; constraints: Array<{ fieldName: string; relatedFieldName: string }>;
       cardinality?: string; relatedTableCardinality?: string; relationshipType?: string;
@@ -1408,6 +1396,52 @@ ${relationsXml}
 \t<SubRoles />
 </AxSecurityRole>`;
   }
+
+  /** Normalize a name list that may arrive as an array or a comma/semicolon/newline-separated string. */
+  private static normalizeNameList(value: any): string[] {
+    if (!value) return [];
+    const arr = Array.isArray(value) ? value : String(value).split(/[,;\n]+/);
+    return arr.map((s: any) => String(s).trim()).filter((s: string) => s.length > 0);
+  }
+
+  private static refContainer(container: string, childTag: string, names: string[]): string {
+    if (names.length === 0) return `\t<${container} />`;
+    const children = names
+      .map(n => `\t\t<${childTag}>\n\t\t\t<Name>${n}</Name>\n\t\t</${childTag}>`)
+      .join('\n');
+    return `\t<${container}>\n${children}\n\t</${container}>`;
+  }
+
+  /**
+   * Generate AxSecurityDutyExtension XML — adds privileges to an EXISTING duty
+   * without overlaying it. Name convention: "<BaseDuty>.<PrefixOrModel>Extension".
+   */
+  static generateAxSecurityDutyExtensionXml(name: string, properties?: Record<string, any>): string {
+    const privileges = this.normalizeNameList(properties?.privileges);
+    return `<?xml version="1.0" encoding="utf-8"?>
+<AxSecurityDutyExtension xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+\t<Name>${name}</Name>
+${this.refContainer('Privileges', 'AxSecurityPrivilegeReference', privileges)}
+\t<PropertyModifications />
+</AxSecurityDutyExtension>`;
+  }
+
+  /**
+   * Generate AxSecurityRoleExtension XML — adds duties/privileges to an EXISTING
+   * role without overlaying it. Name convention: "<BaseRole>.<PrefixOrModel>Extension".
+   */
+  static generateAxSecurityRoleExtensionXml(name: string, properties?: Record<string, any>): string {
+    const duties = this.normalizeNameList(properties?.duties);
+    const privileges = this.normalizeNameList(properties?.privileges);
+    return `<?xml version="1.0" encoding="utf-8"?>
+<AxSecurityRoleExtension xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+\t<Name>${name}</Name>
+\t<DirectAccessPermissions />
+${this.refContainer('Duties', 'AxSecurityDutyReference', duties)}
+${this.refContainer('Privileges', 'AxSecurityPrivilegeReference', privileges)}
+\t<PropertyModifications />
+</AxSecurityRoleExtension>`;
+  }
 }
 
 /**
@@ -1463,6 +1497,9 @@ export async function handleGenerateD365Xml(
       'security-privilege': 'AxSecurityPrivilege',
       'security-duty': 'AxSecurityDuty',
       'security-role': 'AxSecurityRole',
+      'security-duty-extension': 'AxSecurityDutyExtension',
+      'security-role-extension': 'AxSecurityRoleExtension',
+      map: 'AxMap',
     };
 
     const objectFolder = objectFolderMap[args.objectType];

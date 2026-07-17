@@ -59,7 +59,7 @@ One unified reader covers every object type via `objectType`; type-specific flag
 |------|--------------|----------------|
 | `get_object_info` † | Read one object's metadata by `objectType`: `class`, `table`, `form`, `query`, `view`, `enum`, `edt`, `report`, `data-entity`, `menu-item`, `service`, `map`, `config-key`, `security-policy`, `macro`. Options: `{includeRdl}` (report), `{searchControl}` (form), `{compact:false}` (class), `{mode:"hierarchy"}` (edt), `{filter}` (macro). For classes, `{members:"names"}` (optional `{prefix}`) returns a fast IntelliSense-style member-name list. | *"Show the structure of SalesFormLetter"* · *"Methods on SalesTable starting with calc"* · *"Datasets of the SalesInvoice report"* |
 | `get_method` † | Method `include="signature"` (exact signature — **mandatory before CoC**), `include="source"` (full X++ body), or `include="both"` (default) | *"Signature of SalesFormLetter.run?"* · *"Show me the body of CustTable.validateWrite"* |
-| `find_references` † | Where-used analysis, xref-enriched (reference type, caller class/method) | *"Where is updateInventory called from?"* |
+| `find_references` † | Where-used analysis, xref-enriched (reference type, caller class/method). Also does **label where-used** — `targetType="label"` or an `@…` id (e.g. `@WAX2194`, `@ApplicationPlatform:AbortButtonText`) — returning every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), grouped by source type | *"Where is updateInventory called from?"* · *"What references label @SYS9694?"* |
 
 ## 🏷️ Label Management (1)
 
@@ -69,31 +69,33 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 |------|--------------|----------------|
 | `labels` | `action=search` — full-text query across 20M+ label rows, all languages · `action=info` — all translations of a labelId (or list label files when omitted) · `action=create` — add a label to all language files of a model · `action=rename` — rename a label ID across .label.txt, X++ and XML | *"Is there a label for 'payment terms'?"* · *"Show translations of @SYS12345"* · *"Create label 'Priority tier' in en-US, cs, de"* · *"Rename label MyOldId to MyNewId everywhere"* |
 
+> **Label where-used** (which objects reference a label) is not a `labels` action — use `find_references` with `targetType="label"` or an `@…` id. See Advanced Object Info above.
+
 ## 🧠 Code Intelligence (2)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `get_knowledge` | `kind="knowledge"` — queryable X++ rulebook: select grammar, CoC, SysDa, FormRun lifecycle, form patterns, AX2012→D365FO migration · `kind="error"` — compiler / runtime / BP errors explained with concrete fixes | *"What are the rules for crossCompany selects?"* · *"Explain error 'object not initialized' in batch"* |
+| `get_knowledge` | `kind="knowledge"` — queryable X++ rulebook: select grammar, CoC, SysDa, FormRun lifecycle, form patterns, reading Excel/CSV files, parallel batch, direct SQL, AX2012→D365FO migration · `kind="error"` — compiler / runtime / BP errors explained with concrete fixes | *"What are the rules for crossCompany selects?"* · *"How do I read an uploaded Excel file in X++?"* · *"Explain error 'object not initialized' in batch"* |
 | `analyze_code` † | `mode="patterns"` — common patterns for a scenario · `mode="implementations"` — real implementations of a similar method · `mode="completeness"` — missing standard methods on a class · `mode="api-usage"` — how an API is initialized and called (compiler-resolved callers) | *"How are number sequences usually implemented here?"* · *"How do other classes implement validateWrite?"* · *"What standard methods is my service class missing?"* |
 
 ## 🎨 Code Generation (2)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `generate_object` | `mode="pattern"` — named X++ skeleton from a pattern enum (text only): SysOperation, CoC, event handler, business event, custom service, lookup form, … · `mode="scaffold"` — pattern-aware whole-object generation: `objectType=table` (EDT suggestions), `objectType=form` (**clones reference forms** via `cloneFrom` + `tableMapping`, patterns/sub-patterns preserved, optional `includeMethodStubs`), `objectType=report` (complete SSRS stack: TmpTable + Contract + DP + Controller + AxReport/RDL) | *"Generate a SysOperation skeleton for VendRecalc"* · *"Create an audit log table with SalesId, PostedAt, PostedBy"* · *"Create a SimpleList form for MyRentalGroup by cloning CustGroup"* · *"Create report InventByZones with these 7 fields"* |
+| `generate_object` | `mode="pattern"` — named X++ skeleton from a pattern enum (text only): SysOperation, CoC, event handler, business event, custom service, lookup form, … · `mode="scaffold"` — pattern-aware whole-object generation: `objectType=table` (EDT suggestions), `objectType=form` (**clones reference forms** via `cloneFrom` + `tableMapping`, patterns/sub-patterns preserved, optional `includeMethodStubs`), `objectType=report` (complete SSRS stack: TmpTable + Contract + DP + Controller + AxReport/RDL) · `mode="find-methods"` — static `find()`/`findRecId()`/`exists()` for a table, keyed on its primary/unique index · `mode="relation-xpp"` — a table's relations → X++ `select` + `QueryBuildRange` snippets · `mode="fields"` — a field-name list → `AxTableField` XML with auto-resolved EDTs (+ optional field group) · `mode="table-relation"` — EDT-referencing fields → `AxTableRelation` XML (the inverse of `relation-xpp`) | *"Generate a SysOperation skeleton for VendRecalc"* · *"Create an audit log table with SalesId, PostedAt, PostedBy"* · *"Create a SimpleList form for MyRentalGroup by cloning CustGroup"* · *"Add find/exists methods to MyOrderTable"* · *"Generate table relations for the EDT fields on MyOrderLine"* |
 | `suggest_edt` | EDT suggestions for a field name (fuzzy, confidence-ranked) | *"Which EDT for a field CustomerAccount?"* |
 
 ## 📈 Pattern Analysis (1)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `object_patterns` | `domain="table"` — field/index/relation patterns for table groups · `domain="form"` — form-pattern toolkit: `action="analyze"` (pattern advisor via `recommend={entityKind, fieldCount, usageIntent, tableName}` → right pattern + reference forms; also analyzes existing forms), `action="spec"` (full pattern spec: required containers/ordering, sub-patterns, versions, lifecycle), `action="validate"` (structural validation FP001–FP010; errors **block form writes** via `FORM_PATTERN_ENFORCE`) | *"What do parameter tables typically look like?"* · *"Which form pattern fits a header+lines order entity?"* · *"Validate this form XML before I create it"* |
+| `object_patterns` | `domain="table"` — field/index/relation patterns for table groups · `domain="form"` — form-pattern toolkit: `action="analyze"` (pattern advisor via `recommend={entityKind, fieldCount, usageIntent, tableName}` → right pattern + reference forms; also analyzes existing forms), `action="spec"` (full pattern spec: required containers/ordering, sub-patterns, versions, lifecycle), `action="validate"` (structural validation FP001–FP010; errors **block form writes** via `FORM_PATTERN_ENFORCE`), `action="repair"` (auto-fill a form's **missing required controls** from its declared pattern — turns the FP003 report into a fix; existing controls preserved verbatim) | *"What do parameter tables typically look like?"* · *"Which form pattern fits a header+lines order entity?"* · *"Validate this form XML before I create it"* · *"Repair the missing controls on MyInquiryForm"* |
 
 ## 📝 File Operations (2)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `d365fo_file` | `action=create` — create any of 18 AOT object types in the correct location + register in `.rnrproj` (gated by grounding token and form-pattern validation) · `action=modify` — safe metadata edits via the C# bridge, 25 operations: add-field, add-control, add-method, replace-code, modify-property, … · `action=generate` — XML preview without writing (cloud-friendly) | *"Create the class file in my project"* · *"Add the field to the General tab of the form extension"* · *"Show me the XML for this enum without creating it"* |
+| `d365fo_file` | `action=create` — create any of 32 AOT object types in the correct location + register in `.rnrproj` (gated by grounding token and form-pattern validation) · `action=modify` — safe metadata edits via the C# bridge, 25 operations: add-field, add-control, add-method, replace-code, modify-property, …; op-specific parameters go in a single `params` object (flat top-level keys still accepted) and a missing/wrong parameter returns the complete per-op spec (error-driven guidance, source: `d365foFileOpSpecs.ts`) · `action=generate` — XML preview without writing (cloud-friendly) | *"Create the class file in my project"* · *"Add the field to the General tab of the form extension"* · *"Show me the XML for this enum without creating it"* |
 | `undo_last_modification` | Revert the last write: checkout HEAD or delete untracked file (also re-syncs the symbol index) | *"Undo that last change"* |
 
 ## 🔐 Security & Extensions (5)
@@ -115,7 +117,7 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 | `build_d365fo_project` | MSBuild compilation with structured xppc diagnostics (severity, object, line, fix hints for the first errors) | *"Build the project and show the errors"* |
 | `trigger_db_sync` | Database sync for the current model | *"Sync the database"* |
 | `run_bp_check` | Microsoft Best Practices (xppbp.exe) analysis | *"Run a BP check on my model"* |
-| `run_systest_class` | Execute SysTest unit tests via SysTestRunner | *"Run the MyServiceTest class"* |
+| `run_systest_class` | Execute SysTest unit tests via SysTestConsole.exe (requires an interactive console session) | *"Run the MyServiceTest class"* |
 | `update_symbol_index` | Re-index a single changed file without restart | *"Refresh the index for the table I just created"* |
 
 ## ✅ Quality & Grounding (3)
@@ -132,7 +134,7 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 >
 > This ensures generated code is grounded in your actual codebase, not AI training data.
 >
-> **Hybrid deployment note:** grounding tokens live in the issuing process's memory. In `write-only` mode (local companion) `prepare` is not exposed and tokens issued by the read-only/Azure instance cannot be validated locally, so `GROUNDING_ENFORCE=true` is **ignored** there (with a startup warning) — otherwise the agent would loop forever between the two servers. Only enable enforcement on a `full`-mode server.
+> **Hybrid deployment note:** grounding tokens live in the issuing process's memory by default. In `write-only` mode (local companion) `prepare` is not exposed and in-memory tokens issued by the read-only/Azure instance cannot be validated locally, so `GROUNDING_ENFORCE=true` is **ignored** there (with a startup warning) — otherwise the agent would loop forever between the two servers. To enforce grounding end-to-end in a hybrid deployment, set the same `GROUNDING_SECRET` on **both** instances: tokens are then HMAC-signed and the companion validates them statelessly.
 
 ---
 
@@ -140,4 +142,4 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 - **Describe goals, not tools.** The instruction files route requests automatically — *"add a priority field to CustTable and show it on the form"* triggers the whole chain.
 - **Let the gates work.** `GROUNDING_ENFORCE` and `FORM_PATTERN_ENFORCE` (both default on) reject ungrounded or structurally invalid writes — that's the feature, not friction.
 - **Verify after writing.** `verify_d365fo_project` confirms disk + project registration in one call.
-- **Full conversations:** [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) shows seven real multi-tool scenarios end to end.
+- **Full conversations:** [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) shows five real multi-tool scenarios end to end.

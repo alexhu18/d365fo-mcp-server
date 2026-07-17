@@ -2,7 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
-import { SERVER_MODE, LOCAL_TOOLS } from '../server/serverMode.js';
+import { SERVER_MODE, LOCAL_TOOLS, isToolAllowedInMode } from '../server/serverMode.js';
 import { searchUnifiedTool } from './searchUnified.js';
 import { batchGetInfoTool } from './batchGetInfo.js';
 import { getObjectInfoTool } from './getObjectInfo.js';
@@ -43,10 +43,8 @@ import { buildProgressMessage } from '../utils/toolProgressMessage.js';
 
 /**
  * Extract workspace path from GitHub Copilot _meta.
- * Stdio requests use this to seed the shared runtime context.
- * HTTP requests already run inside AsyncLocalStorage request scope and must not
- * overwrite the shared runtime context, otherwise concurrent users can bleed
- * workspace state into each other.
+ * HTTP requests must not overwrite the shared runtimeContext (AsyncLocalStorage
+ * already isolates per-request state there) — only stdio uses this path.
  */
 function extractWorkspaceFromMeta(meta: any): string | null {
   if (!meta) return null;
@@ -94,20 +92,11 @@ const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
   // Uncapped — XML generation, file writes, or long structured output
   generate_object:                  'uncapped',
   d365fo_file:                      'uncapped',
-  // get_object_info can return reports (RDL) and full class bodies — never truncate
-  get_object_info:                  'uncapped',
-  // Method source must never be truncated — partial code is useless
-  get_method:                       'uncapped',
-  // Build output must never be truncated — compiler errors appear at the end of
-  // long phase-timing logs and would be lost. The structured diagnostics section
-  // already caps at 25 items; readFullLog now focuses on diagnostic lines only.
-  build_d365fo_project:             'uncapped',
-  // New tools with longer output
+  get_object_info:                  'uncapped', // can return reports (RDL) and full class bodies
+  get_method:                       'uncapped', // partial method source is useless
+  build_d365fo_project:             'uncapped', // compiler errors can appear late in long logs
   security_info:                    8000,
-  // extensibility merges the former table-extension/extension-point/strategy/
-  // coc/event-handler tools — keep the most generous of their old caps
   extension_info:                   6000,
-  // Default for everything else
   default:                          5000,
 };
 
@@ -132,18 +121,14 @@ function capToolResponse(toolName: string, result: any): any {
 }
 
 export function registerToolHandler(server: Server, context: XppServerContext): void {
-  // Start periodic metrics logging (every 5 min to stderr)
   startMetricsLogging();
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const toolName = request.params.name;
     const configManager = getConfigManager();
 
-    // Extract workspace path from _meta (GitHub Copilot injects workspace context here)
-    // This is a secondary extraction path — transport.ts does the primary one from HTTP headers.
-    // In stdio mode there is no transport-level request context, so we persist the detected
-    // workspace on the shared runtimeContext. In HTTP mode we intentionally avoid mutating
-    // runtimeContext because the transport already isolates workspace per request.
+    // Secondary extraction path (transport.ts does the primary one from HTTP headers).
+    // Only persist to shared runtimeContext when there's no request-scoped context (stdio mode).
     const workspacePath =
       extractWorkspaceFromMeta((request as any).params?._meta) ??
       extractWorkspaceFromMeta((request.params as any)._meta);
@@ -151,38 +136,54 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       configManager.setRuntimeContext({ workspacePath });
     }
 
-    // In stdio mode the DB loads asynchronously after transport connect.
-    // ctx.dbReady resolves once the real 1.5 GB symbol database is open and
-    // patched into the context. Awaiting it here ensures every tool call uses
-    // the real index — tools that arrive during DB loading will block (showing
-    // a spinner in the IDE) rather than silently returning empty results.
-    // LOCAL_TOOLS (create_d365fo_file, verify_d365fo_project, get_workspace_info
-    // etc.) access the local filesystem or in-memory config — no DB needed,
-    // so they skip the wait and execute immediately.
+    // ctx.dbReady resolves once the real symbol database is loaded; await it so
+    // tools use the real index instead of silently returning empty results.
+    // LOCAL_TOOLS need no DB (filesystem/in-memory config only) and skip the wait.
     if (context.dbReady && !LOCAL_TOOLS.has(toolName)) {
       const t0 = Date.now();
-      await context.dbReady;
+      // Race dbReady against a 55-second timeout so VS Code's ~60 s client
+      // timeout doesn't silently cancel the request. If the DB is still loading
+      // after 55 s, return an informative message instead of hanging forever.
+      const DB_WAIT_TIMEOUT_MS = 55_000;
+      const timeoutPromise = new Promise<'timeout'>(resolve =>
+        setTimeout(() => resolve('timeout'), DB_WAIT_TIMEOUT_MS),
+      );
+      const result = await Promise.race([
+        context.dbReady.then(() => 'ready' as const),
+        timeoutPromise,
+      ]);
+      if (result === 'timeout') {
+        return {
+          content: [{
+            type: 'text',
+            text: `⏳ The MCP server is still loading the X++ symbol database (takes 30–90 s on first start). Please retry the request in a few seconds.`,
+          }],
+          isError: true,
+        };
+      }
       const elapsed = Date.now() - t0;
       if (elapsed > 200) {
         console.error(`[toolHandler] ⏳ ${toolName}: DB was loading, waited ${elapsed} ms`);
       }
     }
 
-    // Enforce server mode: block local tools in read-only (Azure) mode, block search/analysis tools in write-only mode
-    if (SERVER_MODE === 'read-only' && LOCAL_TOOLS.has(toolName)) {
+    // Enforce server mode: block local tools in read-only (Azure) mode, block search/analysis
+    // tools in write-only mode. isToolAllowedInMode is the same predicate the ListTools filter
+    // uses (ALWAYS_TOOLS included), so a tool is refused here iff it is not advertised.
+    if (SERVER_MODE === 'read-only' && !isToolAllowedInMode(SERVER_MODE, toolName)) {
       return {
         content: [{ type: 'text', text: `⚠️ Tool '${toolName}' requires local Windows VM filesystem access and is not available in read-only mode.\n\nThis MCP server is running in read-only mode (Azure deployment).\nTo use file operations and workspace diagnostics, configure a local MCP server with MCP_SERVER_MODE=write-only in your .mcp.json.\n\nSee: https://github.com/dynamics365ninja/d365fo-mcp-server/blob/main/docs/MCP_CONFIG.md` }],
         isError: true,
       };
     }
-    if (SERVER_MODE === 'write-only' && !LOCAL_TOOLS.has(toolName)) {
+    if (SERVER_MODE === 'write-only' && !isToolAllowedInMode(SERVER_MODE, toolName)) {
       return {
         content: [{ type: 'text', text: `⚠️ Tool '${toolName}' is not available in write-only mode.\n\nThis local MCP server only handles file operations. Search and analysis tools are provided by the Azure MCP server.` }],
         isError: true,
       };
     }
 
-    // ── Loop detection + duplicate-call dedup ────────────────────────────────
+    // Loop detection + duplicate-call dedup
     const callKey = dedupKey(toolName, request.params.arguments);
     const occurrences = recordCallSequence(toolName, callKey);
     if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
@@ -195,8 +196,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           `the result above is identical. Use the data you already have instead of re-querying.`,
         );
       }
-      // In-flight dedup: if the same call is already executing, coalesce onto it
-      // rather than starting a redundant parallel execution.
+      // In-flight dedup: coalesce onto an identical call that's already executing.
       const inFlight = getInFlight(callKey);
       if (inFlight) {
         console.error(`[toolHandler] ⏳ ${toolName}: identical call already in-flight — coalescing`);
@@ -221,12 +221,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       const args = request.params.arguments as Record<string, any> | undefined;
       const progressMsg = buildProgressMessage(toolName, args);
 
-      // ── Channel 1: notifications/progress (request-scoped) ──────────────────
-      // If the client sent a progressToken in _meta, it supports in-band progress
-      // notifications (MCP spec §Progress). We send one immediately so the client
-      // can show a spinner / status text while the tool runs.
-      // GitHub Copilot / VS2026 will render this as inline progress once they
-      // implement the spec — the server side is already ready.
+      // Channel 1: notifications/progress (MCP spec) — sent when the client provides a progressToken.
       const progressToken = (extra._meta as any)?.progressToken;
       if (progressToken !== undefined && progressToken !== null) {
         try {
@@ -244,10 +239,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         }
       }
 
-      // ── Channel 2: notifications/message (logging) ───────────────────────────
-      // Fallback for clients that do not send progressToken but do consume log
-      // notifications (e.g. MCP Inspector, Claude Desktop). Requires logging
-      // capability declared in mcpServer.ts. Silently ignored in HTTP mode.
+      // Channel 2: notifications/message (logging) — fallback for clients without progressToken support.
       try {
         await server.sendLoggingMessage({
           level: 'info',
@@ -358,36 +350,27 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           'mymodel', 'mypackage', 'model', 'package', 'modelname', 'packagename',
           'yourmodel', 'yourpackage', 'custommodel', 'custompackage',
           'testmodel', 'testpackage', 'samplemodel', 'samplepackage',
-          // Microsoft tutorial / demo models — these are shipped as sample code with D365FO
-          // and should never be the target model for a new custom project.
-          // If auto-detection lands on one of these it almost always means the developer
-          // forgot to change the default model in the VS new-project wizard.
+          // Microsoft tutorial/demo models shipped with D365FO — never a valid target model.
           'fleetmanagement', 'fleetmanagementextension',
           'fleetmanagementunittests', 'tutorial',
         ]);
         const isPlaceholder = !modelName || PLACEHOLDER_NAMES.has(modelName.toLowerCase());
-        // The "Microsoft standard model" warning only makes sense for an AUTO-DETECTED
-        // model: its whole premise is that a .rnrproj scan landed on a standard/demo
-        // model because the developer forgot to change the VS new-project wizard default.
-        // An explicitly configured model (D365FO_MODEL_NAME env var or a modelName key
-        // in .mcp.json) was named deliberately, so second-guessing it produces false
-        // positives — e.g. a model whose ISV prefix is only an abbreviation of its name.
+        // The "Microsoft standard model" warning only applies to an auto-detected model —
+        // an explicitly configured model was named deliberately and shouldn't be second-guessed.
         const isAutoDetectedSource = isModelSourceAutoDetected;
-        // Also flag when auto-detection found a Microsoft standard model name
-        // that isn't in the PLACEHOLDER_NAMES set but is not a custom model.
         const isStandardMsModel = modelName
           ? !isCustomModel(modelName) && !isPlaceholder && isAutoDetectedSource
           : false;
 
-        // Determine the effective custom write root for display and freshness check.
-        // Precedence: D365FO_CUSTOM_PACKAGES_PATH > D365FO_PACKAGE_PATH (read-only MS root).
+        // Effective custom write root: D365FO_CUSTOM_PACKAGES_PATH > D365FO_PACKAGE_PATH (read-only MS root).
         const effectiveWritePath = customPackagesPath ?? packagePath;
         const effectiveWriteSource = customPackagesPath ? customPackagesSource : packageSource;
 
-        // The MS framework path shown in diagnostics: prefer the explicit
-        // D365FO_MICROSOFT_PACKAGES_PATH; fall back to the bridge frameworkDirectory;
-        // in a single-root traditional setup neither is set so omit the line.
+        // MS framework path shown in diagnostics; omitted for single-root traditional setups.
         const msFrameworkPath = frameworkDirectory ?? (!customPackagesPath ? null : packagePath);
+
+        // Verbose diagnostic sections cost tokens on every call — opt-in only.
+        const diagnostics = args.diagnostics === true;
 
         const lines: string[] = [
           `## D365FO Workspace Configuration`,
@@ -406,22 +389,26 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
             ? `✅ EXTENSION_PREFIX is set — all new objects will use prefix "${effectivePrefix}".`
             : `⚠️  EXTENSION_PREFIX is not set in the server environment. The model name "${modelName}" will be used as prefix. Add EXTENSION_PREFIX=MY (or your ISV prefix) to the .env file and restart the server.`,
           ``,
-          `## Suffix Configuration`,
-          ``,
-          `EXTENSION_SUFFIX: ${objectSuffixEnv ?? '(not set)'}`,
-          `Effective suffix: ${effectiveSuffix || '(none)'}`,
-          effectiveSuffix
-            ? `✅ EXTENSION_SUFFIX is set — new objects will have suffix "${effectiveSuffix}" appended (e.g. MyTable${effectiveSuffix}).`
-            : `ℹ️  EXTENSION_SUFFIX is not set. No suffix will be applied. This is normal — most projects use prefixes only.`,
-          ``,
         ];
 
-        // ── Extension naming style ────────────────────────────────────────────
-        // The prefix doubles as the extension infix UNLESS EXTENSION_NAMING_STYLE
-        // is set to "model-name", in which case extension elements/classes embed the
-        // MODEL NAME (Visual Studio default). The tool ALWAYS normalises the extension
-        // token to whatever this style dictates — so pass the BASE object name and let
-        // the tool name it; do not hand-build the infix yourself.
+        if (diagnostics) {
+          lines.push(
+            `## Suffix Configuration`,
+            ``,
+            `EXTENSION_SUFFIX: ${objectSuffixEnv ?? '(not set)'}`,
+            `Effective suffix: ${effectiveSuffix || '(none)'}`,
+            effectiveSuffix
+              ? `✅ EXTENSION_SUFFIX is set — new objects will have suffix "${effectiveSuffix}" appended (e.g. MyTable${effectiveSuffix}).`
+              : `ℹ️  EXTENSION_SUFFIX is not set. No suffix will be applied. This is normal — most projects use prefixes only.`,
+            ``,
+          );
+        } else if (effectiveSuffix) {
+          lines.push(`Suffix          : "${effectiveSuffix}" appended to new objects (EXTENSION_SUFFIX)`, ``);
+        }
+
+        // Extension naming: prefix is the infix unless EXTENSION_NAMING_STYLE="model-name"
+        // (embeds the model name instead, VS default). Tool always normalises the token —
+        // pass the BASE object name and let the tool name it.
         const extNamingStyle = getExtensionNamingStyle();
         const extInfix = deriveExtensionInfix(effectivePrefix);
         const sampleClassExt = extNamingStyle === 'model-name' && modelName
@@ -444,8 +431,6 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         );
 
         if (isPlaceholder) {
-          // Only scan .rnrproj files when model name looks like a placeholder — avoids
-          // misleading "no .rnrproj files found" warnings when config is fully set up.
           const rawDetectedModel = await configManager.getRawAutoDetectedModelName();
           const detectedHint = rawDetectedModel
             ? `> ✅ Auto-detected from .rnrproj: **${rawDetectedModel}**\n` +
@@ -466,10 +451,6 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
             `> Do you want to fix the configuration first, or continue with built-in tools (limited functionality)?`,
           );
         } else if (isStandardMsModel) {
-          // Model was auto-detected from a .rnrproj whose <Model> tag points to a Microsoft
-          // standard model. This almost always means the developer created a new VS project
-          // and forgot to change the default model name in the project wizard (D365FO VS
-          // extension defaults to "FleetManagement" in new-project dialogs).
           const allProj = configManager.getAllDetectedProjects();
           const customCandidates = allProj.filter(p => isCustomModel(p.modelName));
           const hint = customCandidates.length > 0
@@ -495,7 +476,6 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           lines.push(`✅ Configuration looks valid. Proceed with D365FO operations using model "${modelName}".`);
         }
 
-        // List all projects found under D365FO_SOLUTIONS_PATH so the user can switch
         const allProjects = configManager.getAllDetectedProjects();
         if (allProjects.length > 1) {
           lines.push(``);
@@ -509,10 +489,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           lines.push(`To switch project: call get_workspace_info with projectName = "<ModelName>"`);
         }
 
-        // -----------------------------------------------------------------------
-        // Index freshness — compare workspace mtimes vs last_indexed_at so the
-        // model (and user) know whether symbol lookups reflect current code.
-        // -----------------------------------------------------------------------
+        // Index freshness — compare workspace mtimes vs last_indexed_at.
         try {
           const lastIndexedAt = context.symbolIndex.getLastIndexedAt?.() ?? null;
           const modelMetadataDir = effectiveWritePath && modelName
@@ -524,10 +501,8 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           // Freshness reporting is best-effort — never break get_workspace_info
         }
 
-        // -----------------------------------------------------------------------
-        // Stdio session info — what VS 2022 sent during the MCP handshake
-        // Populated by the stdin sniffer in index.ts (always active in stdio mode).
-        // -----------------------------------------------------------------------
+        // Stdio session info — what VS 2022 sent during the MCP handshake. Debugging aid only.
+        if (diagnostics) {
         const sio = getStdioSessionInfo();
         lines.push(``);
         lines.push(`## Stdio Session Info`);
@@ -563,11 +538,9 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
             lines.push(`✅ VS 2022 IS sending roots/list_changed — solution switching IS detectable.`);
           }
         }
+        }
 
-        // -----------------------------------------------------------------------
-        // Context Snapshot — curated "what am I working on" view: recently edited
-        // objects + uncommitted X++ changes. Best-effort; never breaks the tool.
-        // -----------------------------------------------------------------------
+        // Context Snapshot — recently edited objects + uncommitted X++ changes. Best-effort.
         try {
           const snapshot = await buildContextSnapshot(context);
           lines.push('', ...renderContextSnapshotSection(snapshot));
@@ -590,12 +563,8 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
     } })();
     })();
     } catch (err) {
-      // Central safety net: convert ANY thrown error (incl. zod validation,
-      // bridge failures, unexpected exceptions) into a proper tool result with
-      // isError:true so the agent SEES the failure and can react/retry, instead
-      // of it surfacing as an opaque JSON-RPC protocol error. Individual tools
-      // may still return their own richer isError messages; this only catches
-      // what escapes them.
+      // Safety net: convert any thrown error into a tool result with isError:true
+      // instead of an opaque JSON-RPC protocol error.
       const message = err instanceof Error ? err.message : String(err);
       console.error(`[toolHandler] ❌ ${toolName} threw: ${message}`);
       result = {
@@ -612,11 +581,9 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
     if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
       storeDedupResult(callKey, capped);
-      // Resolve the in-flight promise so any coalesced waiters get the result.
       inFlightHandle?.resolve(capped);
       clearInFlight(callKey);
-      // Loop hint: 3+ identical calls in the recent window means the model is
-      // cycling (cache misses only happen when calls are >60 s apart).
+      // Loop hint: 3+ identical calls in the recent window means the model is cycling.
       if (occurrences >= 3) {
         capped = appendNote(
           capped,

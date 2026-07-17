@@ -50,7 +50,7 @@ The bridge has **zero** label support — `IMetadataProvider` does not expose `.
 
 | Tool | SQLite APIs | Purpose |
 |------|------------|---------|
-| `searchLabels` | FTS on `labels` table (19M+ entries) | Full-text search across 70 languages |
+| `searchLabels` | FTS on `labels` table (20M+ entries) | Full-text search across 70 languages |
 | `getLabelInfo` | `getLabelFileIds`, `getLabelById` | Read label content by ID or file |
 | `createLabel` | `searchLabels` (dedup check) + `bulkAddLabels` | Duplicate detection + index sync after write |
 | `renameLabel` | `renameLabelInIndex` | Index update after file-level rename |
@@ -117,7 +117,7 @@ DYNAMICSXREFDB contains three tables: `Names`, `References`, `Modules`. It store
 
 SQLite fills all of these gaps with pre-indexed, pre-aggregated data optimized for analytical queries.
 
-### 3. Sole Source for 19M+ Labels
+### 3. Sole Source for 20M+ Labels
 
 The labels database contains tens of millions of entries across 70 languages. `IMetadataProvider` has no API for reading or searching label files. Every label operation — search, read, create, rename — goes exclusively through SQLite. There is no alternative data path.
 
@@ -128,7 +128,7 @@ The labels database contains tens of millions of entries across 70 languages. `I
 | Approach | Feasibility | Cost |
 |----------|-------------|------|
 | Add FTS to DYNAMICSXREFDB | ❌ Microsoft-owned DB, read-only schema | Would require custom SQL Server full-text index + schema changes to a production database |
-| Add label API to bridge | ⚠️ Possible but laborious | Requires parsing all `.label.txt` files (19M entries) in C#, plus building search/CRUD — essentially reimplementing `labelsDb.ts` |
+| Add label API to bridge | ⚠️ Possible but laborious | Requires parsing all `.label.txt` files (20M+ entries) in C#, plus building search/CRUD — essentially reimplementing `labelsDb.ts` |
 | Add aggregation endpoints to bridge | ⚠️ Possible for individual queries | Each analytical query (pattern mining, EDT chain walk, security hierarchy) would need a dedicated C# endpoint — dozens of new endpoints, each doing what one SQL query does today |
 | Enumerate all objects via bridge for aggregation | ❌ Prohibitively slow | Reading the full symbol set one-by-one via IPC to compute a GROUP BY would take minutes vs. milliseconds in SQLite |
 | Drop Azure/Linux support | ❌ Violates product requirements | The MCP server must work in read-only Azure deployments where no D365FO runtime exists |

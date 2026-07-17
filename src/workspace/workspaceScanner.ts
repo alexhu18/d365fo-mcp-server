@@ -50,12 +50,7 @@ export interface WorkspaceContext {
 export class WorkspaceScanner {
   private workspaceCache: Map<string, { files: WorkspaceFile[]; scannedAt: number }> = new Map();
 
-  /**
-   * Short cache TTL so the context pipeline reflects freshly-saved files within
-   * seconds rather than the old 5-minute window. Combined with invalidate()
-   * (called after writes) this keeps "recently edited" / "active file" current
-   * without an fs.watch. Lazy expiry — no background timer to leak.
-   */
+  /** Cache TTL; paired with invalidate() (called after writes) to keep results current without an fs.watch. Lazy expiry — no background timer. */
   private static readonly CACHE_TTL_MS = 15_000;
 
   /**
@@ -78,10 +73,7 @@ export class WorkspaceScanner {
     });
 
     for (const filePath of xmlFiles) {
-      // Defense in depth: verify that each globbed file (after symlink
-      // resolution) still resolves under the validated workspace root.
-      // A symlink placed inside the workspace could otherwise redirect a read
-      // to an arbitrary location outside the allowed root.
+      // Reject symlinks that resolve outside the workspace root.
       if (!isFileUnderRoot(filePath, workspacePath)) {
         console.warn(`[WorkspaceScanner] Skipping ${filePath} — resolves outside workspace root ${workspacePath}`);
         continue;
@@ -89,8 +81,6 @@ export class WorkspaceScanner {
 
       const stat = await fs.stat(filePath);
       const fileName = path.basename(filePath, '.xml');
-      
-      // Detect type from path
       const type = this.detectFileType(filePath);
       
       files.push({
@@ -219,7 +209,6 @@ export class WorkspaceScanner {
       properties: {},
     };
 
-    // Parse class header
     if (classNode.Extends) {
       metadata.extends = classNode.Extends;
     }
@@ -230,7 +219,6 @@ export class WorkspaceScanner {
         : [classNode.Implements];
     }
 
-    // Parse methods
     if (classNode.MethodInfo) {
       const methods = Array.isArray(classNode.MethodInfo)
         ? classNode.MethodInfo
@@ -265,12 +253,10 @@ export class WorkspaceScanner {
       properties: {},
     };
 
-    // Parse table properties
     if (tableNode.Label) {
       metadata.properties!.label = tableNode.Label;
     }
 
-    // Parse fields
     if (tableNode.Fields?.AxTableField) {
       const fields = Array.isArray(tableNode.Fields.AxTableField)
         ? tableNode.Fields.AxTableField
@@ -288,7 +274,7 @@ export class WorkspaceScanner {
       }
     }
 
-    // Parse methods (tables can have methods too)
+    // Tables can have methods too.
     if (tableNode.MethodInfo) {
       const methods = Array.isArray(tableNode.MethodInfo)
         ? tableNode.MethodInfo

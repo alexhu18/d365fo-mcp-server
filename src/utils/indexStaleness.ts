@@ -1,10 +1,8 @@
 /**
  * Index staleness detection.
  *
- * The symbol index is the single source of truth for grounding — but only
- * while it reflects the current workspace. This module compares the newest
- * XML mtime in the active model's metadata folder with the index's
- * last_indexed_at bookkeeping timestamp and produces a warning when the
+ * Compares the newest XML mtime in the active model's metadata folder with
+ * the index's last_indexed_at timestamp and produces a warning when the
  * workspace has changed since the last (re)index.
  */
 

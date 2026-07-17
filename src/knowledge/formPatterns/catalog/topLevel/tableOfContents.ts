@@ -28,10 +28,9 @@ export const tableOfContents: FormPatternSpec = {
       id: 'TOCTabs',
       controlTypes: ['Tab'],
       occurrence: 'required',
-      // The top-level TOC navigation Tab uses Style=VerticalTabs (NOT the invalid
-      // 'TOCList', which makes xppc abort deserialization and suppress pattern
-      // validation for the whole build). Each TOC section is an unpatterned
-      // TabPage holding a TOCTitleContainer heading + a nested FastTabs tab.
+      // Style must be 'VerticalTabs' — 'TOCList' is invalid here. Each TOC
+      // section is an unpatterned TabPage holding a TOCTitleContainer heading
+      // plus a nested FastTabs tab.
       properties: { Style: 'VerticalTabs' },
       children: [
         {

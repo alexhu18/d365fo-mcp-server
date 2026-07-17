@@ -18,12 +18,11 @@ import {
   type FormPatternViolation,
 } from '../validation/formPatternValidator.js';
 import { resolveSubPattern } from '../knowledge/formPatterns/index.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 import {
   walkFormDesign,
   type FormControlNode,
 } from '../metadata/formPatternMiner.js';
-
-// ── Schema ──────────────────────────────────────────────────────────────────
 
 export const validateFormPatternArgsSchema = z.object({
   xml: z.string().optional().describe(
@@ -39,8 +38,6 @@ export const validateFormPatternArgsSchema = z.object({
 
 // Tool registration (name, description, inputSchema) lives inline in
 // src/server/mcpServer.ts - the single source of truth for tool instructions.
-
-// ── Formatting ──────────────────────────────────────────────────────────────
 
 function formatReport(report: FormPatternReport, source: string): string {
   const errors = report.violations.filter((v) => v.severity === 'error');
@@ -78,8 +75,6 @@ function formatReport(report: FormPatternReport, source: string): string {
   return lines.join('\n');
 }
 
-// ── Tool handler ────────────────────────────────────────────────────────────
-
 export async function validateFormPatternTool(
   request: any,
   context?: { symbolIndex?: any },
@@ -104,9 +99,11 @@ export async function validateFormPatternTool(
       source = filePath;
     } else if (!formXml && formName) {
       const db = context?.symbolIndex?.getReadDb?.();
+      // Resolve the caller's casing to the canonical AOT name first (#686).
+      const canonicalForm = db ? (canonicalSymbolName(db, formName, ['form']) ?? formName) : formName;
       const row = db
         ?.prepare(`SELECT file_path FROM symbols WHERE type = 'form' AND name = ? LIMIT 1`)
-        ?.get(formName) as { file_path?: string } | undefined;
+        ?.get(canonicalForm) as { file_path?: string } | undefined;
       if (!row?.file_path) {
         return {
           isError: true,
@@ -142,8 +139,6 @@ export async function validateFormPatternTool(
     content: [{ type: 'text', text: formatReport(report, source) }],
   };
 }
-
-// ── Write-gate helper (used by create_d365fo_file / generate) ────
 
 /** FORM_PATTERN_ENFORCE defaults to enabled; set to 'false'/'0' to disable blocking. */
 export function isFormPatternEnforceEnabled(): boolean {
@@ -227,7 +222,6 @@ export async function gateOnFormPatternErrors(
 
   if (errors.length === 0 || !isFormPatternEnforceEnabled()) {
     if (errors.length > 0) {
-      // Enforcement disabled — surface errors as warnings instead of blocking
       const downgraded =
         `⚠️ FORM_PATTERN_ENFORCE is disabled — ${errors.length} pattern error(s) NOT blocking:\n` +
         errors.map((v) => `   🔴 [${v.rule}] ${v.path}: ${v.excerpt}`).join('\n');

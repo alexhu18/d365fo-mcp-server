@@ -81,7 +81,6 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
 
     if (tracked) {
       await git(['checkout', 'HEAD', '--', relativePath], repoRoot);
-      // Re-index the reverted file so the symbol index reflects the restored version
       await cleanupIndexAfterUndo(context, absolutePath, 'reverted');
       return {
         content: [{ type: 'text', text: 'Successfully reverted tracked file modification: ' + absolutePath + '\nSymbol index updated to reflect the reverted state.' }],
@@ -119,7 +118,6 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
     }
 
     fs.unlinkSync(absolutePath);
-    // Clean up stale index entries for the deleted file
     await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
     return {
       content: [{ type: 'text', text: 'Successfully undid file creation (deleted untracked file): ' + absolutePath + '\nStale index entries cleaned up.' }],
@@ -132,14 +130,10 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
   }
 };
 
-// ── Index cleanup after undo ───────────────────────────────────────────────
-
 /**
- * Clean up the symbol index, label index, and bridge after
- * a file is reverted or deleted by undo_last_modification.
- *
- * - For DELETED files: remove all stale symbols + labels.
- * - For REVERTED files: re-index from the restored file content.
+ * Clean up the symbol index, label index, and bridge after a file is reverted or
+ * deleted by undo_last_modification. Deleted files: remove stale symbols + labels.
+ * Reverted files: re-index from the restored content.
  */
 async function cleanupIndexAfterUndo(
   context: XppServerContext,
@@ -149,24 +143,20 @@ async function cleanupIndexAfterUndo(
   const { symbolIndex } = context;
 
   try {
-    // 1. Remove stale symbols from SQLite
     const { deletedCount } = symbolIndex?.removeSymbolsByFile?.(filePath) ?? { deletedCount: 0 };
     console.error(`[undo] Removed ${deletedCount} stale symbol(s) for ${path.basename(filePath)}`);
 
-    // 2. Remove stale labels (label .txt files have the same path pattern)
     const labelCount = symbolIndex?.removeLabelsByFile?.(filePath) ?? 0;
     if (labelCount > 0) {
       console.error(`[undo] Removed ${labelCount} stale label(s) for ${path.basename(filePath)}`);
     }
 
-    // 3. Refresh bridge metadata provider
     try {
       await bridgeRefreshProvider(context.bridge);
     } catch { /* bridge not available */ }
 
-    // 4. For reverted files: re-index the restored content
     if (action === 'reverted' && fs.existsSync(filePath)) {
-      // Import dynamically to avoid circular dependency
+      // Dynamic import to avoid a circular dependency
       const { updateSymbolIndexTool } = await import('./updateSymbolIndex.js');
       await updateSymbolIndexTool({ filePath }, context);
       console.error(`[undo] Re-indexed reverted file: ${path.basename(filePath)}`);

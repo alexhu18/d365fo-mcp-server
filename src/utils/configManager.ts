@@ -54,36 +54,29 @@ class ConfigManager {
   private config: McpConfig | null = null;
   private configPath: string;
   private runtimeContext: Partial<McpContext> = {};
-  // Guards the one-time registration of explicitly-configured custom models
-  // (the resolved target model + any CUSTOM_MODELS entries) performed in ensureLoaded().
+  // Guards one-time registration of configured custom models in ensureLoaded().
   private configuredModelsRegistered = false;
   /**
    * Per-request context storage — isolates each HTTP request's workspace path
    * from concurrent requests. Populated via runWithRequestContext() in transport.ts.
-   * Takes priority over runtimeContext in getContext() so multi-user HTTP scenarios
-   * never bleed workspace state between requests.
+   * Takes priority over runtimeContext in getContext().
    */
   private requestContextStorage = new AsyncLocalStorage<Partial<McpContext>>();
   private autoDetectedProject: D365ProjectInfo | null = null;
   private autoDetectionAttempted: boolean = false;
-  // Cache auto-detection results per workspace path (PERFORMANCE FIX)
+  // Auto-detection results cached per workspace path.
   private autoDetectionCache = new Map<string, D365ProjectInfo | null>();
-  // All projects found when D365FO_SOLUTIONS_PATH is configured
+  // All projects found when D365FO_SOLUTIONS_PATH is configured.
   private allDetectedProjects: D365ProjectInfo[] = [];
-  // Monotonically-increasing counter — each new background detection call gets a unique ID.
-  // Before writing autoDetectedProject, the call verifies its ID is still current.
-  // This prevents a slower earlier scan (e.g. home-dir BFS) from overwriting a faster,
-  // more specific scan (e.g. direct workspace path lookup) that finished first.
+  // Monotonically-increasing counter identifying each background detection call;
+  // a scan whose generation is stale by the time it finishes is discarded so it
+  // can't overwrite a more recent, more specific scan's result.
   private detectionGeneration = 0;
-  // Promise that resolves once the D365FO_SOLUTIONS_PATH eager scan completes.
-  // setRuntimeContextFromRoots awaits this before trying matchProjectForWorkspace,
-  // eliminating the race where roots/list arrives before allDetectedProjects is populated.
+  // Resolves once the D365FO_SOLUTIONS_PATH eager scan completes; awaited by
+  // setRuntimeContextFromRoots() before matchProjectForWorkspace() runs.
   private allDetectedProjectsReady: Promise<void> | null = null;
-  // Promise for the currently in-progress background autoDetectProject call.
-  // getWorkspaceInfoDiagnostics awaits this when autoDetectedProject is still null,
-  // fixing the "null on first call" race (autoDetectionAttempted is set immediately
-  // at the start of autoDetectProject, so the !autoDetectionAttempted guard is
-  // bypassed even though the async scan hasn't returned a result yet).
+  // Promise for the in-progress background autoDetectProject() call, awaited by
+  // getWorkspaceInfoDiagnostics() when autoDetectedProject is still null.
   private detectionInProgress: Promise<void> | null = null;
   private xppConfigProvider: XppConfigProvider | null = null;
   private xppConfig: XppEnvironmentConfig | null = null;
@@ -96,10 +89,8 @@ class ConfigManager {
 
   /**
    * Start scanning D365FO_SOLUTIONS_PATH immediately at startup (fire-and-forget).
-   * Stores a Promise so setRuntimeContextFromRoots can await it, guaranteeing
-   * that allDetectedProjects is populated before the first roots/list notification
-   * is processed — otherwise matchProjectForWorkspace always returns null because
-   * the list is empty (roots/list often arrives within 1–2 s of startup).
+   * Stores a Promise so setRuntimeContextFromRoots() can await it, guaranteeing
+   * allDetectedProjects is populated before the first roots/list notification.
    * Safe to call multiple times; subsequent calls are no-ops.
    */
   initEagerScan(): void {
@@ -112,9 +103,7 @@ class ConfigManager {
         const all = await scanAllD365Projects(solutionsRoot);
         if (all.length > 0) {
           this.allDetectedProjects = all;
-          // Compact summary: group by model, then list counts + first project path per model.
-          // Operational/info only — gated behind DEBUG_LOGGING so it doesn't surface as
-          // dozens of "[server stderr]" warnings in the MCP client on every startup.
+          // Group by model for a compact summary; gated behind DEBUG_LOGGING.
           const byModel = new Map<string, string[]>();
           for (const p of all) {
             const list = byModel.get(p.modelName) ?? [];
@@ -137,9 +126,9 @@ class ConfigManager {
   }
 
   /**
-   * Auto-detect D365FO project from workspace
-   * Called automatically when projectPath/solutionPath is requested but not configured
-   * PERFORMANCE: Results are cached per workspace path
+   * Auto-detect D365FO project from workspace.
+   * Called automatically when projectPath/solutionPath is requested but not configured.
+   * Results are cached per workspace path.
    */
   private async autoDetectProject(workspacePath?: string, generation?: number): Promise<void> {
     if (this.autoDetectionAttempted) {
@@ -155,7 +144,6 @@ class ConfigManager {
       return;
     }
 
-    // Check cache first (PERFORMANCE FIX)
     const cacheKey = workspacePath || 'default';
     if (this.autoDetectionCache.has(cacheKey)) {
       this.autoDetectedProject = this.autoDetectionCache.get(cacheKey) || null;

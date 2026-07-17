@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
 import { getObjectSuffix, getExtensionNamingStyle } from '../utils/modelClassifier.js';
 import { getConfigManager } from '../utils/configManager.js';
+import { lookupSymbolNocase, lookupSymbolsNocase } from '../utils/symbolLookup.js';
 
 const ValidateObjectNamingArgsSchema = z.object({
   proposedName: z.string().describe('The proposed object name to validate'),
@@ -45,8 +46,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
     const name = args.proposedName;
     const isExtension = EXTENSION_TYPES.has(args.objectType);
 
-    // ── Max name length check — D365FO has a hard 81-character limit on AOT names ──
-    // Exceeding this causes build error: "Object name exceeds maximum length"
+    // D365FO has a hard 81-character limit on AOT names; exceeding it is a build error.
     const MAX_NAME_LENGTH = 81;
     if (name.length > MAX_NAME_LENGTH) {
       errors.push(`Name "${name}" is ${name.length} characters — exceeds the D365FO AOT maximum of ${MAX_NAME_LENGTH} characters. This will cause a build error.`);
@@ -55,10 +55,9 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       warnings.push(`Name is ${name.length} characters — approaching the ${MAX_NAME_LENGTH}-char AOT limit. Consider a shorter name to leave room for extensions.`);
     }
 
-    // ── Resolve model prefix: explicit arg → EXTENSION_PREFIX env → DB auto-detect ───
+    // Resolve model prefix: explicit arg → EXTENSION_PREFIX env → DB auto-detect (mirrors resolveObjectPrefix()).
     let prefix = args.modelPrefix?.toUpperCase() || '';
     if (!prefix) {
-      // Mirror resolveObjectPrefix() priority: EXTENSION_PREFIX has absolute precedence
       const envPrefix = process.env.EXTENSION_PREFIX?.trim().replace(/_+$/, '');
       if (envPrefix) {
         prefix = envPrefix.toUpperCase();
@@ -67,12 +66,9 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       }
     }
 
-    // ── Resolve extension-naming style and (for model-name style) the model name ──
-    // Under EXTENSION_NAMING_STYLE=model-name the extension token is the MODEL NAME
-    // (Visual Studio developer-tools default), not the prefix infix:
-    //   class extension   → {Base}_{ModelName}_Extension
-    //   element extension → {Base}.{ModelName}
-    // Explicit modelName arg wins; otherwise resolve from the active workspace config.
+    // Under EXTENSION_NAMING_STYLE=model-name the extension token is the model name (Visual Studio
+    // default) rather than the prefix infix: class extension → {Base}_{ModelName}_Extension,
+    // element extension → {Base}.{ModelName}. Explicit modelName arg wins over workspace config.
     const namingStyle = getExtensionNamingStyle();
     let modelName = args.modelName?.trim() || '';
     if (!modelName && namingStyle === 'model-name') {
@@ -80,9 +76,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
     }
     const useModelName = namingStyle === 'model-name' && !!modelName;
 
-    // ══════════════════════════════════════════════════════════════════
-    // RULE SET 1: Extension naming rules
-    // ══════════════════════════════════════════════════════════════════
+    // Rule set 1: extension naming rules
     if (isExtension) {
       const baseObjectName = args.baseObjectName;
 
@@ -90,9 +84,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
         errors.push(`baseObjectName is required for extension types (${args.objectType}).`);
       } else {
         if (args.objectType === 'class-extension') {
-          // Class extensions:
-          //   prefix style     → {Base}{Prefix}_Extension
-          //   model-name style → {Base}_{ModelName}_Extension
+          // prefix style → {Base}{Prefix}_Extension; model-name style → {Base}_{ModelName}_Extension
           const expectedPattern = useModelName
             ? `${baseObjectName}_${modelName}_Extension`
             : `${baseObjectName}${prefix}_Extension`;
@@ -105,8 +97,8 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
             errors.push(`Class extension names must end with '_Extension'.\n  Expected format: ${expectedPattern}`);
             if (expectedToken) suggestions.push(`Correct name: ${expectedPattern}`);
           } else {
-            // Has correct structure — check the expected token is included.
-            // Strip a leading separator so "_ContosoRobotics" compares cleanly to the model name.
+            // Structure is correct — check the expected token is included. Strip a leading
+            // separator so "_ContosoRobotics" compares cleanly to the model name.
             const middle = name.slice(baseObjectName.length, -'_Extension'.length).replace(/^_+/, '');
             if (expectedToken &&
                 middle.toLowerCase() !== expectedToken.toLowerCase() &&
@@ -119,7 +111,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
             }
           }
 
-          // AOT element-extension name suggestion (if an element extension is meant instead)
           suggestions.push(
             useModelName
               ? `AOT name for an element extension instead: ${baseObjectName}.${modelName}`
@@ -127,8 +118,8 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
           );
 
         } else if (useModelName) {
-          // AOT extensions (table/form/enum/edt), model-name style: {Base}.{ModelName}
-          // Visual Studio names these with the bare model name and NO "Extension" word.
+          // AOT extensions (table/form/enum/edt), model-name style: {Base}.{ModelName} — bare model
+          // name, no "Extension" word.
           const expectedPattern = `${baseObjectName}.${modelName}`;
 
           if (!name.includes('.')) {
@@ -146,7 +137,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
           }
 
         } else {
-          // AOT extensions (table/form/enum/edt), prefix style: {Base}.{Prefix}Extension
+          // AOT extensions (table/form/enum/edt), prefix style: {Base}.{Prefix}Extension.
           const expectedPattern = `${baseObjectName}.${prefix}Extension`;
 
           if (!name.includes('.')) {
@@ -166,15 +157,14 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
           }
         }
 
-        // Verify base object exists in index
         const dbTypes = args.objectType.includes('class') ? ['class'] :
           args.objectType.includes('table') ? ['table'] :
           args.objectType.includes('form') ? ['form'] :
           args.objectType.includes('enum') ? ['enum'] : ['edt'];
 
-        const baseExists = db.prepare(
-          `SELECT name FROM symbols WHERE name = ? AND type IN (${dbTypes.map(() => '?').join(',')}) LIMIT 1`
-        ).get(baseObjectName, ...dbTypes) as any;
+        // Case-insensitive: the base object may be spelled with different casing
+        // than the canonical AOT name (#686).
+        const baseExists = lookupSymbolNocase(db, baseObjectName, dbTypes);
 
         if (!baseExists) {
           warnings.push(`Base object "${baseObjectName}" not found in symbol index for types: ${dbTypes.join(', ')}. Ensure it's indexed.`);
@@ -182,13 +172,10 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // RULE SET 2: New object naming rules
-    // ══════════════════════════════════════════════════════════════════
+    // Rule set 2: new object naming rules
     if (!isExtension) {
-      // Underscores are allowed ONLY as a prefix separator: {Prefix}_{Rest}
-      //   Valid:   MY_VendPaymTermsMaintain  (prefix="MY", separator "_", then name)
-      //   Invalid: MYVendPaymTerms_Helper    (underscore mid-name, not immediately after prefix)
+      // Underscores are allowed only as a prefix separator: {Prefix}_{Rest}
+      // (e.g. valid "MY_VendPaymTermsMaintain", invalid "MYVendPaymTerms_Helper").
       if (name.includes('_')) {
         const underscoreIdx = name.indexOf('_');
         const beforeUnderscore = name.slice(0, underscoreIdx);
@@ -204,7 +191,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
         }
       }
 
-      // Must start with a prefix (letter, avoid starting with Microsoft-reserved ones)
       if (prefix) {
         if (!name.startsWith(prefix) && !name.toUpperCase().startsWith(prefix)) {
           warnings.push(`Proposed name does not start with model prefix "${prefix}". All custom objects should be prefixed to avoid conflicts.`);
@@ -212,7 +198,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
         }
       }
 
-      // Suffix check — if EXTENSION_SUFFIX is configured, verify the name ends with it
       const configuredSuffix = getObjectSuffix();
       if (configuredSuffix) {
         if (!name.toLowerCase().endsWith(configuredSuffix.toLowerCase())) {
@@ -221,7 +206,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
         }
       }
 
-      // Security object naming conventions
       if (args.objectType === 'security-privilege') {
         if (!/(View|Maintain|Delete|Admin|Invoke|Approve|FullControl)$/.test(name)) {
           warnings.push(`Security privileges typically end with an action suffix: View, Maintain, Delete, Admin, Invoke, Approve, or FullControl.\n  Examples: ${name}View, ${name}Maintain`);
@@ -243,10 +227,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    // RULE SET 3: Conflict detection
-    // ══════════════════════════════════════════════════════════════════
-    // Exact name collision
+    // Rule set 3: conflict detection
     const dbType = args.objectType === 'class-extension' ? 'class-extension' :
       args.objectType === 'table-extension' ? 'table-extension' :
       args.objectType === 'form-extension' ? 'form-extension' :
@@ -255,18 +236,16 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       args.objectType === 'data-entity' ? 'view' :
       args.objectType;
 
-    const exactConflict = db.prepare(
-      `SELECT name, type, model FROM symbols WHERE name = ? ORDER BY model LIMIT 5`
-    ).all(name) as any[];
+    // AOT names are case-insensitive, so an existing object differing only in
+    // casing IS a conflict — a case-sensitive probe here reported a false
+    // "no existing objects" (#686). Scoped to top-level objects: a method or
+    // field sharing the name is not an AOT naming conflict.
+    const exactConflict = lookupSymbolsNocase(db, name, { limit: 5 });
 
-    // Near-match search (same prefix, similar name)
     const similarSymbols = db.prepare(
       `SELECT name, type, model FROM symbols WHERE name LIKE ? AND type = ? ORDER BY name LIMIT 5`
     ).all(`${name.slice(0, Math.max(4, name.length - 3))}%`, dbType) as any[];
 
-    // ══════════════════════════════════════════════════════════════════
-    // FORMAT OUTPUT
-    // ══════════════════════════════════════════════════════════════════
     let output = `Validation: "${name}" as ${args.objectType}\n`;
     if (args.baseObjectName) output += `Base Object: ${args.baseObjectName}\n`;
     if (prefix) output += `Model Prefix: ${prefix}\n`;
@@ -308,7 +287,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       output += '\n';
     }
 
-    // Conflicts
     output += `CONFLICT CHECK:\n`;
     if (exactConflict.length > 0) {
       output += `  ✗ Name "${name}" already exists:\n`;
@@ -319,7 +297,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       output += `  ✓ No existing objects named "${name}" found\n`;
     }
 
-    if (similarSymbols.length > 0 && !exactConflict.some(c => c.name === name)) {
+    if (similarSymbols.length > 0 && !exactConflict.some(c => c.name.toLowerCase() === name.toLowerCase())) {
       output += `  Similar ${args.objectType} names:\n`;
       for (const s of similarSymbols) {
         output += `    ${s.name} [${s.model}]\n`;
@@ -328,7 +306,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
 
     output += '\n';
 
-    // Naming rules applied
     const rules = isExtension
       ? ['Extension suffix pattern', 'Model prefix included', 'Base object exists in index']
       : ['No underscore in non-extension names', 'Model prefix', 'Type-specific conventions'];
@@ -356,7 +333,6 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
  * Looks for 2-4 char prefix shared by many objects in the index.
  */
 function detectModelPrefix(db: any, proposedName: string): string {
-  // If proposed name starts with common D365 standard prefixes, return empty
   const stdPrefixes = ['Cust', 'Vend', 'Sales', 'Purch', 'Ledger', 'Invent', 'Proj', 'WHS',
     'Sma', 'MCR', 'Retail', 'Ax', 'Sys', 'Global', 'Common', 'Tax', 'Bank'];
   for (const p of stdPrefixes) {
@@ -364,7 +340,6 @@ function detectModelPrefix(db: any, proposedName: string): string {
   }
 
   try {
-    // Sample a few symbols starting with the first 3 chars of the proposed name
     const prefix3 = proposedName.slice(0, 3).toUpperCase();
     const sample = db.prepare(
       `SELECT name FROM symbols WHERE type = 'class' AND name LIKE ? LIMIT 20`
@@ -372,7 +347,6 @@ function detectModelPrefix(db: any, proposedName: string): string {
 
     if (sample.length >= 3) return prefix3;
 
-    // Try 2 chars
     const prefix2 = proposedName.slice(0, 2).toUpperCase();
     return prefix2.length >= 2 ? prefix2 : '';
   } catch {

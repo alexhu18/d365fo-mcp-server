@@ -80,12 +80,10 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
       searchControl,
     } = args;
 
-    // 0. If an explicit filePath is provided, skip bridge entirely.
-    // This is the retry path for newly-created forms not yet in bridge metadata.
+    // Explicit filePath skips the bridge — retry path for newly-created forms not yet indexed.
     if (explicitFilePath) {
-      // Security: validate that the supplied path falls within a configured D365FO
-      // package root before reading any file content.  Without this check a
-      // prompt-injection attack could read arbitrary local files via this parameter.
+      // Validate the path is within a configured D365FO package root before reading —
+      // otherwise a prompt-injection attack could read arbitrary local files.
       const containment = await assertWritePathAllowed(explicitFilePath);
       if (!containment.ok) {
         return {
@@ -111,7 +109,6 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
       return await parseAndFormatForm(formName, 'Unknown', xmlContent, includeControls, includeDataSources, includeMethods, searchControl);
     }
 
-    // 1. C# bridge (IMetadataProvider — live D365FO metadata, always available)
     const bridgeResult = await tryBridgeForm(context.bridge, formName);
     if (bridgeResult) return bridgeResult;
 
@@ -155,7 +152,7 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
   }
 }
 
-// ── Shared XML parse + format helper ────────────────────────────────────────
+// Shared XML parse + format helper
 
 /**
  * Parse form XML and return the formatted tool response.
@@ -205,7 +202,7 @@ async function parseAndFormatForm(
   return formatFormOutput(formInfo, includeControls, includeDataSources, includeMethods);
 }
 
-// ── Control search helpers ───────────────────────────────────────────────────
+// Control search helpers
 
 interface ControlSearchResult {
   control: FormControl;
@@ -303,9 +300,6 @@ function formatControlSearchResults(
   return out;
 }
 
-/**
- * Extract datasources from form XML
- */
 function extractDataSources(dataSourcesNode: any): FormDataSource[] {
   const dataSources: FormDataSource[] = [];
 
@@ -342,9 +336,6 @@ function extractDataSources(dataSourcesNode: any): FormDataSource[] {
   return dataSources;
 }
 
-/**
- * Extract fields from datasource
- */
 function extractDataSourceFields(fieldsNode: any): string[] {
   const fields: string[] = [];
 
@@ -358,17 +349,11 @@ function extractDataSourceFields(fieldsNode: any): string[] {
   return fields;
 }
 
-/**
- * Extract controls from design
- */
 function extractControls(designNode: any): FormControl[] {
   const controls: FormControl[] = [];
 
-  // Design XML can be structured as:
-  // 1. Design > AxFormDesign > Controls > AxFormControl[]
-  // 2. Design > Controls > AxFormControl[] (older format)
-  
-  // Try AxFormDesign wrapper first (newer format)
+  // Design XML can be Design > AxFormDesign > Controls > AxFormControl[] (newer)
+  // or Design > Controls > AxFormControl[] (older format).
   let controlsNode = null;
   if (designNode.AxFormDesign && designNode.AxFormDesign[0]) {
     controlsNode = designNode.AxFormDesign[0].Controls;
@@ -388,9 +373,6 @@ function extractControls(designNode: any): FormControl[] {
   return controls;
 }
 
-/**
- * Extract single control
- */
 function extractControl(node: any): FormControl | null {
   if (!node) return null;
 
@@ -401,7 +383,6 @@ function extractControl(node: any): FormControl | null {
     children: [],
   };
 
-  // Extract common properties
   const propertiesToExtract = [
     'Caption',
     'Visible',
@@ -422,7 +403,6 @@ function extractControl(node: any): FormControl | null {
     }
   }
 
-  // Recursively extract child controls (nested under Controls > AxFormControl)
   if (node.Controls && node.Controls[0] && node.Controls[0].AxFormControl) {
     for (const childNode of node.Controls[0].AxFormControl) {
       const childControl = extractControl(childNode);
@@ -435,9 +415,6 @@ function extractControl(node: any): FormControl | null {
   return control;
 }
 
-/**
- * Extract methods from form
- */
 function extractMethods(methodsNode: any): FormMethod[] {
   const methods: FormMethod[] = [];
 
@@ -448,9 +425,7 @@ function extractMethods(methodsNode: any): FormMethod[] {
   for (const methodNode of methodsNode.Method) {
     const name = methodNode.Name ? methodNode.Name[0] : 'Unknown';
     const source = methodNode.Source ? methodNode.Source[0] : '';
-    
-    // Extract first line as signature
-    const signature = source.split('\n')[0].trim();
+    const signature = source.split('\n')[0].trim(); // first line as signature
 
     methods.push({
       name,
@@ -461,9 +436,6 @@ function extractMethods(methodsNode: any): FormMethod[] {
   return methods;
 }
 
-/**
- * Format form output
- */
 function formatFormOutput(
   formInfo: FormInfo,
   includeControls: boolean,
@@ -473,7 +445,6 @@ function formatFormOutput(
   let output = `# Form: \`${formInfo.name}\`\n\n`;
   output += `**Model:** ${formInfo.model}\n\n`;
 
-  // Data Sources
   if (includeDataSources && formInfo.dataSources.length > 0) {
     output += `## 📊 Data Sources\n\n`;
     for (const ds of formInfo.dataSources) {
@@ -505,13 +476,11 @@ function formatFormOutput(
     }
   }
 
-  // Design (Controls)
   if (includeControls && formInfo.design.length > 0) {
     output += `## 🎨 Design (Controls)\n\n`;
     output += formatControlHierarchy(formInfo.design, 0);
   }
 
-  // Methods
   if (includeMethods && formInfo.methods.length > 0) {
     output += `## 🔧 Form Methods\n\n`;
     for (const method of formInfo.methods) {
@@ -520,7 +489,6 @@ function formatFormOutput(
     }
   }
 
-  // Summary
   output += `## 📈 Summary\n\n`;
   output += `- **Data Sources:** ${formInfo.dataSources.length}\n`;
   output += `- **Controls:** ${countControls(formInfo.design)}\n`;
@@ -536,9 +504,6 @@ function formatFormOutput(
   };
 }
 
-/**
- * Format control hierarchy
- */
 function formatControlHierarchy(controls: FormControl[], indent: number): string {
   let output = '';
   const indentStr = '  '.repeat(indent);
@@ -564,9 +529,6 @@ function formatControlHierarchy(controls: FormControl[], indent: number): string
   return output;
 }
 
-/**
- * Count total controls recursively
- */
 function countControls(controls: FormControl[]): number {
   let count = controls.length;
   for (const control of controls) {

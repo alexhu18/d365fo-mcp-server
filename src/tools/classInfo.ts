@@ -49,7 +49,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
       // If not found in workspace, continue to external search
     }
 
-    // Try C# bridge first (IMetadataProvider — live D365FO metadata).
+    // Try C# bridge first (IMetadataProvider — live D365FO metadata)
     const bridgeResult = await tryBridgeClass(context.bridge, args.className, args.compact !== false, args.methodOffset ?? 0);
     if (bridgeResult) {
       return bridgeResult;
@@ -146,8 +146,6 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
     if (hasMore) {
       output += `> ⚠️ **${totalMethods - methodOffset - METHOD_PAGE_SIZE} more methods not shown.** Call again with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\` to see the next page.\n\n`;
     }
-
-    // (formerly wrote to cache here)
 
     return {
       content: [

@@ -1,26 +1,18 @@
 /**
- * Lightweight, ADVISORY X++ select-statement linter.
+ * Lightweight, advisory X++ select-statement linter.
  *
- * replace-code / add-method write X++ source verbatim — they are not a compiler — so a
- * structural select mistake reaches disk and only surfaces as a build error later (with a
- * line number the agent then hunts via filesystem grep). This catches the one mistake that
- * is both common in AI-generated X++ and unambiguous to detect:
- *
- *   a main-table WHERE clause placed AFTER a join.
- *
- * In X++ a select reads:
+ * Detects a main-table WHERE clause placed after a join. In X++ a select reads:
  *   select [field] from Main [where mainCond]
  *       [ [exists|notexists|outer] join Buf from T where joinCond ]...
- * The main WHERE must precede every join, and each join clause carries at most ONE where.
- * Two `where` keywords inside a single join segment therefore means a stray where landed
- * after the join — exactly the "WHERE after exists join" bug.
+ * The main WHERE must precede every join, and each join clause carries at most one where.
+ * Two `where` keywords inside a single join segment means a stray where landed after
+ * the join.
  *
- * ADVISORY ONLY: returns human-readable warnings, never throws or blocks. A compiler this is
- * not, and a false positive must never break a legitimate write — at worst it adds a note.
+ * Advisory only: returns human-readable warnings, never throws or blocks.
  */
 
-/** Strip X++ line/block/doc comments and string literals so 'where'/'join' tokens inside
- *  them don't skew the scan. Replaces stripped spans with spaces to preserve offsets loosely. */
+/** Strip X++ line/block comments and string literals so 'where'/'join' tokens inside
+ *  them don't skew the scan. */
 function stripCommentsAndStrings(s: string): string {
   let out = '';
   let i = 0;
@@ -65,9 +57,8 @@ export function lintXppSelect(source: string | undefined): string[] {
     const stmt = m[0];
     if (!/\bjoin\b/i.test(stmt)) continue; // only join-bearing selects can have this bug
 
-    // Split into segments at each `join` keyword. Segment 0 is the main-table region
-    // (its where is legal); every later segment is one join's clause and may hold at
-    // most ONE where. Two wheres in a single join segment ⇒ a stray (main-table) where.
+    // Segment 0 is the main-table region (its where is legal); every later segment is
+    // one join's clause and may hold at most one where.
     const segments = stmt.split(/\bjoin\b/i);
     for (let s = 1; s < segments.length; s++) {
       const whereCount = (segments[s].match(/\bwhere\b/gi) ?? []).length;

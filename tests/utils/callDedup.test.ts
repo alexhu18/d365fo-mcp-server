@@ -54,6 +54,15 @@ describe('dedup cache', () => {
     expect(DEDUP_EXCLUDED_TOOLS.has('search')).toBe(false);
     expect(DEDUP_EXCLUDED_TOOLS.has('get_table_info')).toBe(false);
   });
+
+  it('excludes generate_object from dedup (writes to disk + reads live symbol-index state)', () => {
+    // Regression (2026-07-01 usage-examples eval, scenario 2): generate_object(mode="scaffold",
+    // objectType="form", cloneFrom=...) writes the file directly to disk in traditional/Windows
+    // mode, and its cloneFrom/tableMapping resolution depends on the CURRENT symbol-index state.
+    // A retry after update_symbol_index() used to be served the stale/broken cached result
+    // instead of re-reading the now-current index.
+    expect(DEDUP_EXCLUDED_TOOLS.has('generate_object')).toBe(true);
+  });
 });
 
 describe('appendNote', () => {

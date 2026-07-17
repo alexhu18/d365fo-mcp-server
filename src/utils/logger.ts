@@ -1,7 +1,4 @@
-/**
- * Simple logger utility
- * Set DEBUG_LOGGING=true environment variable to enable verbose logging
- */
+/** Set DEBUG_LOGGING=true to enable verbose logging via debugLog. */
 
 const DEBUG_LOGGING = process.env.DEBUG_LOGGING === 'true';
 

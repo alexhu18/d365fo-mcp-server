@@ -8,12 +8,9 @@
 
 /**
  * Detect the dominant line ending in a file's content.
- *
- * Strategy: first-CRLF-wins — any CRLF in the file is treated as evidence that
- * the whole file is CRLF (the realistic D365FO failure mode is "tool stripped CRs
- * from a CRLF file", not a genuinely mixed-EOL file we need to majority-vote on).
- * Falls back to LF only when line endings are present but none are CRLF.
- * Defaults to CRLF for brand-new or empty files to match D365FO conventions.
+ * Any CRLF present is treated as evidence the whole file is CRLF; falls back
+ * to LF only when line endings exist but none are CRLF. Defaults to CRLF for
+ * brand-new or empty files to match D365FO conventions.
  */
 export function detectEol(content: string): '\r\n' | '\n' {
   if (content.includes('\r\n')) return '\r\n';

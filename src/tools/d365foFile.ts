@@ -29,6 +29,9 @@ const D365FileArgsSchema = z
       'generate → XML text only (no file written, Azure/Linux fallback); ' +
       'create → write a NEW object file (Windows); modify → edit an EXISTING object (Windows).',
     ),
+    // Operation-specific parameters may arrive nested in `params` (the published
+    // schema advertises only this object) — they are flattened before dispatch.
+    params: z.record(z.string(), z.unknown()).optional(),
   })
   .passthrough();
 
@@ -45,7 +48,15 @@ export async function d365foFileTool(request: CallToolRequest, context: XppServe
     };
   }
 
-  const { action, ...rest } = parsed.data;
+  const { action, params, ...flat } = parsed.data;
+
+  // Back-compat merge: op-specific values may come nested in `params` (the
+  // published schema shape) or flat at top level (legacy callers). Nested
+  // values win on key collision; the `params` wrapper itself is not forwarded.
+  const rest: Record<string, unknown> =
+    params && typeof params === 'object' && !Array.isArray(params)
+      ? { ...flat, ...params }
+      : flat;
 
   if (action === 'create') {
     return handleCreateD365File(subRequest('create_d365fo_file', rest), context);

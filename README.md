@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D24.0.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/tests-1100%2B-brightgreen.svg)](docs/TESTING.md)
+[![Tests](https://img.shields.io/badge/tests-1400%2B-brightgreen.svg)](docs/TESTING.md)
 
 *Grounded AI development for Dynamics 365 Finance & Operations — works with GitHub Copilot and Claude Code*
 
@@ -46,10 +46,10 @@ This server pre-indexes your entire D365FO installation (580 000+ symbols across
 |---|---|
 | 🔍 **Full-codebase intelligence** | 580K+ symbols indexed: classes, tables, forms, EDTs, enums, labels (20M+ rows), security artifacts — FTS5 search in < 10 ms |
 | 🛡️ **Grounded generation** | Fail-closed gates: `prepare` issues grounding tokens, `validate_code(mode="references")` proves every identifier, `validate_code(mode="syntax")` enforces best practices — hallucinated code never reaches disk |
-| 🧩 **Form pattern engine** | Complete catalog of Microsoft form patterns and sub-patterns: recommends the right pattern, clones reference forms with datasource re-binding, validates structure and blocks invalid writes |
+| 🧩 **Form pattern engine** | Complete catalog of Microsoft form patterns and sub-patterns: recommends the right pattern, clones reference forms with datasource re-binding, **deterministically expands** patterns that have no reference form, **auto-repairs** a form's missing required controls, validates structure and blocks invalid writes |
 | ✍️ **Safe metadata writes** | C# bridge uses Microsoft's own `IMetadataProvider` — no string-replacement XML corruption, automatic `.rnrproj` registration, one-call undo |
 | 🏗️ **SDLC integration** | MSBuild compilation with structured diagnostics, DB sync, xppbp best practices, SysTestRunner — all from chat |
-| 📐 **X++ knowledge base** | Queryable rules: select grammar, CoC authoring, SysDa, FormRun lifecycle, AX2012→D365FO migration — prevents deprecated APIs |
+| 📐 **X++ knowledge base** | Queryable rules: select grammar, CoC authoring, financial dimensions, the posting engine (`LedgerVoucher`), number sequences, `SysExtension`, Electronic Reporting, AX2012→D365FO migration — prevents deprecated APIs |
 
 ### Pattern-grounded form development
 
@@ -79,6 +79,22 @@ Pick your path:
 | **C/E — Local** | Single developer, everything on the VM | Clone + build + index (~15 min) |
 
 Full walkthrough with all scenarios: **[docs/QUICK_START.md](docs/QUICK_START.md)**
+
+### Interactive setup (recommended)
+
+After cloning and `npm install`, the management CLI walks you through everything else — scenario selection, C# bridge build, `.env` configuration, index build — and prints the `.mcp.json` block to paste:
+
+```powershell
+git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
+cd K:\d365fo-mcp-server
+npm install
+npm run setup        # first-time setup wizard
+npm run doctor       # health check — verifies Node, build, index, bridge
+```
+
+Day-to-day management runs through the same CLI (`npx d365fo-mcp` or `npm run cli --`): `start`, `update`, `index`, and `instance add/list/run/rebuild/upgrade` for multi-instance setups. Every command works non-interactively with arguments, or asks with predefined choices when run bare.
+
+### Manual setup
 
 ```powershell
 # Local / hybrid install (on the D365FO VM)

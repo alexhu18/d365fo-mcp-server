@@ -84,8 +84,6 @@ export const FORM_PATTERN_CATALOG: FormPatternCatalog = {
   ],
 };
 
-// ── Lookup helpers ───────────────────────────────────────────────────────────
-
 const patternByKey = new Map<string, FormPatternSpec>();
 for (const p of FORM_PATTERN_CATALOG.patterns) {
   patternByKey.set(p.id.toLowerCase(), p);

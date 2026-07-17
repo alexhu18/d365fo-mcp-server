@@ -6,15 +6,29 @@
 import { loadEnv } from '../src/utils/loadEnv.js';
 loadEnv(import.meta.url);
 import * as fs from 'fs/promises';
-import * as fsSync from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { XppMetadataParser } from '../src/metadata/xmlParser.js';
+import { XppMetadataParser, buildClassExtensionRecord } from '../src/metadata/xmlParser.js';
+import type { XppClassInfo } from '../src/metadata/types.js';
 import { isCustomModel as checkIsCustomModel, getCustomModels } from '../src/utils/modelClassifier.js';
 import { XppConfigProvider } from '../src/utils/xppConfigProvider.js';
+import { box, kv, sectionTitle, statusLine, spread, c, glyph, log, shortPath, supportsUnicode, sanitize } from '../src/utils/terminalUi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Sanitise emoji/fancy punctuation at the stream level on legacy Windows consoles
+// (cp852/cp1250) so output stays readable instead of turning into mojibake.
+// No-op on terminals that render Unicode (Windows Terminal, VS Code, *nix).
+if (!supportsUnicode) {
+  const wrapWrite = (stream: NodeJS.WriteStream) => {
+    const orig = stream.write.bind(stream) as (...a: any[]) => boolean;
+    (stream as any).write = (chunk: any, ...rest: any[]): boolean =>
+      typeof chunk === 'string' ? orig(sanitize(chunk), ...rest) : orig(chunk, ...rest);
+  };
+  wrapWrite(process.stdout);
+  wrapWrite(process.stderr);
+}
 
 const PACKAGES_PATH = process.env.D365FO_PACKAGE_PATH || 'C:\\AOSService\\PackagesLocalDirectory';
 const OUTPUT_PATH = process.env.METADATA_PATH || './extracted-metadata';
@@ -96,6 +110,15 @@ interface ExtractionStats {
   enumExtensions: number;
   edtExtensions: number;
   dataEntityExtensions: number;
+  viewExtensions: number;
+  queryExtensions: number;
+  mapExtensions: number;
+  menuExtensions: number;
+  securityDutyExtensions: number;
+  securityRoleExtensions: number;
+  menuItemDisplayExtensions: number;
+  menuItemActionExtensions: number;
+  menuItemOutputExtensions: number;
   services: number;
   serviceGroups: number;
   maps: number;
@@ -139,39 +162,146 @@ function formatPercent(current: number, total: number): string {
   return `${formatDecimal((current / total) * 100)}%`;
 }
 
-async function countXmlFilesInDirectory(dirPath: string): Promise<number> {
-  if (!fsSync.existsSync(dirPath)) {
-    return 0;
-  }
+/** The model-level values every extractor needs, threaded through AOT_EXTRACTORS. */
+interface ModelContext {
+  parser: XppMetadataParser;
+  modelName: string;
+  stats: ExtractionStats;
+  isCustom: boolean;
+}
 
+/** One entry of AOT_EXTRACTORS: the folders to read and the extractor that reads them. */
+interface AotExtractor {
+  /** AOT folders this extractor reads, in canonical PascalCase. */
+  dirs: string[];
+  /**
+   * Runs with `dirPaths` = those of `dirs` that exist in this model, as real on-disk
+   * paths. Never called with an empty list, so extractors need no "missing folder" check.
+   */
+  run: (ctx: ModelContext, dirPaths: string[]) => Promise<void>;
+}
+
+/**
+ * Every extractor a model is run through, in order, paired with the AOT folders it reads.
+ *
+ * This is the single source of truth for both the extraction work and the progress
+ * denominator (EXTRACTED_AOT_DIRS is derived from it), so the two cannot drift apart.
+ * They previously did: only 9 folders were counted while ~36 were extracted, which put
+ * progress past 100%.
+ *
+ * No AxClassExtension: the AOT has no such folder. Class extensions are AxClass files
+ * carrying [ExtensionOf(...)], and extractClasses emits their records (#693).
+ * AxMapExtension is empty in every package surveyed, but generate_object can emit one,
+ * so it stays wired to keep our own output indexable. AxWorkflow*Extension folders are
+ * likewise empty and nothing creates them - left out (#693).
+ */
+const AOT_EXTRACTORS: AotExtractor[] = [
+  { dirs: ['AxClass'], run: (c, [dir]) => extractClasses(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxTable'], run: (c, [dir]) => extractTables(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxForm'], run: (c, [dir]) => extractForms(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxQuery'], run: (c, [dir]) => extractQueries(dir, c.modelName, c.stats, c.isCustom) },
+  // One extractor for both: parseViewFile tells a view from a data entity by content.
+  { dirs: ['AxView', 'AxDataEntityView'], run: (c, dirs) => extractViews(c.parser, dirs, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxEnum'], run: (c, [dir]) => extractEnums(dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxEdt'], run: (c, [dir]) => extractEdts(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxReport'], run: (c, [dir]) => extractReports(dir, c.modelName, c.stats, c.isCustom) },
+
+  { dirs: ['AxSecurityPrivilege'], run: (c, [dir]) => extractSecurityPrivileges(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxSecurityDuty'], run: (c, [dir]) => extractSecurityDuties(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxSecurityRole'], run: (c, [dir]) => extractSecurityRoles(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+
+  { dirs: ['AxMenuItemDisplay'], run: (c, [dir]) => extractMenuItems(c.parser, dir, c.modelName, 'display', c.stats, c.isCustom) },
+  { dirs: ['AxMenuItemAction'], run: (c, [dir]) => extractMenuItems(c.parser, dir, c.modelName, 'action', c.stats, c.isCustom) },
+  { dirs: ['AxMenuItemOutput'], run: (c, [dir]) => extractMenuItems(c.parser, dir, c.modelName, 'output', c.stats, c.isCustom) },
+
+  { dirs: ['AxTableExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'table-extension', c.stats, c.isCustom) },
+  { dirs: ['AxFormExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'form-extension', c.stats, c.isCustom) },
+  { dirs: ['AxEnumExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'enum-extension', c.stats, c.isCustom) },
+  { dirs: ['AxEdtExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'edt-extension', c.stats, c.isCustom) },
+  { dirs: ['AxDataEntityViewExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'data-entity-extension', c.stats, c.isCustom) },
+  { dirs: ['AxViewExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'view-extension', c.stats, c.isCustom) },
+  { dirs: ['AxQuerySimpleExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'query-extension', c.stats, c.isCustom) },
+  { dirs: ['AxMenuExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'menu-extension', c.stats, c.isCustom) },
+  { dirs: ['AxSecurityDutyExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'security-duty-extension', c.stats, c.isCustom) },
+  { dirs: ['AxSecurityRoleExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'security-role-extension', c.stats, c.isCustom) },
+  { dirs: ['AxMenuItemDisplayExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'menu-item-display-extension', c.stats, c.isCustom) },
+  { dirs: ['AxMenuItemActionExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'menu-item-action-extension', c.stats, c.isCustom) },
+  { dirs: ['AxMenuItemOutputExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'menu-item-output-extension', c.stats, c.isCustom) },
+  { dirs: ['AxMapExtension'], run: (c, [dir]) => extractExtensions(c.parser, dir, c.modelName, 'map-extension', c.stats, c.isCustom) },
+
+  { dirs: ['AxService'], run: (c, [dir]) => extractServices(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxServiceGroup'], run: (c, [dir]) => extractServiceGroups(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+
+  { dirs: ['AxMap'], run: (c, [dir]) => extractMaps(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxConfigurationKey'], run: (c, [dir]) => extractConfigurationKeys(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxLicenseCode'], run: (c, [dir]) => extractLicenseCodes(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxSecurityPolicy'], run: (c, [dir]) => extractSecurityPolicies(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+  { dirs: ['AxMacroDictionary'], run: (c, [dir]) => extractMacros(c.parser, dir, c.modelName, c.stats, c.isCustom) },
+];
+
+/** Every AOT folder the extractors read - the progress denominator. Derived, never edited. */
+export const EXTRACTED_AOT_DIRS: string[] = AOT_EXTRACTORS.flatMap(e => e.dirs);
+
+/** The folders that mark a directory as an X++ model rather than bin/Resources/etc. */
+const MODEL_MARKER_DIRS = ['AxClass', 'AxTable', 'AxEnum', 'AxEdt', 'AxView', 'AxDataEntityView'];
+
+/**
+ * Map a model's real subdirectory names by their lowercased form, so callers can look
+ * up a canonical 'AxClass' regardless of the casing on disk (the AOT ships PascalCase,
+ * but Linux checkouts may be lowercased).
+ *
+ * Reading the directory once and matching case-insensitively is what keeps a folder
+ * from resolving twice: probing 'AxClass' and then an 'axclass' twin hits the same
+ * directory on case-insensitive filesystems, which double-counted every folder on
+ * Windows and made extractViews parse each view file twice.
+ */
+export async function mapModelDirs(modelPath: string): Promise<Map<string, string>> {
+  const byLowerName = new Map<string, string>();
+  try {
+    for (const entry of await fs.readdir(modelPath, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        byLowerName.set(entry.name.toLowerCase(), path.join(modelPath, entry.name));
+      }
+    }
+  } catch {
+    // Model path unreadable - callers treat this as "no extractable folders".
+  }
+  return byLowerName;
+}
+
+/** Resolve canonical folder names against a model's actual folders, dropping absent ones. */
+function resolveDirs(dirsByLowerName: Map<string, string>, canonicalDirs: string[]): string[] {
+  return canonicalDirs
+    .map(dirName => dirsByLowerName.get(dirName.toLowerCase()))
+    .filter((dirPath): dirPath is string => dirPath !== undefined);
+}
+
+async function countXmlFilesInDirectory(dirPath: string): Promise<number> {
   const files = await fs.readdir(dirPath);
   return files.filter(file => file.endsWith('.xml')).length;
 }
 
-async function countModelXmlFiles(modelPath: string): Promise<number> {
+/** Expected XML file count for a model, over exactly the folders the extractors read. */
+export async function countModelXmlFiles(dirsByLowerName: Map<string, string>): Promise<number> {
   let total = 0;
-  const sourceDirs = [
-    'AxClass', 'axclass',
-    'AxTable', 'axtable',
-    'AxForm', 'axform',
-    'AxQuery', 'axquery',
-    'AxView', 'axview',
-    'AxDataEntityView', 'axdataentityview',
-    'AxEnum', 'axenum',
-    'AxEdt', 'axedt',
-    'AxReport', 'axreport',
-  ];
-
-  for (const sourceDir of sourceDirs) {
-    total += await countXmlFilesInDirectory(path.join(modelPath, sourceDir));
+  for (const dirPath of resolveDirs(dirsByLowerName, EXTRACTED_AOT_DIRS)) {
+    total += await countXmlFilesInDirectory(dirPath);
   }
-
   return total;
 }
 
 async function extractMetadata() {
   const extractionStart = Date.now();
-  console.log('🔍 X++ Metadata Extraction');
+
+  const W = 56;
+  console.log('');
+  for (const line of box([
+    spread(c.bold('D365 F&O Metadata Extraction'), c.dim(`mode=${EXTRACT_MODE}`), W),
+    c.gray('XML metadata -> JSON'),
+  ], W)) {
+    console.log(line);
+  }
+  console.log('');
 
   // Build list of metadata root paths to scan
   // Priority: XPP config auto-detection > PACKAGES_PATH fallback
@@ -183,12 +313,12 @@ async function extractMetadata() {
     const configName = process.env.XPP_CONFIG_NAME || undefined;
     const xppConfig = await xppProvider.getActiveConfig(configName);
     if (xppConfig) {
-      console.log(`[UDE] XPP config: ${xppConfig.configName} v${xppConfig.version}`);
+      log.info(`UDE config: ${xppConfig.configName} v${xppConfig.version}`);
       customRoot = xppConfig.customPackagesPath;
       metadataRoots.push(xppConfig.customPackagesPath);
-      console.log(`[UDE] Custom packages path: ${xppConfig.customPackagesPath}`);
+      log.detail(`Custom packages: ${shortPath(xppConfig.customPackagesPath)}`);
       metadataRoots.push(xppConfig.microsoftPackagesPath);
-      console.log(`[UDE] Microsoft packages path: ${xppConfig.microsoftPackagesPath}`);
+      log.detail(`Microsoft packages: ${shortPath(xppConfig.microsoftPackagesPath)}`);
     }
   }
   // Fallback: traditional single path
@@ -196,34 +326,33 @@ async function extractMetadata() {
     metadataRoots.push(PACKAGES_PATH);
   }
 
-  console.log(`📂 Source: ${metadataRoots.join(', ')}`);
-  console.log(`📁 Output: ${OUTPUT_PATH}`);
-  console.log(`🎯 Extract Mode: ${EXTRACT_MODE}`);
+  console.log(kv('Source', metadataRoots.join(', ')));
+  console.log(kv('Output', shortPath(OUTPUT_PATH)));
   
   if (EXTRACT_MODE === 'custom') {
     if (MODELS_TO_EXTRACT.length > 0) {
-      console.log(`📋 Custom Models (explicit): ${MODELS_TO_EXTRACT.join(', ')}`);
+      log.detail(`Custom models (explicit): ${MODELS_TO_EXTRACT.join(', ')}`);
     } else {
-      console.log(`📋 Mode: Extract custom models only`);
+      log.detail('Extracting custom models only');
       if (CUSTOM_MODELS.length > 0) {
-        console.log(`📋 Custom Model patterns: ${CUSTOM_MODELS.join(', ')}`);
+        log.detail(`Custom model patterns: ${CUSTOM_MODELS.join(', ')}`);
       }
       const extensionPrefix = process.env.EXTENSION_PREFIX;
       if (extensionPrefix) {
-        console.log(`📋 Extension Prefix: ${extensionPrefix}`);
+        log.detail(`Extension prefix: ${extensionPrefix}`);
       }
     }
   } else if (EXTRACT_MODE === 'standard') {
-    console.log(`📋 Mode: Extract standard models (exclude custom)`);
+    log.detail('Extracting standard models (exclude custom)');
     if (CUSTOM_MODELS.length > 0) {
-      console.log(`📋 Custom Models to exclude: ${CUSTOM_MODELS.join(', ')}`);
+      log.detail(`Custom models to exclude: ${CUSTOM_MODELS.join(', ')}`);
     }
   } else {
-    console.log(`📋 Mode: Extract all models (standard + custom)`);
+    log.detail('Extracting all models (standard + custom)');
   }
   console.log('');
-  console.log(`ℹ️  Note: AxLabelFile labels (.label.txt) are NOT extracted here.`);
-  console.log(`   Labels are indexed directly from PACKAGES_PATH during 'npm run build-database'.`);
+  log.info('AxLabelFile labels (.label.txt) are NOT extracted here.');
+  log.detail(`Labels are indexed directly from PACKAGES_PATH during 'npm run build-database'.`);
   console.log('');
 
   const parser = new XppMetadataParser();
@@ -250,6 +379,15 @@ async function extractMetadata() {
     enumExtensions: 0,
     edtExtensions: 0,
     dataEntityExtensions: 0,
+    viewExtensions: 0,
+    queryExtensions: 0,
+    mapExtensions: 0,
+    menuExtensions: 0,
+    securityDutyExtensions: 0,
+    securityRoleExtensions: 0,
+    menuItemDisplayExtensions: 0,
+    menuItemActionExtensions: 0,
+    menuItemOutputExtensions: 0,
     services: 0,
     serviceGroups: 0,
     maps: 0,
@@ -265,12 +403,12 @@ async function extractMetadata() {
   if (EXTRACT_MODE === 'all') {
     try {
       await fs.rm(OUTPUT_PATH, { recursive: true, force: true });
-      console.log('🗑️  Cleaned up existing metadata directory');
+      log.step('Cleaned up existing metadata directory');
     } catch (error) {
       // Ignore errors if directory doesn't exist
     }
   } else {
-    console.log(`ℹ️  Preserving existing metadata (mode: ${EXTRACT_MODE})`);
+    log.info('Preserving existing metadata (incremental build)');
   }
 
   // Create output directory
@@ -310,7 +448,7 @@ async function extractMetadata() {
         pkg => pkg.toLowerCase() === modelName.toLowerCase()
       );
       if (!found) {
-        console.warn(`⚠️  Model not found: ${modelName}`);
+        log.warn(`Model not found: ${modelName}`);
       }
     }
   } else {
@@ -352,11 +490,11 @@ async function extractMetadata() {
 
     const packagesToProcessCount = packageRootMap.size;
     if (FILTER_MODE === 'custom-only') {
-      console.log(`📦 Found ${formatCount(packagesToProcessCount)} custom packages to process (${formatCount(totalAllPackageNames - packagesToProcessCount)} standard models excluded)`);
+      log.step(`Found ${formatCount(packagesToProcessCount)} custom packages to process (${formatCount(totalAllPackageNames - packagesToProcessCount)} standard models excluded)`);
     } else if (FILTER_MODE === 'standard-only') {
-      console.log(`📦 Found ${formatCount(packagesToProcessCount)} standard packages to process (${formatCount(totalAllPackageNames - packagesToProcessCount)} custom models excluded)`);
+      log.step(`Found ${formatCount(packagesToProcessCount)} standard packages to process (${formatCount(totalAllPackageNames - packagesToProcessCount)} custom models excluded)`);
     } else {
-      console.log(`📦 Found ${formatCount(packagesToProcessCount)} packages to process`);
+      log.step(`Found ${formatCount(packagesToProcessCount)} packages to process`);
     }
   }
 
@@ -369,7 +507,7 @@ async function extractMetadata() {
     try {
       await fs.access(packagePath);
     } catch {
-      console.warn(`⚠️  Package path not found: ${packagePath}`);
+      log.warn(`Package path not found: ${packagePath}`);
       continue;
     }
 
@@ -378,45 +516,34 @@ async function extractMetadata() {
     const modelDirs = entries.filter(e => e.isDirectory() || e.isSymbolicLink()).map(e => e.name);
 
     for (const modelName of modelDirs) {
+      const modelPath = path.join(packagePath, modelName);
+
+      // Check if this directory contains X++ metadata (has AxClass, AxTable, etc.)
+      // Do this first so non-model directories (bin, Resources, Reports, …) are
+      // silently skipped before any model-name-based filtering is applied.
+      const modelDirsByLowerName = await mapModelDirs(modelPath);
+      if (resolveDirs(modelDirsByLowerName, MODEL_MARKER_DIRS).length === 0) {
+        // Skip directories that don't contain X++ metadata
+        continue;
+      }
+
       // Skip FormAdaptor models
       if (modelName.endsWith('FormAdaptor')) {
-        console.log(`   ⏭️  Skipping FormAdaptor model: ${modelName}`);
+        log.detail(`${glyph.arrow} skip FormAdaptor model: ${modelName}`);
         continue;
       }
 
       // Apply model-level filtering
       if (FILTER_MODE === 'custom-only' && !isCustomModel(modelName)) {
-        console.log(`   ⏭️  Skipping standard model: ${modelName}`);
+        log.detail(`${glyph.arrow} skip standard model: ${modelName}`);
         continue;
       }
       if (FILTER_MODE === 'standard-only' && isCustomModel(modelName)) {
-        console.log(`   ⏭️  Skipping custom model: ${modelName}`);
+        log.detail(`${glyph.arrow} skip custom model: ${modelName}`);
         continue;
       }
 
-      const modelPath = path.join(packagePath, modelName);
-
-      // Check if this directory contains X++ metadata (has AxClass, AxTable, etc.)
-      // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-      const hasAxClass = await fs.access(path.join(modelPath, 'AxClass')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axclass')).then(() => true).catch(() => false));
-      const hasAxTable = await fs.access(path.join(modelPath, 'AxTable')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axtable')).then(() => true).catch(() => false));
-      const hasAxEnum = await fs.access(path.join(modelPath, 'AxEnum')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axenum')).then(() => true).catch(() => false));
-      const hasAxEdt = await fs.access(path.join(modelPath, 'AxEdt')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axedt')).then(() => true).catch(() => false));
-      const hasAxView = await fs.access(path.join(modelPath, 'AxView')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axview')).then(() => true).catch(() => false));
-      const hasAxDataEntityView = await fs.access(path.join(modelPath, 'AxDataEntityView')).then(() => true)
-        .catch(() => fs.access(path.join(modelPath, 'axdataentityview')).then(() => true).catch(() => false));
-
-      if (!hasAxClass && !hasAxTable && !hasAxEnum && !hasAxEdt && !hasAxView && !hasAxDataEntityView) {
-        // Skip directories that don't contain X++ metadata
-        continue;
-      }
-
-      const expectedXmlFiles = await countModelXmlFiles(modelPath);
+      const expectedXmlFiles = await countModelXmlFiles(modelDirsByLowerName);
       // In UDE mode: custom iff the package lives under customRoot.
       // In traditional mode: fall back to name-based detection.
       const isCustom = customRoot ? rootPath === customRoot : isCustomModel(modelName);
@@ -426,7 +553,8 @@ async function extractMetadata() {
 
   const totalModels = modelWorkItems.length;
   const totalExpectedFiles = modelWorkItems.reduce((sum, item) => sum + item.expectedXmlFiles, 0);
-  console.log(`📍 Planned work: ${formatCount(totalModels)} models, ${formatCount(totalExpectedFiles)} XML files`);
+  console.log('');
+  log.step(`Planned work: ${formatCount(totalModels)} models, ${formatCount(totalExpectedFiles)} XML files`);
 
   // Process each model with progress tracking
   let currentPackage = '';
@@ -436,66 +564,26 @@ async function extractMetadata() {
   for (const modelItem of modelWorkItems) {
     if (currentPackage !== modelItem.packageName) {
       currentPackage = modelItem.packageName;
-      console.log(`\n📦 Processing package: ${currentPackage} | Model progress: ${formatPercent(processedModels, totalModels)} (${formatCount(processedModels)}/${formatCount(totalModels)})`);
+      console.log('');
+      log.step(`${c.bold(currentPackage)} ${c.dim(glyph.dot)} model progress ${formatPercent(processedModels, totalModels)} (${formatCount(processedModels)}/${formatCount(totalModels)})`);
     }
 
     const modelStart = Date.now();
-    console.log(`   📂 Model: ${modelItem.modelName} (${formatCount(modelItem.expectedXmlFiles)} XML files)`);
+    log.detail(`${modelItem.modelName} (${formatCount(modelItem.expectedXmlFiles)} XML files)`);
 
     const { modelPath, modelName, isCustom } = modelItem;
 
-    // Extract classes
-    await extractClasses(parser, modelPath, modelName, stats, isCustom);
+    // Resolve the model's folders once, then run every extractor whose folders exist.
+    // AOT_EXTRACTORS is the same list countModelXmlFiles counted, so the numerator and
+    // the denominator cover exactly the same folders.
+    const ctx: ModelContext = { parser, modelName, stats, isCustom };
+    const dirsByLowerName = await mapModelDirs(modelPath);
 
-    // Extract tables
-    await extractTables(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract forms
-    await extractForms(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract queries
-    await extractQueries(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract views
-    await extractViews(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract enums
-    await extractEnums(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract EDTs
-    await extractEdts(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract Reports
-    await extractReports(modelPath, modelName, stats, isCustom);
-
-    // Extract security objects
-    await extractSecurityPrivileges(parser, modelPath, modelName, stats, isCustom);
-    await extractSecurityDuties(parser, modelPath, modelName, stats, isCustom);
-    await extractSecurityRoles(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract menu items
-    await extractMenuItems(parser, modelPath, modelName, 'display', stats, isCustom);
-    await extractMenuItems(parser, modelPath, modelName, 'action', stats, isCustom);
-    await extractMenuItems(parser, modelPath, modelName, 'output', stats, isCustom);
-
-    // Extract extensions
-    await extractExtensions(parser, modelPath, modelName, 'table-extension', 'AxTableExtension', stats, isCustom);
-    await extractExtensions(parser, modelPath, modelName, 'class-extension', 'AxClassExtension', stats, isCustom);
-    await extractExtensions(parser, modelPath, modelName, 'form-extension', 'AxFormExtension', stats, isCustom);
-    await extractExtensions(parser, modelPath, modelName, 'enum-extension', 'AxEnumExtension', stats, isCustom);
-    await extractExtensions(parser, modelPath, modelName, 'edt-extension', 'AxEdtExtension', stats, isCustom);
-    await extractExtensions(parser, modelPath, modelName, 'data-entity-extension', 'AxDataEntityViewExtension', stats, isCustom);
-
-    // Extract services + service groups
-    await extractServices(parser, modelPath, modelName, stats, isCustom);
-    await extractServiceGroups(parser, modelPath, modelName, stats, isCustom);
-
-    // Extract maps, feature gating, security policies, macros
-    await extractMaps(parser, modelPath, modelName, stats, isCustom);
-    await extractConfigurationKeys(parser, modelPath, modelName, stats, isCustom);
-    await extractLicenseCodes(parser, modelPath, modelName, stats, isCustom);
-    await extractSecurityPolicies(parser, modelPath, modelName, stats, isCustom);
-    await extractMacros(parser, modelPath, modelName, stats, isCustom);
+    for (const extractor of AOT_EXTRACTORS) {
+      const dirPaths = resolveDirs(dirsByLowerName, extractor.dirs);
+      if (dirPaths.length === 0) continue;
+      await extractor.run(ctx, dirPaths);
+    }
 
     const modelDuration = Date.now() - modelStart;
     cumulativeModelDuration += modelDuration;
@@ -504,75 +592,84 @@ async function extractMetadata() {
     const elapsed = Date.now() - extractionStart;
     const avgModelDuration = processedModels > 0 ? cumulativeModelDuration / processedModels : 0;
     const avgFileDuration = stats.totalFiles > 0 ? elapsed / stats.totalFiles : 0;
-    console.log(
-      `   ⏱️  Model done in ${formatDuration(modelDuration)} | Progress: ${formatPercent(processedModels, totalModels)} (${formatCount(processedModels)}/${formatCount(totalModels)} models), ${formatPercent(stats.totalFiles, totalExpectedFiles)} (${formatCount(stats.totalFiles)}/${formatCount(totalExpectedFiles)} files) | Avg: ${formatDuration(avgModelDuration)}/model, ${formatDuration(avgFileDuration)}/file`
+    log.detail(
+      `done in ${formatDuration(modelDuration)} ${glyph.dot} progress ${formatPercent(processedModels, totalModels)} (${formatCount(processedModels)}/${formatCount(totalModels)} models), ${formatPercent(stats.totalFiles, totalExpectedFiles)} (${formatCount(stats.totalFiles)}/${formatCount(totalExpectedFiles)} files) ${glyph.dot} avg ${formatDuration(avgModelDuration)}/model, ${formatDuration(avgFileDuration)}/file`
     );
   }
 
-  console.log('\n✅ Extraction complete!');
   const totalDuration = Date.now() - extractionStart;
   const averagePerFile = stats.totalFiles > 0 ? totalDuration / stats.totalFiles : 0;
   const averagePerModel = processedModels > 0 ? cumulativeModelDuration / processedModels : 0;
-  console.log(`⏱️  Duration: ${formatDuration(totalDuration)} (avg ${formatDuration(averagePerModel)}/model, ${formatDuration(averagePerFile)}/file)`);
-  console.log(`📊 Statistics:`);
-  console.log(`   Total files: ${formatCount(stats.totalFiles)}`);
-  console.log(`   Classes: ${formatCount(stats.classes)}`);
-  console.log(`   Tables: ${formatCount(stats.tables)}`);
-  console.log(`   Forms: ${formatCount(stats.forms)}`);
-  console.log(`   Queries: ${formatCount(stats.queries)}`);
-  console.log(`   Views: ${formatCount(stats.views)}`);
-  console.log(`   Data entities: ${formatCount(stats.dataEntities)}`);
-  console.log(`   Enums: ${formatCount(stats.enums)}`);
-  console.log(`   EDTs: ${formatCount(stats.edts)}`);
-  console.log(`   Reports: ${formatCount(stats.reports)}`);
-  console.log(`   Security privileges: ${formatCount(stats.securityPrivileges)}`);
-  console.log(`   Security duties: ${formatCount(stats.securityDuties)}`);
-  console.log(`   Security roles: ${formatCount(stats.securityRoles)}`);
-  console.log(`   Menu items (display): ${formatCount(stats.menuItemDisplays)}`);
-  console.log(`   Menu items (action): ${formatCount(stats.menuItemActions)}`);
-  console.log(`   Menu items (output): ${formatCount(stats.menuItemOutputs)}`);
-  console.log(`   Table extensions: ${formatCount(stats.tableExtensions)}`);
-  console.log(`   Class extensions: ${formatCount(stats.classExtensions)}`);
-  console.log(`   Form extensions: ${formatCount(stats.formExtensions)}`);
-  console.log(`   Enum extensions: ${formatCount(stats.enumExtensions)}`);
-  console.log(`   EDT extensions: ${formatCount(stats.edtExtensions)}`);
-  console.log(`   Data entity extensions: ${formatCount(stats.dataEntityExtensions)}`);
-  console.log(`   Services: ${formatCount(stats.services)}`);
-  console.log(`   Service groups: ${formatCount(stats.serviceGroups)}`);
-  console.log(`   Maps: ${formatCount(stats.maps)}`);
-  console.log(`   Configuration keys: ${formatCount(stats.configurationKeys)}`);
-  console.log(`   License codes: ${formatCount(stats.licenseCodes)}`);
-  console.log(`   Security policies: ${formatCount(stats.securityPolicies)}`);
-  console.log(`   Macros: ${formatCount(stats.macros)}`);
-  console.log(`   Errors: ${formatCount(stats.errors)}`);
+  console.log('');
+  console.log(statusLine('ok', c.green(`Extraction complete in ${formatDuration(totalDuration)}`)));
+  log.detail(`avg ${formatDuration(averagePerModel)}/model, ${formatDuration(averagePerFile)}/file`);
+  console.log('');
+  console.log(sectionTitle(`Statistics (${formatCount(stats.totalFiles)} files)`));
+  console.log('');
+  const statRows: Array<[string, number]> = [
+    ['Classes', stats.classes],
+    ['Tables', stats.tables],
+    ['Forms', stats.forms],
+    ['Queries', stats.queries],
+    ['Views', stats.views],
+    ['Data entities', stats.dataEntities],
+    ['Enums', stats.enums],
+    ['EDTs', stats.edts],
+    ['Reports', stats.reports],
+    ['Security privileges', stats.securityPrivileges],
+    ['Security duties', stats.securityDuties],
+    ['Security roles', stats.securityRoles],
+    ['Menu items (display)', stats.menuItemDisplays],
+    ['Menu items (action)', stats.menuItemActions],
+    ['Menu items (output)', stats.menuItemOutputs],
+    ['Table extensions', stats.tableExtensions],
+    ['Class extensions', stats.classExtensions],
+    ['Form extensions', stats.formExtensions],
+    ['Enum extensions', stats.enumExtensions],
+    ['EDT extensions', stats.edtExtensions],
+    ['Data entity extensions', stats.dataEntityExtensions],
+    ['View extensions', stats.viewExtensions],
+    ['Query extensions', stats.queryExtensions],
+    ['Map extensions', stats.mapExtensions],
+    ['Menu extensions', stats.menuExtensions],
+    ['Security duty extensions', stats.securityDutyExtensions],
+    ['Security role extensions', stats.securityRoleExtensions],
+    ['Menu item extensions (display)', stats.menuItemDisplayExtensions],
+    ['Menu item extensions (action)', stats.menuItemActionExtensions],
+    ['Menu item extensions (output)', stats.menuItemOutputExtensions],
+    ['Services', stats.services],
+    ['Service groups', stats.serviceGroups],
+    ['Maps', stats.maps],
+    ['Configuration keys', stats.configurationKeys],
+    ['License codes', stats.licenseCodes],
+    ['Security policies', stats.securityPolicies],
+    ['Macros', stats.macros],
+  ];
+  const statLabelWidth = Math.max(...statRows.map(([label]) => label.length)) + 2;
+  for (const [label, value] of statRows) {
+    if (value === 0) continue;
+    console.log(kv(label, c.cyan(formatCount(value)), statLabelWidth));
+  }
+  console.log('');
+  if (stats.errors > 0) {
+    console.log(statusLine('warn', c.yellow(`${formatCount(stats.errors)} error(s) during extraction - see log above`)));
+  } else {
+    console.log(statusLine('ok', 'No errors'));
+  }
+  console.log('');
 }
 
 async function extractClasses(
   parser: XppMetadataParser,
-  modelPath: string,
+  classesPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let classesPath = path.join(modelPath, 'AxClass');
-  
-  try {
-    await fs.access(classesPath);
-  } catch {
-    // Try lowercase
-    classesPath = path.join(modelPath, 'axclass');
-    try {
-      await fs.access(classesPath);
-    } catch {
-      return; // No classes in this model
-    }
-  }
-
   const files = await fs.readdir(classesPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   Classes: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Classes: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(classesPath, file);
@@ -582,7 +679,7 @@ async function extractClasses(
       const classInfo = await parser.parseClassFile(filePath, modelName);
       
       if (!classInfo.success || !classInfo.data) {
-        console.error(`   ⚠️  Failed to parse ${file}: ${classInfo.error || 'Unknown error'}`);
+        log.warn(`Failed to parse ${file}: ${classInfo.error || 'Unknown error'}`);
         stats.errors++;
         continue;
       }
@@ -594,40 +691,58 @@ async function extractClasses(
       await fs.writeFile(outputFile, JSON.stringify(classInfo.data, isCustom ? sourcePathReplacer : undefined, 2));
 
       stats.classes++;
+
+      // A class carrying [ExtensionOf(...)] is also a class extension. It stays
+      // indexed as a class (it is a real AxClass) and additionally gets an
+      // extension record, which is what find_coc_extensions and
+      // resolve_references' extension-method path query.
+      if (classInfo.data.extensionOf) {
+        await writeClassExtensionRecord(classInfo.data, modelName, stats, isCustom);
+      }
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
 
 }
 
+/**
+ * Write the class-extension record for an AxClass carrying [ExtensionOf(...)]
+ * into the `class-extensions/` folder symbolIndex.indexExtensions already
+ * reads, so both the symbols row and the extension_metadata row come out of
+ * the existing pipeline unchanged.
+ */
+async function writeClassExtensionRecord(
+  classInfo: XppClassInfo,
+  modelName: string,
+  stats: ExtractionStats,
+  isCustom: boolean,
+) {
+  const record = buildClassExtensionRecord(classInfo, modelName);
+  if (!record) return;
+
+  const outputDir = path.join(OUTPUT_PATH, modelName, 'class-extensions');
+  await fs.mkdir(outputDir, { recursive: true });
+  await fs.writeFile(
+    path.join(outputDir, `${classInfo.name}.json`),
+    JSON.stringify(record, isCustom ? sourcePathReplacer : undefined, 2),
+  );
+
+  stats.classExtensions++;
+}
+
 async function extractTables(
   parser: XppMetadataParser,
-  modelPath: string,
+  tablesPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let tablesPath = path.join(modelPath, 'AxTable');
-  
-  try {
-    await fs.access(tablesPath);
-  } catch {
-    // Try lowercase
-    tablesPath = path.join(modelPath, 'axtable');
-    try {
-      await fs.access(tablesPath);
-    } catch {
-      return; // No tables in this model
-    }
-  }
-
   const files = await fs.readdir(tablesPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   Tables: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Tables: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(tablesPath, file);
@@ -637,7 +752,7 @@ async function extractTables(
       const tableInfo = await parser.parseTableFile(filePath, modelName);
       
       if (!tableInfo.success || !tableInfo.data) {
-        console.error(`   ⚠️  Failed to parse ${file}: ${tableInfo.error || 'Unknown error'}`);
+        log.warn(`Failed to parse ${file}: ${tableInfo.error || 'Unknown error'}`);
         stats.errors++;
         continue;
       }
@@ -650,7 +765,7 @@ async function extractTables(
 
       stats.tables++;
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -659,30 +774,15 @@ async function extractTables(
 
 async function extractForms(
   parser: XppMetadataParser,
-  modelPath: string,
+  formsPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let formsPath = path.join(modelPath, 'AxForm');
-  
-  try {
-    await fs.access(formsPath);
-  } catch {
-    // Try lowercase
-    formsPath = path.join(modelPath, 'axform');
-    try {
-      await fs.access(formsPath);
-    } catch {
-      return; // No forms in this model
-    }
-  }
-
   const files = await fs.readdir(formsPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   Forms: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Forms: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(formsPath, file);
@@ -693,7 +793,7 @@ async function extractForms(
       const result = await parser.parseFormFile(filePath, modelName);
       
       if (!result.success || !result.data) {
-        console.error(`   ❌ Error parsing ${file}: ${result.error || 'Unknown error'}`);
+        log.err(`Error parsing ${file}: ${result.error || 'Unknown error'}`);
         stats.errors++;
         continue;
       }
@@ -707,7 +807,7 @@ async function extractForms(
 
       stats.forms++;
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -715,31 +815,15 @@ async function extractForms(
 }
 
 async function extractQueries(
-  parser: XppMetadataParser,
-  modelPath: string,
+  queriesPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let queriesPath = path.join(modelPath, 'AxQuery');
-  
-  try {
-    await fs.access(queriesPath);
-  } catch {
-    // Try lowercase
-    queriesPath = path.join(modelPath, 'axquery');
-    try {
-      await fs.access(queriesPath);
-    } catch {
-      return; // No queries in this model
-    }
-  }
-
   const files = await fs.readdir(queriesPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   Queries: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Queries: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(queriesPath, file);
@@ -762,7 +846,7 @@ async function extractQueries(
 
       stats.queries++;
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -771,24 +855,11 @@ async function extractQueries(
 
 async function extractViews(
   parser: XppMetadataParser,
-  modelPath: string,
+  sourceDirs: string[],
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  const sourceDirs: string[] = [];
-
-  for (const dirName of ['AxView', 'axview', 'AxDataEntityView', 'axdataentityview']) {
-    const candidate = path.join(modelPath, dirName);
-    if (fsSync.existsSync(candidate)) {
-      sourceDirs.push(candidate);
-    }
-  }
-
-  if (sourceDirs.length === 0) {
-    return;
-  }
-
   let totalXmlFiles = 0;
 
   for (const sourceDir of sourceDirs) {
@@ -804,7 +875,7 @@ async function extractViews(
         const viewInfo = await parser.parseViewFile(filePath, modelName);
 
         if (!viewInfo.success || !viewInfo.data) {
-          console.error(`   ⚠️  Failed to parse ${file}: ${viewInfo.error || 'Unknown error'}`);
+          log.warn(`Failed to parse ${file}: ${viewInfo.error || 'Unknown error'}`);
           stats.errors++;
           continue;
         }
@@ -820,41 +891,25 @@ async function extractViews(
           stats.views++;
         }
       } catch (error) {
-        console.error(`   ❌ Error parsing ${file}:`, error);
+        log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
         stats.errors++;
       }
     }
   }
 
-  console.log(`   Views/Data entities: ${formatCount(totalXmlFiles)} files`);
+  log.detail(`Views/Data entities: ${formatCount(totalXmlFiles)} files`);
 }
 
 async function extractEnums(
-  parser: XppMetadataParser,
-  modelPath: string,
+  enumsPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let enumsPath = path.join(modelPath, 'AxEnum');
-  
-  try {
-    await fs.access(enumsPath);
-  } catch {
-    // Try lowercase
-    enumsPath = path.join(modelPath, 'axenum');
-    try {
-      await fs.access(enumsPath);
-    } catch {
-      return; // No enums in this model
-    }
-  }
-
   const files = await fs.readdir(enumsPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   Enums: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Enums: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(enumsPath, file);
@@ -870,7 +925,7 @@ async function extractEnums(
 
       stats.enums++;
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -879,30 +934,15 @@ async function extractEnums(
 
 async function extractEdts(
   parser: XppMetadataParser,
-  modelPath: string,
+  edtsPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let edtsPath = path.join(modelPath, 'AxEdt');
-
-  try {
-    await fs.access(edtsPath);
-  } catch {
-    // Try lowercase
-    edtsPath = path.join(modelPath, 'axedt');
-    try {
-      await fs.access(edtsPath);
-    } catch {
-      return; // No EDTs in this model
-    }
-  }
-
   const files = await fs.readdir(edtsPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
-  console.log(`   EDTs: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`EDTs: ${formatCount(xmlFiles.length)} files`);
 
   for (const file of xmlFiles) {
     const filePath = path.join(edtsPath, file);
@@ -913,7 +953,7 @@ async function extractEdts(
       const result = await parser.parseEdtFile(filePath, modelName);
       
       if (!result.success || !result.data) {
-        console.error(`   ❌ Error parsing ${file}: ${result.error || 'Unknown error'}`);
+        log.err(`Error parsing ${file}: ${result.error || 'Unknown error'}`);
         stats.errors++;
         continue;
       }
@@ -927,7 +967,7 @@ async function extractEdts(
 
       stats.edts++;
     } catch (error) {
-      console.error(`   ❌ Error parsing ${file}:`, error);
+      log.err(`Error parsing ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -941,31 +981,16 @@ async function extractEdts(
  * caching a full parse, so we only need enough for the symbol DB entry.
  */
 async function extractReports(
-  modelPath: string,
+  reportsPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  // Support both uppercase and lowercase directory names (Linux case-sensitivity)
-  let reportsPath = path.join(modelPath, 'AxReport');
-
-  try {
-    await fs.access(reportsPath);
-  } catch {
-    // Try lowercase
-    reportsPath = path.join(modelPath, 'axreport');
-    try {
-      await fs.access(reportsPath);
-    } catch {
-      return; // No reports in this model
-    }
-  }
-
   const files = await fs.readdir(reportsPath);
   const xmlFiles = files.filter(f => f.endsWith('.xml'));
 
   if (xmlFiles.length === 0) return;
-  console.log(`   Reports: ${formatCount(xmlFiles.length)} files`);
+  log.detail(`Reports: ${formatCount(xmlFiles.length)} files`);
 
   const outputDir = path.join(OUTPUT_PATH, modelName, 'reports');
   await fs.mkdir(outputDir, { recursive: true });
@@ -989,7 +1014,7 @@ async function extractReports(
 
       stats.reports++;
     } catch (error) {
-      console.error(`   ❌ Error extracting report ${file}:`, error);
+      log.err(`Error extracting report ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -997,19 +1022,14 @@ async function extractReports(
 
 async function extractSecurityPrivileges(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  let dirPath = path.join(modelPath, 'AxSecurityPrivilege');
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, 'axsecurityprivilege');
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Security privileges: ${formatCount(files.length)} files`);
+  log.detail(`Security privileges: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, 'security-privileges');
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1022,7 +1042,7 @@ async function extractSecurityPrivileges(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'security-privilege' }, isCustom ? sourcePathReplacer : undefined, 2));
       stats.securityPrivileges++;
     } catch (error) {
-      console.error(`   ❌ Error extracting security privilege ${file}:`, error);
+      log.err(`Error extracting security privilege ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1030,19 +1050,14 @@ async function extractSecurityPrivileges(
 
 async function extractSecurityDuties(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  let dirPath = path.join(modelPath, 'AxSecurityDuty');
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, 'axsecurityduty');
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Security duties: ${formatCount(files.length)} files`);
+  log.detail(`Security duties: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, 'security-duties');
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1055,7 +1070,7 @@ async function extractSecurityDuties(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'security-duty' }, isCustom ? sourcePathReplacer : undefined, 2));
       stats.securityDuties++;
     } catch (error) {
-      console.error(`   ❌ Error extracting security duty ${file}:`, error);
+      log.err(`Error extracting security duty ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1063,19 +1078,14 @@ async function extractSecurityDuties(
 
 async function extractSecurityRoles(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  let dirPath = path.join(modelPath, 'AxSecurityRole');
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, 'axsecurityrole');
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Security roles: ${formatCount(files.length)} files`);
+  log.detail(`Security roles: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, 'security-roles');
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1088,7 +1098,7 @@ async function extractSecurityRoles(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'security-role' }, isCustom ? sourcePathReplacer : undefined, 2));
       stats.securityRoles++;
     } catch (error) {
-      console.error(`   ❌ Error extracting security role ${file}:`, error);
+      log.err(`Error extracting security role ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1096,26 +1106,19 @@ async function extractSecurityRoles(
 
 async function extractMenuItems(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   itemType: 'display' | 'action' | 'output',
   stats: ExtractionStats,
   isCustom = false
 ) {
-  const dirName = itemType === 'display' ? 'AxMenuItemDisplay'
-    : itemType === 'action' ? 'AxMenuItemAction' : 'AxMenuItemOutput';
   const outDirName = `menu-item-${itemType}s`;
   const statKey = itemType === 'display' ? 'menuItemDisplays'
     : itemType === 'action' ? 'menuItemActions' : 'menuItemOutputs';
 
-  let dirPath = path.join(modelPath, dirName);
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, dirName.toLowerCase());
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Menu items (${itemType}): ${formatCount(files.length)} files`);
+  log.detail(`Menu items (${itemType}): ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, outDirName);
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1128,7 +1131,7 @@ async function extractMenuItems(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: `menu-item-${itemType}` }, isCustom ? sourcePathReplacer : undefined, 2));
       (stats as any)[statKey]++;
     } catch (error) {
-      console.error(`   ❌ Error extracting menu item (${itemType}) ${file}:`, error);
+      log.err(`Error extracting menu item (${itemType}) ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1136,10 +1139,9 @@ async function extractMenuItems(
 
 async function extractExtensions(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   extensionType: string,
-  axDirName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
@@ -1151,16 +1153,20 @@ async function extractExtensions(
     'enum-extension': 'enumExtensions',
     'edt-extension': 'edtExtensions',
     'data-entity-extension': 'dataEntityExtensions',
+    'view-extension': 'viewExtensions',
+    'query-extension': 'queryExtensions',
+    'map-extension': 'mapExtensions',
+    'menu-extension': 'menuExtensions',
+    'security-duty-extension': 'securityDutyExtensions',
+    'security-role-extension': 'securityRoleExtensions',
+    'menu-item-display-extension': 'menuItemDisplayExtensions',
+    'menu-item-action-extension': 'menuItemActionExtensions',
+    'menu-item-output-extension': 'menuItemOutputExtensions',
   };
 
-  let dirPath = path.join(modelPath, axDirName);
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, axDirName.toLowerCase());
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   ${extensionType}s: ${formatCount(files.length)} files`);
+  log.detail(`${extensionType}s: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, outDirName);
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1174,7 +1180,7 @@ async function extractExtensions(
       const statKey = statKeyMap[extensionType];
       if (statKey) (stats as any)[statKey]++;
     } catch (error) {
-      console.error(`   ❌ Error extracting ${extensionType} ${file}:`, error);
+      log.err(`Error extracting ${extensionType} ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1182,19 +1188,14 @@ async function extractExtensions(
 
 async function extractServices(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  let dirPath = path.join(modelPath, 'AxService');
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, 'axservice');
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Services: ${formatCount(files.length)} files`);
+  log.detail(`Services: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, 'services');
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1207,7 +1208,7 @@ async function extractServices(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'service' }, isCustom ? sourcePathReplacer : undefined, 2));
       stats.services++;
     } catch (error) {
-      console.error(`   ❌ Error extracting service ${file}:`, error);
+      log.err(`Error extracting service ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1215,19 +1216,14 @@ async function extractServices(
 
 async function extractServiceGroups(
   parser: XppMetadataParser,
-  modelPath: string,
+  dirPath: string,
   modelName: string,
   stats: ExtractionStats,
   isCustom = false
 ) {
-  let dirPath = path.join(modelPath, 'AxServiceGroup');
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, 'axservicegroup');
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   Service groups: ${formatCount(files.length)} files`);
+  log.detail(`Service groups: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, 'service-groups');
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1240,7 +1236,7 @@ async function extractServiceGroups(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type: 'service-group' }, isCustom ? sourcePathReplacer : undefined, 2));
       stats.serviceGroups++;
     } catch (error) {
-      console.error(`   ❌ Error extracting service group ${file}:`, error);
+      log.err(`Error extracting service group ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
@@ -1251,9 +1247,8 @@ async function extractServiceGroups(
  * writes JSON metadata with the given `type`, and bumps `statKey`.
  */
 async function extractSimpleType(
-  modelPath: string,
+  dirPath: string,
   modelName: string,
-  axDirName: string,
   outDirName: string,
   type: string,
   statKey: keyof ExtractionStats,
@@ -1262,14 +1257,9 @@ async function extractSimpleType(
   isCustom: boolean,
   label: string,
 ) {
-  let dirPath = path.join(modelPath, axDirName);
-  try { await fs.access(dirPath); } catch {
-    dirPath = path.join(modelPath, axDirName.toLowerCase());
-    try { await fs.access(dirPath); } catch { return; }
-  }
   const files = (await fs.readdir(dirPath)).filter(f => f.endsWith('.xml'));
   if (files.length === 0) return;
-  console.log(`   ${label}: ${formatCount(files.length)} files`);
+  log.detail(`${label}: ${formatCount(files.length)} files`);
   const outputDir = path.join(OUTPUT_PATH, modelName, outDirName);
   await fs.mkdir(outputDir, { recursive: true });
   for (const file of files) {
@@ -1282,39 +1272,46 @@ async function extractSimpleType(
       await fs.writeFile(outputFile, JSON.stringify({ ...result.data, model: modelName, type }, isCustom ? sourcePathReplacer : undefined, 2));
       (stats as any)[statKey]++;
     } catch (error) {
-      console.error(`   ❌ Error extracting ${label} ${file}:`, error);
+      log.err(`Error extracting ${label} ${file}: ${error instanceof Error ? error.message : error}`);
       stats.errors++;
     }
   }
 }
 
-async function extractMaps(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
-  await extractSimpleType(modelPath, modelName, 'AxMap', 'maps', 'map', 'maps',
+async function extractMaps(parser: XppMetadataParser, dirPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(dirPath, modelName, 'maps', 'map', 'maps',
     (f) => parser.parseMapFile(f), stats, isCustom, 'Maps');
 }
 
-async function extractConfigurationKeys(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
-  await extractSimpleType(modelPath, modelName, 'AxConfigurationKey', 'configuration-keys', 'configuration-key', 'configurationKeys',
+async function extractConfigurationKeys(parser: XppMetadataParser, dirPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(dirPath, modelName, 'configuration-keys', 'configuration-key', 'configurationKeys',
     (f) => parser.parseConfigurationKeyFile(f), stats, isCustom, 'Configuration keys');
 }
 
-async function extractLicenseCodes(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
-  await extractSimpleType(modelPath, modelName, 'AxLicenseCode', 'license-codes', 'license-code', 'licenseCodes',
+async function extractLicenseCodes(parser: XppMetadataParser, dirPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(dirPath, modelName, 'license-codes', 'license-code', 'licenseCodes',
     (f) => parser.parseLicenseCodeFile(f), stats, isCustom, 'License codes');
 }
 
-async function extractSecurityPolicies(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
-  await extractSimpleType(modelPath, modelName, 'AxSecurityPolicy', 'security-policies', 'security-policy', 'securityPolicies',
+async function extractSecurityPolicies(parser: XppMetadataParser, dirPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(dirPath, modelName, 'security-policies', 'security-policy', 'securityPolicies',
     (f) => parser.parseSecurityPolicyFile(f), stats, isCustom, 'Security policies');
 }
 
-async function extractMacros(parser: XppMetadataParser, modelPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
-  await extractSimpleType(modelPath, modelName, 'AxMacroDictionary', 'macros', 'macro', 'macros',
+async function extractMacros(parser: XppMetadataParser, dirPath: string, modelName: string, stats: ExtractionStats, isCustom = false) {
+  await extractSimpleType(dirPath, modelName, 'macros', 'macro', 'macros',
     (f) => parser.parseMacroFile(f), stats, isCustom, 'Macros');
 }
 
-// Run extraction
-extractMetadata().catch((error) => {
-  console.error('❌ Fatal error:', error);
-  process.exit(1);
-});
+// Run extraction only when invoked as a script: tests import this module for
+// EXTRACTED_AOT_DIRS/mapModelDirs/countModelXmlFiles and must not trigger a full run.
+const invokedAsScript = process.argv[1] !== undefined
+  && path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (invokedAsScript) {
+  extractMetadata().catch((error) => {
+    log.err(`Fatal error: ${error instanceof Error ? error.message : String(error)}`);
+    if (error instanceof Error && error.stack) console.error(error.stack);
+    process.exit(1);
+  });
+}

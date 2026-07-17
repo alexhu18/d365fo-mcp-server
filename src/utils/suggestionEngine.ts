@@ -29,24 +29,19 @@ export function generateSearchSuggestions(
   maxSuggestions: number = 5
 ): SearchSuggestion[] {
   const suggestions: SearchSuggestion[] = [];
-  
-  // 1. Typo corrections (Did you mean?)
+
   const typoSuggestions = generateTypoSuggestions(query, allSymbolNames);
   suggestions.push(...typoSuggestions);
-  
-  // 2. Broader searches (remove suffixes, use wildcards)
+
   const broaderSuggestions = generateBroaderSuggestions(query);
   suggestions.push(...broaderSuggestions);
-  
-  // 3. Narrower searches (add common suffixes)
+
   const narrowerSuggestions = generateNarrowerSuggestions(query);
   suggestions.push(...narrowerSuggestions);
-  
-  // 4. Related term suggestions
+
   const relatedSuggestions = generateRelatedSuggestions(query, symbolsByTerm);
   suggestions.push(...relatedSuggestions);
-  
-  // Sort by confidence and return top suggestions
+
   return suggestions
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, maxSuggestions);
@@ -60,8 +55,6 @@ function generateTypoSuggestions(
   allSymbolNames: string[]
 ): SearchSuggestion[] {
   const suggestions: SearchSuggestion[] = [];
-  
-  // Find fuzzy matches with high similarity
   const matches = findFuzzyMatches(query, allSymbolNames, 0.7, 5);
   
   for (const match of matches) {
@@ -109,8 +102,8 @@ function generateBroaderSuggestions(query: string): SearchSuggestion[] {
 function generateNarrowerSuggestions(query: string): SearchSuggestion[] {
   const suggestions: SearchSuggestion[] = [];
   const narrowerSearches = generateNarrowerSearches(query);
-  
-  // Only suggest top 3 most common suffixes
+
+  // Only suggest the most common suffixes
   const topSuffixes = ['Helper', 'Service', 'Manager'];
   
   for (const narrowerQuery of narrowerSearches) {
@@ -138,14 +131,11 @@ function generateRelatedSuggestions(
 ): SearchSuggestion[] {
   const suggestions: SearchSuggestion[] = [];
   const rootTerm = extractRootTerm(query);
-  
-  // Find symbols with similar root terms
   const relatedTerms = new Set<string>();
-  
+
   for (const [term, _symbols] of symbolsByTerm) {
     const termRoot = extractRootTerm(term);
-    
-    // Check if root terms are related
+
     if (termRoot.toLowerCase().includes(rootTerm.toLowerCase()) ||
         rootTerm.toLowerCase().includes(termRoot.toLowerCase())) {
       if (term.toLowerCase() !== query.toLowerCase()) {
@@ -153,8 +143,7 @@ function generateRelatedSuggestions(
       }
     }
   }
-  
-  // Convert to suggestions
+
   for (const term of Array.from(relatedTerms).slice(0, 3)) {
     suggestions.push({
       type: 'related',
@@ -174,8 +163,7 @@ export function formatSuggestions(suggestions: SearchSuggestion[]): string {
   if (suggestions.length === 0) return '';
   
   const lines: string[] = [];
-  
-  // Group by type
+
   const typoSuggestions = suggestions.filter(s => s.type === 'typo');
   const broaderSuggestions = suggestions.filter(s => s.type === 'broader');
   const narrowerSuggestions = suggestions.filter(s => s.type === 'narrower');

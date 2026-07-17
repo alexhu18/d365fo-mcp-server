@@ -73,20 +73,28 @@ describe('find_coc_extensions', () => {
     const db = createMockDb();
     const ctx = buildContext(db);
 
-    // First prepare call → extension_metadata query
-    db.stmt.all
-      .mockReturnValueOnce([
-        {
-          extension_name: 'SalesFormLetter_MyExt',
-          model: 'MyModel',
-          base_object_name: 'SalesFormLetter',
-          coc_methods: '["run","parmSalesTable"]',
-          added_methods: '[]',
-          event_subscriptions: '[]',
-        },
-      ])
-      // Second prepare call → symbols fallback
-      .mockReturnValueOnce([]);
+    // Routed by SQL rather than by call order: the tool canonicalizes the
+    // caller's name first (a symbols probe), so a positional
+    // mockReturnValueOnce chain would feed the extension_metadata row to the
+    // canonicalization probe instead.
+    db.prepare.mockImplementation(((sql: string) => ({
+      all: vi.fn(() =>
+        sql.includes("extension_type = 'class-extension'")
+          ? [
+              {
+                extension_name: 'SalesFormLetter_MyExt',
+                model: 'MyModel',
+                base_object_name: 'SalesFormLetter',
+                coc_methods: '["run","parmSalesTable"]',
+                added_methods: '[]',
+                event_subscriptions: '[]',
+              },
+            ]
+          : [],
+      ),
+      get: vi.fn(() => undefined),
+      run: vi.fn(() => ({ changes: 0 })),
+    })) as any);
 
     const result = await findCocExtensionsTool(
       req('find_coc_extensions', { className: 'SalesFormLetter' }),
@@ -330,6 +338,8 @@ describe('analyze_extension_points', () => {
     // object type resolution
     db.stmt.get.mockReturnValue({ type: 'class' });
     db.stmt.all
+      // canonical-name probe (symbolLookup, #686) — runs before everything else
+      .mockReturnValueOnce([{ name: 'SalesFormLetter', type: 'class', model: 'M', extends_class: null, file_path: '' }])
       .mockReturnValueOnce([]) // existing extensions
       .mockReturnValueOnce([  // methods
         { name: 'run', type: 'method', signature: 'void run()', is_final: 0 },

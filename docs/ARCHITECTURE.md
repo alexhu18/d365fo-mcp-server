@@ -43,7 +43,7 @@ Three complementary data sources, one rule: **bridge-first when live metadata ma
 | Method signatures / source | ✅ snapshot | ✅ on demand | ✅ live |
 | Cross-references (callers) | ~ FTS approximation | — | ✅ exact (`DYNAMICSXREFDB`) |
 | Labels (20M+ rows) | ✅ sole source | — | create/rename only |
-| Create / modify objects | — | — | ✅ 18 create types, 25 modify ops |
+| Create / modify objects | — | — | ✅ 13 create types, 25 modify ops |
 
 Full tool-by-tool breakdown: [SQLITE_DEPENDENCY.md](SQLITE_DEPENDENCY.md)
 
@@ -83,7 +83,7 @@ Generated code must *prove* itself before touching disk. All gates are fail-clos
 
 | Gate | Tool / mechanism | Blocks when | Switch |
 |------|------------------|-------------|--------|
-| Provenance | `prepare` (mode=change/create) issues a SHA-256 grounding token (30 min TTL, object-bound) | write called without a valid token | `GROUNDING_ENFORCE` |
+| Provenance | `prepare` (mode=change/create) issues a grounding token (30 min TTL, object-bound). In-memory by default; with `GROUNDING_SECRET` set on both instances the token is HMAC-signed and portable, so the hybrid write-only companion (and scaled-out App Service) can validate it — without the secret, write-only mode bypasses enforcement | write called without a valid token | `GROUNDING_ENFORCE` + `GROUNDING_SECRET` |
 | References | `validate_code(mode="references")` — every type, field, method (incl. arity), enum, label checked against the index | any identifier unresolved | `GROUNDING_ENFORCE` |
 | Best practices | `validate_code(mode="syntax")` — 13 static rules + data-driven XML rules mined from standard models (`property_stats`) | error-severity violations | — (advisory in output) |
 | Form patterns | `object_patterns (domain=form, action=validate)` — rules FP001–FP010 against the curated pattern catalog | structural violations (FP001–FP005, FP007) | `FORM_PATTERN_ENFORCE` |
@@ -123,7 +123,7 @@ A .NET Framework 4.8 process (`D365MetadataBridge.exe`) spawned by the server, s
 graph LR
     TS[bridgeClient.ts\nspawn + JSON-RPC + restarts] --> EXE[D365MetadataBridge.exe]
     EXE --> READ[MetadataReadService\nclasses, tables, forms, reports]
-    EXE --> WRITE[MetadataWriteService\n18 create types · 25 modify ops]
+    EXE --> WRITE[MetadataWriteService\n13 create types · 25 modify ops]
     EXE --> XREF[CrossReferenceService\nCoC, event handlers, callers]
     READ & WRITE --> PROV[IMetadataProvider / DiskProvider]
     XREF --> SQL[(DYNAMICSXREFDB)]
@@ -188,7 +188,7 @@ Index refresh is automated via [Azure DevOps pipelines](PIPELINES.md); the App S
 |--------|----------------|
 | Search latency | FTS5 < 10 ms; active invalidation on writes |
 | Rate limits | `/mcp` 500 req / 15 min · `/health` 1000 req / 15 min |
-| Auth (HTTP) | API key / Bearer middleware; HTTPS + TLS 1.2+; Managed Identity for Blob access |
+| Auth (HTTP) | API key / Bearer middleware; HTTPS + TLS 1.2+; Blob access via connection string (`AZURE_STORAGE_CONNECTION_STRING`) |
 | Path safety | every write target validated against `PackagesLocalDirectory/<Package>/<Model>/Ax<Type>/` containment (no traversal) |
 | Error format | JSON-RPC errors with structured `data.detail`; network retries ×3; DB fallbacks logged |
 
@@ -200,5 +200,5 @@ Index refresh is automated via [Azure DevOps pipelines](PIPELINES.md); the App S
 | Transport | MCP SDK — stdio + Express 5 HTTP |
 | Storage | better-sqlite3 (WAL, FTS5) |
 | Bridge | .NET Framework 4.8, Microsoft.Dynamics.AX.Metadata DLLs |
-| Tests | Vitest — 850+ tests, golden quality-gate suites |
+| Tests | Vitest — 1400+ tests, golden quality-gate suites |
 | CI/CD | GitHub Actions (app), Azure DevOps (metadata pipelines) |

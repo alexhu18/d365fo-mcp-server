@@ -18,15 +18,17 @@ import type { XppServerContext } from '../types/context.js';
 import { getFormPatternsTool } from './getFormPatterns.js';
 import { validateFormPatternTool } from './validateFormPattern.js';
 import { getFormPatternSpecTool } from './getFormPatternSpec.js';
+import { repairFormControlsTool } from './repairFormControls.js';
 
-export const FORM_PATTERN_ACTIONS = ['analyze', 'validate', 'spec'] as const;
+export const FORM_PATTERN_ACTIONS = ['analyze', 'validate', 'spec', 'repair'] as const;
 export type FormPatternAction = (typeof FORM_PATTERN_ACTIONS)[number];
 
 const FormPatternArgsSchema = z
   .object({
     action: z.enum(FORM_PATTERN_ACTIONS).describe(
       'analyze (recommend/inspect form patterns), validate (check AxForm XML structure), ' +
-      'spec (full structure spec of a pattern or sub-pattern).',
+      'spec (full structure spec of a pattern or sub-pattern), ' +
+      'repair (auto-add a form\'s missing required controls from its declared pattern).',
     ),
   })
   .passthrough();
@@ -51,6 +53,9 @@ export async function formPatternTool(request: CallToolRequest, context: XppServ
   }
   if (action === 'spec') {
     return getFormPatternSpecTool(subRequest('get_form_pattern_spec', rest), context);
+  }
+  if (action === 'repair') {
+    return repairFormControlsTool(subRequest('repair_form_controls', rest), context);
   }
 
   return getFormPatternsTool(subRequest('get_form_patterns', rest), context);

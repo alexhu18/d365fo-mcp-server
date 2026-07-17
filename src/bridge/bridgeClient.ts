@@ -40,7 +40,6 @@ import type {
   BridgeRefreshResult,
   BridgeWriteResult,
   BridgeSmartTableResult,
-  BridgeDeleteResult,
   BridgeBatchOperationRequest,
   BridgeBatchOperationResult,
   BridgeCapabilities,
@@ -194,9 +193,7 @@ export class BridgeClient extends EventEmitter {
   /** The ready payload from the bridge process */
   get ready(): BridgeReadyPayload | null { return this.readyPayload; }
 
-  // ========================================
   // Lifecycle
-  // ========================================
 
   /**
    * Spawn the C# bridge process and wait for the "ready" message.
@@ -238,8 +235,7 @@ export class BridgeClient extends EventEmitter {
 
     return new Promise<BridgeReadyPayload>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        // Kill only the child — the client itself stays usable so a later
-        // restart() attempt (or dispose() by the owner) can still proceed.
+        // Kill only the child; the client stays usable for a later restart()/dispose().
         this.killChild();
         reject(new Error(`Bridge process did not become ready within ${this.options.readyTimeoutMs ?? READY_TIMEOUT_MS}ms`));
       }, this.options.readyTimeoutMs ?? READY_TIMEOUT_MS);
@@ -255,17 +251,13 @@ export class BridgeClient extends EventEmitter {
         return;
       }
 
-      // Capture the child so late events from a replaced (restarted) process
-      // cannot corrupt the state of its successor.
+      // Capture the child so late events from a replaced (restarted) process cannot
+      // corrupt the state of its successor.
       const child = this.process;
 
-      // Guard the child's stdio streams against unhandled 'error' events. When the
-      // bridge process dies mid-write (e.g. a crash during createSmartTable), Node
-      // can emit EPIPE/ECONNRESET on stdin/stdout/stderr. A stream that emits
-      // 'error' with no listener throws as an uncaughtException and would take the
-      // whole MCP server down ("crashes on the first request"). Recovery is driven
-      // by the 'error'/'exit' handlers on the child below; here we just absorb the
-      // stream-level noise so it never becomes fatal.
+      // Streams can emit EPIPE/ECONNRESET if the child dies mid-write. Without a
+      // listener that throws as an uncaughtException and kills the whole server, so
+      // just log it; recovery is handled by the child's 'error'/'exit' handlers below.
       const onStreamError = (where: string) => (err: Error) => {
         console.error(`[BridgeClient] ${where} stream error: ${err.message}`);
       };
@@ -303,11 +295,8 @@ export class BridgeClient extends EventEmitter {
               this.pending.delete(msg.id);
               clearTimeout(pending.timer);
               if (msg.error) {
-                // A read "object not found" (-32001 from the metadata read path) is a
-                // normal negative result, not an error — resolve null so read methods
-                // (typed T | null) return cleanly and callers don't log it as a failure.
-                // The write path's -32001 ("Write operation returned null") keeps a
-                // distinct message and still rejects.
+                // -32001 "not found" from a read is a normal negative result (T | null),
+                // not a failure; the write path's -32001 keeps a distinct message and rejects.
                 if (msg.error.code === -32001 && /not found/i.test(msg.error.message ?? '')) {
                   pending.resolve(null);
                 } else {
@@ -330,9 +319,7 @@ export class BridgeClient extends EventEmitter {
           for (const line of text.split('\n')) {
             const trimmed = line.trim();
             if (!trimmed) continue;
-            // When log file is configured, forward ALL bridge stderr lines
-            // (diagnostics are captured in the file; surface them on TS side too).
-            // Otherwise only forward errors and warnings to avoid noise.
+            // With a log file configured, forward all stderr lines; otherwise only errors/warnings.
             if (this.options.logFile ||
                 trimmed.includes('[ERROR]') || trimmed.includes('[WARN]')) {
               console.error(`[Bridge] ${trimmed}`);
@@ -523,9 +510,7 @@ export class BridgeClient extends EventEmitter {
 
   /** Kill the current child process (used by dispose and restart). */
   private killChild(): void {
-    // Capture the child reference in a local variable BEFORE clearing this.process.
-    // The deferred SIGTERM closure must retain the reference or it kills nothing,
-    // leaking the D365MetadataBridge child process across restarts.
+    // Capture the reference before clearing this.process so the deferred SIGTERM closure retains it.
     const child = this.process;
     this.process = null;
     if (child) {
@@ -542,7 +527,6 @@ export class BridgeClient extends EventEmitter {
             try { child.kill('SIGKILL'); } catch { /* already gone */ }
           }
         }, 5000);
-        // Do not keep the event loop alive purely for these timers.
         if (typeof graceful.unref === 'function') graceful.unref();
         if (typeof hard.unref === 'function') hard.unref();
       } catch { /* ignore */ }
@@ -614,9 +598,7 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeReferenceResult>('findReferences', params);
   }
 
-  // ========================================
-  // Phase 6 — Security, Menu Items, Table Extensions, Completion, Xref
-  // ========================================
+  // Security, Menu Items, Table Extensions, Completion, Xref
 
   async readSecurityPrivilege(name: string): Promise<BridgeSecurityPrivilegeResult | null> {
     return this.call<BridgeSecurityPrivilegeResult | null>('readSecurityPrivilege', { name });
@@ -669,9 +651,7 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeInfoPayload>('getInfo');
   }
 
-  // ========================================
-  // Write-support methods (Phase 3)
-  // ========================================
+  // Write-support methods
 
   /** Re-create the DiskProvider so newly written files are picked up. */
   async refreshProvider(): Promise<BridgeRefreshResult> {
@@ -688,9 +668,7 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeResolveResult | null>('resolveObjectInfo', { objectType, objectName });
   }
 
-  // ========================================
-  // Write operations (Phase 4)
-  // ========================================
+  // Write operations
 
   /** Create a D365FO object via IMetadataProvider.Create() */
   async createObject(params: {
@@ -844,14 +822,7 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeWriteResult>('addMenuItemToMenu', { objectName: menuName, menuItemToAdd, menuItemToAddType: menuItemToAddType ?? 'display' });
   }
 
-  // ========================================
-  // Delete, Batch, Capabilities, Pattern Discovery
-  // ========================================
-
-  /** Delete a D365FO object by removing its file from disk */
-  async deleteObject(objectType: string, objectName: string): Promise<BridgeDeleteResult> {
-    return this.call<BridgeDeleteResult>('deleteObject', { objectType, objectName });
-  }
+  // Batch, Capabilities, Pattern Discovery
 
   /** Execute multiple write operations on a single object in one call */
   async batchModify(
@@ -872,12 +843,9 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeFormPatternDiscoveryResult>('discoverFormPatterns', {});
   }
 
-  // ========================================
   // Private helpers
-  // ========================================
 
   private resolveBridgeExe(): string {
-    // 1. Explicit path from options
     if (this.options.bridgeExePath) {
       if (!fs.existsSync(this.options.bridgeExePath)) {
         throw new Error(`Bridge exe not found at: ${this.options.bridgeExePath}`);
@@ -885,7 +853,6 @@ export class BridgeClient extends EventEmitter {
       return this.options.bridgeExePath;
     }
 
-    // 2. Look relative to this module's location (project root/bridge/D365MetadataBridge/bin/Release/)
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const candidates = [
@@ -893,7 +860,6 @@ export class BridgeClient extends EventEmitter {
       path.resolve(__dirname, '../../bridge/D365MetadataBridge/bin/Release', BRIDGE_EXE_NAME),
       // Production: alongside the server
       path.resolve(__dirname, '../bridge', BRIDGE_EXE_NAME),
-      // Same directory
       path.resolve(__dirname, BRIDGE_EXE_NAME),
     ];
 
@@ -918,9 +884,7 @@ export class BridgeClient extends EventEmitter {
   }
 }
 
-// ========================================
 // Factory function — detects D365FO presence
-// ========================================
 
 /**
  * Attempt to create and initialize a BridgeClient.
@@ -937,7 +901,6 @@ export async function createBridgeClient(options: {
   xrefDatabase?: string;
   logFile?: string;
 }): Promise<BridgeClient | null> {
-  // Auto-detect packagesPath if not provided
   const packagesPath = options.packagesPath ?? detectPackagesPath();
   if (!packagesPath) {
     console.error(
@@ -952,7 +915,6 @@ export async function createBridgeClient(options: {
 
   console.error(`[BridgeClient] packagesPath=${packagesPath}, binPath=${options.binPath ?? 'auto'}`);
 
-  // Check if bridge exe exists before trying to spawn
   const client = new BridgeClient({
     ...options,
     packagesPath,
@@ -969,9 +931,10 @@ export async function createBridgeClient(options: {
 }
 
 function detectPackagesPath(): string | null {
-  // Check canonical env vars first — these take priority over well-known path probes.
-  // D365FO_PACKAGE_PATH is the env var read by configManager and exposed via .mcp.json env{} blocks.
-  // PACKAGES_PATH is the legacy name documented in .env.example.
+  // Canonical env vars take priority over well-known path probes. D365FO_PACKAGE_PATH can be set
+  // in .env (traditional mode, loaded by dotenv at startup) or in the .mcp.json env{} block
+  // (VS passes it to the subprocess). Both sources land in process.env equivalently.
+  // PACKAGES_PATH is the legacy .env.example name.
   const candidates = [
     process.env.D365FO_PACKAGE_PATH ?? '',
     process.env.PACKAGES_PATH ?? '',

@@ -28,8 +28,6 @@ const GetReportInfoArgsSchema = z.object({
   includeRdl: z.boolean().optional().default(false).describe('Include full embedded RDL content inside <Text><![CDATA[…]]> — can be large, default false'),
 });
 
-// ─── Internal types ────────────────────────────────────────────────────────────
-
 interface ReportField {
   name: string;
   alias: string;
@@ -65,8 +63,6 @@ interface ReportInfo {
   designs: ReportDesign[];
 }
 
-// ─── Main handler ──────────────────────────────────────────────────────────────
-
 export async function getReportInfoTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = GetReportInfoArgsSchema.parse(request.params.arguments);
@@ -80,9 +76,7 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
 
     // 2. Explicit file path fallback for newly-created reports
     if (explicitFilePath) {
-      // Security: validate that the supplied path falls within a configured D365FO
-      // package root before reading any file content.  Without this check a
-      // prompt-injection attack could read arbitrary local files via this parameter.
+      // Must fall within a configured D365FO package root before reading any file content.
       const containment = await assertWritePathAllowed(explicitFilePath);
       if (!containment.ok) {
         return {
@@ -97,7 +91,6 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
         if (trimmed.startsWith('{')) {
           const meta = JSON.parse(raw);
           if (meta.sourcePath) {
-            // Validate indirect sourcePath as well before reading it.
             const srcContainment = await assertWritePathAllowed(meta.sourcePath);
             if (!srcContainment.ok) {
               return {
@@ -122,7 +115,6 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
         };
       }
 
-      // Parse XML from explicit path
       const xmlObj = await parseStringPromise(xmlContent, { explicitArray: true, mergeAttrs: false, trim: true });
       const axReport = xmlObj?.AxReport;
       if (!axReport) {
@@ -161,8 +153,6 @@ export async function getReportInfoTool(request: CallToolRequest, context: XppSe
     };
   }
 }
-
-// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function first(arr: any): string | undefined {
   if (!arr) return undefined;
@@ -231,7 +221,6 @@ function extractDesigns(axReport: any, includeRdl: boolean): ReportDesign[] {
 
     let rdlSummary: string | undefined;
     if (hasRdl && !includeRdl) {
-      // Build a compact summary of RDL top-level elements
       rdlSummary = summarizeRdl(rawText!);
     }
 
@@ -256,7 +245,7 @@ function extractDesigns(axReport: any, includeRdl: boolean): ReportDesign[] {
 function summarizeRdl(rdl: string): string {
   const lines: string[] = [`Length: ${rdl.length.toLocaleString()} chars`];
   try {
-    // Quick regex-based extraction — avoids full parse of potentially huge XML
+    // Regex-based extraction avoids a full parse of potentially huge XML
     const topElements = [
       'DataSources', 'DataSets', 'ReportParameters', 'Page',
       'PageHeader', 'PageFooter', 'Body',
@@ -266,25 +255,20 @@ function summarizeRdl(rdl: string): string {
       if (present) lines.push(`  • <${el}> present`);
     }
 
-    // Count DataSet entries
     const dsCount = (rdl.match(/<DataSet\b/g) ?? []).length;
     if (dsCount > 0) lines.push(`  • ${dsCount} DataSet(s) in RDL`);
 
-    // Count ReportParameter entries
     const rp = (rdl.match(/<ReportParameter\b/g) ?? []).length;
     if (rp > 0) lines.push(`  • ${rp} ReportParameter(s)`);
 
-    // Count Tablix/Chart/Matrix
     const tablix = (rdl.match(/<Tablix\b/g) ?? []).length;
     const chart  = (rdl.match(/<Chart\b/g)  ?? []).length;
     if (tablix > 0) lines.push(`  • ${tablix} Tablix region(s)`);
     if (chart  > 0) lines.push(`  • ${chart} Chart(s)`);
 
-    // Detect grouping
     const groups = (rdl.match(/<Group\b/g) ?? []).length;
     if (groups > 0) lines.push(`  • ${groups} Group expression(s)`);
 
-    // RDL language
     const langMatch = rdl.match(/<Language>(.*?)<\/Language>/);
     if (langMatch) lines.push(`  • Language: ${langMatch[1]}`);
 
@@ -293,8 +277,6 @@ function summarizeRdl(rdl: string): string {
   }
   return lines.join('\n');
 }
-
-// ─── Output formatter ──────────────────────────────────────────────────────────
 
 function formatOutput(info: ReportInfo, includeFields: boolean, includeRdl: boolean): any {
   const lines: string[] = [];

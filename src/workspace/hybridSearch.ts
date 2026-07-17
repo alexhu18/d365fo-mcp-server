@@ -35,7 +35,7 @@ export class HybridSearch {
   ): Promise<HybridSearchResult[]> {
     const results: HybridSearchResult[] = [];
 
-    // 1. Search external metadata (D365FO PackagesLocalDirectory)
+    // External metadata (D365FO PackagesLocalDirectory)
     const externalSymbols = this.symbolIndex.searchSymbols(
       query,
       options.limit || 20,
@@ -50,7 +50,7 @@ export class HybridSearch {
       });
     }
 
-    // 2. Search workspace files (if workspace path provided)
+    // Workspace files, if a workspace path was provided
     if (options.includeWorkspace && options.workspacePath) {
       const workspaceFiles = await this.workspaceScanner.searchInWorkspace(
         options.workspacePath,
@@ -67,10 +67,9 @@ export class HybridSearch {
       }
     }
 
-    // 3. Sort by relevance and deduplicate
     results.sort((a, b) => b.relevance - a.relevance);
 
-    // 4. Deduplicate (prefer workspace over external for same name)
+    // Deduplicate by name, preferring workspace over external.
     const seen = new Set<string>();
     const deduplicated: HybridSearchResult[] = [];
 
@@ -82,7 +81,6 @@ export class HybridSearch {
         seen.add(name);
         deduplicated.push(result);
       } else if (result.source === 'workspace') {
-        // Replace external with workspace version
         const idx = deduplicated.findIndex(
           (r) => (r.symbol?.name || r.file?.name) === name
         );

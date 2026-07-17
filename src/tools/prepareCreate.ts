@@ -19,8 +19,8 @@ import { createProvenanceToken } from '../utils/provenanceStore.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { resolveObjectPrefix, applyObjectPrefix } from '../utils/modelClassifier.js';
 import { rankContext, renderRankedContext } from '../workspace/contextRanker.js';
-
-// ── Schema ────────────────────────────────────────────────────────────────────
+import { lookupSymbolsNocase, type SymbolHit } from '../utils/symbolLookup.js';
+import { RESERVED_SYSTEM_FIELD_NAMES } from './generateSmartTable.js';
 
 export const prepareCreateArgsSchema = z.object({
   goal: z.string().describe(
@@ -34,15 +34,20 @@ export const prepareCreateArgsSchema = z.object({
   objectType: z.enum([
     'class', 'table', 'form', 'enum', 'edt', 'query', 'view',
     'data-entity', 'report', 'menu-item-display', 'menu-item-action',
-    'menu-item-output', 'security-privilege', 'security-duty', 'security-role',
-  ]).describe('Type of the new D365FO object.'),
+    'menu-item-output', 'menu', 'security-privilege', 'security-duty', 'security-role',
+    'business-event', 'tile', 'kpi', 'map',
+  ]).describe(
+    'Type of the new D365FO object. Wholly new standalone objects only — for ' +
+    'extending an EXISTING object (table-extension, form-extension, CoC class-extension, ' +
+    'etc.) use prepare(mode="change") instead, which auto-detects the base object\'s type.'
+  ),
   fieldsHint: z.array(z.string()).optional().describe(
     'For tables/views: planned field names (e.g. ["CustAccount", "ImportDate", "Qty"]). ' +
     'Each gets EDT suggestions from the index.',
   ),
 });
 
-// ── Lookups (all index-only, run in parallel) ────────────────────────────────
+// Lookups below are all index-only, run in parallel.
 
 /** Exact + prefixed collision check. */
 function checkCollisions(
@@ -52,12 +57,20 @@ function checkCollisions(
 ): string {
   try {
     const db = context.symbolIndex.getReadDb();
-    const rows = db.prepare(
-      `SELECT DISTINCT name, type, model FROM symbols
-       WHERE name IN (?, ?) COLLATE NOCASE
-          AND parent_name IS NULL
-       LIMIT 10`,
-    ).all(finalName, baseName) as Array<{ name: string; type: string; model: string }>;
+    // `name IN (?, ?) COLLATE NOCASE` silently compared case-SENSITIVELY (the
+    // COLLATE binds to the IN expression, not the column), so differently-cased
+    // collisions were missed. The nocase helper also stays on the indexes.
+    const rows: SymbolHit[] = [];
+    const seen = new Set<string>();
+    for (const n of new Set([finalName, baseName])) {
+      for (const r of lookupSymbolsNocase(db, n, { limit: 5 })) {
+        const key = `${r.name} ${r.type} ${r.model ?? ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          rows.push(r);
+        }
+      }
+    }
     if (rows.length > 0) {
       return rows
         .map(r => `⚠️  "${r.name}" already exists as ${r.type} in model "${r.model}" — pick a different name or extend it instead.`)
@@ -102,8 +115,13 @@ function findSimilarObjects(
     // Split CamelCase into tokens and search for the most specific ones
     const tokens = baseName.split(/(?=[A-Z])/).filter(t => t.length >= 4);
     const needle = tokens.length > 0 ? tokens[tokens.length - 1] : baseName;
+    // INDEXED BY: without it the planner picks idx_symbols_parent_name for
+    // `parent_name IS NULL` and fetches every top-level row (4.6 min cold on a
+    // production DB, blocking the event loop until the MCP client kills the
+    // server). idx_type_name evaluates the LIKE against the index, so only
+    // name matches ever touch the table (~10 ms).
     const rows = db.prepare(
-      `SELECT name, model FROM symbols
+      `SELECT name, model FROM symbols INDEXED BY idx_type_name
        WHERE type = ? AND name LIKE ? AND parent_name IS NULL
        ORDER BY LENGTH(name) LIMIT 5`,
     ).all(objectType, `%${needle}%`) as Array<{ name: string; model: string }>;
@@ -123,13 +141,29 @@ function suggestEdtsForFields(
   context: XppServerContext,
 ): string {
   const lines: string[] = [];
+
+  // Custom fields using reserved system field names fail compilation
+  const reservedHits = fieldsHint.filter(f => RESERVED_SYSTEM_FIELD_NAMES.has(f.toLowerCase()));
+  if (reservedHits.length > 0) {
+    lines.push(
+      `⛔ **Reserved system field names — do NOT use as custom fields:**`,
+      ...reservedHits.map(f =>
+        `  • \`${f}\` — reserved by the platform (auto-tracked). Rename to a non-reserved name (e.g. "NoteDateTime" instead of "CreatedDateTime").`
+      ),
+      `  The platform auto-provides: CreatedDateTime, ModifiedDateTime, CreatedBy, ModifiedBy, RecId, RecVersion, DataAreaId, Partition.`,
+      ``,
+    );
+  }
+
   try {
     const db = context.symbolIndex.getReadDb();
+    // INDEXED BY keeps the LIKE on the index (runs once per hinted field).
     const stmt = db.prepare(
-      `SELECT name, signature FROM symbols
+      `SELECT name, signature FROM symbols INDEXED BY idx_type_name
        WHERE type = 'edt' AND name LIKE ? ORDER BY LENGTH(name) LIMIT 3`,
     );
     for (const field of fieldsHint.slice(0, 10)) {
+      if (RESERVED_SYSTEM_FIELD_NAMES.has(field.toLowerCase())) continue;
       const tokens = field.split(/(?=[A-Z])/).filter(t => t.length >= 3);
       const needle = tokens.length > 0 ? tokens[tokens.length - 1] : field;
       const rows = stmt.all(`%${needle}%`) as Array<{ name: string; signature: string | null }>;
@@ -149,7 +183,7 @@ function suggestEdtsForFields(
 function findReusableLabels(baseName: string, context: XppServerContext): string {
   try {
     const words = baseName.replace(/([A-Z])/g, ' $1').trim();
-    const rows = context.symbolIndex.searchLabels(words, { language: 'en-us', limit: 5 });
+    const rows = context.symbolIndex.searchLabels(words, { language: 'en-US', limit: 5 });
     if (rows.length > 0) {
       return rows
         .map(r => `  @${r.labelFileId}:${r.labelId} = "${r.text}" (${r.model})`)
@@ -189,8 +223,6 @@ function minedPropertyDefaults(objectType: string, context: XppServerContext): s
   }
   return '(no mined statistics — run build-database to mine standard models)';
 }
-
-// ── Tool handler ──────────────────────────────────────────────────────────────
 
 export async function prepareCreateTool(request: any, context: XppServerContext): Promise<any> {
   const raw = request?.params?.arguments ?? request;
@@ -247,8 +279,7 @@ export async function prepareCreateTool(request: any, context: XppServerContext)
     lines.push('### Property defaults _(mined from standard models)_', propertyDefaults, '');
   }
 
-  // Ranked neighborhood: surface existing code relevant to the goal so the new
-  // object reuses real types/patterns instead of invented ones. Best-effort.
+  // Surface existing code relevant to the goal; best-effort, omit on failure
   try {
     const ranked = rankContext(context, {
       intent: `${goal} ${objectName} ${(fieldsHint ?? []).join(' ')}`,

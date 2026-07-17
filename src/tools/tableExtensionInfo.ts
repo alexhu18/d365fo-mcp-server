@@ -15,6 +15,7 @@ import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { scanFsExtensions } from '../utils/fsExtensionScanner.js';
 import { tryBridgeTableExtensions } from '../bridge/index.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 
 const TableExtensionInfoArgsSchema = z.object({
   tableName: z.string().describe('Base table name whose extensions to find'),
@@ -26,13 +27,21 @@ export async function tableExtensionInfoTool(request: CallToolRequest, context: 
   try {
     const args = TableExtensionInfoArgsSchema.parse(request.params.arguments);
 
-    // ── Bridge fast-path (C# IMetadataProvider) ──
-    const bridgeResult = await tryBridgeTableExtensions(context.bridge, args.tableName);
+    // Resolve the caller's casing to the canonical AOT name before the bridge
+    // call (#686) — the bridge matches by exact name too, and every probe and
+    // extension_metadata join below keys off this name.
+    let tableName = args.tableName;
+    try {
+      tableName = canonicalSymbolName(context.symbolIndex.getReadDb(), args.tableName, ['table'])
+        ?? args.tableName;
+    } catch { /* DB not available — bridge may still resolve it */ }
+
+    // Bridge fast-path (C# IMetadataProvider)
+    const bridgeResult = await tryBridgeTableExtensions(context.bridge, tableName);
     if (bridgeResult) return bridgeResult;
 
-    // ── Fallback: SQLite index + filesystem ──
+    // Fallback: SQLite index + filesystem
     const db = context.symbolIndex.getReadDb();
-    const tableName = args.tableName;
 
     // Verify the base table exists
     const baseTable = db.prepare(
@@ -55,7 +64,7 @@ export async function tableExtensionInfoTool(request: CallToolRequest, context: 
          ORDER BY model, extension_name`
       ).all(tableName) as any[];
     } catch (e) {
-      // extension_metadata table may not exist in older databases — non-fatal
+      // extension_metadata may not exist in older databases
       if (process.env.DEBUG_LOGGING === 'true') console.warn('[tableExtensionInfo] extension_metadata query failed:', e);
     }
 
@@ -99,9 +108,7 @@ export async function tableExtensionInfoTool(request: CallToolRequest, context: 
     if (allExtensions.length === 0) {
       output += `No table extensions found in index.\n`;
 
-      // ── Filesystem fallback ─────────────────────────────────────────────
-      // When the DB has no data (custom model not yet re-indexed), scan the
-      // AxTableExtension folders directly — avoids the AI running PowerShell.
+      // Filesystem fallback: scan AxTableExtension folders directly when DB has no data
       if (process.platform === 'win32') {
         const configManager = getConfigManager();
         const packagePath = configManager.getPackagePath();
@@ -205,17 +212,10 @@ export async function tableExtensionInfoTool(request: CallToolRequest, context: 
   }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Generic object extension info (form-extension, enum-extension,
-// edt-extension, data-entity-extension)
-//
-// Same data-source priority as tableExtensionInfoTool:
-//   1. extension_metadata table (indexed build data)
-//   2. symbols table fallback
-//
-// Unlike table-extension there is no bridge fast-path yet and no filesystem
-// fallback — those can be added incrementally.
-// ────────────────────────────────────────────────────────────────────────────
+// Generic object extension info (form-extension, enum-extension, edt-extension,
+// data-entity-extension). Same data-source priority as tableExtensionInfoTool
+// (extension_metadata table, then symbols fallback), but no bridge fast-path
+// or filesystem fallback yet.
 
 const GenericExtArgsSchema = z.object({
   baseName: z.string().describe('Base object name (or full extension name — dot suffix is stripped automatically)'),
@@ -228,7 +228,7 @@ function makeObjectExtensionTool(
   return async function objectExtensionInfoTool(request: CallToolRequest, context: XppServerContext) {
     try {
       const raw = (request.params.arguments ?? {}) as Record<string, unknown>;
-      // Accept baseName or tableName for compat; strip dot notation if present.
+      // Accept baseName, tableName, or name; strip dot notation if present.
       const rawName = (raw.baseName ?? raw.tableName ?? raw.name ?? '') as string;
       const baseName = rawName.includes('.') ? rawName.split('.')[0] : rawName;
 
@@ -239,7 +239,6 @@ function makeObjectExtensionTool(
 
       const db = context.symbolIndex.getReadDb();
 
-      // ── extension_metadata (rich) ──────────────────────────────────────
       let metaRows: any[] = [];
       try {
         metaRows = db.prepare(
@@ -248,9 +247,9 @@ function makeObjectExtensionTool(
            WHERE base_object_name = ? AND extension_type = ?
            ORDER BY model, extension_name`
         ).all(baseName, extensionType) as any[];
-      } catch { /* older DB without extension_metadata — non-fatal */ }
+      } catch { /* older DB without extension_metadata */ }
 
-      // ── symbols fallback ───────────────────────────────────────────────
+      // Fallback to symbols table
       const symbolRows = db.prepare(
         `SELECT name, model FROM symbols
          WHERE type = ? AND (extends_class = ? OR name LIKE ?)

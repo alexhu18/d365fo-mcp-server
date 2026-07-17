@@ -131,11 +131,8 @@ export async function detectD365Project(workspacePath: string, maxDepth: number 
     debugLog(`[WorkspaceDetector] Found ${projectFiles.length} .rnrproj file(s):`);
     projectFiles.forEach(p => debugLog(`   - ${p}`));
 
-    // D365FO convention: in a multi-project solution folder the "primary" project
-    // usually has the SAME NAME as the solution folder (workspace base name).
-    // e.g. workspace "ContosoCore - FeatureManagement/" → prefer the .rnrproj whose
-    // own folder is also named "ContosoCore - FeatureManagement".
-    // Falls back to the first file found (alphabetically) when no name match.
+    // Prefer the .rnrproj whose own folder name matches the workspace base name
+    // (D365FO multi-project solution convention); else the first file found.
     let primaryProject = projectFiles[0];
     if (projectFiles.length > 1) {
       const wpBase = path.basename(workspacePath).toLowerCase();
@@ -148,9 +145,8 @@ export async function detectD365Project(workspacePath: string, maxDepth: number 
       }
     }
 
-    // Read ALL candidate model names in parallel so we can prefer non-demo models
-    // when the initially selected primaryProject has a Microsoft demo model name
-    // (e.g. FleetManagement — the VS new-project wizard default).
+    // Prefer a non-demo model when the initially selected primaryProject has a
+    // Microsoft demo model name (e.g. FleetManagement).
     const modelName = await extractModelNameFromProject(primaryProject);
     if (modelName && isMicrosoftDemoModel(modelName) && projectFiles.length > 1) {
       debugLog(`[WorkspaceDetector] Primary .rnrproj has MS demo model "${modelName}" — looking for better candidate`);
@@ -209,9 +205,8 @@ export async function autoDetectD365Project(
     if (result) return result;
   }
 
-  // Priority 2: Current working directory
-  // Skip if it's a Node.js project (the MCP server itself or any npm package).
-  // VS 2022 starts the stdio subprocess from the server's own directory, not the D365FO solution.
+  // Priority 2: Current working directory (skip if it's a Node.js project —
+  // VS 2022 starts the stdio subprocess from the server's own directory).
   const cwd = process.cwd();
   const cwdIsNodeProject = existsSync(path.join(cwd, 'package.json'));
   if (cwdIsNodeProject) {
@@ -230,9 +225,9 @@ export async function autoDetectD365Project(
     if (envResult) return envResult;
   }
 
-  // Priority 3b: D365FO_SOLUTIONS_PATH — scan root for ALL D365FO projects, use first as primary.
-  // This is the recommended way to configure multi-solution setups.
-  // All found projects are also returned via scanAllD365Projects() for listing in get_workspace_info.
+  // Priority 3b: D365FO_SOLUTIONS_PATH — scan root for ALL D365FO projects, use
+  // first as primary (recommended for multi-solution setups; full list is
+  // available via scanAllD365Projects()).
   const solutionsRoot = process.env.D365FO_SOLUTIONS_PATH;
   if (solutionsRoot) {
     debugLog(`[WorkspaceDetector] Scanning D365FO_SOLUTIONS_PATH: ${solutionsRoot}`);
@@ -240,15 +235,15 @@ export async function autoDetectD365Project(
     if (result) return result;
   }
 
-  // Priority 4: Well-known VS project directories (Windows only)
-  // NOTE: %USERPROFILE%\source\repos intentionally excluded — it often contains the MCP server
-  // repo itself alongside D365FO projects, making the first-found result unpredictable.
-  // Configure D365FO_SOLUTIONS_PATH instead for reliable detection.
+  // Priority 4: Well-known VS project directories (Windows only).
+  // %USERPROFILE%\source\repos is intentionally excluded — it often contains the
+  // MCP server repo itself alongside D365FO projects, making the first-found
+  // result unpredictable; use D365FO_SOLUTIONS_PATH instead.
   if (process.platform === 'win32') {
     const userProfile = process.env.USERPROFILE || (process.env.USERNAME ? `C:\\Users\\${process.env.USERNAME}` : undefined);
     const wellKnownPaths = [
       userProfile ? `${userProfile}\\Documents\\Visual Studio 2022\\Projects` : undefined,
-      // Common D365FO VM layouts — K: is the data drive in most LCS-provisioned VMs
+      // K: is the data drive in most LCS-provisioned VMs
       `K:\\VSProjects`,
       `K:\\Projects`,
       `K:\\repos`,
@@ -290,12 +285,12 @@ export async function autoDetectD365Project(
     }
   }
 
-  // Priority 5: Extract model name directly from a PackagesLocalDirectory path
-  // e.g. K:\AOSService\PackagesLocalDirectory\MyEnhancedDataSharing → modelName: "MyEnhancedDataSharing"
+  // Priority 5: Extract model name directly from a PackagesLocalDirectory path,
+  // e.g. K:\AOSService\PackagesLocalDirectory\MyEnhancedDataSharing → "MyEnhancedDataSharing"
   if (explicitWorkspacePath) {
     const normalized = path.normalize(explicitWorkspacePath);
 
-    // Also try: K:\...\PackagesLocalDirectory\PackageName\ModelName
+    // K:\...\PackagesLocalDirectory\PackageName\ModelName
     const twoLevelMatch = normalized.match(
       /^(.+[\\\/]PackagesLocalDirectory)[\\\/]([^\\\/]+)[\\\/]([^\\\/]+)\\?\/?$/i
     );
@@ -317,10 +312,10 @@ export async function autoDetectD365Project(
       debugLog(`[WorkspaceDetector] ✅ Extracted model name from PackagesLocalDirectory path: ${modelName}`);
       debugLog(`[WorkspaceDetector]    Package path: ${packagePath}`);
       debugLog(`[WorkspaceDetector]    Note: projectPath unknown — addToProject=true requires projectPath in .mcp.json`);
+      // projectPath and solutionPath omitted — not derivable from this path form
       return {
         modelName,
         packagePath,
-        // projectPath and solutionPath intentionally omitted — not derivable from PackagesLocalDirectory path
       };
     }
   }

@@ -1,20 +1,24 @@
 /**
  * resolve_references tests — semantic reference resolution against a real
- * in-memory SQLite database using the production schema subset.
+ * in-memory symbol index (production schema incl. the FTS table the nocase
+ * lookups fall back to — a hand-rolled schema subset would silently miss
+ * invalid columns or a broken FTS query shape).
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
+import { XppSymbolIndex } from '../../src/metadata/symbolIndex';
 import {
   resolveXppReferences,
   gateOnReferenceErrors,
   resolveReferencesTool,
   type ResolverDeps,
 } from '../../src/tools/resolveReferences';
+import { validateCodeTool } from '../../src/tools/validateCode';
 
 const ORIGINAL_ENFORCE = process.env.GROUNDING_ENFORCE;
 
-let db: InstanceType<typeof Database>;
+let index: XppSymbolIndex;
+let db: ResolverDeps['db'];
 let deps: ResolverDeps;
 
 const LABELS: Record<string, string[]> = {
@@ -23,7 +27,7 @@ const LABELS: Record<string, string[]> = {
   Contoso: ['MyLabel'],
 };
 
-function makeDeps(database: InstanceType<typeof Database>): ResolverDeps {
+function makeDeps(database: ResolverDeps['db']): ResolverDeps {
   return {
     db: database,
     getLabelById: (labelId: string, labelFileId?: string) => {
@@ -37,76 +41,63 @@ function makeDeps(database: InstanceType<typeof Database>): ResolverDeps {
 }
 
 beforeAll(() => {
-  db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE symbols (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      parent_name TEXT,
-      signature TEXT,
-      extends_class TEXT
-    );
-    CREATE TABLE extension_metadata (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      extension_name TEXT,
-      extension_type TEXT,
-      base_object_name TEXT,
-      added_fields TEXT,
-      added_methods TEXT,
-      coc_methods TEXT
-    );
-    CREATE TABLE menu_item_targets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      menu_item_name TEXT NOT NULL,
-      menu_item_type TEXT
-    );
-  `);
+  index = new XppSymbolIndex(':memory:', ':memory:');
+  const sym = (
+    name: string,
+    type: string,
+    parentName?: string,
+    signature?: string,
+    extendsClass?: string,
+  ) => index.addSymbol({
+    name, type, parentName, signature, extendsClass,
+    filePath: '/x.xml', model: 'Test',
+  } as any);
 
-  const sym = db.prepare(
-    'INSERT INTO symbols (name, type, parent_name, signature, extends_class) VALUES (?, ?, ?, ?, ?)',
-  );
   // Tables + fields + methods
-  sym.run('CustTable', 'table', null, null, null);
-  sym.run('AccountNum', 'field', 'CustTable', 'CustAccount', null);
-  sym.run('CustGroup', 'field', 'CustTable', 'CustGroupId', null);
-  sym.run('Blocked', 'field', 'CustTable', 'CustVendorBlocked', null);
-  sym.run('validateWrite', 'method', 'CustTable', 'public boolean validateWrite()', null);
-  sym.run('find', 'method', 'CustTable',
-    'public static CustTable find(CustAccount _custAccount, boolean _forUpdate = false)', null);
-  sym.run('SalesTable', 'table', null, null, null);
-  sym.run('SalesId', 'field', 'SalesTable', 'SalesIdBase', null);
+  sym('CustTable', 'table');
+  sym('AccountNum', 'field', 'CustTable', 'CustAccount');
+  sym('CustGroup', 'field', 'CustTable', 'CustGroupId');
+  sym('Blocked', 'field', 'CustTable', 'CustVendorBlocked');
+  sym('validateWrite', 'method', 'CustTable', 'public boolean validateWrite()');
+  sym('find', 'method', 'CustTable',
+    'public static CustTable find(CustAccount _custAccount, boolean _forUpdate = false)');
+  sym('SalesTable', 'table');
+  sym('SalesId', 'field', 'SalesTable', 'SalesIdBase');
   // Classes with inheritance
-  sym.run('SalesFormLetter', 'class', null, null, 'RunBaseBatch');
-  sym.run('run', 'method', 'SalesFormLetter', 'public void run()', null);
-  sym.run('ContosoBase', 'class', null, null, null);
-  sym.run('doStuff', 'method', 'ContosoBase', 'public int doStuff(int _a, str _b = "")', null);
-  sym.run('ContosoChild', 'class', null, null, 'ContosoBase');
+  sym('SalesFormLetter', 'class', undefined, undefined, 'RunBaseBatch');
+  sym('run', 'method', 'SalesFormLetter', 'public void run()');
+  sym('ContosoBase', 'class');
+  sym('doStuff', 'method', 'ContosoBase', 'public int doStuff(int _a, str _b = "")');
+  sym('ContosoChild', 'class', undefined, undefined, 'ContosoBase');
   // Enum / EDT / form / query
-  sym.run('NoYes', 'enum', null, null, null);
-  sym.run('CustAccount', 'edt', null, 'AccountNum', null);
-  sym.run('CustTableListPage', 'form', null, null, null);
-  sym.run('CustTableSRS', 'query', null, null, null);
+  sym('NoYes', 'enum');
+  sym('CustAccount', 'edt', undefined, 'AccountNum');
+  sym('CustTableListPage', 'form');
+  sym('CustTableSRS', 'query');
 
-  db.prepare(
+  // :memory: read pool is empty, so getReadDb() returns the writer — usable
+  // for inserting the auxiliary rows the resolver checks.
+  const writer = index.getReadDb();
+  db = writer;
+  writer.prepare(
     `INSERT INTO extension_metadata
-       (extension_name, extension_type, base_object_name, added_fields, added_methods, coc_methods)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run('CustTable.ContosoExtension', 'table-extension', 'CustTable', '["ContosoTier"]', null, null);
-  db.prepare(
+       (extension_name, extension_type, base_object_name, added_fields, added_methods, coc_methods, model)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run('CustTable.ContosoExtension', 'table-extension', 'CustTable', '["ContosoTier"]', null, null, 'Test');
+  writer.prepare(
     `INSERT INTO extension_metadata
-       (extension_name, extension_type, base_object_name, added_fields, added_methods, coc_methods)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (extension_name, extension_type, base_object_name, added_fields, added_methods, coc_methods, model)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run('SalesFormLetterContoso_Extension', 'class-extension', 'SalesFormLetter',
-    null, null, '[{"name":"postJournal"}]');
+    null, null, '[{"name":"postJournal"}]', 'Test');
 
-  db.prepare('INSERT INTO menu_item_targets (menu_item_name, menu_item_type) VALUES (?, ?)')
-    .run('CustTableListPage', 'display');
+  writer.prepare('INSERT INTO menu_item_targets (menu_item_name, menu_item_type, model) VALUES (?, ?, ?)')
+    .run('CustTableListPage', 'display', 'Test');
 
   deps = makeDeps(db);
 });
 
-afterAll(() => db.close());
+afterAll(() => index.close());
 
 afterEach(() => {
   if (ORIGINAL_ENFORCE === undefined) delete process.env.GROUNDING_ENFORCE;
@@ -285,6 +276,32 @@ str s = "FakeClass::run()";
   });
 });
 
+// ─── Case-insensitive resolution (regression: NOCASE full scans) ─────────────
+// X++ identifiers are case-insensitive; the resolver must accept any casing.
+// The former `= ? COLLATE NOCASE` probes did that via full table scans; the
+// index-safe replacements (exact probe + FTS fallback, canonicalized parent)
+// must keep the same semantics.
+
+describe('resolveXppReferences — case-insensitive identifiers', () => {
+  it('verifies differently-cased intrinsic targets and members', () => {
+    expect(errorsOf('tableStr(custtable);')).toEqual([]);
+    expect(errorsOf('fieldStr(CUSTTABLE, accountnum);')).toEqual([]);
+    expect(errorsOf('methodStr(custtable, VALIDATEWRITE);')).toEqual([]);
+  });
+
+  it('verifies a static call through the inheritance chain, any casing', () => {
+    expect(errorsOf('contosochild::doStuff(1);')).toEqual([]);
+  });
+
+  it('verifies extension fields on a differently-cased base table', () => {
+    expect(errorsOf('fieldStr(custtable, ContosoTier);')).toEqual([]);
+  });
+
+  it('still flags unknown members under any casing', () => {
+    expect(errorsOf('fieldStr(custtable, NoSuchField);')).toHaveLength(1);
+  });
+});
+
 // ─── Fail-closed gate ────────────────────────────────────────────────────────
 
 describe('gateOnReferenceErrors', () => {
@@ -356,5 +373,73 @@ describe('resolveReferencesTool', () => {
   it('rejects missing code argument', async () => {
     const result = await resolveReferencesTool({ params: { arguments: {} } }, context);
     expect(result.isError).toBe(true);
+  });
+});
+
+// ─── validate_code references mode for XML (xml-table) ───────────────────────
+// Regression for eval/corpus L1-table-basic VALIDATOR_GAP: references mode never
+// checked EDT names inside <ExtendedDataType>, so wrong EDTs passed the gate and
+// only surfaced at build time.
+
+describe('validateCodeTool references mode — xml-table EDT checking', () => {
+  const context = {
+    symbolIndex: {
+      getReadDb: () => db,
+      getLabelById: (id: string, f?: string) => makeDeps(db).getLabelById(id, f),
+      getLabelFileIds: () => Object.keys(LABELS).map(labelFileId => ({ labelFileId })),
+    },
+  } as any;
+
+  it('verifies a valid EDT reference in AxTableField XML', async () => {
+    const xml = `<?xml version="1.0"?><AxTable><Name>MyTable</Name><Fields>
+      <AxTableField i:type="AxTableFieldString"><Name>Account</Name>
+        <ExtendedDataType>CustAccount</ExtendedDataType></AxTableField>
+    </Fields></AxTable>`;
+    const result = await validateCodeTool(
+      { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
+      context,
+    );
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('✅');
+    expect(result.content[0].text).toContain('verified');
+  });
+
+  it('flags a hallucinated EDT name as an error (the VALIDATOR_GAP this closes)', async () => {
+    const xml = `<?xml version="1.0"?><AxTable><Name>MyTable</Name><Fields>
+      <AxTableField i:type="AxTableFieldString"><Name>Subject</Name>
+        <ExtendedDataType>NoSuchEdtName</ExtendedDataType></AxTableField>
+    </Fields></AxTable>`;
+    const result = await validateCodeTool(
+      { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
+      context,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('NoSuchEdtName');
+    expect(result.content[0].text).toContain('ExtendedDataType');
+  });
+
+  it('flags an unknown enum in <EnumType>', async () => {
+    const xml = `<?xml version="1.0"?><AxTable><Name>MyTable</Name><Fields>
+      <AxTableField i:type="AxTableFieldEnum"><Name>Status</Name>
+        <EnumType>NoSuchEnum</EnumType></AxTableField>
+    </Fields></AxTable>`;
+    const result = await validateCodeTool(
+      { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
+      context,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('NoSuchEnum');
+  });
+
+  it('accepts a known enum (NoYes) in <EnumType>', async () => {
+    const xml = `<?xml version="1.0"?><AxTable><Name>MyTable</Name><Fields>
+      <AxTableField i:type="AxTableFieldEnum"><Name>Active</Name>
+        <EnumType>NoYes</EnumType></AxTableField>
+    </Fields></AxTable>`;
+    const result = await validateCodeTool(
+      { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
+      context,
+    );
+    expect(result.isError).toBeFalsy();
   });
 });

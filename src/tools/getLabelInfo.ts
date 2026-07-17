@@ -29,7 +29,7 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
     const { symbolIndex } = context;
     const { labelId, labelFileId, model } = args;
 
-    // ── Mode A: no labelId → list available AxLabelFile IDs ─────────────────
+    // Mode A: no labelId → list available AxLabelFile IDs
     if (!labelId) {
       let files = symbolIndex.getLabelFileIds(model);
 
@@ -91,7 +91,7 @@ export async function getLabelInfoTool(request: CallToolRequest, context: XppSer
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // ── Mode B: look up a specific label ID ─────────────────────────────────
+    // Mode B: look up a specific label ID
     const rows = symbolIndex.getLabelById(labelId, labelFileId, model);
 
     if (rows.length === 0) {

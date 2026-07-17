@@ -389,7 +389,7 @@ export interface BridgeListResult {
 }
 
 // ===========================
-// Write-support types (Phase 3)
+// Write-support types
 // ===========================
 
 export interface BridgeValidateResult {
@@ -416,7 +416,7 @@ export interface BridgeRefreshResult {
 }
 
 // ===========================
-// Write operation types (Phase 4)
+// Write operation types
 // ===========================
 
 /** Result from createObject / addMethod / addField / setProperty / replaceCode */
@@ -497,19 +497,6 @@ export interface BridgeEnumValueParam {
 }
 
 // ===========================
-// Delete result
-// ===========================
-
-export interface BridgeDeleteResult {
-  success: boolean;
-  objectType: string;
-  objectName: string;
-  model?: string;
-  filePath?: string;
-  error?: string;
-}
-
-// ===========================
 // Batch modify types
 // ===========================
 
@@ -560,7 +547,7 @@ export interface BridgeFormPatternDiscoveryResult {
 }
 
 // ===========================
-// Security artifact types (Phase 6)
+// Security artifact types
 // ===========================
 
 export interface BridgeSecurityEntryPoint {
@@ -605,7 +592,7 @@ export interface BridgeSecurityRoleResult {
 }
 
 // ===========================
-// Menu item types (Phase 6)
+// Menu item types
 // ===========================
 
 export interface BridgeMenuItemResult {
@@ -623,7 +610,7 @@ export interface BridgeMenuItemResult {
 }
 
 // ===========================
-// Table extension list types (Phase 6)
+// Table extension list types
 // ===========================
 
 export interface BridgeTableExtensionEntry {
@@ -643,7 +630,7 @@ export interface BridgeTableExtensionListResult {
 }
 
 // ===========================
-// Code completion types (Phase 6)
+// Code completion types
 // ===========================
 
 export interface BridgeCompletionMember {
@@ -661,7 +648,7 @@ export interface BridgeCompletionResult {
 }
 
 // ===========================
-// Extension class xref types (Phase 6)
+// Extension class xref types
 // ===========================
 
 export interface BridgeExtensionClassEntry {
@@ -680,7 +667,7 @@ export interface BridgeExtensionClassResult {
 }
 
 // ===========================
-// Event subscriber xref types (Phase 6 — enriched)
+// Event subscriber xref types
 // ===========================
 
 export interface BridgeEventSubscriberEntry {

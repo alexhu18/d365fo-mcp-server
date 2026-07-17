@@ -5,8 +5,7 @@
  * All transformations are STRING-LEVEL on the original XML text — never
  * parse/re-serialize. D365FO metadata XML is whitespace-, CDATA- and
  * namespace-marker-sensitive (tabs, CRLF, xmlns="", i:nil), and a round-trip
- * through an XML library corrupts it (the same reason normalizeD365Xml
- * exists). Regions we don't touch stay byte-identical.
+ * through an XML library corrupts it. Regions we don't touch stay byte-identical.
  */
 
 export interface CloneFormOptions {
@@ -77,7 +76,6 @@ export function findElementBlocks(xml: string, tagName: string, searchStart = 0,
     if (!open || open.index >= limit) break;
 
     const start = open.index;
-    // Find the end of the opening tag to detect self-closing
     const tagEnd = xml.indexOf('>', start);
     if (tagEnd === -1) break;
     if (xml[tagEnd - 1] === '/') {
@@ -86,7 +84,6 @@ export function findElementBlocks(xml: string, tagName: string, searchStart = 0,
       continue;
     }
 
-    // Balanced scan for the matching close tag
     let depth = 1;
     let scan = tagEnd + 1;
     while (depth > 0 && scan < xml.length) {
@@ -204,7 +201,7 @@ export function cloneFormXml(sourceXml: string, opt: CloneFormOptions): CloneFor
     fieldStats: [],
   };
 
-  // ── 1. Form rename ─────────────────────────────────────────────────────────
+  // Form rename
   const rootNameMatch = xml.match(/<Name>([^<]+)<\/Name>/);
   if (!rootNameMatch) throw new Error('Source XML has no <Name> element — not an AxForm?');
   const sourceFormName = rootNameMatch[1];
@@ -218,7 +215,7 @@ export function cloneFormXml(sourceXml: string, opt: CloneFormOptions): CloneFor
     `class ${targetFormName}`,
   );
 
-  // ── 2. Method stripping (inside <SourceCode> only) ─────────────────────────
+  // Method stripping (inside <SourceCode> only)
   if (stripMethods) {
     const sourceCodeBlocks = findElementBlocks(xml, 'SourceCode');
     if (sourceCodeBlocks.length > 0) {
@@ -235,13 +232,10 @@ export function cloneFormXml(sourceXml: string, opt: CloneFormOptions): CloneFor
     }
   }
 
-  // ── 2b. Empty the <SourceCode> datasource/control method mirror ────────────
-  // <SourceCode> carries a <DataSources>/<DataControls> mirror that exists only
-  // to host per-datasource, per-field and per-control method overrides. We strip
-  // those methods, so the mirror is dead weight — and it still names the SOURCE
-  // table's fields and the source form's controls, which the deserializer
-  // cross-checks against the (re-bound) real datasources and rejects. Reset both
-  // to the empty self-closing form every clean form uses.
+  // Empty the <SourceCode> datasource/control method mirror: it names the
+  // SOURCE table's fields and the source form's controls, which the
+  // deserializer cross-checks against the re-bound real datasources and
+  // rejects, so reset both to the empty self-closing form.
   for (const childTag of ['DataSources', 'DataControls']) {
     const sc = findElementBlocks(xml, 'SourceCode')[0];
     if (!sc) break;

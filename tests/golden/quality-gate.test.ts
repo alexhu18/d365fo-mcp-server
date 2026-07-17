@@ -16,14 +16,14 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import Database from 'better-sqlite3';
+import { XppSymbolIndex } from '../../src/metadata/symbolIndex';
 import { resolveXppReferences, type ResolverDeps } from '../../src/tools/resolveReferences';
 import { validateXppTool } from '../../src/tools/validateXpp';
 import { codeGenTool } from '../../src/tools/codeGen';
 
-// ─── Index fixture (production schema subset, realistic standard objects) ────
+// ─── Index fixture (real in-memory index — production schema incl. FTS) ──────
 
-let db: InstanceType<typeof Database>;
+let index: XppSymbolIndex;
 let deps: ResolverDeps;
 
 const LABELS: Record<string, string[]> = {
@@ -32,47 +32,39 @@ const LABELS: Record<string, string[]> = {
 };
 
 beforeAll(() => {
-  db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE symbols (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL, type TEXT NOT NULL, parent_name TEXT,
-      signature TEXT, extends_class TEXT
-    );
-    CREATE TABLE extension_metadata (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      extension_name TEXT, extension_type TEXT, base_object_name TEXT,
-      added_fields TEXT, added_methods TEXT, coc_methods TEXT
-    );
-    CREATE TABLE menu_item_targets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      menu_item_name TEXT NOT NULL, menu_item_type TEXT
-    );
-  `);
-  const sym = db.prepare(
-    'INSERT INTO symbols (name, type, parent_name, signature, extends_class) VALUES (?, ?, ?, ?, ?)',
-  );
+  index = new XppSymbolIndex(':memory:', ':memory:');
+  const sym = (
+    name: string,
+    type: string,
+    parentName?: string,
+    signature?: string,
+    extendsClass?: string,
+  ) => index.addSymbol({
+    name, type, parentName, signature, extendsClass,
+    filePath: '/x.xml', model: 'Test',
+  } as any);
+
   // Standard tables
-  sym.run('CustTable', 'table', null, null, null);
-  sym.run('AccountNum', 'field', 'CustTable', 'CustAccount', null);
-  sym.run('Blocked', 'field', 'CustTable', 'CustVendorBlocked', null);
-  sym.run('CreditMax', 'field', 'CustTable', 'AmountMST', null);
-  sym.run('validateWrite', 'method', 'CustTable', 'public boolean validateWrite()', null);
-  sym.run('find', 'method', 'CustTable',
-    'public static CustTable find(CustAccount _custAccount, boolean _forUpdate = false)', null);
-  sym.run('SalesTable', 'table', null, null, null);
-  sym.run('SalesId', 'field', 'SalesTable', 'SalesIdBase', null);
-  sym.run('CustAccount', 'field', 'SalesTable', 'CustAccount', null);
+  sym('CustTable', 'table');
+  sym('AccountNum', 'field', 'CustTable', 'CustAccount');
+  sym('Blocked', 'field', 'CustTable', 'CustVendorBlocked');
+  sym('CreditMax', 'field', 'CustTable', 'AmountMST');
+  sym('validateWrite', 'method', 'CustTable', 'public boolean validateWrite()');
+  sym('find', 'method', 'CustTable',
+    'public static CustTable find(CustAccount _custAccount, boolean _forUpdate = false)');
+  sym('SalesTable', 'table');
+  sym('SalesId', 'field', 'SalesTable', 'SalesIdBase');
+  sym('CustAccount', 'field', 'SalesTable', 'CustAccount');
   // Standard enums (incl. platform event enums used in handler attributes)
-  sym.run('CustVendorBlocked', 'enum', null, null, null);
-  sym.run('NoYes', 'enum', null, null, null);
-  sym.run('DataEventType', 'enum', null, null, null);
+  sym('CustVendorBlocked', 'enum');
+  sym('NoYes', 'enum');
+  sym('DataEventType', 'enum');
   // EDTs
-  sym.run('CustAccount', 'edt', null, 'AccountNum', null);
-  sym.run('AmountMST', 'edt', null, 'AmountMSTBase', null);
+  sym('CustAccount', 'edt', undefined, 'AccountNum');
+  sym('AmountMST', 'edt', undefined, 'AmountMSTBase');
 
   deps = {
-    db,
+    db: index.getReadDb(),
     getLabelById: (labelId: string, labelFileId?: string) => {
       const hit = (f: string) => (LABELS[f] ?? []).includes(labelId) ? [{ labelId, labelFileId: f }] : [];
       return labelFileId ? hit(labelFileId) : Object.keys(LABELS).flatMap(hit);
@@ -81,7 +73,7 @@ beforeAll(() => {
   };
 });
 
-afterAll(() => db.close());
+afterAll(() => index.close());
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

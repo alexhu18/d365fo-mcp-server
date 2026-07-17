@@ -4,11 +4,10 @@
  * Regenerates D365FO runtime metadata manifests (.md files) from XML source
  * after an xppc compile, without requiring a full VS build.
  *
- * Background: xppc.exe compiles X++ source into .netmodule files but does NOT
- * update the binary .md manifests that the AOS uses to resolve class names at
- * runtime. VS BuildTask does this as a post-compile step using the
- * MetadataProviderFactory + RuntimeMetadataWriter APIs from
- * Microsoft.Dynamics.AX.Metadata.Storage.dll.
+ * xppc.exe compiles X++ source into .netmodule files but does NOT update the
+ * binary .md manifests that the AOS uses to resolve class names at runtime.
+ * VS BuildTask does this as a post-compile step using the MetadataProviderFactory
+ * + RuntimeMetadataWriter APIs from Microsoft.Dynamics.AX.Metadata.Storage.dll.
  *
  * This module replicates that step by:
  *  1. Compiling a small .NET Framework 4.x helper (GenerateMetadata.exe) on
@@ -30,9 +29,7 @@ import { access, writeFile, unlink, cp } from 'fs/promises';
 
 const execFileAsync = util.promisify(execFile);
 
-// ---------------------------------------------------------------------------
 // C# source for the helper — compiled on first use
-// ---------------------------------------------------------------------------
 
 const CS_SOURCE = `
 using System;
@@ -79,9 +76,7 @@ class GenerateMetadata
 // (editing the C# without this would silently keep running the old binary).
 const HELPER_VERSION = crypto.createHash('sha256').update(CS_SOURCE).digest('hex').slice(0, 8);
 
-// ---------------------------------------------------------------------------
 // csc.exe locations (.NET Framework 4.x, built into Windows)
-// ---------------------------------------------------------------------------
 
 const CSC_CANDIDATES = [
   'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe',
@@ -95,9 +90,7 @@ async function findCscExe(): Promise<string | null> {
   return null;
 }
 
-// ---------------------------------------------------------------------------
 // Compile helper (once per framework version)
-// ---------------------------------------------------------------------------
 
 function exeCachePath(frameworkBinDir: string): string {
   // Place the exe in the framework bin directory itself so .NET finds the
@@ -135,27 +128,12 @@ async function compileHelper(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Compiler-metadata sync
-//
-// xppc reads the X++ source from the -metadata root (the source repo) but
-// writes the compiled model's X++ compiler metadata (the XppMetadata tree:
-// class signatures, RunOn, visibility, method parameters, ...) to the
-// -compilermetadata root (the framework PackagesLocalDirectory). The two roots
-// differ in an MCP-only build.
-//
-// RuntimeMetadataWriter's disk provider reads BOTH source and compiler metadata
-// relative to a single root. Reading from the source root, it finds source for
-// a newly added class but no co-located compiler metadata, so it reports
-// IsCompilerMetadataSet = false and throws "Compiler metadata not set before
-// serialization to runtime format".
-//
-// Fix: after the compile, overlay the freshly written XppMetadata from the
-// -compilermetadata root onto the source metadata root so every source class
-// has its compiler metadata alongside it. Overlay (not mirror) — orphan
-// compiler metadata with no matching source is harmless because the provider
-// enumerates classes from the source XML.
-// ---------------------------------------------------------------------------
+// Compiler-metadata sync: xppc writes compiled X++ compiler metadata (XppMetadata tree) to the
+// -compilermetadata root, which can differ from the -metadata source root in an MCP-only build.
+// RuntimeMetadataWriter needs both source and compiler metadata under one root, so we overlay the
+// freshly written XppMetadata onto the source root before generating runtime manifests. Overlay
+// (not mirror) is safe — orphan compiler metadata with no matching source is harmless since the
+// provider enumerates classes from the source XML.
 
 async function syncCompilerMetadata(
   compilerMetadataRoot: string,
@@ -180,9 +158,7 @@ async function syncCompilerMetadata(
   return `compiler metadata synced from ${src}`;
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 export interface GenerateMetadataResult {
   skipped: boolean;

@@ -1,22 +1,13 @@
 /**
- * Debounced Bridge Refresh
- *
- * Coalesces multiple rapid refreshProvider() calls into a single call.
- * When create/modify operations fire in quick succession (e.g. generating
- * a table + form + class), only one DiskProvider refresh runs — after
- * the last operation settles.
- *
- * Usage:
- *   const result = await debouncedRefresh.refresh(bridge);
- *   // First caller triggers a real refresh; subsequent callers within
- *   // the settle window reuse the same promise.
+ * Coalesces multiple rapid refreshProvider() calls into a single call, so that
+ * a burst of create/modify operations triggers only one DiskProvider refresh.
  */
 
 import type { BridgeClient } from './bridgeClient.js';
 import type { BridgeRefreshResult } from './bridgeClient.js';
 
-const SETTLE_MS = 400;          // Wait 400ms after last request before refreshing
-const MAX_WAIT_MS = 2_000;      // Never wait more than 2s from first request
+const SETTLE_MS = 400;
+const MAX_WAIT_MS = 2_000;
 
 let pending: {
   promise: Promise<BridgeRefreshResult | null>;

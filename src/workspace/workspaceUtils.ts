@@ -8,26 +8,18 @@ import * as path from 'path';
 import { assertReadRootAllowed } from '../utils/pathContainment.js';
 
 /**
- * Validate workspace path
- * Ensures path is safe and accessible, and that it is contained within the
- * configured D365FO package roots.
- *
- * Security: the previous implementation only checked for the literal substring
- * ".." — absolute paths such as "/etc" or "C:\Windows" bypassed it entirely.
- * This version resolves the path to an absolute form and then verifies it falls
- * under one of the operator-configured package roots before any fs operation.
+ * Validate workspace path.
+ * Ensures the path is safe and accessible, and that it resolves under one of
+ * the configured D365FO package roots (not just a ".." substring check).
  */
 export async function validateWorkspacePath(workspacePath: string): Promise<{
   valid: boolean;
   error?: string;
 }> {
   try {
-    // Resolve to absolute, eliminating any relative segments.
     const resolved = path.resolve(workspacePath);
 
-    // Root-containment check: reject any path that does not resolve under a
-    // configured D365FO package root (replaces the old ".." substring test,
-    // which was bypassable with absolute paths such as "/etc" or "C:\Windows").
+    // Reject any path that does not resolve under a configured package root.
     const containment = await assertReadRootAllowed(resolved);
     if (!containment.ok) {
       return {
@@ -36,7 +28,6 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
       };
     }
 
-    // Check if path exists and is a directory.
     try {
       const stats = await fs.stat(resolved);
       if (!stats.isDirectory()) {
@@ -52,7 +43,7 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
       };
     }
 
-    // Check if path contains too many files (prevent DoS)
+    // Prevent DoS via directories with excessive file counts.
     const files = await fs.readdir(resolved);
     if (files.length > 50000) {
       return {
@@ -75,13 +66,9 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
  * Remove any potentially dangerous characters
  */
 export function sanitizeWorkspacePath(workspacePath: string): string {
-  // Normalize path separators
   let sanitized = path.normalize(workspacePath);
-
-  // Remove any null bytes
   sanitized = sanitized.replace(/\0/g, '');
 
-  // Ensure absolute path
   if (!path.isAbsolute(sanitized)) {
     sanitized = path.resolve(sanitized);
   }

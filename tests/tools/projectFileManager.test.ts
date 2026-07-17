@@ -149,8 +149,9 @@ describe('ProjectFileManager', () => {
         ['security-privilege', 'AxSecurityPrivilege', 'Security Privileges'],
         ['security-duty', 'AxSecurityDuty', 'Security Duties'],
         ['security-role', 'AxSecurityRole', 'Security Roles'],
+        ['security-duty-extension', 'AxSecurityDutyExtension', 'Security Duties'],
+        ['security-role-extension', 'AxSecurityRoleExtension', 'Security Roles'],
         ['business-event', 'AxClass', 'Classes'],
-        ['label-file', 'AxLabelFile', 'Label Files'],
         ['tile', 'AxTile', 'Tiles'],
         ['kpi', 'AxKPI', 'KPIs'],
       ];

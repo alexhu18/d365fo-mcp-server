@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
 import { resolvePattern, type FormPatternSpec } from '../knowledge/formPatterns/index.js';
 import { hasMinedPatternData } from '../knowledge/formPatterns/crossCheck.js';
+import { lookupSymbolNocase } from '../utils/symbolLookup.js';
 
 const RecommendSchema = z.object({
   entityKind: z
@@ -206,13 +207,21 @@ async function renderRecommendation(symbolIndex: any, input: RecommendInput): Pr
   // Enrich fieldCount from the index when only a table name was given
   const enriched: RecommendInput = { ...input };
   const rdb = symbolIndex.getReadDb();
+  // Canonicalize once — `parent_name = ? COLLATE NOCASE` cannot use
+  // idx_parent_type_name and scans all 360k field rows (180 s cold).
+  let canonicalTable = enriched.tableName;
+  if (enriched.tableName) {
+    try {
+      canonicalTable = lookupSymbolNocase(rdb, enriched.tableName)?.name ?? enriched.tableName;
+    } catch { /* older index without FTS — keep the input casing */ }
+  }
   if (enriched.tableName && enriched.fieldCount === undefined) {
     try {
       const row = rdb.prepare(`
         SELECT COUNT(*) AS c FROM symbols
-        WHERE type = 'field' AND parent_name = ? COLLATE NOCASE
+        WHERE type = 'field' AND parent_name = ?
           AND name NOT IN ('RecId', 'RecVersion', 'DataAreaId', 'Partition')
-      `).get(enriched.tableName) as { c: number } | undefined;
+      `).get(canonicalTable) as { c: number } | undefined;
       if (row && row.c > 0) enriched.fieldCount = row.c;
     } catch { /* index without fields — keep undefined */ }
   }
@@ -266,9 +275,17 @@ async function renderRecommendation(symbolIndex: any, input: RecommendInput): Pr
   // Existing forms on the same table — strong cloning candidates
   if (enriched.tableName) {
     try {
-      const sameTable = rdb.prepare(`
-        SELECT DISTINCT form_name FROM form_datasources WHERE table_name = ? COLLATE NOCASE LIMIT 5
-      `).all(enriched.tableName) as Array<{ form_name: string }>;
+      // BINARY probe on idx_form_datasources_table first; table_name casing
+      // comes from form XML, so fall back to NOCASE only when the probe misses
+      // (form_datasources is small — that scan is cheap).
+      let sameTable = rdb.prepare(`
+        SELECT DISTINCT form_name FROM form_datasources WHERE table_name = ? LIMIT 5
+      `).all(canonicalTable) as Array<{ form_name: string }>;
+      if (sameTable.length === 0) {
+        sameTable = rdb.prepare(`
+          SELECT DISTINCT form_name FROM form_datasources WHERE table_name = ? COLLATE NOCASE LIMIT 5
+        `).all(enriched.tableName) as Array<{ form_name: string }>;
+      }
       if (sameTable.length > 0) {
         lines.push('');
         lines.push(`**Forms already using \`${enriched.tableName}\`:** ${sameTable.map((f) => `\`${f.form_name}\``).join(', ')}`);
@@ -440,7 +457,7 @@ async function analyzeFormPattern(symbolIndex: any, formPattern: string, limit: 
 
   output += `**Sample Forms Found:** ${sampleForms.length}\n\n`;
 
-  // ── BATCHED datasource query: fetch all datasources for all sample forms in ONE query ──
+  // Fetch all datasources for all sample forms in one query
   const formNames = sampleForms.map(f => f.name);
   const placeholders = formNames.map(() => '?').join(',');
   const allDatasources = rdb.prepare(`

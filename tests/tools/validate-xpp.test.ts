@@ -70,6 +70,81 @@ describe('SEL rules', () => {
     const result = await validateXppTool(req({ code, codeType: 'xpp' }));
     expect(getText(result)).toContain('SEL004');
   });
+
+  it('SEL005: flags a genuine function call inside a where clause', async () => {
+    const code = `
+      void run()
+      {
+          CustTable custTable;
+          select firstOnly custTable where custTable.AccountNum == someFunc(1);
+      }
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).toContain('SEL005');
+  });
+
+  it('SEL005: does NOT flag statements after the where-clause terminates on the same line', async () => {
+    // Regression (eval L4-vendor-cert-compliance): `select count(x) from t where ...).RecId;`
+    // followed by an unrelated info() call was misattributed as "inside where clause" —
+    // the scanner never closed the where-clause state because it only reset on `{`,
+    // never on the statement-terminating `;`.
+    const code = `
+      class TestSelectCountValidator
+      {
+          public void run()
+          {
+              CustTable custTable;
+              int c;
+
+              c = (select count(RecId) from custTable
+                  where custTable.AccountNum != '').RecId;
+
+              info(strFmt("%1", c));
+          }
+      }
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).not.toContain('SEL005');
+  });
+
+  it('SEL005: does NOT bleed into unrelated later methods in the same class', async () => {
+    // Even more pathological form of the same bug: a where-clause on an early
+    // line left `inWhere` stuck true for the rest of the file, so a completely
+    // unrelated method DECLARATION several lines later ("run2(") was flagged.
+    const code = `
+      class TestSelectCountValidator2
+      {
+          public void run()
+          {
+              CustTable custTable;
+              int c;
+
+              c = (select count(RecId) from custTable
+                  where custTable.AccountNum != '').RecId;
+          }
+
+          public void run2()
+          {
+              info(strFmt("%1", 1));
+          }
+      }
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).not.toContain('SEL005');
+  });
+
+  it('SEL005: does not flag an aggregate function in the select list before "where" on the same line', async () => {
+    const code = `
+      void run()
+      {
+          CustTable custTable;
+          int c;
+          c = (select count(RecId) from custTable where custTable.AccountNum != '').RecId;
+      }
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).not.toContain('SEL005');
+  });
 });
 
 // ─── COC rules ───────────────────────────────────────────────────────────────
@@ -168,6 +243,25 @@ describe('XML rules', () => {
           </AxTableIndex>
         </Indexes>
       </AxTable>
+    `;
+    const result = await validateXppTool(req({ code: xml, codeType: 'xml-table' }));
+    expect(getText(result)).not.toContain('XML001');
+  });
+
+  it('XML001: does NOT fire on a table EXTENSION (inherits base alternate key)', async () => {
+    // Regression (eval L2-table-extension): an AxTableExtension adding a field has
+    // no index of its own and must not be required to declare an alternate key —
+    // the base table already has one.
+    const xml = `
+      <AxTableExtension>
+        <Name>CustGroup.ContosoExtension</Name>
+        <Fields>
+          <AxTableField i:type="AxTableFieldInt">
+            <Name>NotePriority</Name>
+            <ExtendedDataType>Counter</ExtendedDataType>
+          </AxTableField>
+        </Fields>
+      </AxTableExtension>
     `;
     const result = await validateXppTool(req({ code: xml, codeType: 'xml-table' }));
     expect(getText(result)).not.toContain('XML001');

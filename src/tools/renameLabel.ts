@@ -22,10 +22,7 @@ import { PackageResolver } from '../utils/packageResolver.js';
 import { detectEol } from '../utils/eolUtils.js';
 import { isExtensionLabelFile } from '../metadata/labelParser.js';
 
-// UTF-8 BOM
 const UTF8_BOM = '\uFEFF';
-
-// ── Input schema ─────────────────────────────────────────────────────────────
 
 const RenameLabelArgsSchema = z.object({
   oldLabelId: z
@@ -79,8 +76,6 @@ const RenameLabelArgsSchema = z.object({
     .default(true)
     .describe('Update the MCP label index after renaming (default: true)'),
 });
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Strip UTF-8 BOM from string */
 function stripBom(s: string): string {
@@ -164,8 +159,6 @@ async function collectFiles(dir: string, extensions: string[]): Promise<string[]
   return results;
 }
 
-// ── Tool implementation ───────────────────────────────────────────────────────
-
 export async function renameLabelTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = RenameLabelArgsSchema.parse(request.params.arguments);
@@ -179,9 +172,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       };
     }
 
-    // Guard: don't operate on a label file EXTENSION (e.g. "Base_Extension").
-    // Labels belong in the model's own ORIGINAL label file. Opt out with
-    // allowExtensionLabelFile=true.
+    // Labels belong in the model's own original label file, not an extension; opt out with allowExtensionLabelFile=true.
     if (isExtensionLabelFile(labelFileId) && !args.allowExtensionLabelFile) {
       return {
         content: [{
@@ -198,7 +189,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       };
     }
 
-    // ── 1. Resolve package path ──────────────────────────────────────────────
+    // Resolve package path
     const configManager = getConfigManager();
     const envType = await configManager.getDevEnvironmentType();
 
@@ -230,7 +221,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
     const modelDir = path.join(resolvedPackagePath, resolvedPackageName, model);
     const labelResourcesDir = path.join(modelDir, 'AxLabelFile', 'LabelResources');
 
-    // ── 2. Check old label exists in at least one .label.txt ────────────────
+    // Check old label exists in at least one .label.txt
     let existingLanguages: string[] = [];
     try {
       existingLanguages = await fs.readdir(labelResourcesDir);
@@ -289,7 +280,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       } catch { /* skip */ }
     }
 
-    // ── 3. Collect all files to scan for references ──────────────────────────
+    // Collect all files to scan for references
     const scanRoots = [modelDir, ...(args.searchPaths ?? [])];
     const allXppFiles = (
       await Promise.all(scanRoots.map(d => collectFiles(d, ['.xpp'])))
@@ -298,7 +289,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       await Promise.all(scanRoots.map(d => collectFiles(d, ['.xml'])))
     ).flat();
 
-    // ── 4. Phase: rename in .label.txt files ─────────────────────────────────
+    // Phase: rename in .label.txt files
     type FileChange = { file: string; replacements: number };
     const labelTxtChanges: FileChange[] = [];
     const xppChanges: FileChange[] = [];
@@ -320,7 +311,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       }
     }
 
-    // ── 5. Phase: replace @LabelFileId:OldId references in .xpp files ────────
+    // Phase: replace @LabelFileId:OldId references in .xpp files
     for (const xppFile of allXppFiles) {
       let content: string;
       try {
@@ -336,9 +327,9 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       }
     }
 
-    // ── 6. Phase: replace references in XML metadata files ───────────────────
+    // Phase: replace references in XML metadata files
     for (const xmlFile of allXmlFiles) {
-      // Skip the AxLabelFile XML descriptors themselves — they don't contain label refs
+      // AxLabelFile XML descriptors don't contain label refs
       if (xmlFile.includes('AxLabelFile')) continue;
 
       let content: string;
@@ -355,12 +346,12 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       }
     }
 
-    // ── 7. Update SQLite index ────────────────────────────────────────────────
+    // Update SQLite index
     if (!dryRun && updateIndex && labelTxtChanges.length > 0) {
       symbolIndex.renameLabelInIndex(oldLabelId, newLabelId, labelFileId, model);
     }
 
-    // ── 8. Build result summary ───────────────────────────────────────────────
+    // Build result summary
     const totalFiles =
       labelTxtChanges.length + xppChanges.length + xmlChanges.length;
     const totalReplacements =
@@ -387,7 +378,6 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
     if (labelTxtChanges.length > 0) {
       lines.push(`🏷️  .label.txt files (${labelTxtChanges.length}):`);
       for (const c of labelTxtChanges) {
-        // Show the language folder name and filename for clarity (e.g. en-US/MyModel.en-US.label.txt)
         const lang = path.basename(path.dirname(c.file));
         lines.push(`   ${dryRun ? '○' : '✔'} [${lang}] ${path.basename(c.file)}`);
       }
@@ -410,8 +400,6 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       lines.push('');
     }
 
-    // Warn when label was updated in .txt but no code references were found —
-    // this may mean the label is unreferenced, or that searchPaths needs to be extended.
     if (xppChanges.length === 0 && xmlChanges.length === 0) {
       lines.push(`ℹ️  No X++ or XML references to "${oldRef}" found in scanned directories.`);
       lines.push(`   If the label is used in code, add its directory to the searchPaths parameter.`);

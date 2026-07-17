@@ -1,0 +1,64 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/dynamics365ninja/d365fo-mcp-server/eval/cases/schema.json",
+  "title": "Agent eval use-case spec",
+  "description": "A single D365FO implementation use-case for the agent eval loop. See docs/AGENT_EVAL_LOOP.md section 8.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "tier", "instruction", "target_artifact_types", "golden_path"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^L[0-4]-[a-z0-9-]+$",
+      "description": "Stable case id, e.g. L1-table-basic. Prefix is the complexity tier."
+    },
+    "title": { "type": "string", "description": "Human-readable one-line title." },
+    "tier": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4,
+      "description": "Complexity tier L0-L4. Must match the id prefix."
+    },
+    "instruction": {
+      "type": "string",
+      "description": "The natural-language task the agent must implement using only the grounded tool path."
+    },
+    "target_artifact_types": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "AOT object types the case is expected to produce, e.g. AxTable, AxClass, AxForm."
+    },
+    "golden_path": {
+      "type": "string",
+      "description": "Repo-relative path to the golden metadata folder for this case."
+    },
+    "systest": {
+      "type": "string",
+      "description": "Optional repo-relative path to a SysTest definition for runtime correctness."
+    },
+    "golden_pending": {
+      "type": "boolean",
+      "description": "When true, the case spec is authored but its golden has not yet been captured on the VM (golden authoring requires a real build artifact, §6.4). Such a case is exempt from the 'every case has a golden' CI gate until the golden is committed; flip to false (or remove) once the golden lands."
+    },
+    "systest_pending": {
+      "type": "boolean",
+      "description": "When true, the golden is committed but the case's live SysTest run (the runtime-correctness signal, §6.3) has not been successfully completed yet — e.g. blocked by a platform/environment limitation rather than the implementation itself. See the case's corpus evidence for the reason. Flip to false (or remove) once a live run completes."
+    },
+    "ignore": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Per-case normalisation exceptions: element paths legitimately allowed to vary in the golden diff."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-form tags for clustering, e.g. table, coc, form, security."
+    },
+    "split": {
+      "type": "string",
+      "enum": ["train", "holdout"],
+      "description": "Train/holdout split (docs/AGENT_EVAL_LOOP.md §10). A fix is accepted only if holdout scores do not regress; new cases enter 'holdout' first. Defaults to 'holdout' when omitted."
+    }
+  }
+}

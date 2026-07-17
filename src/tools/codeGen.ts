@@ -54,7 +54,7 @@ const CodeGenArgsSchema = z.object({
     ),
 });
 
-// Templates for NEW elements: (name already includes prefix)
+// Templates for NEW elements (name already includes prefix)
 const newElementTemplates: Record<string, (name: string) => string> = {
   class: (name) => `
 /// <summary>
@@ -475,7 +475,7 @@ const extensionTemplates: Record<string, (baseName: string, prefix: string) => s
   'map-extension': mapExtensionTemplate,
 };
 
-// ── SysOperation pattern (3 classes: DataContract + Controller + Service) ──
+// SysOperation pattern: 3 classes (DataContract + Controller + Service)
 function sysOperationTemplate(name: string, serviceMethod = 'process'): string {
   return `
 // ── 1. DataContract ─────────────────────────────────────────────────────
@@ -553,7 +553,7 @@ class ${name}Service extends SysOperationServiceBase
 }`;
 }
 
-// ── Event handler pattern (class with SubscribesTo handlers) ─────────────
+// Event handler pattern: class with SubscribesTo handlers
 function eventHandlerTemplate(baseName: string, _prefix: string): string {
   return `
 /// <summary>
@@ -594,7 +594,7 @@ public final class ${baseName}EventHandler
 }`;
 }
 
-// ── Security privilege XML pattern ──────────────────────────────────────
+// Security privilege XML pattern
 function securityPrivilegeXmlTemplate(name: string, targetMenuItemName: string): string {
   const viewName = name.endsWith('View') ? name : `${name}View`;
   const maintainName = name.endsWith('Maintain') ? name : `${name}Maintain`;
@@ -644,7 +644,7 @@ function securityPrivilegeXmlTemplate(name: string, targetMenuItemName: string):
   return `<!-- FILE 1: ${viewName}.xml (Read access) -->\n${viewXml}\n\n<!-- FILE 2: ${maintainName}.xml (Update/Create/Delete access) -->\n${maintainXml}`;
 }
 
-// ── Menu item XML pattern ────────────────────────────────────────────────
+// Menu item XML pattern
 function menuItemXmlTemplate(name: string, itemType: string, targetObject: string): string {
   const elemName = itemType === 'action' ? 'AxMenuItemAction'
     : itemType === 'output' ? 'AxMenuItemOutput'
@@ -670,7 +670,7 @@ function menuItemXmlTemplate(name: string, itemType: string, targetObject: strin
 </${elemName}>`;
 }
 
-// ── SSRS Report Full pattern (DataContract + DP + Controller + TmpTable note) ─
+// SSRS Report Full pattern: DataContract + DP + Controller + TmpTable note
 function ssrsReportFullTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════
 // SSRS Report: ${name}
@@ -764,7 +764,7 @@ public class ${name}Controller extends SrsReportRunController
 }`;
 }
 
-// ── SysTableLookup pattern ─────────────────────────────────────────────────
+// SysTableLookup pattern
 function lookupFormTemplate(name: string): string {
   return `/// <summary>
 /// Lookup for ${name} field.
@@ -792,7 +792,7 @@ public static void lookup${name}(FormStringControl _formControl)
 }`;
 }
 
-// ── Dialog Box pattern ─────────────────────────────────────────────────────
+// Dialog Box pattern
 function dialogBoxTemplate(name: string): string {
   return `/// <summary>
 /// Dialog for ${name}. Uses D365FO Dialog API without a dedicated form.
@@ -865,7 +865,7 @@ public class ${name}Dialog
 }`;
 }
 
-// ── DimensionDefaultingController pattern ─────────────────────────────────
+// DimensionDefaultingController pattern
 function dimensionControllerTemplate(name: string): string {
   return `/// <summary>
 /// Handles financial dimension defaulting for ${name} form.
@@ -944,7 +944,7 @@ public class ${name}DimensionController
 // }`;
 }
 
-// ── NumberSeqFormHandler pattern ──────────────────────────────────────────
+// NumberSeqFormHandler pattern
 function numberSeqHandlerTemplate(name: string): string {
   return `/// <summary>
 /// Integrates number sequence auto-generation into the ${name} form.
@@ -1028,7 +1028,7 @@ final class CompanyInfo_${name}_Extension
 }`;
 }
 
-// ── Display Menu Controller pattern ──────────────────────────────────────
+// Display Menu Controller pattern
 function displayMenuControllerTemplate(name: string): string {
   return `/// <summary>
 /// Menu controller for ${name}. Handles Args-based routing when a menu item
@@ -1083,7 +1083,7 @@ public class ${name}Controller extends MenuFunction
 }`;
 }
 
-// ── Data Entity with Staging (DMF import) pattern ─────────────────────────
+// Data Entity with Staging (DMF import) pattern
 function dataEntityStagingTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════════════
 // Data Entity with Staging Table: ${name}
@@ -1168,7 +1168,7 @@ public class ${name}EntityClass extends DMFEntityBase
 }`;
 }
 
-// ── AIF/OData Service class pattern ──────────────────────────────────────
+// AIF/OData Service class pattern
 function serviceClassAisTemplate(name: string): string {
   return `/// <summary>
 /// OData/AIF service class for ${name}.
@@ -1288,7 +1288,7 @@ public class ${name}Contract
 }`;
 }
 
-// ── Business Event pattern (contract + event class) ──────────────────────
+// Business Event pattern: contract + event class
 function businessEventTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════
 // Business Event: ${name}
@@ -1387,7 +1387,7 @@ public final class ${name}BusinessEvent extends BusinessEventsBase
 }`;
 }
 
-// ── Custom Telemetry pattern ─────────────────────────────────────────────
+// Custom Telemetry pattern
 function customTelemetryTemplate(name: string): string {
   return `/// <summary>
 /// Custom telemetry signal for ${name}.
@@ -1459,7 +1459,7 @@ public final class ${name}Telemetry
 
 
 
-// ── Feature Class pattern ────────────────────────────────────────────────
+// Feature Class pattern
 function featureClassTemplate(name: string): string {
   return `/// <summary>
 /// Feature management class for ${name}.
@@ -1521,7 +1521,7 @@ public final class ${name}Feature
 }`;
 }
 
-// ── Composite Entity pattern ─────────────────────────────────────────────
+// Composite Entity pattern
 function compositeEntityTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════
 // Composite Data Entity: ${name}
@@ -1594,7 +1594,7 @@ function compositeEntityTemplate(name: string): string {
 // 5. After import: check staging table for errors (DMFTransferStatus)`;
 }
 
-// ── Custom Service (Service Group + Operations) pattern ──────────────────
+// Custom Service pattern: Service Group + Operations
 function customServiceTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════
 // Custom Service: ${name}
@@ -1742,7 +1742,7 @@ public class ${name}Service
 //   https://{env}.operations.dynamics.com/api/services/${name}ServiceGroup/${name}Service/processRequest`;
 }
 
-// ── ER Custom Function pattern ───────────────────────────────────────────
+// ER Custom Function pattern
 function erCustomFunctionTemplate(name: string): string {
   return `/// <summary>
 /// Electronic Reporting custom function provider for ${name}.

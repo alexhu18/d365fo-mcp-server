@@ -10,7 +10,7 @@ child process. It provides live, always-current metadata access — reads and wr
 same API that Visual Studio uses internally.
 
 For build instructions, see [SETUP.md § Building the C# Bridge](SETUP.md#building-the-c-bridge).
-For architecture details, see [ARCHITECTURE.md § C# Bridge Architecture](ARCHITECTURE.md#c-bridge-architecture).
+For architecture details, see [ARCHITECTURE.md § C# Metadata Bridge](ARCHITECTURE.md#c-metadata-bridge).
 
 ---
 
@@ -30,7 +30,7 @@ Every tool handler follows a strict **Bridge → DB → Disk** priority:
 
 ## Read Endpoints
 
-19 read endpoints (mapped through 12 `tryBridge*()` adapter functions in `bridgeAdapter.ts`) — return `null` when bridge is unavailable.
+19 read endpoints (mapped through 19 `tryBridge*()` adapter functions in `bridgeAdapter.ts`) — return `null` when bridge is unavailable.
 
 | Method | Parameters | Source |
 |---|---|---|
@@ -62,9 +62,17 @@ All bridge-sourced output includes `_Source: C# bridge (IMetadataProvider)_` in 
 
 32 write adapters (`bridge*()` in `bridgeAdapter.ts`) — **no fallback**, bridge is required.
 
-### Create Operations (18 object types)
+### Create Operations (13 object types)
 
-All use `IMetaXxxProvider.Create()` via explicit interface cast.
+All use `IMetaXxxProvider.Create()` via explicit interface cast. These are the
+types listed in `BRIDGE_CREATE_TYPES` (`bridgeAdapter.ts`) — `create_d365fo_file`
+accepts a broader set of 32 object types in total, but any type not in this
+list (query, view, report, data-entity(-extension), security-privilege/duty/role
+(-extension), edt-extension, menu-extension, menu-item-*-extension,
+business-event, tile, kpi, map) is generated via the TypeScript XML-template
+path instead of the bridge's `Create()` API — typically because the bridge
+either doesn't expose that provider or (for security artifacts) silently
+drops structured collections like `EntryPoints`/`Duties`/`Privileges`.
 
 | Object Type | API |
 |---|---|
@@ -73,9 +81,7 @@ All use `IMetaXxxProvider.Create()` via explicit interface cast.
 | enum, enum-extension | `IMetaEnumProvider.Create()` / `IMetaEnumExtensionProvider.Create()` |
 | edt | `IMetaEdtProvider.Create()` |
 | form, form-extension | `IMetaFormProvider.Create()` / `IMetaFormExtensionProvider.Create()` |
-| query, view | `IMetaQueryProvider.Create()` / `IMetaViewProvider.Create()` |
 | menu, menu-item (action/display/output) | `IMetaMenuProvider.Create()` / `IMetaMenuItemXxxProvider.Create()` |
-| security-privilege, security-duty, security-role | `IMetaSecurityXxxProvider.Create()` |
 
 ### Modify Operations (25 operations, all bridged)
 
@@ -98,7 +104,6 @@ All use the Read → Modify → `IMetaXxxProvider.Update()` pattern.
 
 | Method | Purpose |
 |---|---|
-| `deleteObject` | `IMetaXxxProvider.Delete()` for class, table, enum, edt |
 | `batchModify` | Multiple operations in one call |
 | `getCapabilities` | Reports supported types + operations |
 | `discoverFormPatterns` | Analyzes form design patterns |
@@ -174,7 +179,7 @@ The TypeScript client transparently recovers from transient bridge failures:
 | Cause | Fix |
 |---|---|
 | Bridge not built | Run `dotnet build -c Release` in `bridge/D365MetadataBridge/` |
-| Wrong `packagePath` | Fix `D365FO_PACKAGE_PATH` env var in `.mcp.json` to point to `PackagesLocalDirectory` |
+| Wrong `packagePath` | Fix `D365FO_PACKAGE_PATH` env var (in `.env` for traditional, or `.mcp.json` env block) to point to `PackagesLocalDirectory` |
 | Missing DLLs | Verify `{D365FO_PACKAGE_PATH}/bin/` contains `Microsoft.Dynamics.AX.Metadata.*.dll` |
 | Running on Linux/macOS | Expected — bridge is Windows-only, server uses SQLite fallback |
 

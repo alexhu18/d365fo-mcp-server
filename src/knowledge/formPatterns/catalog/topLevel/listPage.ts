@@ -10,8 +10,7 @@ export const listPage: FormPatternSpec = {
   id: 'ListPage',
   xmlName: 'ListPage',
   displayName: 'List Page',
-  // 'UX7 1.0' is the installed-platform version (mined from 179 shipped ListPages);
-  // the legacy 1.1/1.0 remain for back-compat with older metadata.
+  // 'UX7 1.0' is the current platform version; 1.1/1.0 remain for older metadata.
   versions: ['UX7 1.0', '1.1', '1.0'],
   purpose:
     'Read-optimized grid entry point for browsing records and acting on them, typically with ' +

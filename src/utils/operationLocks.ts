@@ -41,7 +41,7 @@ function isProcessAlive(pid: number): boolean {
   if (pid === process.pid) return true;
   try {
     process.kill(pid, 0);
-    return true;          // signal 0 delivered → process exists
+    return true;
   } catch (e: any) {
     return e?.code === 'EPERM'; // EPERM = exists but not ours; ESRCH = gone
   }
@@ -52,9 +52,7 @@ async function tryRemoveStaleLock(lockDir: string, normalizedKey: string): Promi
     const stat = await fs.stat(lockDir);
     const ageMs = Date.now() - stat.mtimeMs;
 
-    // Primary: check if the owning process is still alive.
-    // If it died (e.g. MCP server was killed mid-build), remove immediately
-    // regardless of age so we don't wait up to LOCK_STALE_MS (20 min).
+    // If the owning process is dead, remove immediately regardless of age.
     const ownerFile = path.join(lockDir, 'owner.json');
     try {
       const ownerRaw = await fs.readFile(ownerFile, 'utf8');
@@ -166,23 +164,19 @@ export function getOperationLockCount(): number {
 export async function isOperationLockHeld(lockKey: string): Promise<boolean> {
   const normalizedKey = lockKey.trim().toLowerCase();
 
-  // In-process: check map
   if (operationLocks.has(normalizedKey)) return true;
 
-  // Filesystem: check lock directory existence, owner liveness, and freshness
   const lockDir = getLockDirectory(normalizedKey);
   try {
     const stat = await fs.stat(lockDir);
     const ageMs = Date.now() - stat.mtimeMs;
 
-    // Check if the owning process is still alive
     const ownerFile = path.join(lockDir, 'owner.json');
     try {
       const ownerRaw = await fs.readFile(ownerFile, 'utf8');
       const owner = JSON.parse(ownerRaw) as { pid?: number };
       if (typeof owner.pid === 'number' && !isProcessAlive(owner.pid)) {
-        // Dead process — lock is orphaned, not held
-        return false;
+        return false; // dead process — lock is orphaned, not held
       }
     } catch {
       // owner.json missing/unreadable — fall back to age check
@@ -202,7 +196,6 @@ export async function forceReleaseLock(lockKey: string): Promise<void> {
   const normalizedKey = lockKey.trim().toLowerCase();
   const lockDir = getLockDirectory(normalizedKey);
   await fs.rm(lockDir, { recursive: true, force: true }).catch(() => {});
-  // Also clear in-process map entry so we don't wait on a resolved-but-retained promise
   operationLocks.delete(normalizedKey);
   console.error(`[operationLocks] force-released lock for ${normalizedKey}`);
 }

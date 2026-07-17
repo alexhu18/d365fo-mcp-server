@@ -104,21 +104,17 @@ export async function discoverLabelFiles(
   modelDir: string,  // e.g. K:\AosService\PackagesLocalDirectory\MyPackage\MyModel
 ): Promise<Array<{ labelFileId: string; language: string; filePath: string }>> {
   const results: Array<{ labelFileId: string; language: string; filePath: string }> = [];
-  
-  // 🔧 CASE-INSENSITIVE: On Linux, unzip may convert directory names to lowercase.
-  // Try both cases: AxLabelFile (Windows) and axlabelfile (Linux unzip)
+
+  // Directory casing varies: Windows uses AxLabelFile/LabelResources, Linux unzip may lowercase either segment.
   let axLabelDir = path.join(modelDir, 'AxLabelFile', 'LabelResources');
   if (!fsSync.existsSync(axLabelDir)) {
     axLabelDir = path.join(modelDir, 'axlabelfile', 'LabelResources');
     if (!fsSync.existsSync(axLabelDir)) {
-      // Also try lowercase labelresources
       axLabelDir = path.join(modelDir, 'axlabelfile', 'labelresources');
     }
   }
-  
-  // 🎯 OPTIMIZATION: Only index languages you actually use!
-  // Reduces database from 20M rows to ~1M (20x smaller, 20x faster)
-  // Configure via LABEL_LANGUAGES env var (default: en-US,cs,sk,de)
+
+  // Restrict indexing to configured languages to keep the label table small; LABEL_LANGUAGES=all indexes everything.
   const langConfig = process.env.LABEL_LANGUAGES || 'en-US,cs,sk,de';
   const SUPPORTED_LANGUAGES = langConfig.toLowerCase() === 'all'
     ? null  // null = index all languages
@@ -132,10 +128,8 @@ export async function discoverLabelFiles(
   }
 
   for (const locale of locales) {
-    // 🔧 CASE-INSENSITIVE locale matching: Linux unzip may convert en-US to en-us
-    // Skip unsupported languages early (unless SUPPORTED_LANGUAGES is null = all languages)
+    // Locale directory names may be lowercased on Linux, so compare case-insensitively.
     if (SUPPORTED_LANGUAGES) {
-      // Case-insensitive check
       const normalizedLocale = locale.toLowerCase();
       const isSupported = Array.from(SUPPORTED_LANGUAGES).some(
         supported => supported.toLowerCase() === normalizedLocale
@@ -156,20 +150,17 @@ export async function discoverLabelFiles(
     for (const file of files) {
       if (!file.endsWith('.label.txt')) continue;
       // Filename pattern: {LabelFileId}.{locale}.label.txt
-      // e.g. MyModel.en-US.label.txt or mymodel.en-us.label.txt (Linux)
       const withoutSuffix = file.replace(/\.label\.txt$/, '');
       const dotIdx = withoutSuffix.lastIndexOf('.');
       if (dotIdx < 0) continue;
       const labelFileId = withoutSuffix.substring(0, dotIdx);
       const fileLang = withoutSuffix.substring(dotIdx + 1);
 
-      // Sanity-check: locale from directory should match lang in filename (case-insensitive)
       if (fileLang.toLowerCase() !== locale.toLowerCase()) continue;
 
       results.push({
         labelFileId,
-        // Normalize locale to BCP-47 canonical form (e.g. 'en-us' → 'en-US', 'es-mx' → 'es-MX')
-        // Microsoft packages on Linux use lowercase directory names; custom packages use mixed-case.
+        // Normalize to BCP-47 canonical casing (e.g. 'en-us' -> 'en-US').
         language: locale.split('-').map((part, i) => i === 0 ? part.toLowerCase() : part.toUpperCase()).join('-'),
         filePath: path.join(localeDir, file),
       });
@@ -242,10 +233,7 @@ export async function indexAllLabels(
   let models: string[];
   try {
     const entries = fsSync.readdirSync(packagesPath, { withFileTypes: true });
-    // Include both real directories AND symbolic links / junction points.
-    // On Windows, D365FO PackagesLocalDirectory model folders are often NTFS
-    // junction points, which readdirSync reports as isSymbolicLink()=true
-    // rather than isDirectory()=true.
+    // Model folders are often NTFS junction points, reported as isSymbolicLink() not isDirectory().
     models = entries.filter(e => e.isDirectory() || e.isSymbolicLink()).map(e => e.name);
   } catch {
     console.error(`[LabelParser] Cannot read packages path: ${packagesPath}`);
@@ -264,9 +252,7 @@ export async function indexAllLabels(
 
     const packageDir = path.join(packagesPath, packageOrModel);
 
-    // Find all model subdirectories that contain AxLabelFile.
-    // In UDE, a package (top-level dir) can contain multiple model subdirectories,
-    // each with its own AxLabelFile directory.
+    // A package dir can contain multiple model subdirectories, each with its own AxLabelFile.
     const modelDirs: { modelDir: string; modelName: string }[] = [];
 
     try {
@@ -287,8 +273,7 @@ export async function indexAllLabels(
       // Directory not readable
     }
 
-    // Fallback: flat structure (no model subdirectory with AxLabelFile found)
-    // This covers the Git source structure where AxLabelFile is directly in the top-level dir
+    // Fallback: flat structure where AxLabelFile sits directly under the package dir.
     if (modelDirs.length === 0) {
       const flatAxLabel = path.join(packageDir, 'AxLabelFile');
       const flatAxLabelLower = path.join(packageDir, 'axlabelfile');
@@ -302,9 +287,7 @@ export async function indexAllLabels(
       continue;
     }
 
-    // Process each model directory found within this package
     for (const { modelDir, modelName } of modelDirs) {
-      // Skip per-model FTS rebuild; do a single rebuild after all models are indexed
       const count = await indexModelLabels(symbolIndex, modelDir, modelName, { skipFtsRebuild: true });
       if (count > 0) {
         totalLabels += count;
@@ -315,12 +298,11 @@ export async function indexAllLabels(
     }
   }
 
-  // Single FTS rebuild after all models — avoids O(N²) cost of rebuilding per model
+  // Rebuild FTS once for all models rather than per-model (avoids O(n^2) rebuild cost).
   if (totalLabels > 0) {
     symbolIndex.rebuildLabelsFts();
   }
 
-  // Debug statistics
   if (modelsIndexed === 0) {
     console.log(`   ℹ️  No labels indexed:`);
     console.log(`      - Models skipped by filter: ${skippedByFilter}`);

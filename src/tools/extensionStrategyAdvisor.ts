@@ -8,7 +8,7 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
 
-// ─── Schema ─────────────────────────────────────────────────────────────────
+// Schema
 
 const scenarioTypes = [
   'data-validation',
@@ -42,7 +42,7 @@ const ExtensionStrategyArgsSchema = z.object({
 // Tool registration (name, description, inputSchema) lives inline in
 // src/server/mcpServer.ts - the single source of truth for tool instructions.
 
-// ─── Decision Rules ─────────────────────────────────────────────────────────
+// Decision Rules
 
 interface StrategyRule {
   /** Short pattern ID */
@@ -66,7 +66,7 @@ interface StrategyRule {
 }
 
 const STRATEGY_RULES: readonly StrategyRule[] = [
-  // ── Data validation ───────────────────────────────────────────────────
+  // Data validation
   {
     id: 'validate-table-data',
     scenarios: ['data-validation'],
@@ -96,7 +96,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Field defaulting / initialization ─────────────────────────────────
+  // Field defaulting / initialization
   {
     id: 'field-defaulting',
     scenarios: ['field-defaulting'],
@@ -124,7 +124,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Reacting to a user/field value change ─────────────────────────────
+  // Reacting to a user/field value change
   {
     id: 'field-change-reaction',
     scenarios: ['field-change-reaction'],
@@ -165,7 +165,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Business logic modification ───────────────────────────────────────
+  // Business logic modification
   {
     id: 'business-logic-change',
     scenarios: ['business-logic-change'],
@@ -197,7 +197,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Outbound integration ──────────────────────────────────────────────
+  // Outbound integration
   {
     id: 'outbound-integration',
     scenarios: ['outbound-integration'],
@@ -230,7 +230,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Inbound data / external data transfer ─────────────────────────────
+  // Inbound data / external data transfer
   {
     id: 'inbound-data',
     scenarios: ['inbound-data'],
@@ -263,7 +263,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── UI modification ───────────────────────────────────────────────────
+  // UI modification
   {
     id: 'ui-modification',
     scenarios: ['ui-modification'],
@@ -295,7 +295,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Document output / printing ────────────────────────────────────────
+  // Document output / printing
   {
     id: 'document-output',
     scenarios: ['document-output'],
@@ -328,7 +328,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Number sequence ───────────────────────────────────────────────────
+  // Number sequence
   {
     id: 'number-sequence',
     scenarios: ['number-sequence'],
@@ -355,7 +355,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Security / access control ─────────────────────────────────────────
+  // Security / access control
   {
     id: 'security-access',
     scenarios: ['security-access'],
@@ -386,7 +386,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
     ],
   },
 
-  // ── Batch processing ──────────────────────────────────────────────────
+  // Batch processing
   {
     id: 'batch-processing',
     scenarios: ['batch-processing'],
@@ -417,8 +417,7 @@ const STRATEGY_RULES: readonly StrategyRule[] = [
   },
 ];
 
-// ─── Scenario Auto-Detection ────────────────────────────────────────────────
-
+// Scenario Auto-Detection
 function detectScenario(goal: string): typeof scenarioTypes[number] | undefined {
   const lower = goal.toLowerCase();
 
@@ -450,8 +449,7 @@ function detectScenario(goal: string): typeof scenarioTypes[number] | undefined 
   return best?.scenario;
 }
 
-// ─── Rule Matching ──────────────────────────────────────────────────────────
-
+// Rule Matching
 function findMatchingRules(goal: string, scenario?: string): StrategyRule[] {
   const lower = goal.toLowerCase();
 
@@ -477,8 +475,7 @@ function findMatchingRules(goal: string, scenario?: string): StrategyRule[] {
   return scored.filter(s => s.score > 0).map(s => s.rule);
 }
 
-// ─── Formatting ─────────────────────────────────────────────────────────────
-
+// Formatting
 function formatRecommendation(
   goal: string,
   resolvedScenario: string,
@@ -564,8 +561,7 @@ function formatNoMatch(goal: string, objectName?: string): string {
   return out;
 }
 
-// ─── Tool Handler ───────────────────────────────────────────────────────────
-
+// Tool Handler
 export async function extensionStrategyAdvisorTool(
   request: CallToolRequest,
   _context: XppServerContext,

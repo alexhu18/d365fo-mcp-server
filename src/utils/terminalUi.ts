@@ -1,17 +1,10 @@
 /**
  * terminalUi — capability-aware console formatting for the dev/HTTP startup banner.
  *
- * Two Windows-specific problems this solves:
- *   1. Mojibake icons. Node writes UTF-8 bytes to stdout; the classic Windows
- *      PowerShell 5.1 / conhost window interprets them in the OEM code page
- *      (cp852 on Czech locale), so emoji render as garbage. We detect terminals
- *      that genuinely render Unicode (Windows Terminal, VS Code, ConEmu, *nix)
- *      and fall back to ASCII glyphs everywhere else.
- *   2. Colour noise. ANSI is honoured on Win10+ TTYs but must be disabled for
- *      pipes, NO_COLOR, and dumb terminals.
- *
- * Everything degrades gracefully: on a legacy terminal you still get clean,
- * aligned, readable output — just with [OK]/[!]/-> instead of ✓/⚠/›.
+ * Legacy Windows terminals (PowerShell 5.1/conhost) render UTF-8 emoji as
+ * mojibake, so we detect Unicode-capable terminals and fall back to ASCII
+ * glyphs ([OK]/[!]/-> instead of ✓/⚠/›) elsewhere. ANSI colour is likewise
+ * disabled for pipes, NO_COLOR, and dumb terminals.
  */
 
 import { relative, isAbsolute, sep } from 'path';
@@ -20,19 +13,18 @@ const isWin = process.platform === 'win32';
 
 /**
  * Whether the terminal reliably renders Unicode (box-drawing + emoji).
- * On Windows only modern hosts qualify; the default PowerShell/conhost window
- * does not, so we stay on ASCII there. Honour FORCE_UNICODE=1/0 as an override.
+ * On Windows only modern hosts qualify. Honour FORCE_UNICODE=1/0 as an override.
  */
 export const supportsUnicode: boolean = (() => {
   if (process.env.FORCE_UNICODE === '1') return true;
   if (process.env.FORCE_UNICODE === '0') return false;
   if (!isWin) return process.env.TERM !== 'linux';
   return (
-    Boolean(process.env.WT_SESSION) ||              // Windows Terminal
-    process.env.TERM_PROGRAM === 'vscode' ||        // VS Code integrated terminal
-    Boolean(process.env.ConEmuTask) ||              // ConEmu / Cmder
-    process.env.TERM === 'xterm-256color' ||        // explicit xterm
-    process.env.WSLENV !== undefined                // WSL interop
+    Boolean(process.env.WT_SESSION) ||       // Windows Terminal
+    process.env.TERM_PROGRAM === 'vscode' ||
+    Boolean(process.env.ConEmuTask) ||       // ConEmu / Cmder
+    process.env.TERM === 'xterm-256color' ||
+    process.env.WSLENV !== undefined         // WSL interop
   );
 })();
 
@@ -47,7 +39,7 @@ export const supportsColor: boolean = (() => {
   return Boolean(process.stdout.isTTY);
 })();
 
-// ─── Colour helpers ──────────────────────────────────────────────────────────
+// Colour helpers
 const wrap = (open: number, close: number) => (s: string): string =>
   supportsColor ? `\x1b[${open}m${s}\x1b[${close}m` : s;
 
@@ -63,7 +55,7 @@ export const c = {
   gray: wrap(90, 39),
 };
 
-// ─── Glyphs (Unicode with ASCII fallback) ────────────────────────────────────
+// Glyphs (Unicode with ASCII fallback)
 const U = supportsUnicode;
 export const glyph = {
   tl: U ? '╭' : '+',
@@ -82,12 +74,9 @@ export const glyph = {
   ellipsis: U ? '…' : '...',
 };
 
-// ─── Emoji → ASCII sanitiser ─────────────────────────────────────────────────
-// Maps the semantic emoji used in startup logs to short ASCII tags, then strips
-// any remaining decorative emoji + variation selectors. No-op when Unicode is
-// supported, so modern terminals keep the emoji.
-// Semantic emoji → short ASCII tag. The trailing space (if any) is preserved so
-// "✅ Loaded" becomes "[OK] Loaded".
+// Emoji -> ASCII sanitiser. Maps semantic emoji to short ASCII tags, then strips
+// remaining decorative emoji + variation selectors. No-op when Unicode is supported.
+// Trailing space (if any) is preserved so "✅ Loaded" becomes "[OK] Loaded".
 const EMOJI_TAGS: Array<[RegExp, string]> = [
   [/✅|✔️?/g, '[OK]'],
   [/❌/g, '[X]'],
@@ -95,24 +84,21 @@ const EMOJI_TAGS: Array<[RegExp, string]> = [
   [/ℹ️?/g, '[i]'],
   [/⏭️?/g, '[skip]'],
 ];
-// Decorative emoji / pictographs (+ variation selector & ZWJ) together with the
-// spaces that immediately follow them — so stripping "🚀 Starting" yields
-// "Starting" and "  🔍 Search" yields "  Search", preserving real indentation.
+// Decorative emoji / pictographs (+ variation selector & ZWJ) plus any spaces
+// immediately following them, so real indentation is preserved after stripping.
 const EMOJI_STRIP = /(?:[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{2190}-\u{21FF}\u{2300}-\u{23FF}])+ */gu;
 
-// "Fancy" punctuation that also mojibakes on legacy code pages (cp852/cp1250).
-// These appear throughout existing log strings (em-dashes, middots, ellipses…),
-// so transliterate them to plain ASCII rather than leave garbage bytes.
+// Fancy punctuation that also mojibakes on legacy code pages (cp852/cp1250); transliterate to plain ASCII.
 const PUNCT_MAP: Array<[RegExp, string]> = [
-  [/[—–‒―]/g, '-'],   // — – ‒ ― dashes
-  [/…/g, '...'],                      // … ellipsis
-  [/[·•]/g, '-'],                // · • separators/bullets
-  [/[‘’‛]/g, "'"],          // ' ' curly single quotes
-  [/[“”‟]/g, '"'],          // " " curly double quotes
-  [/[‹›]/g, '>'],                // ‹ › angle quotes
-  [/→/g, '->'],                        // → arrow
-  [/×/g, 'x'],                         // × multiplication sign
-  [/ /g, ' '],                         // non-breaking space
+  [/[—–‒―]/g, '-'],
+  [/…/g, '...'],
+  [/[·•]/g, '-'],
+  [/[‘’‛]/g, "'"],
+  [/[“”‟]/g, '"'],
+  [/[‹›]/g, '>'],
+  [/→/g, '->'],
+  [/×/g, 'x'],
+  [/ /g, ' '],   // non-breaking space
 ];
 
 /** Replace/strip emoji & fancy punctuation so legacy code pages don't show mojibake. No-op on Unicode terminals. */
@@ -125,7 +111,7 @@ export function sanitize(text: string): string {
   return out;
 }
 
-// ─── Layout helpers ──────────────────────────────────────────────────────────
+// Layout helpers
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 /** Visible length of a string, ignoring ANSI colour codes. */
@@ -182,19 +168,15 @@ export function statusLine(kind: 'step' | 'ok' | 'warn' | 'err' | 'info', msg: s
   return '  ' + paint(g) + ' ' + msg;
 }
 
-/**
- * Warnings emitted during startup are collected here so a compact summary can be
- * printed at the end (so an individual warning doesn't get lost in the scroll).
- */
+/** Warnings emitted during startup, collected for an end-of-startup summary. */
 export const startupWarnings: string[] = [];
 
 /**
- * Convenience status loggers for the startup sequence. They resolve console.*
- * lazily at call time, so the stdio/HTTP overrides installed in main() apply.
- *  - step/ok/info → stdout (operational; suppressed in stdio mode)
+ * Convenience status loggers for the startup sequence. Resolve console.*
+ * lazily at call time so stdio/HTTP overrides installed in main() apply.
+ *  - step/ok/info → stdout (suppressed in stdio mode)
  *  - warn/err     → stderr (kept visible to MCP clients in stdio mode)
  *  - detail       → dimmed, indented sub-line under the preceding status
- * warn also records the message in startupWarnings for the end-of-startup recap.
  */
 export const log = {
   step: (msg: string): void => console.log(statusLine('step', msg)),

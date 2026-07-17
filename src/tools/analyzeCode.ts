@@ -50,9 +50,7 @@ export async function analyzeCodeTool(request: CallToolRequest, context: XppServ
 
   const { mode, ...rest } = parsed.data;
 
-  // api-usage expects `apiName`, but the "API" is frequently a class (e.g.
-  // NumberSeqFormHandler), so agents reach for className/class/api. Map them so the
-  // first call succeeds instead of failing "apiName required".
+  // api-usage accepts className/class/api as aliases for apiName since the "API" is often a class.
   if (mode === 'api-usage') {
     const r = rest as Record<string, unknown>;
     if (r.apiName === undefined) {

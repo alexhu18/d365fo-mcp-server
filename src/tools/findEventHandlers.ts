@@ -31,8 +31,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
 
     const targetName = args.targetClass || args.targetTable!;
 
-    // ── Bridge fast-path (DYNAMICSXREFDB) ──
-    // Enriched: bridge now supports eventName and handlerType filtering directly in C#
+    // Bridge fast-path (DYNAMICSXREFDB): supports eventName and handlerType filtering directly in C#
     const bridgeResult = await tryBridgeEventHandlers(
       context.bridge,
       targetName,
@@ -41,7 +40,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
     );
     if (bridgeResult) return bridgeResult;
 
-    // ── Fallback: SQLite index ──
+    // Fallback: SQLite index
     const rdb = context.symbolIndex.getReadDb();
     const isTable = !!args.targetTable;
 
@@ -49,7 +48,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
     if (args.eventName) output += `Filtering by event: ${args.eventName}\n`;
     output += '\n';
 
-    // ── 1. Static event handlers via extension_metadata.event_subscriptions ──
+    // Static event handlers via extension_metadata.event_subscriptions
     let metaHandlers: any[] = [];
     if (args.handlerType !== 'delegate') {
       try {
@@ -65,7 +64,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
       }
     }
 
-    // ── 2. FTS5 search for SubscribesTo (replaces LIKE full-table scan) ──
+    // FTS5 search for SubscribesTo (replaces LIKE full-table scan)
     let ftsHandlers: any[] = [];
     if (args.handlerType !== 'delegate') {
       try {
@@ -99,7 +98,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
       }
     }
 
-    // ── 3. Delegate subscription search (+= syntax) ──
+    // Delegate subscription search (+= syntax)
     let delegateHandlers: any[] = [];
     if (args.handlerType !== 'static') {
       delegateHandlers = rdb.prepare(
@@ -126,7 +125,6 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
       }
     }
 
-    // ── Build grouped output by event name ──
     interface HandlerEntry {
       handlerClass: string;
       handlerMethod: string;

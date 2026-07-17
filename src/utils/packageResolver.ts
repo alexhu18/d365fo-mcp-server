@@ -41,9 +41,8 @@ export interface ResolvedPackage {
 
 export class PackageResolver {
   private roots: string[];
-  // Original-case map for getAllMappings() — returns clean results without duplicates
   private modelToPackageMap: Map<string, ResolvedPackage> | null = null;
-  // Lowercase lookup map for case-insensitive resolve()
+  /** Lowercase lookup mirror of modelToPackageMap for case-insensitive resolve(). */
   private lowercaseLookup: Map<string, ResolvedPackage> | null = null;
   private buildPromise: Promise<void> | null = null;
 
@@ -122,7 +121,7 @@ export class PackageResolver {
       for (const pkgName of packageDirs) {
         const pkgPath = path.join(root, pkgName);
 
-        // Strategy 1: Read descriptor files
+        // Strategy 1: descriptor XML files
         const descriptorDir = path.join(pkgPath, 'Descriptor');
         try {
           const descriptorFiles = await fs.readdir(descriptorDir);
@@ -150,7 +149,7 @@ export class PackageResolver {
           // No Descriptor directory -- fall through to filesystem scan
         }
 
-        // Strategy 2: Filesystem scan (find subdirs that have AxClass/AxTable)
+        // Strategy 2: filesystem scan (subdirs containing an AOT-type folder)
         try {
           const subEntries = await fs.readdir(pkgPath, { withFileTypes: true });
           const subDirs = subEntries

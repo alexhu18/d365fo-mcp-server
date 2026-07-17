@@ -1,13 +1,7 @@
 /**
- * Batch Search Tool - Priority 3 Optimization
+ * Batch Search Tool
  *
  * Allows AI agents to parallelize independent search queries in a single HTTP request.
- * Reduces round-trip overhead and enables concurrent search execution.
- *
- * Expected Impact:
- * - 3 HTTP requests → 1 HTTP request (3x faster)
- * - Enable 40% of searches to be parallelized
- * - Reduce total workflow time for exploratory searches
  */
 
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -66,7 +60,7 @@ export const BatchSearchArgsSchema = z.object({
     ),
 });
 
-// ── Regex to extract [TYPE] SymbolName from search result lines ──
+// Regex to extract [TYPE] SymbolName from search result lines
 const RESULT_LINE_RE =
   /\[(CLASS|TABLE|FORM|FIELD|METHOD|ENUM|EDT|QUERY|VIEW|REPORT|SECURITY-PRIVILEGE|SECURITY-DUTY|SECURITY-ROLE|MENU-ITEM-DISPLAY|MENU-ITEM-ACTION|MENU-ITEM-OUTPUT|TABLE-EXTENSION|CLASS-EXTENSION|FORM-EXTENSION|ENUM-EXTENSION|EDT-EXTENSION|DATA-ENTITY-EXTENSION|WORKFLOW-TYPE|AGGREGATE-MEASUREMENT|CONFIGURATION-KEY)\]\s+(\w+)/;
 
@@ -112,7 +106,6 @@ function extractSymbolKeys(text: string): string[] {
   return keys;
 }
 
-// ── Internal result type ─────────────────────────────────────────────────────
 interface QueryResult {
   query: string;
   typeLabel?: string;  // e.g. "CLASS, TABLE" for fan-out queries
@@ -154,10 +147,8 @@ export async function batchSearchTool(request: CallToolRequest, context: XppServ
       (t): t is SymbolType => (SYMBOL_TYPES as readonly string[]).includes(t)
     );
 
-    // ── Build flat list of sub-searches ──────────────────────────────────────
-    // Each query either maps 1:1, or fans out into multiple searches (globalTypeFilter).
-    // We track which original query index each sub-search belongs to.
-
+    // Build flat list of sub-searches: each query maps 1:1, or fans out into multiple
+    // searches (globalTypeFilter). Track which original query index each sub-search belongs to.
     interface SubSearch {
       queryIdx: number;         // 0-based index into args.queries
       query: string;
@@ -181,7 +172,7 @@ export async function batchSearchTool(request: CallToolRequest, context: XppServ
       }
     }
 
-    // ── Execute all sub-searches in parallel ─────────────────────────────────
+    // Execute all sub-searches in parallel
     const rawResults: Array<SubSearch & { success: boolean; result?: any; error?: string }> =
       await Promise.all(
         subSearches.map(async (sub) => {
@@ -195,7 +186,7 @@ export async function batchSearchTool(request: CallToolRequest, context: XppServ
         })
       );
 
-    // ── Merge fan-out sub-searches back per original query ────────────────────
+    // Merge fan-out sub-searches back per original query
     const mergedResults: QueryResult[] = args.queries.map((q, i) => {
       const subs = rawResults.filter(r => r.queryIdx === i);
       if (subs.length === 1) {
@@ -218,7 +209,7 @@ export async function batchSearchTool(request: CallToolRequest, context: XppServ
       };
     });
 
-    // ── Build cross-reference map (before dedup annotation changes the text) ──
+    // Build cross-reference map before dedup annotation changes the text.
     // Maps symbolKey → Set of 1-based query indices where it appears
     const crossRefMap = new Map<string, Set<number>>();
     if (args.crossReference) {
@@ -232,7 +223,6 @@ export async function batchSearchTool(request: CallToolRequest, context: XppServ
       }
     }
 
-    // ── Deduplication ─────────────────────────────────────────────────────────
     let dedupStats = { total: 0 };
     if (args.deduplicate) {
       const seenKeys = new Map<string, number>(); // key → 1-based query index

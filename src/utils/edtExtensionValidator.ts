@@ -6,7 +6,7 @@
  * that the metadata system rejects — so we gate them up-front and explain
  * the proper alternative.
  *
- * Key rules (verified against Microsoft docs and SDK behaviour):
+ * Key rules:
  *
  *   1. **StringSize** can only be modified on a *root* string EDT (one that
  *      does NOT have <Extends>). For derived EDTs, StringSize is inherited
@@ -70,8 +70,8 @@ export function extractBaseEdtName(extensionObjectName: string): string {
   if (!extensionObjectName) return extensionObjectName;
   const dotIdx = extensionObjectName.indexOf('.');
   if (dotIdx > 0) return extensionObjectName.substring(0, dotIdx);
-  // Underscore convention: only treat as separator when right side looks like
-  // an Extension token (case-insensitive) so we don't truncate normal EDT names.
+  // Underscore convention: only treat as separator when the right side looks
+  // like an Extension token, so normal EDT names aren't truncated.
   const usMatch = extensionObjectName.match(/^([A-Za-z][A-Za-z0-9]*?)_[A-Za-z0-9]*Extension$/);
   if (usMatch) return usMatch[1];
   return extensionObjectName;
@@ -101,7 +101,7 @@ export function lookupBaseEdtFromIndex(db: any, baseEdtName: string): EdtBaseInf
 
     if (!rows || rows.length === 0) return null;
 
-    // Pick the most informative row: non-null `extends` wins; tiebreak on non-null `string_size`.
+    // Prefer the row with a non-null `extends`, tiebreaking on non-null `string_size`.
     let pick = rows[0];
     for (const r of rows) {
       const pickHasExt = !!(pick.extends && pick.extends.trim().length > 0);
@@ -121,7 +121,7 @@ export function lookupBaseEdtFromIndex(db: any, baseEdtName: string): EdtBaseInf
       databaseStringSize: pick.database_string_size,
     };
   } catch {
-    // Older DB schemas may lack `database_string_size`; fall back to a query without it.
+    // Fallback for older DB schemas that lack `database_string_size`.
     try {
       const rows = db.prepare(`
         SELECT edt_name, extends, string_size
@@ -230,7 +230,6 @@ export function validateEdtExtensionProperty(
 ): EdtExtensionValidationResult {
   const propLower = (propertyPath || '').trim().toLowerCase();
 
-  // Hard refuse re-parenting via extension
   if (FORBIDDEN_EXT_PROPERTIES.has(propLower)) {
     return {
       ok: false,
@@ -241,7 +240,6 @@ export function validateEdtExtensionProperty(
     };
   }
 
-  // Inherited size properties: only allowed when base EDT is the root
   if (INHERITED_PROPERTIES.has(propLower)) {
     if (base.extends && base.extends.trim().length > 0) {
       const chain = db ? resolveEdtChain(db, base.edtName) : [base];
@@ -266,7 +264,7 @@ export function validateEdtExtensionProperty(
           `extension points on derived EDTs.)`,
       };
     }
-    // Root EDT: still must be IsExtensible (when we know)
+    // Root EDT still must be IsExtensible (when known).
     if (base.isExtensible === false) {
       return {
         ok: false,
@@ -276,10 +274,8 @@ export function validateEdtExtensionProperty(
           `Create a new EDT extending '${base.edtName}' with the desired ${propertyPath} instead.`,
       };
     }
-    // Cannot verify IsExtensible (no bridge / EDT not in live metadata).
-    // Refuse rather than silently allow a change that may be a runtime no-op or
-    // get rejected at compile time. The model can still proceed via the safe
-    // alternative paths (create derived EDT or table-extension on the field).
+    // Unknown IsExtensible (no bridge / EDT not in live metadata): refuse rather
+    // than silently allow a change that may be a no-op or get rejected at compile time.
     if (base.isExtensible == null) {
       return {
         ok: false,
@@ -294,7 +290,7 @@ export function validateEdtExtensionProperty(
           `Re-run with a connected bridge to verify IsExtensible if you believe extension is permitted.`,
       };
     }
-    // Defensive: refuse shrinking string size, which would corrupt existing data
+    // Refuse shrinking StringSize — would truncate/corrupt existing column data.
     if (propLower === 'stringsize') {
       const newSize = parseInt(String(propertyValue), 10);
       const currentSize = base.stringSize ? parseInt(base.stringSize, 10) : NaN;
@@ -306,8 +302,8 @@ export function validateEdtExtensionProperty(
             `Decreasing StringSize via extension is unsupported and risks truncating existing column data.`,
         };
       }
-      // Enforce the metadata invariant `StringSize <= DatabaseStringSize` (when known).
-      // -1 means unlimited (memo / nvarchar(max)) and is always permissible.
+      // Invariant: StringSize <= DatabaseStringSize (when known). -1 means
+      // unlimited (memo / nvarchar(max)) and is always permissible.
       const dbSize = resolveEffectiveDatabaseStringSize(db, base.edtName);
       if (Number.isFinite(newSize) && dbSize != null && dbSize > 0 && newSize > dbSize) {
         return {
@@ -325,8 +321,8 @@ export function validateEdtExtensionProperty(
         };
       }
     }
-    // Same invariant in the other direction: DatabaseStringSize must not be
-    // shrunk below the current StringSize, which would orphan existing data.
+    // Same invariant in reverse: DatabaseStringSize must not shrink below
+    // the current StringSize, which would orphan existing data.
     if (propLower === 'databasestringsize') {
       const newDb = parseInt(String(propertyValue), 10);
       const currentSize = base.stringSize ? parseInt(base.stringSize, 10) : NaN;

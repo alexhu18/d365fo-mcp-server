@@ -5,6 +5,7 @@ import {
   isInfrastructureField,
   heuristicEdtBaseType,
   resolveEdtBaseType,
+  resolveEdtEnumType,
   isEnumName,
 } from '../../src/tools/generateSmartTable';
 
@@ -135,6 +136,17 @@ describe('heuristicEdtBaseType (fallback when EDT not indexed)', () => {
     expect(heuristicEdtBaseType('CreatedDateTime')).toBe('UtcDateTime');
   });
 
+  it('maps TransDateTime to UtcDateTime (regression: substring-exclusion bug)', () => {
+    // Found live while implementing the eval-loop "sales credit review + audit" scenario:
+    // a table field created with only `{ name: "PostedAt", edt: "TransDateTime" }` came
+    // back as plain AxTableFieldString instead of AxTableFieldUtcDateTime. Root cause: the
+    // old check was `e.includes('datetime') && !e.includes('transdate')` — but
+    // "transdatetime".includes('transdate') is true, so the exclusion fired on the exact
+    // name it should have matched, and the field silently defaulted to String.
+    expect(heuristicEdtBaseType('TransDateTime')).toBe('UtcDateTime');
+    expect(heuristicEdtBaseType('ModifiedDateTime')).toBe('UtcDateTime');
+  });
+
   it('returns undefined for names with no recognizable base type', () => {
     expect(heuristicEdtBaseType('ContosoRentEquipmentId')).toBeUndefined();
     expect(heuristicEdtBaseType('Name')).toBeUndefined();
@@ -184,14 +196,64 @@ describe('resolveEdtBaseType (indexed EDT, root-EDT ambiguity)', () => {
   });
 });
 
-describe('isEnumName (enum vs EDT detection)', () => {
-  function enumDb(enums: string[]) {
+describe('resolveEdtEnumType (recover the enum name behind an Enum-based EDT)', () => {
+  function edtMetaDb(rows: Record<string, { extends?: string | null; enum_type?: string | null }>) {
     return {
       prepare(_sql: string) {
         return {
           get(arg: string) {
-            return enums.some(e => e.toLowerCase() === String(arg).toLowerCase()) ? { 1: 1 } : undefined;
+            const key = Object.keys(rows).find(k => k.toLowerCase() === String(arg).toLowerCase());
+            if (!key) return undefined;
+            const r = rows[key];
+            return { extends: r.extends ?? null, enum_type: r.enum_type ?? null };
           },
+        };
+      },
+    };
+  }
+
+  it('resolves the underlying enum name for a directly enum-backed EDT', () => {
+    // Regression: resolveEdtBaseType('Posted', db) correctly returns the literal string
+    // "Enum", but createD365File's field-type resolution had no way to learn WHICH enum
+    // (NoYes) — so a field created with only `{ name, edt: "Posted" }` got `type: 'Enum'`
+    // with no `enumType`, and the bridge silently emitted AxTableFieldString instead of
+    // AxTableFieldEnum. This helper closes that gap.
+    const db = edtMetaDb({ Posted: { enum_type: 'NoYes' } });
+    expect(resolveEdtEnumType('Posted', db)).toBe('NoYes');
+  });
+
+  it('follows the EDT chain to find the enum on an indirectly enum-backed EDT', () => {
+    const db = edtMetaDb({
+      Posted: { enum_type: 'NoYes' },
+      MyPostedFlag: { extends: 'Posted' },
+    });
+    expect(resolveEdtEnumType('MyPostedFlag', db)).toBe('NoYes');
+  });
+
+  it('returns undefined for a non-enum EDT', () => {
+    const db = edtMetaDb({ TransDate: {}, MyAmount: { extends: 'Real' } });
+    expect(resolveEdtEnumType('TransDate', db)).toBeUndefined();
+    expect(resolveEdtEnumType('MyAmount', db)).toBeUndefined();
+  });
+
+  it('returns undefined for an EDT missing from the index', () => {
+    expect(resolveEdtEnumType('ContosoCustomId', edtMetaDb({}))).toBeUndefined();
+  });
+});
+
+describe('isEnumName (enum vs EDT detection)', () => {
+  function enumDb(enums: string[]) {
+    // The nocase symbol lookup (utils/symbolLookup) probes via .all().
+    return {
+      prepare(_sql: string) {
+        return {
+          all(...args: unknown[]) {
+            const hit = enums.find(e => e.toLowerCase() === String(args[0]).toLowerCase());
+            return hit
+              ? [{ name: hit, type: 'enum', model: 'Test', extends_class: null, file_path: null }]
+              : [];
+          },
+          get() { return undefined; },
         };
       },
     };

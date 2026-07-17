@@ -9,6 +9,14 @@ import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { scanFsExtensions } from '../utils/fsExtensionScanner.js';
 import { tryBridgeCocExtensions } from '../bridge/index.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
+
+/**
+ * Object kinds a class extension can be based on. [ExtensionOf] takes
+ * classStr/tableStr/formStr/formDataSourceStr/formControlStr/
+ * dataEntityViewStr/mapStr/viewStr — so the base is by no means always a class.
+ */
+const COC_BASE_TYPES = ['class', 'table', 'form', 'view', 'data-entity', 'map', 'query'] as const;
 
 const FindCocExtensionsArgsSchema = z.object({
   className: z.string().describe('Base class or table name being extended'),
@@ -21,12 +29,17 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
   try {
     const args = FindCocExtensionsArgsSchema.parse(request.params.arguments);
     const rdb = context.symbolIndex.getReadDb();
-    const className = args.className;
     const methodName = args.methodName;
 
-    // ── Bridge fast-path (DYNAMICSXREFDB) ──
-    // Enriched: bridge now returns method-level CoC detail (wrappedMethods per extension class),
-    // so we can use it even when methodName filter is specified.
+    // Canonicalize the caller's name once, up front: every probe below matches
+    // base_object_name/extends_class BINARY (so it stays on-index), and the
+    // bridge's IMetadataProvider matches by exact AOT name too — so a mis-cased
+    // name must be resolved before either is consulted, not after.
+    const canonical = canonicalSymbolName(rdb, args.className, COC_BASE_TYPES);
+    const className = canonical ?? args.className;
+
+    // Bridge fast-path (DYNAMICSXREFDB): returns method-level CoC detail (wrappedMethods per
+    // extension class), so it can be used even when a methodName filter is specified.
     const bridgeResult = await tryBridgeCocExtensions(context.bridge, className, methodName);
     if (bridgeResult) return bridgeResult;
 
@@ -43,16 +56,35 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
          WHERE base_object_name = ? AND extension_type = 'class-extension'
          ORDER BY model, extension_name`
       ).all(className) as any[];
+      // Base object not in symbols under any casing, so it could not be
+      // canonicalized above and a mis-cased argument would miss. Same bounded
+      // nocase re-probe resolveReferences uses: extension_metadata is small
+      // (single-digit thousands of rows), unlike symbols.
+      if (extensionRows.length === 0 && !canonical) {
+        extensionRows = rdb.prepare(
+          `SELECT extension_name, model, base_object_name, coc_methods, added_methods, event_subscriptions
+           FROM extension_metadata
+           WHERE base_object_name = ? COLLATE NOCASE AND extension_type = 'class-extension'
+           ORDER BY model, extension_name`
+        ).all(args.className) as any[];
+      }
     } catch {
       // extension_metadata table may not exist yet
     }
 
-    // 2. Fallback: query symbols by extends_class column
+    // 2. Fallback: query symbols by extends_class column.
+    //
+    // Matched on the base object only — never on a `${className}%_Extension`
+    // name prefix. The prefix is not just unreliable but actively wrong:
+    // `Route%_Extension` also matches every RouteInventProd_* and RouteOpr_*
+    // extension, which extend *different* objects, so the tool reported them
+    // as CoC on Route. (Harmless while no class-extension row existed at all;
+    // live the moment #693 populated them.)
     const symbolExtensions = rdb.prepare(
       `SELECT name, model, file_path FROM symbols
-       WHERE type = 'class-extension' AND (extends_class = ? OR name LIKE ?)
+       WHERE type = 'class-extension' AND extends_class = ?
        ORDER BY model, name`
-    ).all(className, `${className}%_Extension`) as any[];
+    ).all(className) as any[];
 
     // Merge: deduplicate by extension_name
     const seen = new Set<string>();
@@ -92,10 +124,8 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
     if (filtered.length === 0) {
       output += `No class extensions found for: ${className}\n`;
 
-      // ── Filesystem fallback ────────────────────────────────────────────────
-      // Class extensions live in AxClass/ as `ClassName_Extension.xml` (or
-      // `ClassName_ModelExtension.xml`). When the DB index is stale these won't
-      // appear via symbol queries — scan the filesystem directly.
+      // Filesystem fallback: class extensions live in AxClass/ as `ClassName_Extension.xml`
+      // (or `ClassName_ModelExtension.xml`). Scan the filesystem directly when the DB index is stale.
       if (process.platform === 'win32') {
         const configManager = getConfigManager();
         const packagePath = configManager.getPackagePath();

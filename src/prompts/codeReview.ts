@@ -20,7 +20,6 @@ const ExplainClassArgsSchema = z.object({
 export function registerCodeReviewPrompt(server: Server, context: XppServerContext): void {
   const { symbolIndex, parser } = context;
 
-  // List available prompts
   server.setRequestHandler(ListPromptsRequestSchema, async () => {
     return {
       prompts: [

@@ -7,9 +7,9 @@ import type { FormPatternSpec, NodeSpec } from '../../types.js';
 import { actionPane, filterGroup } from './common.js';
 
 /**
- * Read-only navigation list (left SidePanel grid of header records). Required by
- * the platform's DetailsTransaction pattern from v1.4 onward; kept `optional`
- * here so faithful clones of older header+lines forms don't false-fail.
+ * Read-only navigation list (left SidePanel grid of header records). Required
+ * from platform version 1.4 onward; kept `optional` here so clones of older
+ * header+lines forms don't false-fail.
  */
 const navigationListPanel: NodeSpec = {
   id: 'NavigationList',
@@ -31,8 +31,7 @@ const headerLinesTabs: NodeSpec = {
       id: 'HeaderOrLinesPage',
       controlTypes: ['TabPage'],
       occurrence: 'oneOrMore',
-      // Header pages follow field sub-patterns; the Lines page holds
-      // ActionPaneTab + Grid and typically has no sub-pattern.
+      // Header pages follow field sub-patterns; the Lines page (ActionPaneTab + Grid) typically has none.
       requiresSubPattern: false,
       extraChildren: 'any',
     },

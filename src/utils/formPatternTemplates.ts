@@ -88,14 +88,7 @@ export class FormPatternTemplates {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // SimpleList  (v1.1)
-  // Use: simple entity with < 10 fields per record (setup tables, groups, etc.)
-  // Reference: CustGroup form
-  // Structure: ActionPane → ButtonGroup
-  //            CustomFilterGroup → QuickFilterControl
-  //            Grid → field columns
-  // ---------------------------------------------------------------------------
+  // SimpleList (v1.1): simple entity with < 10 fields per record (setup tables, groups, etc). Reference: CustGroup.
   static buildSimpleList(opt: FormTemplateOptions): string {
     const { formName, dsName = formName, dsTable = dsName, caption, gridFields = [] } = opt;
     const captionXml = caption
@@ -241,14 +234,7 @@ ${fieldControls}\t\t\t\t</Controls>
 `;
   }
 
-  // ---------------------------------------------------------------------------
-  // SimpleListDetails  (v1.3)
-  // Use: entities of medium complexity — left list panel, right details panel
-  // Reference: PaymTerm form
-  // Structure: ActionPane → ButtonGroup
-  //            GridContainer (SidePanel) → QuickFilter + Grid (Style=List)
-  //            DetailsGroup (FieldsFieldGroups) → Tab → TabPages
-  // ---------------------------------------------------------------------------
+  // SimpleListDetails (v1.3): medium complexity entity — left list panel, right details panel. Reference: PaymTerm.
   static buildSimpleListDetails(opt: FormTemplateOptions): string {
     const { formName, dsName = formName, dsTable = dsName, caption, gridFields = [] } = opt;
     const captionXml = caption
@@ -264,9 +250,7 @@ ${fieldControls}\t\t\t\t</Controls>
       FormPatternTemplates.fieldControl(f, dsName, '\t\t\t\t\t\t\t\t\t\t', 'Overview_', opt.fieldTypes)
     ).join('');
 
-    // FastTab page fields: the Tab's FieldsFieldGroups page must hold real
-    // controls — an empty group does not qualify as a "Details Tab Page" and
-    // xppc rejects the Tab as missing that required child.
+    // xppc requires the Tab's FieldsFieldGroups page to hold real controls; an empty group is rejected.
     const tabFieldControls = gridFields.map(f =>
       FormPatternTemplates.fieldControl(f, dsName, '\t\t\t\t\t\t\t\t\t', 'Tab_', opt.fieldTypes)
     ).join('');
@@ -450,14 +434,7 @@ ${tabFieldControls}\t\t\t\t\t\t\t\t</Controls>
 `;
   }
 
-  // ---------------------------------------------------------------------------
-  // DetailsMaster  (v1.1)
-  // Use: complex master entity with FastTabs (customers, vendors, workers...)
-  // Reference: CustTable form structure
-  // Structure: ActionPane; header Group (Status fields); Tab (FastTabs)
-  //   Grid view (hidden by default, Pattern=PanoramaBody_MasterGrid) OR
-  //   Details view with FastTabs (Pattern=FieldsFieldGroups per FastTab)
-  // ---------------------------------------------------------------------------
+  // DetailsMaster (v1.1): complex master entity with FastTabs (customers, vendors, workers...). Reference: CustTable.
   static buildDetailsMaster(opt: FormTemplateOptions): string {
     const { formName, dsName = formName, dsTable = dsName, caption, gridFields = [] } = opt;
     const captionXml = caption

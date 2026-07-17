@@ -14,6 +14,7 @@
 import type { BridgeClient } from './bridgeClient.js';
 import * as debouncedRefresh from './debouncedRefresh.js';
 import { debugLog } from '../utils/logger.js';
+import { reindentXppSource } from '../utils/xppFormat.js';
 import type {
   BridgeTableInfo,
   BridgeClassInfo,
@@ -44,9 +45,7 @@ export interface ToolResult {
   isError?: boolean;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // TABLE
-// ════════════════════════════════════════════════════════════════════════
 
 const TABLE_METHOD_PAGE_SIZE = 25;
 
@@ -138,9 +137,7 @@ function formatTable(t: BridgeTableInfo, methodOffset: number): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // CLASS
-// ════════════════════════════════════════════════════════════════════════
 
 const CLASS_METHOD_PAGE_SIZE = 15;
 
@@ -209,9 +206,7 @@ function formatClass(cls: BridgeClassInfo, compact: boolean, methodOffset: numbe
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // METHOD SOURCE
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeMethodSource(
   bridge: BridgeClient | undefined,
@@ -244,9 +239,7 @@ export async function tryBridgeMethodSource(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // ENUM
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeEnum(
   bridge: BridgeClient | undefined,
@@ -276,9 +269,7 @@ export async function tryBridgeEnum(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // EDT
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeEdt(
   bridge: BridgeClient | undefined,
@@ -321,9 +312,7 @@ function formatEdt(edt: BridgeEdtInfo): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // FORM
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeForm(
   bridge: BridgeClient | undefined,
@@ -418,9 +407,7 @@ function countControls(controls: BridgeFormControl[]): number {
   return count;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // FIND REFERENCES
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Outcome of a bridge where-used lookup. The caller must distinguish a clean
@@ -439,6 +426,7 @@ export async function tryBridgeReferences(
   target: string | string[],
   limit = 50,
   displayName?: string,
+  formatAs: 'default' | 'label' = 'default',
 ): Promise<BridgeReferencesOutcome> {
   if (!bridge?.isReady || !bridge.xrefAvailable) return { status: 'unavailable' };
   // Accept several candidate paths (e.g. one per container type when an owner
@@ -467,6 +455,14 @@ export async function tryBridgeReferences(
   // No rows: "empty" is authoritative only when nothing went wrong; otherwise
   // signal "error" so the caller falls back instead of trusting the 0.
   if (merged.length === 0) return errored ? { status: 'error' } : { status: 'empty' };
+
+  // Labels are referenced from every object type (tables, forms, EDTs, enums,
+  // reports, menu items, security objects, …), mostly via declarative metadata
+  // properties rather than X++ code — so they get a dedicated formatter that
+  // groups by source object type and surfaces the referencing property.
+  if (formatAs === 'label') {
+    return { status: 'ok', result: formatLabelReferences(merged, label, limit) };
+  }
 
   {
     const refs = { count: merged.length, references: merged };
@@ -529,9 +525,152 @@ export async function tryBridgeReferences(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
+// LABEL REFERENCES (formatting)
+
+/**
+ * Friendly display name for an xref source-container segment. Handles both xref
+ * path conventions seen for label references: code references use plural,
+ * slash-prefixed containers ("/Classes/…", "/Tables/…"), while declarative
+ * metadata references use singular containers with no leading slash
+ * ("Table/…", "Form/…", "EdtString/…", "MenuItemDisplay/…").
+ */
+const XREF_SOURCE_TYPE_LABELS: Record<string, string> = {
+  classes: 'Class', class: 'Class',
+  tables: 'Table', table: 'Table', tableextension: 'Table extension',
+  forms: 'Form', form: 'Form', formextension: 'Form extension',
+  views: 'View', view: 'View', viewextension: 'View extension',
+  maps: 'Map', map: 'Map',
+  queries: 'Query', querysimple: 'Query',
+  enum: 'Enum', enums: 'Enum', enumextension: 'Enum extension',
+  reports: 'Report', report: 'Report',
+  dataentityviews: 'Data entity', dataentityview: 'Data entity',
+  compositedataentityview: 'Composite data entity', dataentityviewextension: 'Data entity extension',
+  aggregatedataentity: 'Aggregate data entity', aggregatedimension: 'Aggregate dimension',
+  aggregatemeasurement: 'Aggregate measurement',
+  menu: 'Menu', menuextension: 'Menu extension',
+  menuitemdisplay: 'Menu item (display)', menuitemaction: 'Menu item (action)', menuitemoutput: 'Menu item (output)',
+  securityprivilege: 'Security privilege', securityduty: 'Security duty',
+  securityrole: 'Security role', securitypolicy: 'Security policy',
+  configurationkey: 'Configuration key', configurationkeygroup: 'Configuration key group',
+  tile: 'Tile', kpi: 'KPI', licensecode: 'License code', resource: 'Resource',
+};
+
+function friendlyXrefSourceType(container: string): string {
+  const key = container.toLowerCase();
+  if (XREF_SOURCE_TYPE_LABELS[key]) return XREF_SOURCE_TYPE_LABELS[key];
+  if (key.startsWith('edt')) return 'EDT';            // EdtString, EdtEnum, EdtReal, EdtInt64, …
+  if (key.startsWith('workflow')) return 'Workflow';  // WorkflowTemplate, WorkflowApproval, …
+  return container || 'Other';
+}
+
+interface ParsedLabelSource {
+  type: string;        // friendly source type, e.g. "Form", "EDT", "Table"
+  objectName: string;  // referencing object, e.g. "AbatementCertificate_IN"
+  detail?: string;     // X++ method (code ref) or referencing property (metadata ref)
+}
+
+/**
+ * Parse an xref source path for a label reference into (type, object, detail).
+ * `detail` names *where on the object* the label is used, so a reader can jump
+ * straight to it — the X++ method for code refs, or "<member> › <property>" for
+ * declarative metadata refs (the referencing field / enum value / form control
+ * plus the property it sits on). The member is omitted when the property is
+ * declared directly on the object itself (e.g. an EDT's own HelpText).
+ * Examples:
+ *   "/Classes/WhsWorkManualComplete/Methods/performValidation" → Class · WhsWorkManualComplete · performValidation
+ *   "Form/AbatementCertificate_IN/FormDesign/.../ShowData?Text" → Form  · AbatementCertificate_IN · ShowData › Text
+ *   "Table/Foo/Fields/Bar?Label"                               → Table · Foo · Bar › Label
+ *   "Enum/ABC/EnumValue/A?Label"                               → Enum  · ABC · A › Label
+ *   "EdtString/ABNControllingCorporation_AU?HelpText"          → EDT   · ABNControllingCorporation_AU · HelpText
+ */
+function parseLabelSource(sourcePath: string): ParsedLabelSource {
+  const parts = sourcePath.split('/').filter(Boolean);
+  const type = friendlyXrefSourceType(parts[0] ?? '');
+
+  let objectName = parts[1] ?? sourcePath;
+  const objQ = objectName.indexOf('?');            // e.g. "EdtString/Foo?HelpText" — object is 2nd segment
+  if (objQ >= 0) objectName = objectName.substring(0, objQ);
+
+  let detail: string | undefined;
+  const mi = parts.indexOf('Methods');
+  if (mi >= 0 && parts[mi + 1]) {
+    detail = parts[mi + 1].split('?')[0];           // X++ method name (code reference)
+  } else {
+    const q = sourcePath.lastIndexOf('?');
+    if (q >= 0) {
+      const property = sourcePath.substring(q + 1); // property: Label/Caption/HelpText/Text/…
+      // The member the property sits on is the last path segment before the "?"
+      // (a form control, table field, enum value, …). Keep it unless it *is* the
+      // object — a property declared directly on the object needs no member.
+      const member = (parts[parts.length - 1] ?? '').split('?')[0];
+      detail = member && member !== objectName ? `${member} › ${property}` : property;
+    }
+  }
+  return { type, objectName, detail };
+}
+
+/**
+ * Format label where-used results, grouped by source object type. Unlike the
+ * default (caller/method-oriented) formatter, this makes the object-type spread
+ * explicit — a label is typically referenced far more from metadata (form
+ * captions, field/EDT labels, menu-item captions, …) than from X++ code.
+ */
+function formatLabelReferences(references: BridgeReferenceInfo[], label: string, limit: number): ToolResult {
+  type LabelRefRow = ParsedLabelSource & { module?: string; line: number };
+  const parsed: LabelRefRow[] = references.map(r => ({
+    ...parseLabelSource(r.sourcePath),
+    module: r.sourceModule,
+    line: r.line,
+  }));
+
+  let out = `# References to label \`${label}\`\n\n`;
+  out += `**Total:** ${references.length} reference(s) found\n`;
+  out += `_Source: C# bridge (DYNAMICSXREFDB) — includes both X++ code and declarative metadata references_\n\n`;
+
+  // Summary: count by source object type (most-referenced first). This counts
+  // ALL references, whereas the detail section below is capped at `limit` — so
+  // each truncated group carries a "showing X of Y" marker to keep the two
+  // sections reconcilable.
+  const byType = new Map<string, number>();
+  for (const p of parsed) byType.set(p.type, (byType.get(p.type) || 0) + 1);
+  out += `## 📊 By source object type\n\n`;
+  for (const [type, count] of [...byType.entries()].sort((a, b) => b[1] - a[1])) {
+    out += `- **${type}**: ${count} reference(s)\n`;
+  }
+  out += `\n`;
+
+  // Detail: grouped by type, capped at `limit` total rows
+  out += `## 📍 References\n\n`;
+  const visible = parsed.slice(0, limit);
+  const groups = new Map<string, LabelRefRow[]>();
+  for (const p of visible) {
+    const bucket = groups.get(p.type) ?? [];
+    bucket.push(p);
+    groups.set(p.type, bucket);
+  }
+  for (const [type, refs] of [...groups.entries()].sort((a, b) => b[1].length - a[1].length)) {
+    // When the overall `limit` truncates a group, show "shown of total" so the
+    // rows below don't appear to contradict the summary count above.
+    const total = byType.get(type) ?? refs.length;
+    const heading = refs.length < total ? `${refs.length} of ${total}` : `${refs.length}`;
+    out += `### ${type} (${heading})\n\n`;
+    for (const r of refs) {
+      const loc = r.line > 0 ? `:${r.line}` : '';
+      const mod = r.module ? ` [${r.module}]` : '';
+      const det = r.detail ? ` › ${r.detail}` : '';
+      out += `- **${r.objectName}**${det}${loc}${mod}\n`;
+    }
+    out += `\n`;
+  }
+
+  if (references.length > limit) {
+    out += `> ⚠️ Showing first ${limit} of ${references.length} references. Raise \`limit\` to see more.\n`;
+  }
+
+  return { content: [{ type: 'text', text: out }] };
+}
+
 // SEARCH
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeSearch(
   bridge: BridgeClient | undefined,
@@ -559,9 +698,7 @@ export async function tryBridgeSearch(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // QUERY
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeQuery(
   bridge: BridgeClient | undefined,
@@ -637,9 +774,7 @@ function formatQueryDataSource(ds: BridgeQueryDataSource, depth: number): string
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // VIEW
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeView(
   bridge: BridgeClient | undefined,
@@ -726,9 +861,7 @@ function formatView(v: BridgeViewInfo): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // DATA ENTITY
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeDataEntity(
   bridge: BridgeClient | undefined,
@@ -793,9 +926,7 @@ function formatDataEntity(e: BridgeDataEntityInfo): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // REPORT (fallback only — used when XML file is not found on disk)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeReport(
   bridge: BridgeClient | undefined,
@@ -850,9 +981,7 @@ function formatReport(r: BridgeReportInfo): string {
   return out;
 }
 
-// ============================================================
-// Write-support adapters (Phase 3)
-// ============================================================
+// Write-support adapters
 
 /**
  * Refreshes the C# DiskProvider so it picks up newly written/modified files.
@@ -929,23 +1058,27 @@ export async function bridgeResolveObject(
   }
 }
 
-// ========================================
-// Write operations (Phase 4)
-// ========================================
+// Write operations
 
 /**
  * Supported object types for bridge-based creation.
- * Covers core types + menu items + security + extensions + form + menu.
+ * Covers core types + menu items + extensions + form + menu.
  * Complex types (report, data-entity, business-event, tile, kpi) continue
  * using TypeScript XML generation — the bridge handles them via xmlContent passthrough.
+ *
+ * security-privilege/security-duty/security-role and query/view are DELIBERATELY
+ * excluded: the bridge's generic `properties: Dictionary<string,string>` channel
+ * can't carry the structured collections these types need (EntryPoints, Privileges,
+ * Duties, query data sources, etc.) — creation would "succeed" but produce an empty,
+ * functionally-broken object. The local XML generators (securityPrivilegeXml.ts,
+ * queryViewXml.ts, generateAxSecurityDuty/RoleXml) build these correctly instead.
  */
 const BRIDGE_CREATE_TYPES = new Set([
   'class', 'class-extension', 'table', 'enum', 'edt',
-  'query', 'view', 'form',
+  'form',
   'table-extension', 'form-extension', 'enum-extension',
   'menu',
   'menu-item-action', 'menu-item-display', 'menu-item-output',
-  'security-privilege', 'security-duty', 'security-role',
 ]);
 
 /**
@@ -1088,7 +1221,10 @@ export async function bridgeAddMethod(
   if (!BRIDGE_MODIFY_TYPES.has(objectType.toLowerCase())) return null;
 
   try {
-    const result = await bridge.addMethod(objectType, objectName, methodName, sourceCode);
+    // The bridge stores sourceCode verbatim — whatever indentation the caller typed
+    // (or didn't) ends up in the AOT XML as-is. Re-derive consistent indentation
+    // from brace depth so ragged/flush-left input doesn't produce garbled formatting.
+    const result = await bridge.addMethod(objectType, objectName, methodName, reindentXppSource(sourceCode));
     return {
       success: result.success,
       message: result.success
@@ -1601,41 +1737,7 @@ export async function bridgeAddDataSource(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// DELETE OBJECT
-// ════════════════════════════════════════════════════════════════════════
-
-/**
- * Deletes a D365FO object via the C# bridge.
- * Returns a formatted ToolResult or null if bridge unavailable.
- */
-export async function bridgeDeleteObject(
-  bridge: BridgeClient | undefined,
-  objectType: string,
-  objectName: string,
-): Promise<ToolResult | null> {
-  if (!bridge?.isReady || !bridge.metadataAvailable) return null;
-
-  try {
-    const result = await bridge.deleteObject(objectType, objectName);
-    if (result.success) {
-      let text = `✅ **Deleted** ${objectType} \`${objectName}\`\n`;
-      if (result.model) text += `- **Model:** ${result.model}\n`;
-      if (result.filePath) text += `- **File:** ${result.filePath}\n`;
-      return { content: [{ type: 'text', text }] };
-    } else {
-      const text = `❌ **Delete failed** for ${objectType} \`${objectName}\`\n- Error: ${result.error ?? 'Unknown error'}`;
-      return { content: [{ type: 'text', text }], isError: true };
-    }
-  } catch (e) {
-    console.error(`[BridgeAdapter] deleteObject(${objectType}, ${objectName}) failed: ${e}`);
-    return null;
-  }
-}
-
-// ════════════════════════════════════════════════════════════════════════
 // TABLE-EXTENSION: ADD FIELD MODIFICATION
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Adds or updates a FieldModification entry in a table-extension via the C# bridge.
@@ -1664,9 +1766,7 @@ export async function bridgeAddFieldModification(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // MENU: ADD MENU ITEM TO MENU
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Adds a menu item reference to a menu via the C# bridge.
@@ -1693,9 +1793,7 @@ export async function bridgeAddMenuItemToMenu(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // BATCH MODIFY
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Executes multiple write operations on a single object in one bridge call.
@@ -1736,9 +1834,7 @@ export async function bridgeBatchModify(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // CAPABILITIES
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Retrieves the structured capabilities map from the C# bridge.
@@ -1768,9 +1864,7 @@ export async function bridgeGetCapabilities(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // FORM PATTERN DISCOVERY
-// ════════════════════════════════════════════════════════════════════════
 
 /**
  * Discovers available D365FO form patterns from the Patterns DLL or fallback list.
@@ -1800,9 +1894,7 @@ export async function bridgeDiscoverFormPatterns(
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // SECURITY ARTIFACT (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeSecurityArtifact(
   bridge: BridgeClient | undefined,
@@ -1915,9 +2007,7 @@ function formatSecurityRole(role: BridgeSecurityRoleResult, _includeChain: boole
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // MENU ITEM (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeMenuItem(
   bridge: BridgeClient | undefined,
@@ -1961,9 +2051,7 @@ function formatMenuItem(mi: BridgeMenuItemResult): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // TABLE EXTENSIONS (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeTableExtensions(
   bridge: BridgeClient | undefined,
@@ -2009,9 +2097,7 @@ function formatTableExtensions(r: BridgeTableExtensionListResult): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // CODE COMPLETION (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeCompletion(
   bridge: BridgeClient | undefined,
@@ -2067,9 +2153,7 @@ function formatCompletion(r: BridgeCompletionResult, prefix?: string): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // FIND COC EXTENSIONS via XREF (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeCocExtensions(
   bridge: BridgeClient | undefined,
@@ -2121,9 +2205,7 @@ function formatCocExtensions(r: BridgeExtensionClassResult, methodNameFilter?: s
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // FIND EVENT HANDLERS via XREF (Phase 6)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeEventHandlers(
   bridge: BridgeClient | undefined,
@@ -2175,9 +2257,7 @@ function formatEventHandlers(r: BridgeEventSubscriberResult): string {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════════
 // API USAGE CALLERS via XREF (P5)
-// ════════════════════════════════════════════════════════════════════════
 
 export async function tryBridgeApiUsageCallers(
   bridge: BridgeClient | undefined,

@@ -41,11 +41,8 @@ function runWithStreaming(
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    // Bound in-memory buffering of child output. A 60-minute sync on a verbose
-    // SyncEngine can emit tens of MB which previously all accumulated in RAM.
-    // Once the cap is hit we drop the oldest bytes — progress is still logged
-    // live to stderr, and the final client-facing output is already capped by
-    // MAX_OUTPUT_LENGTH below.
+    // Cap in-memory buffering; a long sync can emit tens of MB. Oldest bytes
+    // are dropped once the cap is hit, but progress still streams to stderr.
     const MAX_BUFFER_BYTES = 2 * 1024 * 1024; // 2 MB per stream
     const truncated = { stdout: false, stderr: false };
     let stdout = '';
@@ -197,16 +194,13 @@ export const dbSyncTool = async (params: any, _context: any) => {
       };
     }
 
-    // ── Pre-flight: check StaticMetadata exists for the model ─────────────
+    // Pre-flight check; warning is logged but does not block the sync.
     const metadataWarning = await checkStaticMetadata(packagesRoot, modelName);
-    // Warning is logged but does NOT block — we pass both -metadata (source XML)
-    // and -metadatabinaries so SyncEngine can fall back to source files.
     if (metadataWarning) {
       console.error(`[trigger_db_sync] ${metadataWarning}`);
     }
 
-    // ── Resolve table list ────────────────────────────────────────────────
-    // Priority: explicit tables[] / tableName > projectPath extraction > full sync
+    // Resolve table list: explicit tables[]/tableName > projectPath extraction > full sync
     let tableList: string[] = [
       ...(params.tables ?? []),
       ...(params.tableName ? [params.tableName] : []),

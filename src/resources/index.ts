@@ -1,12 +1,11 @@
 /**
  * Unified MCP Resource registrar.
  *
- * The MCP SDK keeps ONE handler per request schema, so each call to
- * server.setRequestHandler(ListResourcesRequestSchema, …) overwrites the
- * previous one. Class and workspace resources used to register separately,
- * which meant whichever ran last silently shadowed the other. This module
- * registers a single dispatcher for ListResources / ListResourceTemplates /
- * ReadResource and routes by URI scheme, so both coexist.
+ * The MCP SDK keeps ONE handler per request schema — a second
+ * server.setRequestHandler(ListResourcesRequestSchema, …) call would silently
+ * overwrite the first. This module is the single dispatcher for ListResources /
+ * ListResourceTemplates / ReadResource, routing by URI scheme so class and
+ * workspace resources can coexist.
  *
  * Resources exposed:
  *   • xpp://class/{className}     — class source (resource template)
@@ -78,14 +77,12 @@ function json(uri: string, data: unknown) {
 }
 
 export function registerResources(server: Server, context: XppServerContext): void {
-  // ── List concrete (non-templated) resources ──────────────────────────────
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: WORKSPACE_RESOURCES.map((r) => ({ ...r })),
   }));
 
-  // ── Advertise templated resources (classes are addressable by name) ──────
-  // Enumerating every class would return 100k+ entries, so expose a template
-  // instead — clients resolve xpp://class/<ClassName> on demand.
+  // Classes are exposed as a template instead of being enumerated (100k+ entries) —
+  // clients resolve xpp://class/<ClassName> on demand.
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
     resourceTemplates: [
       {
@@ -97,11 +94,9 @@ export function registerResources(server: Server, context: XppServerContext): vo
     ],
   }));
 
-  // ── Read dispatcher ──────────────────────────────────────────────────────
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const uri = request.params.uri;
 
-    // xpp://class/{className}
     if (isClassUri(uri)) {
       const source = await readClassSource(context, uri);
       return {
@@ -109,7 +104,6 @@ export function registerResources(server: Server, context: XppServerContext): vo
       };
     }
 
-    // workspace://*
     if (uri.startsWith('workspace://')) {
       const snapshot = await buildContextSnapshot(context);
 

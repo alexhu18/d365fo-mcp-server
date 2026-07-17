@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
 import { scanFsExtensions, EXTENSION_FOLDER_CONFIG } from '../utils/fsExtensionScanner.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 
 // Standard D365FO table events available for subscription
 const TABLE_STANDARD_EVENTS = [
@@ -31,9 +32,15 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
   try {
     const args = AnalyzeExtensionPointsArgsSchema.parse(request.params.arguments);
     const rdb = context.symbolIndex.getReadDb();
-    const objName = args.objectName;
+    // Resolve the caller's casing to the canonical AOT name once (#686) — the
+    // method/datasource probes below are parent-scoped on this name.
+    const objName = canonicalSymbolName(
+      rdb,
+      args.objectName,
+      args.objectType === 'auto' ? ['class', 'table', 'form'] : [args.objectType],
+    ) ?? args.objectName;
 
-    // ── Step 1: Resolve object type ──
+    // Resolve object type
     let resolvedType = args.objectType;
     if (resolvedType === 'auto') {
       const sym = rdb.prepare(
@@ -52,7 +59,7 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
     if (baseSymbol) output += ` — ${baseSymbol.model}`;
     output += '\n\n';
 
-    // ── Step 2: Load existing extension data ──
+    // Load existing extension data
     let existingExtensions: any[] = [];
     if (args.showExistingExtensions) {
       try {
@@ -68,10 +75,8 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
         if (process.env.DEBUG_LOGGING === 'true') console.warn('[analyzeExtensionPoints] extension_metadata query failed:', e);
       }
 
-      // ── Bridge enrichment ──────────────────────────────────────────────
-      // When the DB index has no extension_metadata, try the C# bridge
-      // (DYNAMICSXREFDB) which provides compiler-resolved extension data
-      // with method-level CoC detail.
+      // Bridge enrichment: when the DB index has no extension_metadata, try the C# bridge
+      // (DYNAMICSXREFDB), which provides compiler-resolved extension data with method-level CoC detail.
       if (existingExtensions.length === 0 && context.bridge?.isReady && context.bridge.xrefAvailable) {
         try {
           const bridgeExts = await context.bridge.findExtensionClasses(objName);
@@ -88,10 +93,8 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
         } catch { /* non-fatal */ }
       }
 
-      // ── Filesystem fallback ──────────────────────────────────────────────
-      // When the DB index has no extension_metadata for this object (e.g. a
-      // custom model that hasn't been re-indexed yet), scan Ax*Extension XML
-      // files directly so the caller sees real data without running PowerShell.
+      // Filesystem fallback: when the DB index has no extension_metadata for this object
+      // (e.g. an unindexed custom model), scan Ax*Extension XML files directly.
       if (existingExtensions.length === 0 && resolvedType !== 'auto' && process.platform === 'win32') {
         const extTypeName = `${resolvedType}-extension`;
         if (EXTENSION_FOLDER_CONFIG[extTypeName]) {
@@ -101,7 +104,6 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
             if (packagePath) {
               const fsExts = await scanFsExtensions(objName, extTypeName, packagePath);
               if (fsExts.length > 0) {
-                // Convert to the shape that the map-building code below expects
                 existingExtensions = fsExts.map(e => ({
                   extension_name: e.name,
                   model: e.model,
@@ -117,7 +119,6 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       }
     }
 
-    // ── Flag whether the extension list came from the filesystem or bridge ──
     const extensionsFromFs = existingExtensions.some((e: any) => e._fromFs);
     const extensionsFromBridge = existingExtensions.some((e: any) => e._fromBridge);
 
@@ -172,7 +173,7 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       if (process.env.DEBUG_LOGGING === 'true') console.warn('[analyzeExtensionPoints] symbols SubscribesTo scan failed:', e);
     }
 
-    // ── Step 3: For classes — analyze methods ──
+    // For classes — analyze methods
     if (resolvedType === 'class' || resolvedType === 'auto') {
       const methods = rdb.prepare(
         `SELECT name, signature, source_snippet FROM symbols
@@ -199,8 +200,7 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
           } else if (src.includes('[replaceable]') || src.includes('replaceable]')) {
             replaceables.push(m);
           } else if (sig.includes('public ') || sig.includes('protected ')) {
-            // CoC eligible: public or protected, non-final
-            cocEligible.push(m);
+            cocEligible.push(m); // CoC eligible: public or protected, non-final
           }
         }
 
@@ -253,10 +253,9 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       }
     }
 
-    // ── Step 4: For tables — show standard events ──
+    // For tables — show standard events
     if (resolvedType === 'table' || resolvedType === 'auto') {
-      // Batch: single FTS5 query for ALL standard events instead of 8× individual full-table scans.
-      // This is O(1) FTS5 lookup instead of O(N × 584K) LIKE scans.
+      // Single FTS5 query for all standard events instead of one LIKE scan per event.
       const eventHandlerCounts = new Map<string, number>();
       try {
         const allEvHandlers = rdb.prepare(
@@ -307,7 +306,7 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       }
     }
 
-    // ── Step 5: For forms — show data sources and methods ──
+    // For forms — show data sources and methods
     if (resolvedType === 'form') {
       const formDataSources = rdb.prepare(
         `SELECT name FROM symbols WHERE parent_name = ? AND type = 'datasource' ORDER BY name`
@@ -333,7 +332,7 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       }
     }
 
-    // ── Summary of existing extensions ──
+    // Summary of existing extensions
     if (args.showExistingExtensions && existingExtensions.length > 0) {
       const sourceLabel = extensionsFromFs
         ? ' (sourced from disk — not yet in index)'

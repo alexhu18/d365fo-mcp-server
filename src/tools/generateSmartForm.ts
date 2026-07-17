@@ -17,10 +17,12 @@ import { extractModelFromProject, findProjectInSolution } from '../utils/project
 import { normalizeD365Xml } from '../utils/d365XmlNormalizer.js';
 import { validateFormPatternXml } from '../validation/formPatternValidator.js';
 import { resolvePattern } from '../knowledge/formPatterns/index.js';
+import { expandPatternToXml, canExpandPattern } from '../utils/formControlExpander.js';
 import { cloneFormXml } from '../utils/formCloner.js';
 import { methodStubsForPattern, injectMethodStubs } from '../knowledge/formPatterns/methodStubs.js';
 import { findBaseFormXml } from './modifyD365File.js';
 import { getFieldControlMap, type FieldControlMap } from '../utils/fieldControlTypes.js';
+import { lookupSymbolNocase } from '../utils/symbolLookup.js';
 
 interface GenerateSmartFormArgs {
   name: string;
@@ -121,6 +123,44 @@ export const generateSmartFormTool: Tool = {
 };
 
 /**
+ * Default Design/Caption for a scaffolded form (pure — no DB access).
+ *
+ * Regression (eval/corpus/runs/2026-07-06T17__L1-form-listpage__cb1b73d.json,
+ * cross-referenced by L1-form-dialog and L1-form-lookup — "a systemic
+ * scaffold default, not a one-off"): when neither an explicit `caption` nor
+ * `label` argument was given, the caption defaulted to the raw object name
+ * (e.g. "PFXDemoNoteHeaderListPage") instead of reusing the bound
+ * datasource table's own Label — even though that Label is resolvable via
+ * the bridge/symbol index and is exactly the value real D365FO forms use
+ * (raw-text captions also trip BPErrorLabelIsText and cascade into
+ * BPErrorCaptionNotDefined on unlabeled ActionPane/ButtonGroups). Reusing
+ * the bound table's Label when available is both more correct and BP-clean.
+ */
+export function resolveFormCaption(
+  explicitCaption: string | undefined,
+  explicitLabel: string | undefined,
+  tableLabel: string | undefined,
+  fallbackName: string,
+): string {
+  return explicitCaption || explicitLabel || tableLabel || fallbackName;
+}
+
+/**
+ * Look up a table's own Label reference (e.g. "@TaxTransactionInquiry:HeaderNote")
+ * from the symbol index, for use as a scaffolded form's default caption. Returns
+ * undefined when the table is unindexed or has no Label recorded — callers fall
+ * back to `label`/the raw object name via `resolveFormCaption`.
+ */
+export function lookupTableLabel(symbolIndex: XppSymbolIndex, table: string | undefined): string | undefined {
+  if (!table) return undefined;
+  try {
+    return symbolIndex.getSymbolByName?.(table, 'table')?.signature || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Pre-write check for cloneFrom: cloning copies the reference form's control
  * hierarchy and sub-patterns verbatim. If the caller asked for a different
  * pattern than the reference declares, the result will likely violate the
@@ -151,6 +191,47 @@ export function cloneFromPatternMismatchWarning(
   );
 }
 
+/**
+ * Pre-clone table-mapping coverage check (pure — no DB/fs access).
+ *
+ * `getTableFields(table)` must return the field-name list for a table, or `null`
+ * when the table is unknown to the caller (e.g. not yet in the symbol index).
+ * Two independent failure classes, checked separately:
+ *   - unknownTargets: the MAPPED target table has no known fields at all — cloning
+ *     cannot verify overlap, and (per cloneFormXml's own "unknown table → keep
+ *     fields" fallback) would silently leave that datasource bound to the SOURCE
+ *     table's fields instead of failing. Always worth surfacing loudly.
+ *   - poorOverlap: both tables are known, but share too few fields (<30%) for the
+ *     clone to be structurally meaningful.
+ * Source tables with <3 known fields are skipped (too little signal either way).
+ */
+export function checkTableMappingCoverage(
+  tableMapping: Record<string, string>,
+  getTableFields: (table: string) => string[] | null,
+): { unknownTargets: string[]; poorOverlap: string[] } {
+  const unknownTargets: string[] = [];
+  const poorOverlap: string[] = [];
+  for (const [srcTable, tgtTable] of Object.entries(tableMapping)) {
+    if (!tgtTable || srcTable.toLowerCase() === tgtTable.toLowerCase()) continue;
+    const srcFields = getTableFields(srcTable);
+    const tgtFields = getTableFields(tgtTable);
+    if (!tgtFields || tgtFields.length === 0) {
+      unknownTargets.push(tgtTable);
+      continue;
+    }
+    if (!srcFields || srcFields.length < 3) continue;
+    const tgtFieldSet = new Set(tgtFields.map((f) => f.toLowerCase()));
+    const shared = srcFields.filter((f) => tgtFieldSet.has(f.toLowerCase()));
+    const ratio = shared.length / srcFields.length;
+    if (ratio < 0.3) {
+      poorOverlap.push(
+        `${srcTable} → ${tgtTable}: ${shared.length}/${srcFields.length} fields shared (${Math.round(ratio * 100)} %)`,
+      );
+    }
+  }
+  return { unknownTargets: [...new Set(unknownTargets)], poorOverlap };
+}
+
 export async function handleGenerateSmartForm(
   args: GenerateSmartFormArgs,
   symbolIndex: XppSymbolIndex
@@ -179,13 +260,12 @@ export async function handleGenerateSmartForm(
   let dataSources: FormDataSourceSpec[] = [];
   let controls: FormControlSpec[] = [];
 
-  // Strategy 1: Copy from existing form
+  // Strategy 1: copy datasources from an existing form
   if (copyFrom) {
     console.log(`[generateSmartForm] Copying structure from: ${copyFrom}`);
     try {
       const db = symbolIndex.getReadDb();
 
-      // Copy datasources directly from form_datasources DB
       const dbDataSources = db.prepare(`
         SELECT datasource_name, table_name, allow_edit, allow_create, allow_delete
         FROM form_datasources
@@ -200,7 +280,6 @@ export async function handleGenerateSmartForm(
       }>;
 
       if (dbDataSources.length === 0) {
-        // Fall back: check if form exists at all
         const formExists = db.prepare(`
           SELECT name FROM symbols WHERE type = 'form' AND name = ? LIMIT 1
         `).get(copyFrom);
@@ -226,29 +305,28 @@ export async function handleGenerateSmartForm(
     }
   }
 
-  // Strategy 2: Create datasource from table and analyze patterns
+  // Strategy 2: create datasource from table and analyze patterns
   if (dataSource && !copyFrom) {
-    // Validate the primary datasource table exists and fuzzy-correct common pluralisation
-    // mistakes (e.g. agent passes "AslRentEquipmentTables" instead of "AslRentEquipmentTable").
+    // Validates the table exists and fuzzy-corrects pluralisation (e.g. "...Tables" -> "...Table").
     let dataSourceResolved = dataSource;
     try {
       const db = symbolIndex.getReadDb();
-      const directHit = db.prepare(
-        `SELECT name FROM symbols WHERE type = 'table' AND name = ? COLLATE NOCASE LIMIT 1`,
-      ).get(dataSource) as { name: string } | undefined;
-      if (!directHit) {
+      // Index-safe nocase lookup; also canonicalizes the casing so the field
+      // probes below stay BINARY on idx_parent_type_name.
+      const directHit = lookupSymbolNocase(db, dataSource, ['table']);
+      if (directHit) {
+        dataSourceResolved = directHit.name;
+      } else {
         const add = (n: string | undefined) => {
           const v = (n ?? '').trim();
           if (v && !candidates.some((c: string) => c.toLowerCase() === v.toLowerCase())) candidates.push(v);
         };
         const candidates: string[] = [];
-        add(dataSource.replace(/s$/i, ''));            // strip trailing "s"
-        add(dataSource.replace(/Tables?$/i, 'Table')); // "Tables" → "Table"
-        add(dataSource.replace(/Table$/i, ''));        // strip "Table" suffix entirely
+        add(dataSource.replace(/s$/i, ''));
+        add(dataSource.replace(/Tables?$/i, 'Table'));
+        add(dataSource.replace(/Table$/i, ''));
         const matched = candidates
-          .map(c => db.prepare(
-            `SELECT name FROM symbols WHERE type = 'table' AND name = ? COLLATE NOCASE LIMIT 1`,
-          ).get(c) as { name: string } | undefined)
+          .map(c => lookupSymbolNocase(db, c, ['table']))
           .find(r => r)?.name;
         if (matched) {
           console.log(`[generateSmartForm] dataSource "${dataSource}" → "${matched}" (auto-corrected)`);
@@ -279,7 +357,6 @@ export async function handleGenerateSmartForm(
       allowDelete: true,
     });
 
-    // Analyze similar forms using this table
     if (formPattern) {
       try {
         await handleGetFormPatterns(
@@ -293,29 +370,32 @@ export async function handleGenerateSmartForm(
     }
   }
 
-  // Strategy 3: Generate controls for datasource fields
-  // Also collects gridFields for pattern templates regardless of generateControls flag
+  // Strategy 3: generate controls for datasource fields (also collects gridFields
+  // for pattern templates regardless of the generateControls flag)
   let gridFields: string[] = [];
-  // Field → control-type maps so generated controls get the right type
-  // (enum→ComboBox, date→Date, …) instead of defaulting every field to String.
+  // Field -> control-type map (enum->ComboBox, date->Date, etc.) so generated controls
+  // aren't all typed as String.
   let fieldTypes: FieldControlMap | undefined;
   let linesFields: string[] = [];
   let linesFieldTypes: FieldControlMap | undefined;
 
-  // Resolve the table fields (minus system fields), capped for a sensible grid width.
+  // Table fields minus system fields, capped for a sensible grid width.
   const collectGridFields = (db: any, table: string): string[] => {
+    // Canonicalize first — `parent_name = ? COLLATE NOCASE` cannot use
+    // idx_parent_type_name and scans all 360k field rows (180 s cold).
+    const canonical = lookupSymbolNocase(db, table)?.name ?? table;
     const dbFields = db.prepare(`
       SELECT name FROM symbols
-      WHERE type = 'field' AND parent_name = ? COLLATE NOCASE
+      WHERE type = 'field' AND parent_name = ?
       ORDER BY name
-    `).all(table) as Array<{ name: string }>;
+    `).all(canonical) as Array<{ name: string }>;
     return dbFields
       .map((f) => f.name)
       .filter((n) => !['RecId', 'RecVersion', 'DataAreaId', 'Partition'].includes(n))
       .slice(0, 8);
   };
 
-  // After fuzzy resolution the effective datasource name may differ from the input.
+  // May differ from the input after fuzzy resolution above.
   const dataSourceEffective = dataSources[0]?.table ?? dataSource;
 
   if (dataSource && dataSources.length > 0) {
@@ -326,7 +406,6 @@ export async function handleGenerateSmartForm(
 
       if (gridFields.length > 0) {
         if (generateControls) {
-          // Legacy path: also build explicit controls for backward compat
           const gridControl = builder.buildGridControl(
             `${dataSourceEffective}Grid`,
             dataSourceEffective,
@@ -347,40 +426,35 @@ export async function handleGenerateSmartForm(
   // Lines datasource (header+lines patterns): add a second datasource bound to
   // the lines table, with its own typed field controls and field list.
   let linesTableResolved = linesTable || linesDataSource;
-  // The effective lines datasource name (may differ from the corrected table name when
-  // an explicit, distinct linesDataSource is supplied). Hoisted so the method-stub
-  // injection below references the same name as the datasource we actually emit.
+  // Effective lines datasource name; may differ from the corrected table name when an
+  // explicit, distinct linesDataSource is supplied. Hoisted so method-stub injection
+  // below references the same name as the datasource actually emitted.
   let linesDsNameResolved: string | undefined;
-  // Note about an auto-corrected lines table name — threaded into the output via cloneNotes.
+  // Note about an auto-corrected lines table name, surfaced via cloneNotes.
   let linesTableNote = '';
   if (linesTableResolved) {
-    // Validate the lines table exists in the index. The lines-table name is a
-    // frequent source of error: the model guesses it from the header table by
-    // appending "Lines" (e.g. header "AslRentAgreementTable" → "AslRentAgreementTableLines"),
-    // but the real table is usually "<headerBase>Line" ("AslRentAgreementLine").
-    // Generate structured candidates from both the given name and the header
-    // table, auto-correct to the first that actually exists, and only hard-fail
-    // when none resolves.
+    // Lines table names are commonly guessed wrong (e.g. header "...Table" -> "...TableLines"
+    // instead of the real "...Line"). Try structured candidates from the given name and the
+    // header table, auto-correct to the first that exists, hard-fail only if none resolve.
     try {
       const db = symbolIndex.getReadDb();
-      const exists = db.prepare(
-        `SELECT name FROM symbols WHERE type = 'table' AND name = ? COLLATE NOCASE LIMIT 1`,
-      );
-      const direct = exists.get(linesTableResolved) as { name: string } | undefined;
-      if (!direct) {
-        // Build an ordered, de-duplicated candidate list.
+      const exists = (n: string) => lookupSymbolNocase(db, n, ['table']);
+      const direct = exists(linesTableResolved);
+      if (direct) {
+        linesTableResolved = direct.name; // canonical casing for BINARY field probes
+      } else {
         const candidates: string[] = [];
         const add = (n?: string | null) => {
           const v = (n ?? '').trim();
           if (v && !candidates.some(c => c.toLowerCase() === v.toLowerCase())) candidates.push(v);
         };
         const ln = linesTableResolved;
-        add(ln.replace(/s$/i, ''));               // strip trailing plural "s"
-        add(ln.replace(/Lines$/i, 'Line'));       // …Lines → …Line
-        add(ln.replace(/Table(Lines?)$/i, 'Line')); // …Table(Line|Lines) → …Line
-        add(ln.replace(/Table(Lines?)$/i, '$1'));   // …TableLines → …Lines
+        add(ln.replace(/s$/i, ''));
+        add(ln.replace(/Lines$/i, 'Line'));
+        add(ln.replace(/Table(Lines?)$/i, 'Line'));
+        add(ln.replace(/Table(Lines?)$/i, '$1'));
         if (dataSource) {
-          const base = dataSource.replace(/Table$/i, ''); // header base, e.g. AslRentAgreement
+          const base = dataSource.replace(/Table$/i, ''); // header base, e.g. ContosoRentAgreement
           add(`${base}Line`);
           add(`${base}Lines`);
           add(`${base}TransLine`);
@@ -389,18 +463,16 @@ export async function handleGenerateSmartForm(
 
         let matched: string | undefined;
         for (const cand of candidates) {
-          const hit = exists.get(cand) as { name: string } | undefined;
+          const hit = exists(cand);
           if (hit) { matched = hit.name; break; }
         }
 
         if (matched) {
-          // Auto-correct to the verified table and record a visible note.
           linesTableNote =
             `\n   🔍 linesTable "${linesTableResolved}" not found — auto-corrected to "${matched}" (verified in the index).`;
           console.log(`[generateSmartForm] linesTable "${linesTableResolved}" → "${matched}" (auto-corrected)`);
           linesTableResolved = matched;
         } else {
-          // Nothing matched — fail with the best fuzzy suggestion we can find.
           const stem = linesTableResolved.replace(/s$/i, '');
           const alt = db.prepare(
             `SELECT name FROM symbols WHERE type = 'table' AND name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1`,
@@ -426,8 +498,8 @@ export async function handleGenerateSmartForm(
 
     // Datasource name: by D365FO convention it equals the (corrected) table name.
     // Honor an explicit linesDataSource ONLY when it is a genuinely distinct name —
-    // not just the wrong pluralized guess (e.g. "AslRentAgreementLines") that the
-    // table auto-correction above already resolved to "AslRentAgreementLine".
+    // not just the wrong pluralized guess (e.g. "ContosoRentAgreementLines") that the
+    // table auto-correction above already resolved to "ContosoRentAgreementLine".
     // Otherwise the form ends up with a datasource named after a non-existent table.
     // Local const captures the (possibly auto-corrected) table name so TS keeps the
     // non-undefined narrowing through the reassignments above.
@@ -580,8 +652,10 @@ export async function handleGenerateSmartForm(
     }
 
     const db = symbolIndex.getReadDb();
+    // BINARY parent probe on idx_parent_type_name; mapping targets are
+    // canonicalized in the callback below (NOCASE here scanned all field rows).
     const fieldStmt = db.prepare(`
-      SELECT name FROM symbols WHERE type = 'field' AND parent_name = ? COLLATE NOCASE
+      SELECT name FROM symbols WHERE type = 'field' AND parent_name = ?
     `);
     // ── PRE-CLONE FIELD-OVERLAP CHECK ──────────────────────────────────────
     // Before cloning, verify the source and target tables are structurally
@@ -589,21 +663,38 @@ export async function handleGenerateSmartForm(
     // low, cloning will strip most controls and produce a useless form.
     // Fail-fast here rather than returning a gutted result.
     if (tableMapping && Object.keys(tableMapping).length > 0) {
-      const poorOverlap: string[] = [];
-      for (const [srcTable, tgtTable] of Object.entries(tableMapping as Record<string, string>)) {
-        if (!tgtTable || srcTable.toLowerCase() === tgtTable.toLowerCase()) continue;
-        const srcFields = fieldStmt.all(srcTable) as Array<{ name: string }>;
-        const tgtFields = fieldStmt.all(tgtTable) as Array<{ name: string }>;
-        // Unknown table in index → field list is unavailable; skip check for that pair.
-        if (srcFields.length < 3 || tgtFields.length === 0) continue;
-        const tgtFieldSet = new Set(tgtFields.map((f) => f.name.toLowerCase()));
-        const shared = srcFields.filter((f) => tgtFieldSet.has(f.name.toLowerCase()));
-        const ratio = shared.length / srcFields.length;
-        if (ratio < 0.3) {
-          poorOverlap.push(
-            `${srcTable} → ${tgtTable}: ${shared.length}/${srcFields.length} fields shared (${Math.round(ratio * 100)} %)`,
-          );
-        }
+      // Found live 2026-07-01 (usage-examples eval, scenario 2): cloneFrom="CustGroup"
+      // + tableMapping to a just-created table not yet in the symbol index silently
+      // produced a form with 0 datasources/controls, self-reported as success —
+      // getTableFields returning null/empty for an unknown table used to make
+      // cloneFormXml leave that datasource's fields untouched (still bound to the
+      // SOURCE table) instead of failing. checkTableMappingCoverage now catches this
+      // as `unknownTargets`, separate from the pre-existing `poorOverlap` check.
+      const { unknownTargets, poorOverlap } = checkTableMappingCoverage(
+        tableMapping as Record<string, string>,
+        (table: string) => {
+          const canonical = lookupSymbolNocase(db, table)?.name ?? table;
+          const rows = fieldStmt.all(canonical) as Array<{ name: string }>;
+          return rows.length > 0 ? rows.map((r) => r.name) : null;
+        },
+      );
+      if (unknownTargets.length > 0) {
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `❌ PRE-CLONE CHECK — target table${unknownTargets.length > 1 ? 's' : ''} not found in the symbol index: ` +
+              `${unknownTargets.join(', ')}.\n\n` +
+              `Cloning cannot verify field overlap against an unindexed table, and the clone would silently keep ` +
+              `"${cloneFrom}"'s OWN fields unmapped instead of failing — producing a form that looks bound to your ` +
+              `table but whose datasource/controls still reference the source table's fields.\n\n` +
+              `**Fix — choose one:**\n` +
+              `1. If ${unknownTargets.join(', ')} was just created this session, index it first, then retry:\n` +
+              `   \`update_symbol_index(filePath="<absolute path to ${unknownTargets[0]}.xml>")\`\n` +
+              `2. Check the table name for a typo with \`search("${unknownTargets[0]}", type="table")\`.`,
+          }],
+          isError: true,
+        };
       }
       if (poorOverlap.length > 0) {
         const targetList = Object.values(tableMapping as Record<string, string>).filter(Boolean).join(', ');
@@ -697,39 +788,70 @@ export async function handleGenerateSmartForm(
     if (mismatch) noteLines.push(`   ${mismatch}`);
     cloneNotes = `\n${noteLines.join('\n')}`;
   } else {
-    xml = FormPatternTemplates.build(normalizedPattern, {
+    const templateOpts = {
       formName: finalName,
       dsName: primaryDs?.name,
       dsTable: primaryDs?.table,
-      caption: caption || label || finalName,
+      caption: resolveFormCaption(caption, label, lookupTableLabel(symbolIndex, primaryDs?.table), finalName),
       gridFields,
       fieldTypes,
       linesDsName: linesDsNameResolved ?? (linesTableResolved || undefined),
       linesDsTable: linesTableResolved || undefined,
       linesFields,
       linesFieldTypes,
-    });
+    };
+
+    // Patterns FormPatternTemplates has a dedicated, hand-tuned builder for.
+    // Anything else previously degraded silently to SimpleList; we now expand it
+    // deterministically from the catalog instead (single source of truth).
+    const TEMPLATED_PATTERNS = new Set([
+      'SimpleList', 'SimpleListDetails', 'DetailsMaster', 'DetailsTransaction',
+      'Dialog', 'TableOfContents', 'Lookup', 'ListPage', 'Workspace',
+    ]);
+    const intendedSpec = formPattern ? resolvePattern(formPattern) : undefined;
+
+    let expanded: string | undefined;
+    if (intendedSpec && !TEMPLATED_PATTERNS.has(intendedSpec.xmlName) && canExpandPattern(intendedSpec)) {
+      // Deterministic catalog expansion. Self-test it: only adopt the result when
+      // it is structurally error-free — otherwise fall through to the proven
+      // template path so we can never regress.
+      const candidate = expandPatternToXml(intendedSpec, templateOpts);
+      const candidateReport = await validateFormPatternXml(candidate);
+      if (!candidateReport.violations.some(v => v.severity === 'error')) {
+        expanded = candidate;
+        cloneNotes += `\n   ✅ Generated deterministically from the form-pattern catalog (pattern "${intendedSpec.xmlName}", no clone needed).`;
+      } else {
+        console.warn(`[generateSmartForm] Expander output for "${intendedSpec.xmlName}" failed self-test — falling back to template.`);
+      }
+    }
+
+    if (expanded) {
+      xml = expanded;
+    } else {
+      xml = FormPatternTemplates.build(normalizedPattern, templateOpts);
+
+      // Warn when the requested pattern has no dedicated template and silently
+      // degraded to another base (or to SimpleList). The emitted <Pattern> reflects
+      // the template, not the request, and the self-test validates only the emitted
+      // pattern — so this mismatch would otherwise pass unnoticed.
+      const degradedPattern = xml.match(/<Pattern xmlns="">([^<]+)<\/Pattern>/)?.[1];
+      if (formPattern && degradedPattern) {
+        const intended = resolvePattern(formPattern);
+        if (intended && intended.xmlName.toLowerCase() !== degradedPattern.toLowerCase()) {
+          const ref = intended.referenceForms?.[0];
+          cloneNotes +=
+            `\n   ⚠️ No dedicated template for pattern "${intended.xmlName}" — generated a "${degradedPattern}" form instead.` +
+            (ref
+              ? ` For a true "${intended.xmlName}", clone a reference form: ` +
+                `generate_object(mode="scaffold", objectType="form", name="${name}", cloneFrom="${ref}", tableMapping={...}).`
+              : ` Clone a reference form for that pattern via cloneFrom=.`);
+        }
+      }
+    }
 
     // Align the Design-level PatternVersion with the version this environment uses
     // for the pattern; template defaults can lag and be rejected by BP.
     const designPattern = xml.match(/<Pattern xmlns="">([^<]+)<\/Pattern>/)?.[1];
-
-    // Warn when the requested pattern has no dedicated template and silently
-    // degraded to another base (or to SimpleList). The emitted <Pattern> reflects
-    // the template, not the request, and the self-test validates only the emitted
-    // pattern — so this mismatch would otherwise pass unnoticed.
-    if (formPattern && designPattern) {
-      const intended = resolvePattern(formPattern);
-      if (intended && intended.xmlName.toLowerCase() !== designPattern.toLowerCase()) {
-        const ref = intended.referenceForms?.[0];
-        cloneNotes +=
-          `\n   ⚠️ No dedicated template for pattern "${intended.xmlName}" — generated a "${designPattern}" form instead.` +
-          (ref
-            ? ` For a true "${intended.xmlName}", clone a reference form: ` +
-              `generate_object(mode="scaffold", objectType="form", name="${name}", cloneFrom="${ref}", tableMapping={...}).`
-            : ` Clone a reference form for that pattern via cloneFrom=.`);
-      }
-    }
 
     if (designPattern) {
       const envVersion = resolveEnvPatternVersion(symbolIndex.getReadDb(), designPattern);
@@ -764,6 +886,32 @@ export async function handleGenerateSmartForm(
     }
   }
 
+  // Several patterns (SimpleList's Grid, and the FieldsFieldGroups Group control
+  // on SimpleListDetails/DetailsMaster) bind <DataGroup>Overview</DataGroup> —
+  // this ONLY builds if the datasource table has a matching AxTableFieldGroup
+  // named "Overview". A brand-new/custom table created earlier in the same
+  // session almost never has one yet, so the very next build fails with
+  // "Field group 'Overview' does not exist" — a confusing failure with no clue
+  // back to this control. Confirmed on this exact scaffold path (corpus:
+  // eval/corpus/runs/2026-07-07T11__L3-form-add-datasource-lines__cb1b73d.json,
+  // eval/corpus/runs/2026-07-07T15__L4-master-security-slice__cb1b73d.json).
+  // This tool has no bridge/table-write access here to auto-create the field
+  // group (and a prior investigation found that even a same-session
+  // add-field-group call did not reliably become visible to xppc's build —
+  // suspected metadata-provider staleness, unconfirmed without a live VM
+  // re-check) — surface the dependency loudly instead of failing silently.
+  if (/<DataGroup>Overview<\/DataGroup>/.test(xml)) {
+    const overviewDsTable =
+      xml.match(/<AxFormDataSource[^>]*>\s*<Name>[^<]+<\/Name>\s*<Table>([^<]+)<\/Table>/)?.[1]
+      ?? primaryDs?.table ?? primaryDs?.name ?? dataSources[0]?.table;
+    cloneNotes +=
+      `\n   ⚠️ This form references a field group named "Overview" on ` +
+      `${overviewDsTable ?? 'the datasource table'} — verify it already exists, or add one BEFORE ` +
+      `building via d365fo_file(action="modify", objectType="table", objectName="${overviewDsTable ?? '<table>'}", ` +
+      `operation="add-field-group", fieldGroupName="Overview", fieldGroupFields=[...]). Without it the ` +
+      `build fails with "Field group 'Overview' does not exist".`;
+  }
+
   console.log(`[generateSmartForm] Generated XML (${xml.length} bytes)`);
 
   // Self-test: generated XML must conform to its declared pattern.
@@ -795,23 +943,31 @@ export async function handleGenerateSmartForm(
 
   // Warn when a datasource is bound to a table that does not exist in the index,
   // suggesting the closest real table name.
+  //
+  // Regression (eval/corpus/runs/2026-07-06T17__L1-form-dialog__cb1b73d.json): a
+  // `symbols` row for a table can OUTLIVE the table itself — the index is a cache,
+  // not invalidated when an object is deleted/rolled back on the VM. `SELECT 1 ...
+  // WHERE name = ?` matched a phantom row from a prior (rolled-back) run's table, so
+  // this check silently passed and the scaffold produced a form bound to a table with
+  // no file on disk — a build failure with no warning here. Verify the indexed
+  // file_path still exists before trusting a hit; a stale row is treated the same as
+  // "not found".
   try {
     const db = symbolIndex.getReadDb();
-    const tableExists = db.prepare(
-      `SELECT 1 FROM symbols WHERE type = 'table' AND name = ? COLLATE NOCASE LIMIT 1`,
-    );
     const seenTables = new Set<string>();
     for (const m of xml.matchAll(/<Table>([^<]+)<\/Table>/g)) {
       const table = m[1].trim();
       if (!table || seenTables.has(table.toLowerCase())) continue;
       seenTables.add(table.toLowerCase());
-      if (tableExists.get(table)) continue;
+      const row = lookupSymbolNocase(db, table, ['table']);
+      const stale = row?.file_path && !fs.existsSync(row.file_path);
+      if (row && !stale) continue;
       const stem = table.replace(/s$/i, '');
       const alt = db.prepare(
         `SELECT name FROM symbols WHERE type = 'table' AND name LIKE ? COLLATE NOCASE ORDER BY LENGTH(name) ASC LIMIT 1`,
       ).get(`${stem}%`) as { name: string } | undefined;
       cloneNotes +=
-        `\n   ⚠️ Datasource table "${table}" not found in the index` +
+        `\n   ⚠️ Datasource table "${table}" ${stale ? 'is stale in the index (its file no longer exists on disk — run update_symbol_index)' : 'not found in the index'}` +
         (alt && alt.name.toLowerCase() !== table.toLowerCase() ? ` — did you mean "${alt.name}"?` : '') +
         ` The form will not build until that table exists or the datasource is re-pointed.`;
     }

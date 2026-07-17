@@ -21,13 +21,13 @@ export async function completionTool(request: CallToolRequest, context: XppServe
     const args = CompletionArgsSchema.parse(request.params.arguments);
     const { symbolIndex, workspaceScanner } = context;
 
-    // ── Bridge fast-path (C# IMetadataProvider) ──
-    // Try bridge BEFORE the table guard — bridge handles both classes and tables
+    // Bridge fast-path (C# IMetadataProvider) handles both classes and tables,
+    // so it runs before the table guard below.
     const bridgeResult = await tryBridgeCompletion(context.bridge, args.className, args.prefix || undefined);
     if (bridgeResult) return bridgeResult;
-    
-    // ⚠️ EARLY CHECK: Is this a table? If yes, reject immediately!
-    // Use exact-name lookup (not FTS search which does prefix matching and can false-positive)
+
+    // code_completion only supports classes; reject tables early.
+    // Exact-name lookup, not FTS search, to avoid prefix-match false positives.
     const tableCheck = symbolIndex.getSymbolByName(args.className, 'table');
     if (tableCheck) {
       return {
@@ -77,11 +77,9 @@ export async function completionTool(request: CallToolRequest, context: XppServe
     const completions = symbolIndex.getCompletions(args.className, args.prefix);
 
     if (completions.length === 0) {
-      // Check if the class/table exists at all (exact-name lookup, not FTS prefix match)
       const classExists = symbolIndex.getSymbolByName(args.className, 'class') !== null;
       const tableExists = symbolIndex.getSymbolByName(args.className, 'table') !== null;
-      
-      // ⚠️ CRITICAL: If it's a table, explicitly reject and redirect to get_object_info(objectType="table")
+
       if (tableExists) {
         return {
           content: [
@@ -208,7 +206,6 @@ async function getWorkspaceCompletions(
   scanner: any
 ): Promise<any | null> {
   try {
-    // Search for class or table in workspace
     const classFiles = await scanner.searchInWorkspace(args.workspacePath!, args.className, 'class');
     const tableFiles = await scanner.searchInWorkspace(args.workspacePath!, args.className, 'table');
     
@@ -228,7 +225,6 @@ async function getWorkspaceCompletions(
     const metadata = fileWithMetadata.metadata;
     const completions: any[] = [];
 
-    // Add methods
     if (metadata.methods) {
       for (const method of metadata.methods) {
         if (!args.prefix || method.name.toLowerCase().startsWith(args.prefix.toLowerCase())) {
@@ -242,7 +238,6 @@ async function getWorkspaceCompletions(
       }
     }
 
-    // Add fields
     if (metadata.fields) {
       for (const field of metadata.fields) {
         if (!args.prefix || field.name.toLowerCase().startsWith(args.prefix.toLowerCase())) {

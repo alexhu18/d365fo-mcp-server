@@ -12,10 +12,13 @@ import {
 } from '../../src/utils/provenanceStore';
 
 const ORIGINAL_ENFORCE = process.env.GROUNDING_ENFORCE;
+const ORIGINAL_SECRET = process.env.GROUNDING_SECRET;
 
 afterEach(() => {
   if (ORIGINAL_ENFORCE === undefined) delete process.env.GROUNDING_ENFORCE;
   else process.env.GROUNDING_ENFORCE = ORIGINAL_ENFORCE;
+  if (ORIGINAL_SECRET === undefined) delete process.env.GROUNDING_SECRET;
+  else process.env.GROUNDING_SECRET = ORIGINAL_SECRET;
   vi.useRealTimers();
 });
 
@@ -90,6 +93,62 @@ describe('tokenMatchesTarget', () => {
   });
 });
 
+// ─── Signed (portable) tokens — GROUNDING_SECRET ─────────────────────────────
+
+describe('HMAC-signed tokens (GROUNDING_SECRET)', () => {
+  it('issues a g1.-prefixed signed token when the secret is set', () => {
+    process.env.GROUNDING_SECRET = 'test-secret';
+    const token = createProvenanceToken({ goal: 'test', objectName: 'CustTable' });
+    expect(token.startsWith('g1.')).toBe(true);
+    expect(isValidToken(token)).toBe(true);
+  });
+
+  it('validates a signed token without the in-memory bundle (cross-process)', async () => {
+    process.env.GROUNDING_SECRET = 'test-secret';
+    const token = createProvenanceToken({
+      goal: 'test', objectName: 'CustTable', proposedName: 'CustTableContoso_Extension',
+    });
+    // Simulate the write-only companion: a fresh module instance whose
+    // in-memory store never saw this token.
+    vi.resetModules();
+    const fresh = await import('../../src/utils/provenanceStore');
+    expect(fresh.isValidToken(token)).toBe(true);
+    const bundle = fresh.getProvenanceBundle(token)!;
+    expect(bundle.context.objectName).toBe('CustTable');
+    expect(bundle.context.proposedName).toBe('CustTableContoso_Extension');
+    expect(fresh.tokenMatchesTarget(bundle, 'CustTable.ContosoExtension')).toBe(true);
+  });
+
+  it('rejects a tampered signed token', () => {
+    process.env.GROUNDING_SECRET = 'test-secret';
+    const token = createProvenanceToken({ goal: 'test', objectName: 'CustTable' });
+    const [prefix, payload, mac] = token.split('.');
+    const forgedPayload = Buffer.from(
+      JSON.stringify({ o: 'SalesTable', e: Date.now() + 60 * 60 * 1000 }), 'utf8',
+    ).toString('base64url');
+    expect(isValidToken(`${prefix}.${forgedPayload}.${mac}`)).toBe(false);
+  });
+
+  it('rejects a signed token verified with a different secret', async () => {
+    process.env.GROUNDING_SECRET = 'secret-A';
+    const token = createProvenanceToken({ goal: 'test', objectName: 'CustTable' });
+    process.env.GROUNDING_SECRET = 'secret-B';
+    vi.resetModules();
+    const fresh = await import('../../src/utils/provenanceStore');
+    expect(fresh.isValidToken(token)).toBe(false);
+  });
+
+  it('rejects an expired signed token', async () => {
+    process.env.GROUNDING_SECRET = 'test-secret';
+    vi.useFakeTimers();
+    const token = createProvenanceToken({ goal: 'test', objectName: 'CustTable' });
+    vi.advanceTimersByTime(31 * 60 * 1000);
+    vi.resetModules();
+    const fresh = await import('../../src/utils/provenanceStore');
+    expect(fresh.isValidToken(token)).toBe(false);
+  });
+});
+
 // ─── Enforcement ─────────────────────────────────────────────────────────────
 
 describe('enforceGrounding', () => {
@@ -147,6 +206,7 @@ describe('enforceGrounding in write-only server mode', () => {
 
   it('bypasses enforcement even without a token', async () => {
     process.env.GROUNDING_ENFORCE = 'true';
+    delete process.env.GROUNDING_SECRET;
     vi.resetModules();
     vi.doMock('../../src/server/serverMode', async (importOriginal) => ({
       ...(await importOriginal<typeof import('../../src/server/serverMode')>()),
@@ -155,5 +215,21 @@ describe('enforceGrounding in write-only server mode', () => {
     const { enforceGrounding: enforceWriteOnly } = await import('../../src/utils/provenanceStore');
     expect(enforceWriteOnly(undefined, 'create_d365fo_file(...)')).toBeNull();
     expect(enforceWriteOnly('deadbeefdeadbeefdeadbeefdeadbeef', 'op')).toBeNull();
+  });
+
+  it('enforces in write-only mode when GROUNDING_SECRET is shared', async () => {
+    process.env.GROUNDING_ENFORCE = 'true';
+    process.env.GROUNDING_SECRET = 'shared-secret';
+    vi.resetModules();
+    vi.doMock('../../src/server/serverMode', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../../src/server/serverMode')>()),
+      SERVER_MODE: 'write-only' as const,
+    }));
+    const writeOnly = await import('../../src/utils/provenanceStore');
+    // No token → fails closed (signed tokens are validatable here, so no dead-loop)
+    expect(writeOnly.enforceGrounding(undefined, 'op')?.isError).toBe(true);
+    // A signed token issued "elsewhere" with the same secret → passes
+    const token = writeOnly.createProvenanceToken({ goal: 'test', objectName: 'CustTable' });
+    expect(writeOnly.enforceGrounding(token, 'op', 'CustTable.ContosoExtension')).toBeNull();
   });
 });

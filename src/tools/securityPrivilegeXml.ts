@@ -2,8 +2,7 @@
  * Shared builder for AxSecurityPrivilege XML.
  *
  * createD365File.ts and generateD365Xml.ts each expose a mirrored
- * XmlTemplateGenerator class; both delegate here so the two cannot drift
- * (the privilege template previously had to be patched twice by hand).
+ * XmlTemplateGenerator class; both delegate here so the two cannot drift.
  *
  * Element order matches the Microsoft metadata serializer, verified against
  * real shipped privileges in

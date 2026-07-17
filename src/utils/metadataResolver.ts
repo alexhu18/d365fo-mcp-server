@@ -20,14 +20,11 @@ import { getConfigManager, fallbackPackagePath } from './configManager.js';
 // Resolve path relative to this file, not to process.cwd().
 // METADATA_PATH env var allows multi-instance setups to point at different folders.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// METADATA_PATH env var allows each server instance to point to its own extracted-metadata
-// folder when running multiple instances from a single source directory.
+// METADATA_PATH env var lets each server instance point at its own extracted-metadata folder.
 const EXTRACTED_METADATA_BASE = process.env.METADATA_PATH
   ? path.resolve(process.env.METADATA_PATH)
   : path.resolve(__dirname, '../../extracted-metadata');
-// Legacy fallback: some DB file_path values may point into metadata/ (separate from
-// extracted-metadata/).  This is NOT overridden by METADATA_PATH so that the fallback
-// remains useful even when a per-instance METADATA_PATH is set.
+// Legacy fallback (not overridden by METADATA_PATH): some DB file_path values point into metadata/.
 const METADATA_BASE = path.resolve(__dirname, '../../metadata');
 
 export type ExtractedObjectType = 'classes' | 'enums' | 'edts' | 'tables' | 'views';
@@ -69,10 +66,6 @@ export interface ExtractedViewMetadata {
   methods: Array<{ name: string } | string>;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Path helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
  * Build the absolute path to an extracted-metadata JSON file.
  * Returns null if the file doesn't exist (no throw).
@@ -90,10 +83,6 @@ export async function resolveMetadataJsonPath(
     return null;
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Class metadata
-// ─────────────────────────────────────────────────────────────────────────────
 
 export interface ExtractedMethodParam {
   type: string;
@@ -138,11 +127,10 @@ export async function readClassMetadata(
     const raw = await fs.readFile(filePath, 'utf-8');
     const data = JSON.parse(raw) as ExtractedClassMetadata;
 
-    // Normalise parameter format: parameters may be stored as raw "@{type=X; name=Y}" strings
+    // Parameters may be stored as raw PowerShell-serialized strings, e.g. "@{type=RecId; name=_legalEntityRecId}"
     for (const method of data.methods ?? []) {
       method.parameters = (method.parameters ?? []).map((p: any) => {
         if (typeof p === 'string') {
-          // Parse "@{type=RecId; name=_legalEntityRecId}" PowerShell serialization
           const typeMatch = p.match(/type=([^;}\s]+)/);
           const nameMatch = p.match(/name=([^;}\s]+)/);
           return {
@@ -173,10 +161,6 @@ export async function readMethodMetadata(
 
   return classData.methods.find(m => m.name === methodName) ?? null;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Enum metadata (raw XML embedded in JSON)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Read the raw XML string from an extracted-metadata enum JSON file.
@@ -239,29 +223,23 @@ export async function readViewMetadata(
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Build-agent path → local path resolver
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
  * Attempt to remap a build-agent file path to the locally configured packages path.
  *
- * The SQLite index stores paths from the Azure DevOps CI build agent:
+ * The SQLite index stores paths from the Azure DevOps CI build agent, e.g.:
  *   Linux:   /home/vsts/work/1/PackagesLocalDirectory/applicationsuite/Foundation/AxForm/CustTable.xml
  *   Windows: C:\home\vsts\work\1\PackagesLocalDirectory\applicationsuite\Foundation\AxForm\CustTable.xml
  *
- * We extract the relative part after "PackagesLocalDirectory" and combine it with
- * the locally configured packagePath (from .mcp.json / env).  This allows
- * get_object_info and other tools to read standard Microsoft model XML on a local
- * D365FO installation even though the DB path points to a non-existent CI machine.
+ * This extracts the relative part after "PackagesLocalDirectory" and joins it with
+ * the locally configured packagePath, so tools can read the XML from a local D365FO
+ * installation even though the DB path itself points to a non-existent CI machine.
  *
  * Returns null when the path cannot be remapped or the remapped file does not exist.
  */
 export async function resolveDbPathLocally(dbFilePath: string): Promise<string | null> {
-  // Normalise separators so the regex works on both Linux and Windows DB paths
+  // Normalise separators so the regex matches both Linux and Windows DB paths
   const normalised = dbFilePath.replace(/\\/g, '/');
 
-  // Extract the segment that follows "PackagesLocalDirectory/"
   const match = normalised.match(/PackagesLocalDirectory\/(.+)$/i);
   if (!match) return null;
 
@@ -282,14 +260,6 @@ export async function resolveDbPathLocally(dbFilePath: string): Promise<string |
     return null; // File does not exist locally
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Generic "not available" message for objects without extracted metadata
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Type-mismatch detection (shared across tools)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Query the symbol index DB to find what top-level types a given name exists as.
@@ -384,13 +354,9 @@ export function isNotFoundResultText(text: string | undefined): boolean {
 /**
  * Actionable guidance appended to a reader's "object not found" result.
  *
- * Steers the agent to the right MCP tools (search / update_symbol_index) and the
- * config knob for custom packages — and explicitly AWAY from filesystem scanning
- * (Get-ChildItem / Select-String / dir / ls / find). Raw disk scanning is the
- * anti-pattern that turns one missing object into dozens of PowerShell calls: it is
- * slow (350+ model folders), can hang the VS 2022 MCP integration, and bypasses
- * metadata resolution. The "not found" message alone left a guidance vacuum that
- * nudged agents straight into it — this fills the vacuum with the correct next steps.
+ * Steers the agent to the right MCP tools (search / update_symbol_index) and away
+ * from filesystem scanning (Get-ChildItem / Select-String / dir / ls / find), which
+ * is slow across 350+ model folders and can hang the VS 2022 MCP integration.
  */
 export function buildNotFoundGuidance(name: string, objectType: string): string {
   return (

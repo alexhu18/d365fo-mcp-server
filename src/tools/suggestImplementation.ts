@@ -22,7 +22,6 @@ export async function suggestMethodImplementationTool(request: CallToolRequest, 
     const args = SuggestMethodImplementationArgsSchema.parse(request.params.arguments);
     const { symbolIndex } = context;
 
-    // Find similar methods
     const similarMethods = symbolIndex.findSimilarMethods(args.methodName, args.className, 5);
     
     if (similarMethods.length === 0) {
@@ -88,7 +87,6 @@ function formatSuggestion(similarMethods: any[], args: any): string {
   output += `public ${returnType} ${methodName}(${parameters.map((p: any) => `${p.type} _${p.name}`).join(', ')})\n`;
   output += `{\n`;
   
-  // Generate contextual implementation suggestions
   const nameL = methodName.toLowerCase();
   
   if (nameL.includes('validate') || nameL.includes('check') || nameL.includes('verify')) {

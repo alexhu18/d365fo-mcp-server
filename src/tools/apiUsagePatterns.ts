@@ -18,12 +18,11 @@ export async function getApiUsagePatternsTool(request: CallToolRequest, context:
     const args = GetApiUsagePatternsArgsSchema.parse(request.params.arguments);
     const { symbolIndex } = context;
 
-    // ── Bridge fast-path (DYNAMICSXREFDB cross-references) ──
-    // Returns compiler-resolved callers grouped by class
+    // Bridge fast-path: compiler-resolved callers from DYNAMICSXREFDB, grouped by class
     const bridgeResult = await tryBridgeApiUsageCallers(context.bridge, args.apiName);
     if (bridgeResult) return bridgeResult;
 
-    // ── Fallback: SQLite symbol index patterns ──
+    // Fallback: SQLite symbol index patterns
     const patterns = symbolIndex.getApiUsagePatterns(args.apiName);
     
     const formatted = formatPatterns(patterns, args.apiName);

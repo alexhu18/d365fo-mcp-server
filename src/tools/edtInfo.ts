@@ -26,12 +26,12 @@ export async function getEdtInfoTool(request: CallToolRequest, context: XppServe
     const { symbolIndex } = context;
     const { edtName, modelName } = args;
 
-    // ── Hierarchy mode: ancestor chain + children + field usages (SQLite only) ──
+    // Hierarchy mode: ancestor chain + children + field usages (SQLite only)
     if (args.mode === 'hierarchy') {
       return getEdtHierarchy(symbolIndex.getReadDb(), edtName, modelName);
     }
 
-    // ── Standard mode: C# bridge (IMetadataProvider — live D365FO metadata) ──
+    // Standard mode: C# bridge (IMetadataProvider — live D365FO metadata)
     const bridgeResult = await tryBridgeEdt(context.bridge, edtName);
     if (bridgeResult) return bridgeResult;
 

@@ -11,15 +11,14 @@ import { buildObjectTypeMismatchMessage, detectObjectTypeInDb } from '../utils/m
 import { tryBridgeReferences } from '../bridge/bridgeAdapter.js';
 
 const FindReferencesArgsSchema = z.object({
-  // Accept "name" as an alias for "targetName" — agents frequently confuse the two.
-  targetName: z.string().optional().describe('Name of the target. For a precise, type-scoped method where-used, qualify it as "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable") or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name matches that name on every type.'),
+  // "name" is accepted as an alias for "targetName"
+  targetName: z.string().optional().describe('Name of the target. For a precise, type-scoped method where-used, qualify it as "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable") or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name matches that name on every type. For a label, pass the label id ("@WAX2194" or "@LabelFile:LabelId").'),
   name: z.string().optional().describe('Alias for targetName.'),
-  targetType: z.enum(['method', 'class', 'table', 'field', 'enum', 'all']).optional().describe('Type of the target to search for'),
+  targetType: z.enum(['method', 'class', 'table', 'field', 'enum', 'edt', 'form', 'query', 'view', 'report', 'label', 'all']).optional().describe('Type of the target to search for'),
   ownerName: z.string().optional().describe('Declaring table/class/form that owns the method, when targetName is just the bare method name. Used to scope the where-used to a single type (matches Visual Studio xref).'),
   scope: z.enum(['all', 'workspace', 'standard', 'custom']).optional().default('all').describe('Search scope'),
   limit: z.number().optional().default(50).describe('Maximum results to return'),
   // Default OFF: code-context snippets roughly quadruple the token cost of this tool.
-  // Agents typically only need file:line:type — turn context on explicitly when you need snippets.
   includeContext: z.boolean().optional().default(false).describe('Include code context around reference (opt-in to reduce token usage)'),
 }).refine(a => a.targetName || a.name, { message: "must have required property 'targetName'" });
 
@@ -40,6 +39,22 @@ const TYPE_TO_XREF_CONTAINER: Record<string, string> = {
 };
 
 /**
+ * Detect and normalize a label where-used target. Labels live in the xref DB
+ * under "/Labels/@<ref>", where <ref> is either the old concatenated form
+ * ("@WAX2194") or the newer "@LabelFile:LabelId" form
+ * ("@ApplicationPlatform:AbortButtonText"). Both forms are stored verbatim in
+ * the xref Names table, so we match exactly and never convert between them.
+ * Returns the "/Labels/@…" path, or null when the target isn't a label.
+ */
+export function resolveLabelTarget(targetName: string, targetType?: string): string | null {
+  const t = targetName.trim();
+  if (/^\/Labels\//i.test(t)) return t;                          // already an xref label path
+  if (t.startsWith('@')) return `/Labels/${t}`;                  // "@WAX2194" / "@ApplicationPlatform:Foo"
+  if (targetType === 'label') return `/Labels/@${t}`;            // bare id + explicit targetType
+  return null;
+}
+
+/**
  * Resolve which xref containers an owner name exists as (Tables/Classes/…).
  * Usually one; returns several only when a name collides across object types.
  */
@@ -54,11 +69,9 @@ function resolveXrefContainers(db: any, ownerName: string): string[] {
 }
 
 /**
- * Authoritative "no references" result for a member-scoped lookup when the xref
- * bridge is available and cleanly returned nothing. We deliberately do NOT fall
- * back to the name-only FTS scan here — that scan pools callers of every
- * same-named member across all types, which is exactly the wrong answer for
- * where-used. (Reached only on a clean empty, never on a bridge error.)
+ * Authoritative "no references" result for a member-scoped lookup that cleanly
+ * returned nothing from the xref bridge. Does NOT fall back to the name-only FTS
+ * scan — that would pool callers of every same-named member across all types.
  */
 function buildScopedEmptyResult(displayName: string, bridgeTargets: string[]): { content: Array<{ type: 'text'; text: string }> } {
   let out = `# References to \`${displayName}\`\n\n`;
@@ -88,11 +101,39 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
     const { targetType, scope, limit, includeContext, ownerName } = args;
     const targetName = (args.targetName ?? args.name)!; // accept "name" alias
 
-    // --- Parse the target shape ----------------------------------------------
-    // Accept three forms:
-    //   1. AOT path        "/Tables/SalesTable/Methods/initFromSalesQuotationTable"
-    //   2. Owner-qualified "SalesTable.initFromSalesQuotationTable" (or ownerName + bare method)
-    //   3. Bare name       "initFromSalesQuotationTable" / "CustTable"
+    // LABEL where-used — route to the xref bridge with a "/Labels/@…" path.
+    // Every referencing object type (tables, forms, EDTs, enums, reports, menu
+    // items, security objects, views, maps, …) comes back — most label uses are
+    // declarative metadata (captions, field/EDT labels), not X++ code.
+    const labelPath = resolveLabelTarget(targetName, targetType);
+    if (labelPath) {
+      const outcome = await tryBridgeReferences(context.bridge, labelPath, limit, targetName, 'label');
+      if (outcome.status === 'ok') return outcome.result;
+      if (outcome.status === 'empty') {
+        return { content: [{ type: 'text', text:
+          `# References to label \`${targetName}\`\n\n**Total References Found:** 0\n` +
+          `_Source: C# bridge (DYNAMICSXREFDB)_\n\n` +
+          `No references found. Verify the label id is written exactly as stored — ` +
+          `\`@WAX2194\` (old format) or \`@LabelFile:LabelId\` (new format, e.g. \`@ApplicationPlatform:AbortButtonText\`). ` +
+          `Use labels(action="search") to find the exact id from label text.\n` }] };
+      }
+      // error / unavailable — label where-used needs the xref DB. The name-only
+      // FTS scan can't see declarative metadata references, so don't fake a
+      // partial answer by falling through to it.
+      const why = outcome.status === 'unavailable'
+        ? 'The cross-reference bridge is not available in this server mode.'
+        : 'The cross-reference query failed — check the bridge log.';
+      return { content: [{ type: 'text', text:
+        `# References to label \`${targetName}\`\n\n` +
+        `⚠️ Label where-used requires the cross-reference database (DYNAMICSXREFDB), available when ` +
+        `the server runs in full mode with a UDE/local xref DB configured. ${why}\n\n` +
+        `Unlike code symbols, label references live mostly in declarative metadata (form captions, ` +
+        `field/EDT labels, menu-item captions, …) that is not in the text index — so there is no ` +
+        `reliable fallback.\n` }], isError: outcome.status === 'error' };
+    }
+
+    // Target shape: AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"),
+    // owner-qualified ("SalesTable.initFromSalesQuotationTable"), or bare name.
     const cleanTargetName = targetName.replace(/\(.*$/, '').trim(); // strip trailing parens
     const isAotPath = cleanTargetName.startsWith('/');
 
@@ -109,20 +150,15 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       owner ?? ((targetType === 'class' || targetType === 'method') ? memberName : null);
 
     const wantsMethod = !targetType || targetType === 'method' || targetType === 'all';
-    // Which AOT child segments to scope an "Owner.member" target to. A method
-    // lookup hits "/Methods/", a field lookup "/Fields/"; the default ("all" /
-    // unset) covers both, since we don't know whether the member is a method or
-    // field. Building only "/Methods/" (the original bug) made a field-qualified
-    // target return an authoritative — and wrong — "no callers".
+    // AOT child segments to scope an "Owner.member" target to. Default covers both
+    // Methods and Fields since we don't know which the member is.
     const memberSegments: string[] = [];
     if (wantsMethod) memberSegments.push('Methods');
     if (!targetType || targetType === 'field' || targetType === 'all') memberSegments.push('Fields');
 
-    // --- Build the bridge target(s) ------------------------------------------
-    // The DYNAMICSXREFDB bridge scopes a member to its declaring type ONLY when
-    // given a member-qualified path. A bare member name matches no object there
-    // and silently returns 0 — so when an owner is known we resolve its container
-    // type and build "/<Container>/<Owner>/<Methods|Fields>/<member>" before querying.
+    // The DYNAMICSXREFDB bridge only scopes a member to its declaring type when given
+    // a member-qualified path — a bare member name matches nothing there. When an owner
+    // is known, resolve its container type and build "/<Container>/<Owner>/<Methods|Fields>/<member>".
     let bridgeTargets: string[] = [cleanTargetName];
     let memberScoped = false;
     if (isAotPath) {
@@ -131,8 +167,7 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       const containers = resolveXrefContainers(symbolIndex.getReadDb(), owner);
       bridgeTargets = containers.length > 0
         ? containers.flatMap(c => memberSegments.map(seg => `/${c}/${owner}/${seg}/${memberName}`))
-        // Owner not indexed — hand the qualified name to the bridge, which (when
-        // built with member-variant expansion) resolves it across container types.
+        // Owner not indexed — hand the qualified name to the bridge to resolve across container types.
         : [`${owner}.${memberName}`];
       memberScoped = true;
     }
@@ -141,19 +176,15 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
     const bridgeOutcome = await tryBridgeReferences(context.bridge, bridgeTargets, limit, targetName);
     if (bridgeOutcome.status === 'ok') return bridgeOutcome.result;
 
-    // For a member-scoped lookup the xref bridge is authoritative — but ONLY when
-    // it cleanly returned no rows ('empty'). On 'error' (RPC/SQL failure) or
-    // 'unavailable' we deliberately fall through to the FTS heuristic rather than
-    // report a confident "0 references" we can't actually stand behind. Reporting
-    // the empty scoped result here is what avoids the name-only FTS scan pooling
-    // callers of every same-named member across all types (the "25 references" bug).
+    // For a member-scoped lookup, the bridge is authoritative only on a clean 'empty'.
+    // On 'error'/'unavailable' fall through to the FTS heuristic instead of reporting
+    // a confident "0 references" we can't stand behind.
     if (memberScoped && bridgeOutcome.status === 'empty') {
       return buildScopedEmptyResult(targetName, bridgeTargets);
     }
 
-    // Build search patterns (FTS fallback — only reached when the xref bridge is
-    // unavailable). This is a name-based heuristic and cannot scope a method to
-    // its declaring type; match on the bare member name.
+    // FTS fallback (xref bridge unavailable) — name-based heuristic, cannot scope
+    // a method to its declaring type; match on the bare member name.
     const ftsName = isAotPath
       ? (cleanTargetName.split('/').pop() || cleanTargetName)
       : memberName;
@@ -190,14 +221,10 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       references.push(...enumRefs);
     }
 
-    // Limit results
     totalReferences = references.length;
     const limitedReferences = references.slice(0, limit);
-
-    // Generate summary
     const summary = generateReferenceSummary(limitedReferences);
 
-    // Format output
     let output = `# References to \`${targetName}\`\n\n`;
     output += `**Total References Found:** ${totalReferences}\n`;
     output += `**Showing:** ${limitedReferences.length} results\n`;
@@ -211,7 +238,7 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
     }
     output += `\n`;
 
-    // Cross-type check: detect when the caller used a form/table/view name as if it were a class
+    // Detect when the caller used a form/table/view name as if it were a class
     const typeMismatchSection = parentObjectName
       ? buildObjectTypeMismatchMessage(symbolIndex.getReadDb(), parentObjectName)
       : '';
@@ -226,7 +253,6 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
         output += `\n${typeMismatchSection}`;
       }
     } else {
-      // Group by reference type
       const byType = groupByReferenceType(limitedReferences);
 
       output += `## 📊 Summary by Type\n\n`;
@@ -244,7 +270,6 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
         output += `\n`;
       }
 
-      // List all references
       output += `## 📍 All References\n\n`;
       for (const ref of limitedReferences) {
         output += `### ${ref.referenceType} in \`${ref.file}\`\n\n`;
@@ -258,8 +283,7 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
         output += `\n`;
       }
 
-      // Show type mismatch hint even when some references were found
-      // (they might be false positives from fuzzy matching)
+      // Show even when references were found — they might be fuzzy-match false positives
       if (typeMismatchSection) {
         output += `\n---\n\n${typeMismatchSection}`;
       }
@@ -273,9 +297,6 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
         },
       ],
     };
-
-    // Cache for 30 minutes (references are more volatile than class/table metadata)
-    // await cache.set(cacheKey, finalResult, 1800);
 
     return finalResult;
   } catch (error) {
@@ -318,9 +339,6 @@ function ftsMethodSearch(db: any, term: string, limit: number, extraColumns?: st
   }
 }
 
-/**
- * Find method call references
- */
 function findMethodReferences(symbolIndex: any, methodName: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -343,9 +361,7 @@ function findMethodReferences(symbolIndex: any, methodName: string, _scope: stri
   return references;
 }
 
-/**
- * Find class references (extends, implements, instantiations)
- */
+/** Find class references (extends, implements, instantiations) */
 function findClassReferences(symbolIndex: any, className: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -431,9 +447,6 @@ function findClassReferences(symbolIndex: any, className: string, _scope: string
   return references;
 }
 
-/**
- * Find table references (select statements, table buffers)
- */
 function findTableReferences(symbolIndex: any, tableName: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -456,9 +469,6 @@ function findTableReferences(symbolIndex: any, tableName: string, _scope: string
   return references;
 }
 
-/**
- * Find field references
- */
 function findFieldReferences(symbolIndex: any, fieldName: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -481,9 +491,6 @@ function findFieldReferences(symbolIndex: any, fieldName: string, _scope: string
   return references;
 }
 
-/**
- * Find enum references
- */
 function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -506,9 +513,6 @@ function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, 
   return references;
 }
 
-/**
- * Extract context around method call
- */
 function extractMethodCallContext(source: string, methodName: string): string | null {
   if (!source) return null;
 
@@ -525,9 +529,6 @@ function extractMethodCallContext(source: string, methodName: string): string | 
   return null;
 }
 
-/**
- * Extract context around instantiation
- */
 function extractInstantiationContext(source: string, className: string): string | null {
   if (!source) return null;
 
@@ -545,9 +546,6 @@ function extractInstantiationContext(source: string, className: string): string 
   return null;
 }
 
-/**
- * Extract context around table reference
- */
 function extractTableReferenceContext(source: string, tableName: string): string | null {
   if (!source) return null;
 
@@ -563,9 +561,6 @@ function extractTableReferenceContext(source: string, tableName: string): string
   return null;
 }
 
-/**
- * Extract context around field access
- */
 function extractFieldAccessContext(source: string, fieldName: string): string | null {
   if (!source) return null;
 
@@ -581,9 +576,6 @@ function extractFieldAccessContext(source: string, fieldName: string): string | 
   return null;
 }
 
-/**
- * Extract context around enum reference
- */
 function extractEnumReferenceContext(source: string, enumName: string): string | null {
   if (!source) return null;
 
@@ -599,9 +591,6 @@ function extractEnumReferenceContext(source: string, enumName: string): string |
   return null;
 }
 
-/**
- * Generate reference summary
- */
 function generateReferenceSummary(references: Reference[]): {
   topCallers: Array<{ caller: string; count: number }>;
 } {
@@ -620,9 +609,6 @@ function generateReferenceSummary(references: Reference[]): {
   return { topCallers };
 }
 
-/**
- * Group references by type
- */
 function groupByReferenceType(references: Reference[]): Record<string, Reference[]> {
   const groups: Record<string, Reference[]> = {};
 

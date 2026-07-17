@@ -179,8 +179,7 @@ function extractControlNode(node: any): FormControlNode | null {
 
 /**
  * Walk a parsed <Design> node into a normalized tree.
- * Tolerates both Design > Controls > AxFormControl (current serialization)
- * and the legacy Design > AxForm* shape just in case.
+ * Tolerates both Design > Controls > AxFormControl and a bare Design > AxForm* shape.
  */
 export function walkFormDesign(designNode: any): FormDesignInfo {
   const design: FormDesignInfo = { properties: {}, controls: [] };
@@ -202,7 +201,7 @@ export function walkFormDesign(designNode: any): FormDesignInfo {
       if (control) design.controls.push(control);
     }
   } else {
-    // Legacy/defensive: direct AxForm*-keyed children (pre-Controls-wrapper shape)
+    // Fallback: direct AxForm*-keyed children (no Controls wrapper)
     for (const key of Object.keys(designNode).filter((k) => k.startsWith('AxForm'))) {
       for (const node of asArray(designNode[key])) {
         const control = extractControlNode(node);

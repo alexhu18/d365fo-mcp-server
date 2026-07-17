@@ -39,11 +39,9 @@ export function recordToolStart(toolName: string): (isEmpty: boolean) => void {
   };
 }
 
-// ─── Call-sequence tracking (agentic-loop detection) ─────────────────────────
-// Keeps a ring buffer of the most recent tool calls (tool + args hash).
-// A model stuck in a loop re-issues the same call with the same arguments —
-// recordCallSequence returns how many times this exact call appeared in the
-// recent window so the handler can inject a corrective hint into the response.
+// Call-sequence tracking (agentic-loop detection): a ring buffer of recent
+// tool calls (tool + args hash). recordCallSequence returns how many times an
+// exact call appeared in the recent window so callers can flag likely loops.
 
 const SEQUENCE_WINDOW = 15;
 const SEQUENCE_BUFFER_MAX = 30;

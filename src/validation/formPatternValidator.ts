@@ -35,7 +35,7 @@ import {
   type ExtraChildrenPolicy,
 } from '../knowledge/formPatterns/index.js';
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// Types
 
 export interface FormPatternViolation {
   rule: string;
@@ -60,7 +60,7 @@ interface FormFacts {
   formName?: string;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// Helpers
 
 const CONTAINER_TYPES = new Set(['Group', 'TabPage', 'Tab']);
 
@@ -153,7 +153,7 @@ function checkVersion(
   }
 }
 
-// ── Child matching ───────────────────────────────────────────────────────────
+// Child matching
 
 interface MatchedPair {
   spec: NodeSpec;
@@ -423,7 +423,7 @@ function countContainers(nodes: FormControlNode[]): { total: number; patterned: 
   return { total, patterned };
 }
 
-// ── Public API ───────────────────────────────────────────────────────────────
+// Public API
 
 /** Validate an already-walked design tree (used by tests and the miner path). */
 export function validateFormTree(facts: FormFacts): FormPatternReport {

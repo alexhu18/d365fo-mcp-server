@@ -5,19 +5,10 @@
  * object, rank the most relevant symbols from the codebase and return a
  * token-budgeted neighborhood that grounds the next generation step.
  *
- * Design choices:
- *   • Index-only. Candidates come from the FTS5 index and ranking uses the
- *     precomputed xref/usage signals already baked into each symbol
- *     (usageFrequency, calledByCount, relatedMethods, usedTypes). No bridge
- *     call, so it is fast and works on Azure/Linux too.
- *   • Deterministic. No LLM in the loop — scoring is explainable via per-item
- *     `reasons`, which keeps the grounding auditable.
- *   • Best-effort. Every index access is guarded; a missing/empty index yields
- *     an empty ranking rather than an error.
- *
- * The competitor's context pipeline ranks over a single model's crawled files;
- * this ranks over the whole index + relationship graph, which is a strictly
- * richer signal.
+ * Index-only and deterministic: candidates come from the FTS5 index, scoring
+ * uses precomputed xref/usage signals (no bridge call needed), and each item
+ * carries explainable `reasons`. Every index access is guarded so a
+ * missing/empty index yields an empty ranking rather than an error.
  */
 
 import type { XppServerContext } from '../types/context.js';
@@ -113,7 +104,7 @@ export function rankContext(
   const tokens = tokenizeIntent(input.intent);
   const activeName = input.activeObject?.name?.toLowerCase();
 
-  // ── Gather candidates from FTS (intent terms + active object name) ────────
+  // Gather candidates from FTS (intent terms + active object name)
   const pool = new Map<string, XppSymbol>();
   const ftsRank = new Map<string, number>(); // key -> best normalized FTS score
 
@@ -162,7 +153,7 @@ export function rankContext(
     }
   }
 
-  // ── Score ─────────────────────────────────────────────────────────────────
+  // Score
   const scored: RankedItem[] = [];
   for (const [k, sym] of pool) {
     // Drop the active object itself — it is the anchor, not its own neighbor.
@@ -230,7 +221,7 @@ export function rankContext(
 
   scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
 
-  // ── Apply token budget + limit ─────────────────────────────────────────────
+  // Apply token budget + limit
   const items: RankedItem[] = [];
   let used = 0;
   let truncated = false;

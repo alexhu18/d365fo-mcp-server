@@ -26,7 +26,11 @@ const buildContext = (opts: {
     prepare: vi.fn((sql: string) => ({
       all: vi.fn((..._params: unknown[]) => {
         if (sql.includes("type = 'edt'")) return opts.edts ?? [];
-        if (sql.includes('name IN (?, ?)')) return opts.existingNames ?? [];
+        // Collision check goes through the nocase symbol lookup (exact probe
+        // + FTS fallback, both filtered on `parent_name IS NULL`).
+        if (sql.includes('parent_name IS NULL')) {
+          return (opts.existingNames ?? []).map(r => ({ ...r, extends_class: null, file_path: null }));
+        }
         return [];
       }),
       get: vi.fn(() => undefined),
@@ -137,4 +141,20 @@ describe('prepare_create aggregation', () => {
     );
     expect(getText(result)).toContain('must start with an uppercase letter');
   });
+
+  // Regression: objectType enum used to be a much older, narrower list than
+  // what d365fo_file(action="create") actually supports — map/business-event/
+  // tile/kpi/menu were rejected by prepare(mode="create") even though the
+  // create tool itself has always accepted them. Found authoring the
+  // L1-map-basic eval case (2026-07-01).
+  it.each(['map', 'business-event', 'tile', 'kpi', 'menu'])(
+    'accepts objectType=%s (previously rejected — enum drift vs createD365File.ts)',
+    async (objectType) => {
+      const result = await prepareCreateTool(
+        req({ goal: 'x', objectName: 'MyNewObject', objectType }),
+        buildContext(),
+      );
+      expect(result.isError).toBeFalsy();
+    },
+  );
 });

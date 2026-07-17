@@ -1,12 +1,9 @@
 /**
  * Form-extension control-shape validator.
  *
- * Catches the malformed AxFormExtension control shapes that an AI tends to produce
- * when hand-writing `xmlContent` (the escape hatch when add-control can't be used).
- * These exact mistakes were observed in the wild and silently produced a file that
- * the D365FO deserializer rejects — costing a long debugging + filesystem-grep
- * expedition. Flagging them at write time, with the correct shape, fixes that in one
- * shot.
+ * Catches malformed AxFormExtension control shapes in hand-written `xmlContent`
+ * (the escape hatch when add-control can't be used) that would otherwise be
+ * silently accepted and then rejected by the D365FO deserializer.
  *
  * Correct shape (verified against shipped standard extensions, e.g.
  * InventItemSampling.AdvancedQualityManagement):
@@ -56,7 +53,7 @@ export const CORRECT_FORM_EXTENSION_CONTROL_TEMPLATE =
 export function validateFormExtensionControlShape(xml: string): FormExtShapeProblem[] {
   const problems: FormExtShapeProblem[] = [];
 
-  // 1. Wrong wrapper element for a newly-added control.
+  // Wrong wrapper element for a newly-added control.
   if (/<AxFormControlExtension\b/.test(xml)) {
     problems.push({
       found: '<AxFormControlExtension>',
@@ -67,7 +64,7 @@ export function validateFormExtensionControlShape(xml: string): FormExtShapeProb
     });
   }
 
-  // 2. Wrong parent-reference element.
+  // Wrong parent-reference element.
   if (/<ParentControlName\b/.test(xml)) {
     problems.push({
       found: '<ParentControlName>',
@@ -76,10 +73,9 @@ export function validateFormExtensionControlShape(xml: string): FormExtShapeProb
     });
   }
 
-  // 3. <FormControlExtension> used as the control CONTAINER (wrong) — i.e. an opening
-  //    <FormControlExtension> that wraps an <AxForm…Control> child. The legitimate use
-  //    is the self-closing <FormControlExtension i:nil="true" /> INSIDE a <FormControl>,
-  //    which this pattern deliberately does not match.
+  // <FormControlExtension> used as the control container (wrong) — the legitimate use
+  // is the self-closing <FormControlExtension i:nil="true" /> inside a <FormControl>,
+  // which this pattern deliberately does not match.
   if (/<FormControlExtension\s*>[\s\S]*?<AxForm\w*Control\b/.test(xml)) {
     problems.push({
       found: '<FormControlExtension><AxForm…Control>',
@@ -90,7 +86,7 @@ export function validateFormExtensionControlShape(xml: string): FormExtShapeProb
     });
   }
 
-  // 4. Non-existent integer control element.
+  // Non-existent integer control element.
   if (/\bAxFormIntControl\b/.test(xml)) {
     problems.push({
       found: 'AxFormIntControl',

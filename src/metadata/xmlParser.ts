@@ -21,6 +21,97 @@ import type {
 } from './types.js';
 import { EnhancedXppParser } from './enhancedParser.js';
 import { walkFormDesign, collectPatternNodes } from './formPatternMiner.js';
+import {
+  parseXppDeclaration,
+  parseXppClassHeader,
+  parseExtensionOfAttribute,
+  callsNext,
+  type XppDeclaration,
+  type XppClassHeader,
+} from './xppDeclaration.js';
+
+export interface XppExtensionMembers {
+  /** Every method the extension defines. */
+  addedMethods: string[];
+  /** Subset of addedMethods that wrap a base method via `next` — the CoC hooks. */
+  cocMethods: string[];
+  /** Raw [SubscribesTo(...)] attribute text, one per subscribing method. */
+  eventSubscriptions: string[];
+}
+
+/**
+ * Classify the methods of an extension into added / CoC-wrapping / event-
+ * subscribing. Shared by parseExtensionFile (Ax*Extension XML) and the class
+ * extension path in extract-metadata, which reach the same X++ from different
+ * XML shapes and must classify it identically.
+ */
+export function extensionMembersFrom(
+  methods: Array<{ name: string; source: string }>,
+): XppExtensionMembers {
+  const addedMethods: string[] = [];
+  const cocMethods: string[] = [];
+  const eventSubscriptions: string[] = [];
+
+  for (const { name, source } of methods) {
+    if (!name) continue;
+    addedMethods.push(name);
+
+    if (callsNext(source || '')) cocMethods.push(name);
+
+    if (/\[SubscribesTo\s*\(/i.test(source || '')) {
+      eventSubscriptions.push(source.match(/\[SubscribesTo\s*\([^)]+\)/)?.[0] || name);
+    }
+  }
+
+  return { addedMethods, cocMethods, eventSubscriptions };
+}
+
+export interface XppClassExtensionRecord extends XppExtensionMembers {
+  name: string;
+  baseObjectName: string;
+  /** Intrinsic kind from [ExtensionOf] — the base is not always a class. */
+  baseKind: string;
+  /** Data source / control name for the two-argument intrinsics. */
+  baseMemberName?: string;
+  sourcePath: string;
+  /** Always empty — a class extension adds neither; kept so the record shape
+   *  stays uniform with the Ax*Extension kinds that do. */
+  addedFields: string[];
+  addedIndexes: string[];
+  model: string;
+  type: 'class-extension';
+}
+
+/**
+ * Build the class-extension record for an AxClass carrying [ExtensionOf(...)],
+ * or null when the class is not an extension.
+ *
+ * The AOT has no AxClassExtension artifact — class extensions are ordinary
+ * AxClass files — so these records are the only source of class-extension rows
+ * in symbols/extension_metadata. Extraction writes them into the
+ * `class-extensions/` folder symbolIndex.indexExtensions already reads, in the
+ * shape parseExtensionFile emits for the other extension kinds (#693).
+ */
+export function buildClassExtensionRecord(
+  classInfo: XppClassInfo,
+  model: string,
+): XppClassExtensionRecord | null {
+  if (!classInfo.extensionOf) return null;
+  const { baseObjectName, baseKind, memberName } = classInfo.extensionOf;
+
+  return {
+    name: classInfo.name,
+    baseObjectName,
+    baseKind,
+    ...(memberName ? { baseMemberName: memberName } : {}),
+    sourcePath: classInfo.sourcePath,
+    addedFields: [],
+    addedIndexes: [],
+    ...extensionMembersFrom(classInfo.methods),
+    model,
+    type: 'class-extension',
+  };
+}
 
 export class XppMetadataParser {
   private parser: Parser;
@@ -53,13 +144,28 @@ export class XppMetadataParser {
       // Methods are nested in SourceCode.Methods.Method
       const methodsData = axClass.SourceCode?.Methods?.Method || axClass.Methods?.Method;
 
-      // Parse once — reused for both classInfo.methods and extractClassDependencies
       const parsedMethods = this.parseMethods(methodsData, className);
-      const parsedImplements = this.parseImplements(axClass.Implements);
-      const parsedDeclaration = this.extractClassDeclaration(axClass);
-      const isAbstract = axClass.IsAbstract === 'Yes' || axClass.IsAbstract === 'true';
-      const isFinal = axClass.IsFinal === 'Yes' || axClass.IsFinal === 'true';
-      const extendsClass = axClass.Extends || undefined;
+
+      // Inheritance lives in the Declaration CDATA as X++ text, not in XML
+      // elements — see parseXppClassHeader. The element reads are kept only as
+      // a fallback for hand-written/synthetic AxClass XML in tests and tools.
+      const declarationCdata = this.cdataText(axClass.SourceCode?.Declaration);
+      const header = parseXppClassHeader(declarationCdata);
+
+      // [ExtensionOf(...)] marks this AxClass as a class extension. Extraction
+      // reads it to emit an extension record; without it class extensions index
+      // as plain classes and every class-extension lookup misses them (#693).
+      const extensionOf = parseExtensionOfAttribute(declarationCdata) ?? undefined;
+
+      const parsedImplements = header?.implements.length
+        ? header.implements
+        : this.parseImplements(axClass.Implements);
+      const parsedDeclaration = this.extractClassDeclaration(axClass, header);
+      const isAbstract = header?.isAbstract
+        ?? (axClass.IsAbstract === 'Yes' || axClass.IsAbstract === 'true');
+      const isFinal = header?.isFinal
+        ?? (axClass.IsFinal === 'Yes' || axClass.IsFinal === 'true');
+      const extendsClass = header?.extends || axClass.Extends || undefined;
 
       const classInfoBase = {
         name: className,
@@ -70,14 +176,13 @@ export class XppMetadataParser {
         isAbstract,
         isFinal,
         declaration: parsedDeclaration,
+        extensionOf,
         methods: parsedMethods,
         documentation: axClass.DeveloperDocumentation || undefined,
       };
 
-      // Extract class metadata
       const classInfo: XppClassInfo = {
         ...classInfoBase,
-        // Enhanced metadata — reuse already-parsed methods to avoid double work
         tags: this.enhancedParser.generateClassTags({ ...classInfoBase, methods: [] }),
         usedTypes: this.enhancedParser.extractClassDependencies(classInfoBase),
         description: axClass.DeveloperDocumentation || `${className} class${extendsClass ? ` extending ${extendsClass}` : ''}`,
@@ -110,7 +215,7 @@ export class XppMetadataParser {
       const tableInfo: XppTableInfo = {
         name: tableName,
         model: model || 'Unknown',
-        sourcePath: filePath,  // Store original XML file path
+        sourcePath: filePath,
         label: axTable.Label || tableName,
         tableGroup: axTable.TableGroup || 'Main',
         primaryIndex: axTable.PrimaryIndex || undefined,
@@ -170,17 +275,43 @@ export class XppMetadataParser {
     }
   }
 
+  /**
+   * Text of a CDATA-bearing element. xml2js hands back a plain string, unless
+   * the element carries an attribute (mergeAttrs) — then the text sits under
+   * `_` and the raw value is an object.
+   */
+  private cdataText(node: unknown): string {
+    if (typeof node === 'string') return node;
+    const text = (node as { _?: unknown } | null | undefined)?._;
+    return typeof text === 'string' ? text : '';
+  }
+
   private parseImplements(implementsStr?: string | any): string[] {
     if (!implementsStr) return [];
     if (typeof implementsStr !== 'string') return [];
     return implementsStr.split(',').map(i => i.trim()).filter(Boolean);
   }
 
-  private extractClassDeclaration(axClass: any): string {
+  /**
+   * The class's declaration line. Rebuilt from the parsed Declaration CDATA so
+   * it reflects what the source actually says; falls back to synthesising one
+   * from XML elements when there is no declaration to read.
+   */
+  private extractClassDeclaration(axClass: any, header?: XppClassHeader | null): string {
     const modifiers: string[] = [];
+    if (header) {
+      if (header.isAbstract) modifiers.push('abstract');
+      if (header.isFinal) modifiers.push('final');
+      let decl = modifiers.length > 0 ? `${modifiers.join(' ')} ` : '';
+      decl += `${header.kind} ${header.name}`;
+      if (header.extends) decl += ` extends ${header.extends}`;
+      if (header.implements.length) decl += ` implements ${header.implements.join(', ')}`;
+      return decl;
+    }
+
     if (axClass.IsAbstract === 'Yes' || axClass.IsAbstract === 'true') modifiers.push('abstract');
     if (axClass.IsFinal === 'Yes' || axClass.IsFinal === 'true') modifiers.push('final');
-    
+
     let decl = modifiers.length > 0 ? `${modifiers.join(' ')} ` : '';
     decl += `class ${axClass.Name}`;
     if (axClass.Extends) decl += ` extends ${axClass.Extends}`;
@@ -196,18 +327,18 @@ export class XppMetadataParser {
     return methods.map(method => {
       const source = method.Source || '';
       const methodName = method.Name || 'unknown';
-      
+      const decl = parseXppDeclaration(source, methodName);
+
       const baseMethod: XppMethodInfo = {
         name: methodName,
         visibility: this.parseVisibility(method.Visibility),
-        returnType: this.extractReturnType(source, methodName) || method.ReturnType || 'void',
-        parameters: this.extractParametersFromSource(source, methodName),
-        isStatic: this.isMethodStatic(source),
+        returnType: decl?.returnType || method.ReturnType || 'void',
+        parameters: this.toParameterInfo(decl),
+        isStatic: decl?.modifiers.includes('static') ?? false,
         source: source,
         documentation: method.DeveloperDocumentation || undefined,
       };
 
-      // Add enhanced metadata
       return this.enhancedParser.parseMethodEnhanced(baseMethod, parentClass);
     });
   }
@@ -221,22 +352,21 @@ export class XppMetadataParser {
   }
 
   /**
-   * Parse table fields from <AxTableField xmlns="" i:type="AxTableFieldString"> nodes.
-   * xml2js (explicitArray:false) groups all <AxTableField> children under the AxTableField key.
-   * The field type is carried in the i:type XML attribute → field.$['i:type'].
+   * Parses <AxTableField i:type="AxTableFieldString"> nodes; the field type
+   * comes from the i:type XML attribute (field.$['i:type']), not an element.
    */
   private parseFields(fieldsData: any): XppFieldInfo[] {
     if (!fieldsData) return [];
 
     const fields = Array.isArray(fieldsData) ? fieldsData : [fieldsData];
     return fields.map(field => {
-      // i:type attribute value e.g. 'AxTableFieldString' → strip prefix to get 'String'
       const rawType: string = field.$?.['i:type'] || 'AxTableFieldString';
       const xppType = rawType.replace('AxTableField', '') || 'String';
       return {
         name: field.Name || 'unknown',
         type: xppType,
         extendedDataType: field.ExtendedDataType || undefined,
+        enumType: field.EnumType || undefined,
         mandatory: field.Mandatory === 'Yes' || field.Mandatory === 'true',
         label: field.Label || undefined,
       };
@@ -250,7 +380,7 @@ export class XppMetadataParser {
     return indexes.map(index => ({
       name: index.Name || 'unknown',
       fields: this.parseIndexFields(index.Fields),
-      // D365FO uses <AlternateKey>Yes</AlternateKey> to mark unique indexes (NOT AllowDuplicates)
+      // Uniqueness is marked via AlternateKey, not AllowDuplicates
       unique: index.AlternateKey === 'Yes' || index.AlternateKey === 'true',
       clustered: index.IsClustered === 'Yes' || index.IsClustered === 'true',
     }));
@@ -270,7 +400,6 @@ export class XppMetadataParser {
     }
 
     if (typeof fieldsStr !== 'string') {
-      // Handle case where xml2js returns an object or array
       if (Array.isArray(fieldsStr)) {
         return fieldsStr
           .map((field: any) => {
@@ -405,107 +534,9 @@ export class XppMetadataParser {
     return Array.isArray(value) ? value : [value];
   }
 
-  /**
-   * Extract parameters from method source code
-   */
-  private extractParametersFromSource(source: string, methodName: string): XppParameterInfo[] {
-    if (!source) return [];
-
-    // Find method signature in source - look for methodName followed by parentheses
-    // Pattern: methodName(param1, param2, ...)
-    const methodPattern = new RegExp(`\\b${this.escapeRegex(methodName)}\\s*\\(([^)]*)\\)`, 'i');
-    const match = source.match(methodPattern);
-
-    if (!match || !match[1]) return [];
-
-    const paramsStr = match[1].trim();
-    if (!paramsStr) return [];
-
-    // Split by comma, but be careful with generic types that contain commas
-    const params = this.splitParameters(paramsStr);
-
-    return params.map(param => {
-      // Parse "Type name" or "Type _name" format
-      const parts = param.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        // Join all but last part as type (handles complex types like "Dictionary<string, int>")
-        const name = parts[parts.length - 1];
-        const type = parts.slice(0, -1).join(' ');
-        return { type, name };
-      }
-      return { type: 'object', name: param.trim() };
-    }).filter(p => p.name.length > 0);
-  }
-
-  /**
-   * Extract return type from method source
-   */
-  private extractReturnType(source: string, methodName: string): string | undefined {
-    if (!source) return undefined;
-
-    // Look for pattern: [modifiers] returnType methodName(
-    const pattern = new RegExp(`\\b(\\w+)\\s+${this.escapeRegex(methodName)}\\s*\\(`, 'i');
-    const match = source.match(pattern);
-
-    if (match && match[1]) {
-      const returnType = match[1];
-      // Filter out modifiers
-      const modifiers = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'internal'];
-      if (!modifiers.includes(returnType.toLowerCase())) {
-        return returnType;
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Check if method is static from source
-   */
-  private isMethodStatic(source: string): boolean {
-    if (!source) return false;
-    return /\bstatic\s+/i.test(source);
-  }
-
-  /**
-   * Escape special regex characters
-   */
-  private escapeRegex(str: string): string {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  /**
-   * Split parameters by comma, respecting nested generics
-   */
-  private splitParameters(paramsStr: string): string[] {
-    const params: string[] = [];
-    let current = '';
-    let depth = 0;
-
-    for (let i = 0; i < paramsStr.length; i++) {
-      const char = paramsStr[i];
-      
-      if (char === '<' || char === '(') {
-        depth++;
-        current += char;
-      } else if (char === '>' || char === ')') {
-        depth--;
-        current += char;
-      } else if (char === ',' && depth === 0) {
-        if (current.trim()) {
-          params.push(current.trim());
-        }
-        current = '';
-      } else {
-        current += char;
-      }
-    }
-
-    if (current.trim()) {
-      params.push(current.trim());
-    }
-
-    return params;
+  /** Declaration parameters narrowed to the shape XppMethodInfo carries. */
+  private toParameterInfo(decl: XppDeclaration | null): XppParameterInfo[] {
+    return decl?.parameters.map(p => ({ type: p.type, name: p.name })) ?? [];
   }
 
   /**
@@ -635,14 +666,15 @@ export class XppMetadataParser {
     for (const methodNode of methodNodes) {
       const name = methodNode.Name || 'Unknown';
       const source = methodNode.Source || '';
+      const decl = parseXppDeclaration(source, name);
 
       // Parse method info (similar to class methods)
       const methodInfo: any = {
         name,
         visibility: 'public', // Forms typically have public methods
-        returnType: this.extractReturnType(source, name) || 'void',
-        parameters: this.extractParametersFromSource(source, name),
-        isStatic: this.isMethodStatic(source),
+        returnType: decl?.returnType || 'void',
+        parameters: this.toParameterInfo(decl),
+        isStatic: decl?.modifiers.includes('static') ?? false,
         source,
         sourceSnippet: source.split('\n').slice(0, 10).join('\n'),
       };
@@ -881,35 +913,66 @@ export class XppMetadataParser {
       // Determine XML root element by extensionType
       const rootKeyMap: Record<string, string> = {
         'table-extension':       'AxTableExtension',
-        'class-extension':       'AxClassExtension',
+        // Not AxClassExtension: a class extension is an AxClass file carrying
+        // [ExtensionOf(...)], so its root element is AxClass like any other class (#693).
+        'class-extension':       'AxClass',
         'form-extension':        'AxFormExtension',
         'enum-extension':        'AxEnumExtension',
         'edt-extension':         'AxEdtExtension',
         'data-entity-extension': 'AxDataEntityViewExtension',
+        'view-extension':        'AxViewExtension',
+        'query-extension':       'AxQuerySimpleExtension',
+        'map-extension':         'AxMapExtension',
+        'menu-extension':        'AxMenuExtension',
+        'security-duty-extension':     'AxSecurityDutyExtension',
+        'security-role-extension':     'AxSecurityRoleExtension',
+        'menu-item-display-extension': 'AxMenuItemDisplayExtension',
+        'menu-item-action-extension':  'AxMenuItemActionExtension',
+        'menu-item-output-extension':  'AxMenuItemOutputExtension',
       };
       const rootKey = rootKeyMap[extensionType] || Object.keys(parsed || {})[0] || '';
       const root = parsed?.[rootKey];
       if (!root) return { success: false, error: `Cannot parse extension type: ${extensionType}` };
 
       const name: string = root.Name || '';
-      const extendsValue: string = root.Extends || root.BaseObject || '';
 
-      // For class extensions, base object name is inferred from Extends or the name itself
-      // Class extension names follow the pattern "BaseClass.Suffix" or "BaseClass_Suffix_Extension"
-      let baseObjectName = extendsValue;
-      if (!baseObjectName && extensionType === 'class-extension') {
-        // Try to parse from declaration: [ExtensionOf(classStr(BaseName))]
-        const decl: string = root.SourceCode?.Declaration || '';
-        const match = decl.match(/ExtensionOf\s*\(\s*classStr\s*\(\s*(\w+)\s*\)/i)
-          ?? decl.match(/ExtensionOf\s*\(\s*tableStr\s*\(\s*(\w+)\s*\)/i)
-          ?? decl.match(/ExtensionOf\s*\(\s*formStr\s*\(\s*(\w+)\s*\)/i);
-        baseObjectName = match?.[1] || '';
+      // No Ax*Extension XML carries <Extends>/<BaseObject> — these reads are a
+      // fallback for synthetic XML only. Real files identify the base object
+      // either by the [ExtensionOf(<kind>Str(Base))] attribute on the
+      // declaration (class extensions) or by the "Base.<Suffix>" name
+      // convention (every other kind), so both are read here. Leaving this
+      // empty silently kills every extension_metadata lookup keyed on
+      // base_object_name — resolve_references' extension-method and
+      // table-extension-field checks, and table_extension_info.
+      let baseObjectName: string = root.Extends || root.BaseObject || '';
+
+      if (!baseObjectName) {
+        // Any intrinsic, any case, one or two arguments — see
+        // parseExtensionOfAttribute for the shapes this has to survive.
+        baseObjectName =
+          parseExtensionOfAttribute(this.cdataText(root.SourceCode?.Declaration))?.baseObjectName || '';
       }
 
-      // Extract added fields
-      const rawFields = root.Fields?.AxTableField ?? root.Fields?.AxEdtField ?? [];
+      if (!baseObjectName && name.includes('.')) {
+        // "SalesTable.FooExtension" → "SalesTable"; the suffix may itself
+        // contain dots ("OMLegalEntity.Extension.Retail"), so split on the first.
+        baseObjectName = name.slice(0, name.indexOf('.'));
+      }
+
+      // Extract added fields. Each kind stores them under its own typed tag.
+      const rawFields =
+        root.Fields?.AxTableField ??
+        root.Fields?.AxEdtField ??
+        root.Fields?.AxViewField ??
+        root.Fields?.AxMapField ??
+        root.Fields?.AxQueryExtensionQueryDataSourceField ??
+        [];
       const fieldArr = Array.isArray(rawFields) ? rawFields : rawFields ? [rawFields] : [];
-      const addedFields: string[] = fieldArr.map((f: any) => f.Name || '').filter(Boolean);
+      // AxQuerySimpleExtension nests the name one level down, under
+      // <QueryDataSourceField>; every other kind carries <Name> on the field itself.
+      const addedFields: string[] = fieldArr
+        .map((f: any) => f.Name || f.QueryDataSourceField?.Name || '')
+        .filter(Boolean);
 
       // Extract added indexes
       const rawIndexes = root.Indexes?.AxTableIndex ?? [];
@@ -920,30 +983,12 @@ export class XppMetadataParser {
       const rawMethods = root.SourceCode?.Methods?.Method ?? root.Methods?.Method ?? [];
       const methodArr = Array.isArray(rawMethods) ? rawMethods : rawMethods ? [rawMethods] : [];
 
-      const addedMethods: string[] = [];
-      const cocMethods: string[] = [];
-      const eventSubscriptions: string[] = [];
-
-      for (const m of methodArr) {
-        const methodName: string = m.Name || '';
-        const source: string = typeof m.Source === 'string' ? m.Source : (m._ || '');
-        if (!methodName) continue;
-
-        addedMethods.push(methodName);
-
-        // CoC detection: method source calls "next methodName"
-        if (/\bnext\s+\w+\s*\(/i.test(source)) {
-          cocMethods.push(methodName);
-        }
-
-        // Event handler detection: [SubscribesTo(...)]
-        const subMatch = source.match(/\[SubscribesTo\s*\(/i);
-        if (subMatch) {
-          // Extract the subscribes-to target for storage
-          const target = source.match(/\[SubscribesTo\s*\([^)]+\)/)?.[0] || methodName;
-          eventSubscriptions.push(target);
-        }
-      }
+      const { addedMethods, cocMethods, eventSubscriptions } = extensionMembersFrom(
+        methodArr.map((m: any) => ({
+          name: m.Name || '',
+          source: typeof m.Source === 'string' ? m.Source : (m._ || ''),
+        })),
+      );
 
       return {
         success: true,

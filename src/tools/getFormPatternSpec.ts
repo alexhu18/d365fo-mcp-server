@@ -266,8 +266,7 @@ export async function getFormPatternSpecTool(
     ...FORM_PATTERN_CATALOG.subPatterns.map((p) => p.xmlName),
   ];
 
-  // Detect common knowledge topics that look like pattern names so the model
-  // gets an actionable redirect instead of a generic unknown-pattern list.
+  // Redirect common knowledge topics that resemble pattern names
   const KNOWLEDGE_TOPIC_REDIRECTS: Record<string, string> = {
     'number-sequence':   'number-sequences',
     'number-sequences':  'number-sequences',

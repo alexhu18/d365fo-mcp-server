@@ -23,9 +23,10 @@ import type { XppServerContext } from '../types/context.js';
 import { createProvenanceToken } from '../utils/provenanceStore.js';
 import { tryBridgeCocExtensions } from '../bridge/bridgeAdapter.js';
 import { getConfigManager } from '../utils/configManager.js';
+import { lookupSymbolNocase } from '../utils/symbolLookup.js';
 import { rankContext, renderRankedContext } from '../workspace/contextRanker.js';
 
-// ── Schema ────────────────────────────────────────────────────────────────────
+// Schema
 
 export const prepareChangeArgsSchema = z.object({
   goal: z.string().describe(
@@ -42,7 +43,7 @@ export const prepareChangeArgsSchema = z.object({
   ),
   objectType: z.enum([
     'class', 'table', 'form', 'query', 'view', 'enum', 'edt',
-    'data-entity', 'map', 'report',
+    'data-entity', 'map', 'report', 'security-duty', 'security-role',
   ]).optional().describe(
     'D365FO object type. Auto-detected from the symbol index when omitted.',
   ),
@@ -52,19 +53,23 @@ export const prepareChangeArgsSchema = z.object({
   ),
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// Helpers
 
-/** Resolve object type from the symbol index. */
-async function resolveObjectType(
+/** Case-insensitive top-level object lookup — see src/utils/symbolLookup.ts. */
+function lookupObjectNocase(
   objectName: string,
   context: XppServerContext,
-): Promise<string | undefined> {
+): { name: string; type: string; model: string | null } | undefined {
+  return lookupSymbolNocase(context.symbolIndex.getReadDb(), objectName);
+}
+
+/** Resolve an object's canonical name + type from the symbol index. */
+async function resolveObject(
+  objectName: string,
+  context: XppServerContext,
+): Promise<{ name: string; type: string } | undefined> {
   try {
-    const db = context.symbolIndex.getReadDb();
-    const row = db
-      .prepare('SELECT type FROM symbols WHERE name = ? COLLATE NOCASE LIMIT 1')
-      .get(objectName) as { type: string } | undefined;
-    return row?.type;
+    return lookupObjectNocase(objectName, context);
   } catch {
     return undefined;
   }
@@ -78,10 +83,13 @@ async function fetchMethodSignature(
 ): Promise<string> {
   try {
     const db = context.symbolIndex.getReadDb();
+    // parent_name stays BINARY (canonical casing resolved upstream) so the
+    // probe uses idx_parent_type_name; NOCASE applies only to the method name
+    // within that object's few hundred method rows.
     const row = db.prepare(
       `SELECT signature, tags FROM symbols
-       WHERE parentName = ? AND name = ? AND type = 'method'
-       COLLATE NOCASE LIMIT 1`,
+       WHERE parent_name = ? AND type = 'method' AND name = ? COLLATE NOCASE
+       LIMIT 1`,
     ).get(objectName, methodName) as { signature: string; tags: string } | undefined;
     if (row) {
       const lines = [`Signature : ${row.signature ?? '(unavailable)'}`];
@@ -150,8 +158,8 @@ async function fetchEligibility(
     const db = context.symbolIndex.getReadDb();
     const row = db.prepare(
       `SELECT signature, tags FROM symbols
-       WHERE parentName = ? AND name = ? AND type = 'method'
-       COLLATE NOCASE LIMIT 1`,
+       WHERE parent_name = ? AND type = 'method' AND name = ? COLLATE NOCASE
+       LIMIT 1`,
     ).get(objectName, methodName) as { signature: string; tags: string } | undefined;
     if (row) {
       const tags = row.tags ?? '';
@@ -184,6 +192,12 @@ function fetchStrategy(objectType: string | undefined): string {
     strategies.push('• Form datasource extension [ExtensionOf(formDataSourceStr(...))] — CoC on DS methods');
   } else if (objectType === 'map') {
     strategies.push('• Map extension class [ExtensionOf(mapStr(...))] — add/wrap map methods');
+  } else if (objectType === 'security-duty') {
+    strategies.push('• security-duty-extension (AxSecurityDutyExtension) — add privileges to this EXISTING duty without overlaying it');
+    strategies.push('• New standalone security-duty — only if this duty is not a fit for the new privilege at all');
+  } else if (objectType === 'security-role') {
+    strategies.push('• security-role-extension (AxSecurityRoleExtension) — add duties/privileges to this EXISTING role without overlaying it');
+    strategies.push('• New standalone security-role — only if this role is not a fit for the new duty at all');
   } else {
     strategies.push('• Extension class via [ExtensionOf] — check the object type for supported extension mechanisms');
   }
@@ -204,10 +218,7 @@ async function fetchNamingValidation(
     issues.push('❌ Name must start with an uppercase letter (PascalCase).');
   }
   try {
-    const db = context.symbolIndex.getReadDb();
-    const existing = db.prepare(
-      `SELECT name, model FROM symbols WHERE name = ? COLLATE NOCASE LIMIT 1`,
-    ).get(proposedName) as { name: string; model: string } | undefined;
+    const existing = lookupObjectNocase(proposedName, context);
     if (existing) {
       issues.push(`⚠️  Name "${existing.name}" already exists in model "${existing.model}".`);
     }
@@ -229,10 +240,14 @@ async function fetchPatterns(
 ): Promise<string> {
   try {
     const db = context.symbolIndex.getReadDb();
+    // INDEXED BY: with `description != ''` alone the planner scans and fetches
+    // every row of the type (77 s cold on a production DB). Forcing
+    // idx_type_name evaluates the LIKE against the index, so only name
+    // matches ever touch the table.
     const rows = db.prepare(
-      `SELECT name, description FROM symbols
-       WHERE type = ? AND description != ''
-       ORDER BY CASE WHEN name LIKE ? THEN 0 ELSE 1 END
+      `SELECT name, description FROM symbols INDEXED BY idx_type_name
+       WHERE type = ? AND name LIKE ? AND description != ''
+       ORDER BY LENGTH(name)
        LIMIT 3`,
     ).all(objectType ?? 'class', `%${objectName}%`) as Array<{ name: string; description: string }>;
     if (rows.length > 0) {
@@ -244,7 +259,7 @@ async function fetchPatterns(
   return '(no similar patterns found in index)';
 }
 
-// ── Tool handler ──────────────────────────────────────────────────────────────
+// Tool handler
 
 export async function prepareChangeTool(request: any, context: XppServerContext): Promise<any> {
   const raw = request?.params?.arguments ?? request;
@@ -256,10 +271,13 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
     };
   }
 
-  const { goal, objectName, methodName, objectType: explicitType, proposedName } = parsed.data;
+  const { goal, objectName: rawObjectName, methodName, objectType: explicitType, proposedName } = parsed.data;
 
-  // Resolve object type when not provided
-  const resolvedType = explicitType ?? await resolveObjectType(objectName, context);
+  // Resolve canonical casing + type from the index; downstream lookups use the
+  // canonical name so they can stay on BINARY-collated indexes.
+  const resolved = await resolveObject(rawObjectName, context);
+  const objectName = resolved?.name ?? rawObjectName;
+  const resolvedType = explicitType ?? resolved?.type;
 
   // Run all fact-gathering queries in parallel
   const [sigText, cocText, eligText, patternText, namingText] = await Promise.all([
@@ -323,7 +341,7 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
   lines.push(patternText);
   lines.push('');
 
-  // Ranked neighborhood: goal-driven, anchored on the target object. Best-effort.
+  // Ranked neighborhood, anchored on the target object; additive, best-effort.
   try {
     const ranked = rankContext(context, {
       intent: `${goal} ${objectName} ${methodName ?? ''}`,
@@ -332,7 +350,7 @@ export async function prepareChangeTool(request: any, context: XppServerContext)
     lines.push(...renderRankedContext(ranked));
     lines.push('');
   } catch {
-    // Ranked context is additive — omit on failure.
+    // omit on failure
   }
 
   if (namingText !== null) {

@@ -12,10 +12,7 @@ import { generateRuntimeMetadata } from './generateMetadata.js';
 
 const execFileAsync = util.promisify(execFile);
 
-// ---------------------------------------------------------------------------
 // Build-tool file logger
-// ---------------------------------------------------------------------------
-
 async function buildLog(level: 'INFO' | 'WARN' | 'ERROR', message: string): Promise<void> {
   console.error(`[build_d365fo_project] ${message}`);
   try {
@@ -29,10 +26,6 @@ async function buildLog(level: 'INFO' | 'WARN' | 'ERROR', message: string): Prom
   }
 }
 
-// ---------------------------------------------------------------------------
-// Security
-// ---------------------------------------------------------------------------
-
 function assertSafePath(value: string, label: string): void {
   if (/[&|<>^`!;$%"'\n\r]/.test(value)) {
     throw new Error(
@@ -41,22 +34,15 @@ function assertSafePath(value: string, label: string): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Patterns
-// ---------------------------------------------------------------------------
-
 // xppc.exe writes this prefix on error lines in the -log file (standalone/non-VS mode)
 const XPPC_COMPILE_ERROR_RE = /^Compile Error:/m;
 
 // When xppc reports stale symbols from a previous incremental build, a full build is needed
 const XPPC_STALE_SYMBOL_RE = /has not been successfully compiled since it was last changed|Do a Full Build/i;
 
-// ---------------------------------------------------------------------------
-// Structured compiler diagnostics
-// xppc -log lines have the form (observed in standalone/UDE mode):
+// xppc -log line format:
 //   Compile Error: Class Method dynamics://MyModel/MyClass/myMethod: [(28,27),(28,28)]: ';' expected.
 // i.e.  <severity>: <element kind> dynamics://<model>/<object>[/<member>]: [(line,col)[,(line,col)]]: <message>
-// ---------------------------------------------------------------------------
 
 export interface XppcDiagnostic {
   severity: 'error' | 'warning';
@@ -152,10 +138,6 @@ export function formatStructuredDiagnostics(diagnostics: XppcDiagnostic[], maxIt
   return lines.join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Build job state
-// ---------------------------------------------------------------------------
-
 interface QueueResult {
   modelName: string;
   status: 'succeeded' | 'failed';
@@ -180,12 +162,9 @@ interface BuildJobState {
   queueResults?: QueueResult[]; // Results for already-completed models in the queue
 }
 
-// ---------------------------------------------------------------------------
-// State file / log file paths
-// State file is keyed by targetModel so it remains findable throughout
-// a multi-model build even while a dependency is building.
-// Each model in the queue gets its own log file (keyed by targetModel + index).
-// ---------------------------------------------------------------------------
+// State file is keyed by targetModel so it remains findable throughout a
+// multi-model build even while a dependency is building. Each model in the
+// queue gets its own log file (keyed by targetModel + index).
 
 function stateFilePath(targetModel: string, customPackagesPath: string): string {
   const hash = crypto
@@ -226,7 +205,7 @@ function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-// Return the last N lines of a log file (used while a build is running).
+/** Last N lines of a log file (used while a build is running). */
 async function readLogTail(logFile: string, lines = 60): Promise<string> {
   try {
     const content = await readFile(logFile, 'utf-8');
@@ -237,7 +216,7 @@ async function readLogTail(logFile: string, lines = 60): Promise<string> {
   }
 }
 
-// Read the entire log without truncation — used for diagnostics parsing only.
+/** Read the entire log without truncation — used for diagnostics parsing only. */
 async function readWholeLog(logFile: string): Promise<string> {
   try {
     return await readFile(logFile, 'utf-8');
@@ -246,19 +225,13 @@ async function readWholeLog(logFile: string): Promise<string> {
   }
 }
 
-// Return a log excerpt for a failed build that always includes diagnostic lines.
-// When the log is large (e.g. long phase timing tables before the error section),
-// the naive head+tail approach can miss error lines. Instead we:
-//   1. Find every line matching a compiler diagnostic prefix.
-//   2. Include a context window around each such line.
-//   3. Always include the last TAIL_LINES of the log (build summary).
-//   4. Fall back to head+tail only when no diagnostics are found.
-//
-// The number of diagnostic windows is capped at MAX_DIAGS so a build with
-// hundreds of scattered errors cannot blow up the (now uncapped) response —
-// the goal is to optimise the signal, not to dump the whole log. The first
-// MAX_DIAGS diagnostics (in log order, i.e. earliest/most actionable) are
-// shown; the structured diagnostics section above already summarises counts.
+/**
+ * Log excerpt for a failed build that always includes diagnostic lines. A
+ * naive head+tail can miss errors when long phase-timing tables precede them,
+ * so instead: find every diagnostic line, include a context window around
+ * each, always include the trailing summary lines, and cap the number of
+ * diagnostic windows shown (MAX_DIAGS) to bound the response size.
+ */
 async function readFullLog(logFile: string, maxLines = 300): Promise<string> {
   const CONTEXT = 3;     // lines before/after each diagnostic
   const TAIL_LINES = 30; // always-included trailing lines
@@ -319,10 +292,6 @@ async function readFullLog(logFile: string, maxLines = 300): Promise<string> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Parse model name from .rnrproj XML
-// ---------------------------------------------------------------------------
-
 async function getModelFromRnrproj(projectPath: string): Promise<string | null> {
   try {
     const content = await readFile(projectPath, 'utf-8');
@@ -332,10 +301,6 @@ async function getModelFromRnrproj(projectPath: string): Promise<string | null> 
     return null;
   }
 }
-
-// ---------------------------------------------------------------------------
-// Locate xppc.exe
-// ---------------------------------------------------------------------------
 
 async function findXppcExe(microsoftPackagesPath: string | null): Promise<string | null> {
   const candidates: string[] = [];
@@ -369,15 +334,13 @@ async function findXppcExe(microsoftPackagesPath: string | null): Promise<string
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Dependency resolution
-// Reads <ModuleReferences> from the target model's descriptor, recursively
-// follows custom/ISV dependencies (models present in customPackagesPath),
-// and returns a topologically sorted build order (deepest dep first, target
-// last). Microsoft standard models (only in microsoftPackagesPath) are
-// silently skipped.
-// ---------------------------------------------------------------------------
-
+/**
+ * Reads <ModuleReferences> from the target model's descriptor, recursively
+ * follows custom/ISV dependencies (models present in customPackagesPath), and
+ * returns a topologically sorted build order (deepest dep first, target
+ * last). Microsoft standard models (only in microsoftPackagesPath) are
+ * silently skipped.
+ */
 async function resolveBuildQueue(
   targetModel: string,
   customPackagesPath: string,
@@ -424,21 +387,13 @@ async function resolveBuildQueue(
   return order; // Dependencies first, targetModel last
 }
 
-// ---------------------------------------------------------------------------
-// Kill orphaned build processes
-// ---------------------------------------------------------------------------
-
 async function killOrphanedBuildProcesses(): Promise<void> {
   await execFileAsync('taskkill', ['/F', '/IM', 'xppc.exe'], { timeout: 10_000, windowsHide: true })
     .then(({ stdout }) => console.error(`[build_d365fo_project] killed xppc.exe: ${stdout.trim() || '(no output)'}`))
     .catch(() => {});
 }
 
-// ---------------------------------------------------------------------------
-// Build context — passed through the entire queue so the close handler can
-// launch the next model without re-resolving paths.
-// ---------------------------------------------------------------------------
-
+/** Passed through the entire queue so the close handler can launch the next model without re-resolving paths. */
 interface XppcBuildContext {
   xppcExe: string;
   customPackagesPath: string;
@@ -446,14 +401,12 @@ interface XppcBuildContext {
   extraReferenceFolders: string[];
 }
 
-// ---------------------------------------------------------------------------
-// Core spawn — queue-aware
-// Spawns xppc.exe for state.modelName, writes the updated state (with real
-// PID) to disk, and wires up close/error handlers. The close handler
-// automatically advances the queue when a dependency finishes successfully.
-// Returns the PID of the spawned process.
-// ---------------------------------------------------------------------------
-
+/**
+ * Spawns xppc.exe for state.modelName, writes the updated state (with real
+ * PID) to disk, and wires up close/error handlers. The close handler
+ * automatically advances the queue when a dependency finishes successfully.
+ * Returns the PID of the spawned process.
+ */
 async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): Promise<number> {
   const { xppcExe, customPackagesPath, microsoftPackagesPath, extraReferenceFolders } = ctx;
   const { modelName, fullBuild, targetModel } = state;
@@ -472,7 +425,6 @@ async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): P
   const outputPath = path.join(customPackagesPath, modelName, 'bin');
   const xppcErrLog = state.logFile.replace('.log', '.xppc.err');
 
-  // Clear stale diagnostic files from a previous run
   await unlink(xppcErrLog).catch(() => {});
 
   // Deduplicate reference folders
@@ -539,8 +491,8 @@ async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): P
 
     const hasCompileErrors = XPPC_COMPILE_ERROR_RE.test(xppcErrContent);
     const hasStaleSymbol   = XPPC_STALE_SYMBOL_RE.test(xppcErrContent);
-    // A build succeeds only when xppc exits 0 AND the -log has no Compile Error lines.
-    // xppc may exit 0 even when it emits errors (observed in UDE standalone mode).
+    // xppc can exit 0 while still emitting Compile Error lines, so success
+    // requires both exit 0 AND no Compile Error lines in the -log.
     const succeeded = exitCode === 0 && !hasCompileErrors;
 
     // Append compiler diagnostics to the main log so a single tail read finds everything
@@ -625,11 +577,9 @@ async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): P
       return;
     }
 
-    // All models built — regenerate .md runtime metadata manifests from XML source.
-    // xppc produces the compiled .netmodule but does NOT update the binary .md
-    // manifests that the AOS uses to resolve class names at runtime. Without this
-    // step, newly added classes are invisible to D365 after deployment even though
-    // the assembly compiled successfully.
+    // xppc produces the compiled .netmodule but does not update the binary .md
+    // manifests the AOS uses to resolve class names at runtime — regenerate them
+    // here, otherwise newly added classes stay invisible to D365 after deployment.
     const metaResult = await generateRuntimeMetadata(
       microsoftPackagesPath,
       customPackagesPath,

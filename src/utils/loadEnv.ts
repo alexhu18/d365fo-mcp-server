@@ -35,16 +35,13 @@ export function loadEnv(callerImportMetaUrl: string): void {
     ? resolve(process.env.ENV_FILE)
     : resolve(callerDir, '../.env');
 
-  // quiet: true suppresses dotenv v17's stdout "◇ injected env" logging.
-  // That log uses console.log which at module-load time (before the MCP stdio
-  // redirects are set up) writes directly to process.stdout, corrupting the
-  // MCP JSON-RPC channel in stdio mode.
+  // quiet: true suppresses dotenv v17's stdout logging, which would otherwise
+  // corrupt the MCP JSON-RPC channel in stdio mode (writes to process.stdout
+  // before the MCP stdio redirects are set up).
   const result = dotenv.config({ path: envPath, quiet: true });
   if (result.error && !process.env.ENV_FILE) {
-    // Fallback: let dotenv try process.cwd() the normal way.
-    // Only fall back when ENV_FILE was not explicitly set — if the user pointed
-    // at a specific file that is missing, we surface the error rather than
-    // silently loading a different config.
+    // Only fall back to process.cwd() when ENV_FILE wasn't explicitly set;
+    // an explicit-but-missing file should surface as an error, not fall back silently.
     dotenv.config({ quiet: true });
   }
 
@@ -58,13 +55,9 @@ export function loadEnv(callerImportMetaUrl: string): void {
     }
   }
 
-  // Bridge external setting names to the internal variable the code reads.
-  // The public/canonical setting is the D365FO_-prefixed name (same convention
-  // as D365FO_PACKAGE_PATH), but internally every consumer reads the plain
-  // DEV_ENVIRONMENT_TYPE. Copy the prefixed value into the plain name so a
-  // single normalization point serves all consumers — no read-site changes.
-  // Prefixed wins when both are set; a lone plain entry (loaded natively by
-  // dotenv) is tolerated as silent legacy so existing installs keep working.
+  // Bridge the public D365FO_-prefixed setting name to the internal
+  // DEV_ENVIRONMENT_TYPE that consumers read. Prefixed wins when both are set;
+  // a lone plain entry is tolerated for backward compatibility.
   if (process.env.D365FO_DEV_ENVIRONMENT_TYPE) {
     process.env.DEV_ENVIRONMENT_TYPE = process.env.D365FO_DEV_ENVIRONMENT_TYPE;
   }

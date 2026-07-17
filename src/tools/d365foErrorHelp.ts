@@ -7,7 +7,7 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
-// ─── Schema ──────────────────────────────────────────────────────────────────
+// Schema
 
 const D365foErrorHelpArgsSchema = z.object({
   errorText: z.string().describe(
@@ -27,7 +27,7 @@ const D365foErrorHelpArgsSchema = z.object({
 // Tool registration (name, description, inputSchema) lives inline in
 // src/server/mcpServer.ts - the single source of truth for tool instructions.
 
-// ─── Error Entry Type ────────────────────────────────────────────────────────
+// Error entry type
 
 interface ErrorEntry {
   /** Match patterns — checked against errorCode and errorText (case-insensitive) */
@@ -42,10 +42,8 @@ interface ErrorEntry {
   related?: string[];
 }
 
-// ─── Error Database ──────────────────────────────────────────────────────────
-
 const ERROR_DB: ErrorEntry[] = [
-  // ── TTS / Transaction errors ──────────────────────────────────────────────
+  // TTS / Transaction errors
   {
     patterns: ['tts level', 'ttsbegin', 'tts is not 0', 'transaction level', 'unbalanced tts'],
     title: 'TTS Level Mismatch',
@@ -109,7 +107,7 @@ while (!done && retryCount < 5)
     related: ['transactions'],
   },
 
-  // ── Compilation errors ────────────────────────────────────────────────────
+  // Compilation errors
   {
     patterns: ['csuv1', 'cannot be assigned', 'cannot assign', 'type mismatch', 'illegal assignment'],
     title: 'CSUV1 — Illegal Assignment / Type Mismatch',
@@ -324,7 +322,17 @@ catch (Exception::CLRError)
   },
 ];
 
-// ─── Scoring & Search ────────────────────────────────────────────────────────
+// Excluded from the word-level partial-match fallback below — filler/numeric tokens
+// like "is"/"not"/"0" would otherwise spuriously match unrelated error text.
+const STOPWORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'to', 'of', 'in', 'on', 'at', 'by', 'or', 'and', 'not', 'no', 'this',
+  'that', 'it', 'its', 'as', 'for', 'with', 'from',
+]);
+
+function isSignificantWord(word: string): boolean {
+  return word.length >= 3 && !STOPWORDS.has(word) && !/^\d+$/.test(word);
+}
 
 function scoreError(entry: ErrorEntry, errorText: string, errorCode?: string): number {
   const lowerText = errorText.toLowerCase();
@@ -334,15 +342,17 @@ function scoreError(entry: ErrorEntry, errorText: string, errorCode?: string): n
   for (const pattern of entry.patterns) {
     if (lowerCode && lowerCode.includes(pattern)) score += 20;
     if (lowerText.includes(pattern)) score += 10;
-    // partial match — individual words
-    const words = pattern.split(/\s+/);
+    // Partial match fallback on significant words only; multi-word patterns need
+    // at least 2 matched words so one shared generic term can't cause a false match.
+    const words = pattern.split(/\s+/).filter(isSignificantWord);
     const matchedWords = words.filter(w => lowerText.includes(w) || lowerCode.includes(w));
-    score += matchedWords.length * 2;
+    const meetsThreshold = words.length <= 1 ? matchedWords.length === 1 : matchedWords.length >= 2;
+    if (meetsThreshold) {
+      score += matchedWords.length * 2;
+    }
   }
   return score;
 }
-
-// ─── Formatter ───────────────────────────────────────────────────────────────
 
 function formatEntry(entry: ErrorEntry, context?: string): string {
   const lines: string[] = [];
@@ -369,8 +379,6 @@ function formatEntry(entry: ErrorEntry, context?: string): string {
   }
   return lines.join('\n');
 }
-
-// ─── Tool Handler ────────────────────────────────────────────────────────────
 
 /**
  * Programmatic lookup against ERROR_DB — used by build_d365fo_project to

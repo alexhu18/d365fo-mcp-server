@@ -13,6 +13,12 @@ import type { XppServerContext } from '../types/context.js';
 import { buildObjectTypeMismatchMessage } from '../utils/metadataResolver.js';
 import type { BridgeClient } from '../bridge/bridgeClient.js';
 import type { XppMetadataParser } from '../metadata/xmlParser.js';
+import { parseXppDeclaration } from '../metadata/xppDeclaration.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
+
+/** Object types that can own methods. */
+const OBJECT_TYPES = ['class', 'table', 'view', 'data-entity'] as const;
+const OBJECT_TYPES_SQL = `(${OBJECT_TYPES.map(t => `'${t}'`).join(', ')})`;
 
 
 const GetMethodSignatureArgsSchema = z.object({
@@ -41,17 +47,23 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
   try {
     const args = GetMethodSignatureArgsSchema.parse(request.params.arguments);
     const { symbolIndex, parser } = context;
-    const { className, methodName, modelName } = args;
-
-    // 1. Find the class/table/view — methods live on all three object types
-    const OBJECT_TYPES = `('class', 'table', 'view', 'data-entity')`;
+    const { methodName, modelName } = args;
     const rdb = symbolIndex.getReadDb();
+
+    // 1. Find the class/table/view — methods live on all three object types.
+    // Resolve the caller's casing to the canonical AOT name first: X++ treats
+    // AOT identifiers case-insensitively, but the probes below match by exact
+    // name, so a mismatch would report a false "not found" (#686). Canonicalizing
+    // once keeps those probes BINARY and on-index — `name = ? COLLATE NOCASE`
+    // here would scan every class/table/view row instead (~86k rows, 4–8 s warm).
+    const className = canonicalSymbolName(rdb, args.className, OBJECT_TYPES) ?? args.className;
+
     let classRow: any;
     if (modelName) {
       classRow = rdb.prepare(`
         SELECT file_path, model, name, type
         FROM symbols
-        WHERE type IN ${OBJECT_TYPES} AND name = ? AND model = ?
+        WHERE type IN ${OBJECT_TYPES_SQL} AND name = ? AND model = ?
         ORDER BY CASE type WHEN 'class' THEN 0 WHEN 'table' THEN 1 ELSE 2 END
         LIMIT 1
       `).get(className, modelName);
@@ -59,7 +71,7 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
       classRow = rdb.prepare(`
         SELECT file_path, model, name, type
         FROM symbols
-        WHERE type IN ${OBJECT_TYPES} AND name = ?
+        WHERE type IN ${OBJECT_TYPES_SQL} AND name = ?
         ORDER BY CASE type WHEN 'class' THEN 0 WHEN 'table' THEN 1 ELSE 2 END, model
         LIMIT 1
       `).get(className);
@@ -79,20 +91,21 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
     }
 
     // 2. Find the method in database (advisory — delegates and SubscribesTo handlers may be absent)
+    // COLLATE NOCASE on the method name is safe here: `parent_name` is canonical
+    // and `type`/`parent_name` narrow the range to one object's members before
+    // the case-insensitive comparison runs.
     const methodStmt = rdb.prepare(`
       SELECT name, signature, parent_name, file_path
       FROM symbols
       WHERE type = 'method'
-        AND name = ?
         AND parent_name = ?
+        AND name = ? COLLATE NOCASE
       LIMIT 1
     `);
 
-    const methodRow = methodStmt.get(methodName, className);
+    const methodRow = methodStmt.get(className, methodName);
 
     // 3. C# bridge (IMetadataProvider — live source, always current)
-    // Bridge returns full source → parse signature locally + detect obsolete.
-    // This is the sole data path — eliminates JSON file I/O and XML parsing.
     const includeCoc = args.includeCocTemplate ?? false;
     const bridgeSignature = await tryBridgeMethodSignature(
       context.bridge, className, methodName, classRow.model, includeCoc,
@@ -105,10 +118,12 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
     );
     if (xmlSignature) return xmlSignature;
 
-    // Last resort: use SQLite signature column if available
+    // Last resort: use SQLite signature column if available. No declaration is
+    // parsed on this path, so the index's own `name` is the canonical spelling
+    // to render rather than the caller's argument (#691).
     if ((methodRow as any)?.signature) {
       const sigText = (methodRow as any).signature as string;
-      let output = `# Method: \`${className}.${methodName}\`\n`;
+      let output = `# Method: \`${className}.${(methodRow as any).name ?? methodName}\`\n`;
       output += `**Model:** ${classRow.model}\n`;
       output += `_Source: SQLite index (signature only — bridge and XML unavailable)_\n\n`;
       output += `\`\`\`xpp\n${sigText}\n\`\`\`\n`;
@@ -117,9 +132,7 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
     }
 
     // classDeclaration is the class header pseudo-member — it has no
-    // parenthesised signature, so the signature path can never parse it even
-    // though its source is retrievable. Give an accurate pointer instead of the
-    // misleading "delegate / SubscribesTo" not-found message below.
+    // parenthesised signature and can't be parsed by the signature path.
     if (methodName.toLowerCase() === 'classdeclaration') {
       return {
         content: [{
@@ -132,7 +145,6 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
       };
     }
 
-    // Method not in SQLite and not reachable via bridge/XML.
     // Delegates and SubscribesTo handlers are commonly absent from the index.
     if (!methodRow) {
       return {
@@ -172,10 +184,8 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
 }
 
 /**
- * Try C# bridge for method signature.
- * Bridge returns full source → parse signature locally + detect obsolete.
- * This is the fastest path on Windows VMs (one IPC call, no JSON/XML file I/O).
- * Returns null to signal fallback when bridge is unavailable.
+ * Try C# bridge for method signature. Returns null to signal fallback when
+ * the bridge is unavailable.
  */
 async function tryBridgeMethodSignature(
   bridge: BridgeClient | undefined,
@@ -189,12 +199,11 @@ async function tryBridgeMethodSignature(
     const ms = await bridge.getMethodSource(className, methodName);
     if (!ms.found || !ms.source) return null;
 
-    // Parse signature from full source — same function used by the XML path
     const signature = parseMethodSignature(ms.source, methodName);
     if (!signature) return null;
 
     const obsoleteWarning = detectObsolete(ms.source);
-    const result = formatOutput(className, methodName, signature, modelName, includeCoc, obsoleteWarning);
+    const result = formatOutput(className, signature, modelName, includeCoc, obsoleteWarning);
     return result;
   } catch (e) {
     console.error(`[methodSignature] Bridge getMethodSource(${className}, ${methodName}) failed: ${e}`);
@@ -203,9 +212,7 @@ async function tryBridgeMethodSignature(
 }
 
 /**
- * Try XML file parsing for method signature.
- * Fallback when C# bridge is unavailable (Azure, Linux, bridge not running).
- * Mirrors the pattern from classInfo.ts: parse XML with timeout guard.
+ * Fallback when C# bridge is unavailable: parse the XML file with a timeout guard.
  * Returns null to signal fallback to SQLite-only.
  */
 async function tryXmlMethodSignature(
@@ -236,7 +243,7 @@ async function tryXmlMethodSignature(
     if (!signature) return null;
 
     const obsoleteWarning = detectObsolete(method.source);
-    const result = formatOutput(className, methodName, signature, modelName, includeCoc, obsoleteWarning);
+    const result = formatOutput(className, signature, modelName, includeCoc, obsoleteWarning);
     return result;
   } catch (e) {
     console.error(`[methodSignature] XML parse for ${className}.${methodName} failed: ${e}`);
@@ -263,82 +270,29 @@ function parseByObjectType(
 }
 
 /**
- * Parse method signature from source code
+ * Parse method signature from source code.
+ *
+ * The declaration parsing itself lives in ../metadata/xppDeclaration.js and is
+ * shared with the XML metadata parser; this only turns a parsed declaration
+ * into the rendered signature and CoC template. Exported for unit tests.
  */
-function parseMethodSignature(source: string, methodName: string): MethodSignature | null {
-  if (!source) return null;
+export function parseMethodSignature(source: string, methodName: string): MethodSignature | null {
+  const decl = parseXppDeclaration(source, methodName);
+  if (!decl) return null;
 
-  // Find method declaration line
-  const lines = source.split('\n');
-  let declarationLine = '';
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.includes(methodName) && trimmed.includes('(')) {
-      declarationLine = trimmed;
-      break;
-    }
-  }
-
-  if (!declarationLine) return null;
-
-  // Parse modifiers (public, private, protected, static, final, etc.)
-  const modifiers: string[] = [];
-  const modifierKeywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'display'];
-  
-  for (const keyword of modifierKeywords) {
-    if (declarationLine.toLowerCase().includes(keyword)) {
-      modifiers.push(keyword);
-    }
-  }
-
-  // Parse return type
-  let returnType = 'void';
-  const returnTypeMatch = declarationLine.match(/(?:public|private|protected|static|final)?\s+(\w+)\s+\w+\s*\(/);
-  if (returnTypeMatch) {
-    returnType = returnTypeMatch[1];
-  }
-
-  // Parse parameters
-  const parametersMatch = declarationLine.match(/\((.*?)\)/);
-  const parameters: Array<{ type: string; name: string; defaultValue?: string }> = [];
-
-  if (parametersMatch && parametersMatch[1].trim()) {
-    const paramString = parametersMatch[1];
-    const paramParts = paramString.split(',');
-
-    for (const part of paramParts) {
-      const trimmed = part.trim();
-      const paramMatch = trimmed.match(/(\w+)\s+(_?\w+)(?:\s*=\s*(.+))?/);
-      
-      if (paramMatch) {
-        const param: any = {
-          type: paramMatch[1],
-          name: paramMatch[2],
-        };
-        
-        if (paramMatch[3]) {
-          param.defaultValue = paramMatch[3].trim();
-        }
-        
-        parameters.push(param);
-      }
-    }
-  }
-
-  // Build full signature
-  const signature = buildSignatureString(modifiers, returnType, methodName, parameters);
-
-  // Build CoC template
-  const cocTemplate = buildCoCTemplate(modifiers, returnType, methodName, parameters);
+  // Render the declaration's own spelling, never the caller's argument: the
+  // lookup path is case-insensitive end to end, so `methodName` may be
+  // mis-cased. Echoing it would emit a `next CONSTRUCT(...)` CoC template and a
+  // header naming a member that doesn't exist in the AOT with that spelling (#691).
+  const { name, modifiers, returnType, parameters } = decl;
 
   return {
     modifiers,
     returnType,
-    methodName,
+    methodName: name,
     parameters,
-    signature,
-    cocTemplate,
+    signature: buildSignatureString(modifiers, returnType, name, parameters),
+    cocTemplate: buildCoCTemplate(modifiers, returnType, name, parameters),
   };
 }
 
@@ -384,8 +338,8 @@ function buildCoCTemplate(
 ): string {
   let template = '';
 
-  // Add modifiers (replace public/private/protected with method attribute)
-  const cocModifiers = modifiers.filter(m => !['public', 'private', 'protected'].includes(m));
+  // Add modifiers (replace access modifiers with method attribute)
+  const cocModifiers = modifiers.filter(m => !['public', 'private', 'protected', 'internal'].includes(m));
   
   template += '[ExtensionOf(classStr(OriginalClassName))]\n';
   template += 'final class OriginalClassName_Extension\n';
@@ -448,15 +402,19 @@ function detectObsolete(source: string): string {
   }\n> Use the stated replacement instead.`;
 }
 
+/**
+ * `signature.methodName` is the declaration's own spelling (#691) — there is
+ * deliberately no separate name parameter, so the caller's possibly mis-cased
+ * argument cannot reach the output.
+ */
 function formatOutput(
   className: string,
-  methodName: string,
   signature: MethodSignature,
   modelName: string,
   includeCocTemplate: boolean = false,
   obsoleteWarning: string = ''
 ): any {
-  let output = `# Method: \`${className}.${methodName}\`\n`;
+  let output = `# Method: \`${className}.${signature.methodName}\`\n`;
   output += `**Model:** ${modelName}  **Returns:** ${signature.returnType}  **Modifiers:** ${signature.modifiers.join(', ') || 'none'}\n`;
   if (obsoleteWarning) output += obsoleteWarning + '\n';
   output += `\n\`\`\`xpp\n${signature.signature}\n\`\`\`\n`;

@@ -95,8 +95,7 @@ async function gitSafe(args: string[], cwd: string): Promise<string | null> {
  */
 async function getUncommittedXppFiles(workspacePath: string | null): Promise<string[]> {
   if (!workspacePath) return [];
-  // --name-only over HEAD covers staged + unstaged tracked changes; -o picks up
-  // newly-created (untracked) object files that are not yet committed.
+  // diff HEAD covers staged+unstaged tracked changes; ls-files -o adds untracked files.
   const tracked = await gitSafe(['diff', 'HEAD', '--name-only'], workspacePath);
   const untracked = await gitSafe(
     ['ls-files', '--others', '--exclude-standard'],
@@ -125,7 +124,7 @@ export async function buildContextSnapshot(
   const configManager = getConfigManager();
   const { symbolIndex, workspaceScanner } = context;
 
-  // ── Identity (model / project / env) ──────────────────────────────────────
+  // Identity (model / project / env)
   let model: string | null = null;
   let modelSource = 'unknown';
   let projectPath: string | null = null;
@@ -151,7 +150,7 @@ export async function buildContextSnapshot(
 
   const roots = getStdioSessionInfo().lastRoots ?? [];
 
-  // ── Index stats + freshness ───────────────────────────────────────────────
+  // Index stats + freshness
   const index = {
     totalSymbols: 0,
     byType: {} as Record<string, number>,
@@ -159,15 +158,19 @@ export async function buildContextSnapshot(
     lastIndexedAt: null as string | null,
   };
   try {
-    index.totalSymbols = symbolIndex.getSymbolCount();
-    index.byType = symbolIndex.getSymbolCountByType();
+    // Off-thread + memoized — the synchronous count getters block the event
+    // loop for 30-60 s on a cold 2 GB DB, which would starve the MCP transport
+    // during the very first get_workspace_info call.
+    const counts = await symbolIndex.getSymbolCounts();
+    index.totalSymbols = counts.total;
+    index.byType = counts.byType;
     index.indexedModels = Array.from(symbolIndex.getIndexedModels()).sort();
     index.lastIndexedAt = symbolIndex.getLastIndexedAt?.() ?? null;
   } catch {
     /* index may not be built yet */
   }
 
-  // ── Recently-edited objects (mtime desc) ──────────────────────────────────
+  // Recently-edited objects (mtime desc)
   let recentObjects: RecentObject[] = [];
   if (workspacePath) {
     try {
@@ -187,7 +190,7 @@ export async function buildContextSnapshot(
     }
   }
 
-  // ── Uncommitted X++ changes ───────────────────────────────────────────────
+  // Uncommitted X++ changes
   const uncommittedFiles = await getUncommittedXppFiles(workspacePath);
 
   return {

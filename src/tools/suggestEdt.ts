@@ -96,7 +96,6 @@ export async function handleSuggestEdt(
   const suggestions: any[] = [];
   const seen = new Set<string>();
 
-  // Add fuzzy matches with confidence score
   for (const match of fuzzyMatches) {
     if (seen.has(match.edt_name)) continue;
     seen.add(match.edt_name);
@@ -113,12 +112,10 @@ export async function handleSuggestEdt(
     });
   }
 
-  // Add heuristic suggestions
   for (const heuristic of heuristicSuggestions) {
     if (seen.has(heuristic.edt)) continue;
     seen.add(heuristic.edt);
 
-    // Check if EDT exists
     const edtExists = db.prepare(`
       SELECT edt_name, extends, enum_type, reference_table, label
       FROM edt_metadata
@@ -139,10 +136,7 @@ export async function handleSuggestEdt(
     }
   }
 
-  // Sort by confidence (descending)
   suggestions.sort((a, b) => b.confidence - a.confidence);
-
-  // Limit results
   const topSuggestions = suggestions.slice(0, limit);
 
   console.log(`[suggestEdt] Returning ${topSuggestions.length} suggestions`);
@@ -195,7 +189,6 @@ function recommendNewEdt(fieldName: string, _context?: string): {
 } {
   const nameLower = fieldName.toLowerCase();
 
-  // Infer base type from field name pattern
   if (/amount|price|cost|value|sum/i.test(nameLower)) {
     return {
       name: fieldName,
@@ -271,7 +264,6 @@ function recommendNewEdt(fieldName: string, _context?: string): {
     };
   }
 
-  // Generic fallback: string EDT
   return {
     name: fieldName,
     extends: 'SysGroup',
@@ -289,25 +281,18 @@ function calculateConfidence(fieldName: string, edtName: string, context?: strin
   const field = fieldName.toLowerCase();
   const edt = edtName.toLowerCase();
 
-  // Exact match
   if (field === edt) return 1.0;
-
-  // EDT contains field name
   if (edt.includes(field)) {
     return 0.9 - (edt.length - field.length) * 0.01;
   }
-
-  // Field name contains EDT
   if (field.includes(edt)) {
     return 0.8 - (field.length - edt.length) * 0.01;
   }
 
-  // Levenshtein-based similarity
   const distance = levenshteinDistance(field, edt);
   const maxLength = Math.max(field.length, edt.length);
   const similarity = 1 - distance / maxLength;
 
-  // Boost if context matches
   if (context && edt.includes(context.toLowerCase())) {
     return Math.min(similarity + 0.1, 1.0);
   }
@@ -357,7 +342,6 @@ function getHeuristicSuggestions(fieldName: string, context?: string): Array<{
   const nameLower = fieldName.toLowerCase();
   const suggestions: Array<{ edt: string; confidence: number; reason: string }> = [];
 
-  // Common patterns
   const patterns: Array<[RegExp, string, string]> = [
     [/^recid$/i, 'RecId', 'Standard RecId field'],
     [/name/i, 'Name', 'Field contains "name"'],
@@ -394,7 +378,6 @@ function getHeuristicSuggestions(fieldName: string, context?: string): Array<{
     }
   }
 
-  // Context-based suggestions
   if (context) {
     const contextLower = context.toLowerCase();
     

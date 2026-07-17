@@ -44,15 +44,12 @@ export function generateRelatedSearches(
   const suggestions: RelatedSearch[] = [];
   const queryLower = query.toLowerCase();
 
-  // Analyze results to find patterns
   const classResults = results.filter(r => r.type === 'class');
   const tableResults = results.filter(r => r.type === 'table');
 
-  // Pattern 1: If searching for a specific class, suggest related classes
   if (classResults.length > 0) {
     const firstClass = classResults[0];
-    
-    // Suggest base class
+
     if (firstClass.extendsClass && firstClass.extendsClass !== 'Object') {
       suggestions.push({
         query: firstClass.extendsClass,
@@ -60,7 +57,6 @@ export function generateRelatedSearches(
       });
     }
 
-    // Suggest helper classes
     if (!queryLower.includes('helper') && firstClass.name.includes('Table')) {
       const helperQuery = firstClass.name.replace('Table', 'Helper');
       suggestions.push({
@@ -69,7 +65,6 @@ export function generateRelatedSearches(
       });
     }
 
-    // Suggest service classes
     if (!queryLower.includes('service')) {
       suggestions.push({
         query: `${query} service`,
@@ -78,7 +73,6 @@ export function generateRelatedSearches(
     }
   }
 
-  // Pattern 2: If searching for tables, suggest related tables
   if (tableResults.length > 0 && !queryLower.includes('line')) {
     suggestions.push({
       query: `${query}Line`,
@@ -86,7 +80,6 @@ export function generateRelatedSearches(
     });
   }
 
-  // Pattern 3: Common domain-specific searches
   if (queryLower.includes('dimension')) {
     if (!queryLower.includes('helper')) {
       suggestions.push({
@@ -122,7 +115,6 @@ export function generateRelatedSearches(
     });
   }
 
-  // Pattern 4: Broader/narrower searches
   if (results.length > 15) {
     suggestions.push({
       query: `${query} helper`,
@@ -131,8 +123,7 @@ export function generateRelatedSearches(
   }
 
   if (results.length === 0 || results.length < 3) {
-    // Suggest broader search
-    const broaderQuery = queryLower.split(/\s+/)[0]; // First word only
+    const broaderQuery = queryLower.split(/\s+/)[0]; // first word only
     if (broaderQuery !== queryLower) {
       suggestions.push({
         query: broaderQuery,
@@ -141,7 +132,6 @@ export function generateRelatedSearches(
     }
   }
 
-  // Pattern 5: Extension search suggestion
   if (results.length > 0 && !queryLower.includes('custom')) {
     suggestions.push({
       query: `search(scope="extensions") for "${query}"`,
@@ -160,7 +150,6 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
 
   if (results.length === 0) return patterns;
 
-  // Count base classes
   const baseClasses = new Map<string, number>();
   results.forEach(r => {
     if (r.extendsClass && r.extendsClass !== 'Object') {
@@ -168,10 +157,9 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
     }
   });
 
-  // Most common base class
   const mostCommonBase = Array.from(baseClasses.entries())
     .sort((a, b) => b[1] - a[1])[0];
-  
+
   if (mostCommonBase && mostCommonBase[1] > 1) {
     patterns.push({
       pattern: `${mostCommonBase[1]} classes extend ${mostCommonBase[0]}`,
@@ -179,11 +167,10 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
     });
   }
 
-  // Naming patterns
   const hasHelperClasses = results.some(r => r.name.includes('Helper'));
   const hasServiceClasses = results.some(r => r.name.includes('Service'));
   const hasControllerClasses = results.some(r => r.name.includes('Controller'));
-  
+
   if (hasHelperClasses) {
     patterns.push({
       pattern: 'Helper classes found - typically contain reusable utility methods'
@@ -202,14 +189,12 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
     });
   }
 
-  // API patterns from metadata
   const apiPatterns = results
     .filter(r => r.apiPatterns)
     .map(r => r.apiPatterns)
     .filter(Boolean);
-    
+
   if (apiPatterns.length > 0) {
-    // Extract initialization patterns
     const initPatterns = apiPatterns
       .flatMap(p => {
         try {
@@ -220,7 +205,7 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
         }
       })
       .filter(Boolean);
-      
+
     if (initPatterns.length > 0) {
       const mostCommon = initPatterns[0];
       patterns.push({
@@ -229,7 +214,6 @@ export function detectCommonPatterns(results: XppSymbol[]): CommonPattern[] {
     }
   }
 
-  // Pattern from typical usages
   const typicalUsages = results
     .filter(r => r.typicalUsages)
     .map(r => r.typicalUsages)
@@ -270,24 +254,22 @@ export function generateContextualTips(
       tip: 'Use search(scope="extensions") to search only in custom/ISV code',
       tool: 'search'
     });
-    
-    // Query-specific suggestions for empty results
+
     if (queryLower.length < 3) {
       tips.push({
         tip: 'Search terms shorter than 3 characters may not yield results. Try a longer term.'
       });
     }
-    
+
     return tips;
   }
 
   const classResults = results.filter(r => r.type === 'class');
   const methodResults = results.filter(r => r.type === 'method');
 
-  // Tips for class results
   if (classResults.length > 0) {
     const firstClass = classResults[0];
-    
+
     tips.push({
       tip: `Use get_object_info(objectType="class", name="${firstClass.name}") for full method signatures and inheritance chain`,
       tool: 'get_object_info'
@@ -306,21 +288,18 @@ export function generateContextualTips(
     }
   }
 
-  // Tips for method results
   if (methodResults.length > 0) {
     tips.push({
       tip: 'Use get_object_info(objectType="class", name=...) to see full method implementation and parameters'
     });
   }
 
-  // Tips based on search type
   if (searchType === 'all' && results.length > 15) {
     tips.push({
       tip: 'Too many results? Use type parameter to filter: type="class", type="table", type="method"'
     });
   }
 
-  // Pattern-specific tips
   const hasHelpers = results.some(r => r.name.includes('Helper'));
   if (hasHelpers) {
     tips.push({
@@ -343,14 +322,13 @@ export function formatRichContext(
 ): string {
   let output = '';
 
-  // Basic results
   const resultGroups = groupResultsByType(results);
-  
+
   for (const [type, items] of Object.entries(resultGroups)) {
     if (items.length === 0) continue;
-    
+
     output += `\n## ${type.toUpperCase()} (${items.length})\n\n`;
-    
+
     items.slice(0, 10).forEach(item => {
       output += formatSymbolWithMetadata(item);
     });
@@ -360,7 +338,6 @@ export function formatRichContext(
     }
   }
 
-  // Related searches
   if (options.includeRelated !== false && richContext.relatedSearches && richContext.relatedSearches.length > 0) {
     output += '\n\n## 🔍 Related Searches\n';
     richContext.relatedSearches.forEach(rel => {
@@ -368,7 +345,6 @@ export function formatRichContext(
     });
   }
 
-  // Common patterns
   if (options.includePatterns !== false && richContext.commonPatterns && richContext.commonPatterns.length > 0) {
     output += '\n\n## 💡 Common Patterns\n';
     richContext.commonPatterns.forEach(pattern => {
@@ -377,7 +353,6 @@ export function formatRichContext(
     });
   }
 
-  // Tips
   if (options.includeTips !== false && richContext.tips && richContext.tips.length > 0) {
     output += '\n\n## 📌 Tips\n';
     richContext.tips.forEach(tip => {
@@ -390,22 +365,21 @@ export function formatRichContext(
 }
 
 /**
- * Group results by type
+ * Group results by type.
+ *
+ * Groups are built dynamically from the types actually present — a hardcoded
+ * group list silently dropped every other type (form, query, view, report,
+ * security-*, menu-item-*, *-extension) from the rendered output while the
+ * header still claimed the full match count.
  */
+const TYPE_DISPLAY_ORDER = ['class', 'table', 'method', 'field', 'enum', 'edt'];
+
 function groupResultsByType(results: XppSymbol[]): Record<string, XppSymbol[]> {
-  const groups: Record<string, XppSymbol[]> = {
-    class: [],
-    table: [],
-    method: [],
-    field: [],
-    enum: [],
-    edt: []
-  };
+  const groups: Record<string, XppSymbol[]> = {};
+  for (const type of TYPE_DISPLAY_ORDER) groups[type] = [];
 
   results.forEach(r => {
-    if (groups[r.type]) {
-      groups[r.type].push(r);
-    }
+    (groups[r.type] ??= []).push(r);
   });
 
   return groups;

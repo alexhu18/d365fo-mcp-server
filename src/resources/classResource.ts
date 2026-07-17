@@ -1,12 +1,8 @@
 /**
- * MCP Resource helpers: X++ Class Source Code
- * Exposes class source code via xpp://class/{className} URIs.
- *
- * These are pure helpers consumed by the unified resource registrar
- * (resources/index.ts). They no longer register their own request handlers —
- * a single dispatcher owns ListResources/ReadResource so the class and
- * workspace schemes can coexist (previously the later registration silently
- * overwrote the earlier one).
+ * MCP Resource helpers: X++ Class Source Code.
+ * Exposes class source via xpp://class/{className} URIs. Pure helpers
+ * consumed by the unified resource registrar (resources/index.ts), which
+ * owns the actual request handlers.
  */
 
 import type { XppServerContext } from '../types/context.js';

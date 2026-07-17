@@ -17,7 +17,8 @@ const XppKnowledgeArgsSchema = z.object({
     '"set-based operations", "CoC", "data entities", "number sequences", "security", ' +
     '"temp tables", "today() deprecated", "query patterns", "form patterns", ' +
     '"inventory", "feature management", "dual-write", "DMF", "warehouse", ' +
-    '"trade agreements", "configuration keys", "Power Platform"'
+    '"trade agreements", "configuration keys", "Power Platform", ' +
+    '"read Excel/CSV", "parallel batch", "direct SQL"'
   ),
   format: z.enum(['concise', 'detailed']).optional().default('concise').describe(
     'concise = quick reference (default), detailed = full explanation with code examples'
@@ -29,7 +30,7 @@ const XppKnowledgeArgsSchema = z.object({
 
 // ─── Knowledge Entry Type ───────────────────────────────────────────────────
 
-interface KnowledgeEntry {
+export interface KnowledgeEntry {
   id: string;
   title: string;
   /** Search keywords (lowercase) for matching */
@@ -48,7 +49,7 @@ interface KnowledgeEntry {
 
 // ─── Knowledge Base ─────────────────────────────────────────────────────────
 
-const KNOWLEDGE_BASE: KnowledgeEntry[] = [
+export const KNOWLEDGE_BASE: KnowledgeEntry[] = [
   // ── Batch / SysOperation ────────────────────────────────────────────────
   {
     id: 'sysoperation',
@@ -627,12 +628,12 @@ class MyReportDP extends SRSReportDataProviderBase
     examples: [
       {
         label: 'Module class — register the reference in loadModule() (correct API)',
-        code: `public class NumberSeqModuleAslRent extends NumberSeqApplicationModule
+        code: `public class NumberSeqModuleContosoRent extends NumberSeqApplicationModule
 {
     protected void loadModule()
     {
         NumberSeqDatatype datatype = NumberSeqDatatype::construct();
-        datatype.parmDatatypeId(extendedTypeNum(AslRentEquipmentId));
+        datatype.parmDatatypeId(extendedTypeNum(ContosoRentEquipmentId));
         datatype.parmReferenceHelp(literalStr("Equipment ID"));
         datatype.parmWizardIsContinuous(false);
         datatype.parmWizardIsManual(NoYes::No);
@@ -646,7 +647,7 @@ class MyReportDP extends SRSReportDataProviderBase
 
     public NumberSeqModule numberSeqModule()
     {
-        return NumberSeqModule::AslRent;  // your NumberSeqModule enum value
+        return NumberSeqModule::ContosoRent;  // your NumberSeqModule enum value
     }
 }`,
       },
@@ -659,10 +660,10 @@ public NumberSeqFormHandler numberSeqFormHandler()
     if (!numberSeqFormHandler)
     {
         numberSeqFormHandler = NumberSeqFormHandler::newForm(
-            AslRentParameters::numRefAslRentEquipmentId().NumberSequenceId, // RefRecId, not a string
+            ContosoRentParameters::numRefContosoRentEquipmentId().NumberSequenceId, // RefRecId, not a string
             element,
-            AslRentEquipmentTable_ds,
-            fieldNum(AslRentEquipmentTable, AslRentEquipmentId));
+            ContosoRentEquipmentTable_ds,
+            fieldNum(ContosoRentEquipmentTable, ContosoRentEquipmentId));
     }
     return numberSeqFormHandler;
 }`,
@@ -670,10 +671,10 @@ public NumberSeqFormHandler numberSeqFormHandler()
       {
         label: 'Fetching next number at runtime',
         code: `NumberSequenceReference numSeqRef =
-    NumberSeqReference::findReference(extendedTypeNum(AslRentEquipmentId));
+    NumberSeqReference::findReference(extendedTypeNum(ContosoRentEquipmentId));
 
 NumberSeq numSeq = NumberSeq::newGetNum(numSeqRef);
-AslRentEquipmentId newId = numSeq.num();
+ContosoRentEquipmentId newId = numSeq.num();
 
 // If the insert is rolled back, release the number:
 // numSeq.abort();`,
@@ -2165,6 +2166,218 @@ SysQuery::findOrCreateRange(
     ],
     related: ['coc', 'form-patterns'],
   },
+
+  // ── Reading Excel / CSV files in X++ ──────────────────────────────────────
+  {
+    id: 'file-readers',
+    title: 'Reading Excel (XLSX) & CSV Files in X++',
+    keywords: ['excel', 'xlsx', 'csv', 'openxml', 'spreadsheet', 'sysexcel', 'commaio', 'asciiio', 'file upload', 'fileupload', 'import file', 'read file', 'streamreader', 'fileuploadtemporarystoragestrategy', 'office', 'epplus'],
+    summary:
+      'Reading uploaded Excel/CSV in cloud D365FO must be STREAM-based: the AOS is sandboxed (no Office, no arbitrary file-system access). ' +
+      'Use the OpenXML SDK (DocumentFormat.OpenXml) for XLSX and a stream reader for CSV, both fed from a FileUpload stream — never COM Excel or file-path readers.',
+    migration: {
+      ax2012: 'SysExcelApplication / SysExcelWorksheet (COM), or CommaIo("C:\\\\file.csv") / AsciiIo file-path readers',
+      d365fo: 'DocumentFormat.OpenXml.Packaging.SpreadsheetDocument over a System.IO.Stream (XLSX); CommaTextStreamIo / System.IO.StreamReader over a stream (CSV)',
+    },
+    rules: [
+      'XLSX: use the OpenXML SDK — DocumentFormat.OpenXml.Packaging.SpreadsheetDocument::Open(stream, false). It is the only server-side-supported reader.',
+      '⛔ NEVER use SysExcelApplication / SysExcelWorksheet / Microsoft.Office.Interop.Excel — COM Office is NOT installed on cloud AOS; it throws at runtime.',
+      'CSV: read from a System.IO.Stream via CommaTextStreamIo (X++) or System.IO.StreamReader (.NET). ⛔ NEVER use file-path CommaIo / AsciiIo — the AOS has no access to a client/server file path.',
+      'Get the stream from a FileUpload control: FileUploadTemporaryStorageStrategy.uploadResultFileName() → File::UseFileFromURL / openFileUploadDialog returns the stream. In a SysOperation, accept the storage URL as a contract member.',
+      'CommaTextStreamIo.parmDelimiter / parmRecordDelimiter to set separators; check inFieldDelimiter for semicolon-separated regional CSVs.',
+      'Always wrap .NET interop in try/catch and dispose: use System.IO streams in a try/finally and call package.Dispose()/Close().',
+      'Encoding matters for CSV: read with the right System.Text.Encoding (UTF-8 vs ANSI/1252) or accented characters corrupt.',
+      'For large imports prefer the Data Management Framework (DMF) with a file entity — hand-rolled readers are for ad-hoc/lightweight cases.',
+    ],
+    examples: [
+      {
+        label: 'XLSX — OpenXML SDK over an uploaded stream',
+        code: `using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Spreadsheet;
+
+public void readExcel(System.IO.Stream _stream)
+{
+    SpreadsheetDocument doc = SpreadsheetDocument::Open(_stream, false);
+    try
+    {
+        WorkbookPart       wbPart = doc.get_WorkbookPart();
+        WorksheetPart      wsPart = wbPart.get_WorksheetParts().get_Item(0);
+        DocumentFormat.OpenXml.OpenXmlReader reader =
+            DocumentFormat.OpenXml.OpenXmlReader::Create(wsPart);
+
+        while (reader.Read())
+        {
+            if (reader.get_ElementType() == typeof(Row))
+            {
+                // read cells of the row …
+            }
+        }
+    }
+    finally
+    {
+        doc.Dispose();
+    }
+}`,
+      },
+      {
+        label: 'CSV — stream-based reader (cloud-safe)',
+        code: `public void readCsv(System.IO.Stream _stream)
+{
+    CommaTextStreamIo io = CommaTextStreamIo::constructForRead(_stream);
+    io.inFieldDelimiter(';');          // regional CSV
+    container line = io.read();         // header
+    while (io.status() == IO_Status::Ok)
+    {
+        line = io.read();
+        if (io.status() != IO_Status::Ok) break;
+        str itemId = conPeek(line, 1);
+        // …
+    }
+}`,
+      },
+    ],
+    related: ['data-management-framework', 'error-handling'],
+  },
+
+  // ── Parallel / multi-threaded batch ───────────────────────────────────────
+  {
+    id: 'parallel-batch',
+    title: 'Parallel (Multi-threaded) Batch Processing',
+    keywords: ['parallel batch', 'multithread', 'multi-threaded', 'batchheader', 'addruntimetask', 'runtime task', 'batch task', 'fan out', 'partition', 'threads', 'batch bundling', 'addtask', 'adddependency', 'concurrent'],
+    summary:
+      'To process large workloads in parallel, fan the work out into independent batch tasks added to one BatchHeader — the batch engine runs them concurrently across batch threads/AOS instances. ' +
+      'A single run() method is single-threaded; ⛔ never use System.Threading inside batch.',
+    rules: [
+      'Fan-out pattern: in the controller/operation, partition the work (e.g. by a key range) and add one runtime task per partition to a BatchHeader via batchHeader.addRuntimeTask(task, server).',
+      'Each task is its own RunBaseBatch (or SysOperation service) that processes ONE partition with its own ttsbegin/ttscommit scope — never one giant transaction across all data.',
+      '⛔ NEVER use System.Threading.Thread / Tasks inside batch code — the batch framework owns threading; manual threads are unsupported and unsafe with the session/company context.',
+      'Concurrency is controlled by the batch group + the AOS "Maximum batch threads" setting — not by your code. Size partitions so each task is a few minutes of work.',
+      'Use BatchHeader::getCurrentBatchHeader() when adding tasks from within an already-running batch (self-spawning); construct a fresh BatchHeader when scheduling from a UI controller.',
+      'Only add addDependency() between tasks when ordering is required — independent tasks with no dependencies maximise parallelism.',
+      'Make each task idempotent/resumable: a parallel task may be retried after a transient failure, so guard against double-processing (e.g. status flag, RecId watermark).',
+      'For data-parallel set work, also consider SysOperation with parmExecutionMode(SysOperationExecutionMode::ScheduledBatch) plus task fan-out — but the BatchHeader.addRuntimeTask split is the canonical approach.',
+    ],
+    examples: [
+      {
+        label: 'Fan out independent tasks to one BatchHeader',
+        code: `public void scheduleParallel(List _partitions)
+{
+    BatchHeader batchHeader = BatchHeader::construct();
+    ListEnumerator le = _partitions.getEnumerator();
+
+    while (le.moveNext())
+    {
+        MyPartitionTask task = new MyPartitionTask();   // extends RunBaseBatch
+        task.parmPartitionKey(le.current());
+        batchHeader.addRuntimeTask(task, this.parmCurrentBatch().RecId);
+    }
+
+    batchHeader.parmCaption("@MyModel:ParallelImport");
+    batchHeader.save();   // tasks now run concurrently across batch threads
+}`,
+      },
+    ],
+    related: ['sysoperation', 'transactions', 'performance'],
+  },
+
+  // ── Direct SQL execution ──────────────────────────────────────────────────
+  {
+    id: 'direct-sql',
+    title: 'Direct SQL Execution (Connection / Statement)',
+    keywords: ['direct sql', 'connection', 'userconnection', 'statement', 'resultset', 'sqlstatementexecutepermission', 'executequery', 'executeupdate', 'ado', 'raw sql', 'sqlsystem', 'forceliterals sql'],
+    summary:
+      'Direct SQL (Connection + Statement + ResultSet) bypasses the X++ data layer for performance-critical reads. ' +
+      'It REQUIRES an explicit SqlStatementExecutePermission assert, and must use parameters — never string-concatenate user input.',
+    rules: [
+      'Always assert before executing: new SqlStatementExecutePermission(sql).assert();  run the statement;  CodeAccessPermission::revertAssert();  — without the assert you get a CAS runtime error.',
+      '⛔ NEVER concatenate user input into the SQL string — SQL injection. Build parameterised statements; treat any external value as hostile.',
+      'Prefer X++ set-based operations (insert_recordset / update_recordset / delete_from) first — direct SQL is a last resort for reads X++ cannot express efficiently.',
+      'Use Connection for the current company/partition DB; UserConnection when you need an explicit, separate transaction scope.',
+      'Qualify by DataAreaId AND Partition in the WHERE clause — direct SQL does NOT apply the automatic company/partition filter that X++ select does.',
+      'Field/table names in raw SQL are the SQL names (e.g. RECID, DATAAREAID) — use fieldId2name/tableId2name or dbg names, not necessarily the AOT label-cased names.',
+      'Dispose/close ResultSet and Statement; keep the asserted scope as narrow as possible (assert immediately before execute, revert immediately after).',
+      'Direct DDL, cross-database and use of forceLiterals are restricted/forbidden on cloud — keep direct SQL to parameterised SELECTs against the AX database.',
+    ],
+    examples: [
+      {
+        label: 'SELECT with the required permission assert',
+        code: `Connection  conn = new Connection();
+Statement   stmt = conn.createStatement();
+// Filter values must be validated/whitelisted, never raw user input.
+str         custGroup = this.getValidatedCustGroup();
+str         sql  = strFmt(
+    "SELECT RECID, ACCOUNTNUM FROM CUSTTABLE "
+  + "WHERE DATAAREAID = '%1' AND CUSTGROUP = '%2'",
+    curext(), custGroup);
+
+// REQUIRED — assert immediately before execute, revert immediately after
+new SqlStatementExecutePermission(sql).assert();
+try
+{
+    ResultSet rs = stmt.executeQuery(sql);
+    while (rs.next())
+    {
+        int64 recId      = rs.getInt64(1);
+        str   accountNum = rs.getString(2);
+        // …
+    }
+}
+finally
+{
+    CodeAccessPermission::revertAssert();
+}`,
+      },
+    ],
+    related: ['set-based', 'select-statement', 'performance'],
+  },
+
+  // ── Menus & submenu nesting ────────────────────────────────────────────────
+  {
+    id: 'menu-navigation',
+    title: 'Menus, Menu Items & Submenu Nesting',
+    keywords: ['menu', 'submenu', 'sub-menu', 'navigation', 'axmenu', 'axmenuelement', 'menu item', 'nesting', 'inquiries and reports'],
+    summary:
+      'An AxMenu is a flat <Elements> collection of AxMenuElement entries. A menu ITEM reference ' +
+      '(display/action/output) is an AxMenuElementMenuItem. A NESTED SUBMENU (another AxMenu shown ' +
+      'as a folder inside this one, e.g. "Inquiries and reports") is a DIFFERENT element type — ' +
+      'AxMenuElementSubMenu — with its own field name, not a menu-item reference.',
+    rules: [
+      'Menu-item reference: <AxMenuElement i:type="AxMenuElementMenuItem"><Name>X</Name><MenuItemName>X</MenuItemName></AxMenuElement>',
+      'Submenu reference (nesting another AxMenu inside this one): <AxMenuElement i:type="AxMenuElementSubMenu"><Name>X</Name><SubMenu>X</SubMenu></AxMenuElement> — ' +
+        'the field is <SubMenu>, NOT <MenuName> and NOT <MenuItemName>. Verified against the real ' +
+        'Microsoft.Dynamics.AX.Metadata.dll type names: AxMenuElementMenuItem, AxMenuElementSubMenu, ' +
+        'AxMenuElementSeparator, AxMenuElementTile, AxMenuElementMenuReference (a different, legacy concept — not the one you want for a plain submenu).',
+      '❌ There is no tool operation to add a submenu automatically: add-menu-item-to-menu\'s menuItemToAddType only accepts "display"/"action"/"output" (menu ITEMS). To nest a submenu you must hand-author the <AxMenuElementSubMenu> element into the parent menu\'s XML (d365fo_file create/modify with overwrite) — this is a genuine, current tool gap, not a workaround to avoid.',
+      'A submenu is itself just a normal AxMenu object (create it with d365fo_file(action="create", objectType="menu")) — build its own items first, THEN add the AxMenuElementSubMenu reference to it from the parent menu.',
+      'This applies both to brand-new standalone menus AND to menu-extensions (AxMenuExtension) nesting into a standard menu (e.g. under "Inquiries and reports") — neither path has a dedicated add-submenu tool operation.',
+      'Always verify with build_d365fo_project after hand-authoring: a wrong element type name (e.g. the plausible-looking but nonexistent "AxMenuElementMenu"/"MenuName") is NOT caught by xppc itself — it only surfaces when the separate GenerateMetadata runtime-metadata step tries to deserialize the file ("cannot be deserialized as AxMenu ... no knowledge of any type that maps to this name").',
+    ],
+    examples: [
+      {
+        label: 'Parent menu with two items and one nested submenu',
+        code: `<AxMenu xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V1">
+  <Name>MyModule</Name>
+  <Label>@MyModel:MyModule</Label>
+  <Elements>
+    <AxMenuElement xmlns="" i:type="AxMenuElementMenuItem">
+      <Name>MyEquipment</Name>
+      <MenuItemName>MyEquipment</MenuItemName>
+    </AxMenuElement>
+    <AxMenuElement xmlns="" i:type="AxMenuElementMenuItem">
+      <Name>MyAgreement</Name>
+      <MenuItemName>MyAgreement</MenuItemName>
+    </AxMenuElement>
+    <!-- Nested submenu: MySetup is itself a separate AxMenu object -->
+    <AxMenuElement xmlns="" i:type="AxMenuElementSubMenu">
+      <Name>MySetup</Name>
+      <SubMenu>MySetup</SubMenu>
+    </AxMenuElement>
+  </Elements>
+</AxMenu>`,
+      },
+    ],
+    related: ['security', 'form-patterns'],
+  },
 ];
 
 // ─── Search Logic ───────────────────────────────────────────────────────────
@@ -2218,11 +2431,9 @@ function tokenize(topic: string): string[] {
 }
 
 /**
- * Minimum top score for a query to count as a confident match. A score below
- * this means no title/keyword/ID hit landed — only incidental summary-substring
- * overlap (1–2 pts) — so the results are surfaced as low-confidence suggestions
- * rather than authoritative answers. Without this floor, `number-sequence`
- * silently returned Electronic Reporting docs (the nearest substring hit).
+ * Minimum top score for a query to count as a confident match. Below this,
+ * only incidental summary-substring overlap landed (no title/keyword/ID hit),
+ * so results are surfaced as low-confidence suggestions, not authoritative answers.
  */
 const CONFIDENT_SCORE = 3;
 

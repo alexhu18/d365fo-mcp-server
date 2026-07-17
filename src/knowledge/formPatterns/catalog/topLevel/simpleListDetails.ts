@@ -6,9 +6,8 @@
 import type { FormPatternSpec, NodeSpec } from '../../types.js';
 import { actionPane } from './common.js';
 
-// Left nav list: a Group with Style=SidePanel. NOTE: SidePanel is a *Style*, not
-// a <Pattern> — the platform has no "SidePanel" sub-pattern (mining confirmed),
-// so this container carries no sub-pattern.
+// Left nav list: a Group with Style=SidePanel. SidePanel is a Style, not a
+// sub-pattern, so this container carries no sub-pattern.
 const navigationListPanel: NodeSpec = {
   id: 'NavigationList',
   controlTypes: ['Group'],
@@ -18,7 +17,7 @@ const navigationListPanel: NodeSpec = {
   extraChildren: 'any',
 };
 
-// Always-visible header fields above the detail tabs (FieldsFieldGroups group).
+// Always-visible header fields above the detail tabs.
 const detailsHeader: NodeSpec = {
   id: 'DetailsHeader',
   controlTypes: ['Group'],
@@ -28,8 +27,8 @@ const detailsHeader: NodeSpec = {
   extraChildren: 'any',
 };
 
-// The detail FastTabs ("Details Tabs"). Optional in the catalog so clones of
-// older layouts (Tab nested in a Group) are not rejected; the generator emits it.
+// The detail FastTabs ("Details Tabs"). Optional so clones of older layouts
+// (Tab nested in a Group) are not rejected; the generator emits it.
 const detailsTabs: NodeSpec = {
   id: 'DetailsTabs',
   controlTypes: ['Tab', 'Group'],

@@ -33,17 +33,14 @@ export interface EnhancedClassInfo extends XppClassInfo {
 }
 
 export class EnhancedXppParser {
-  constructor() {
-    // Enhanced parser works with already parsed XML data
-  }
+  constructor() {}
 
   /**
    * Extract semantic tags from method name and source code
    */
   extractSemanticTags(source: string, className: string, methodName: string): string[] {
     const tags = new Set<string>();
-    
-    // Tags based on method name patterns
+
     const namePatterns: Record<string, RegExp> = {
       'validation': /validate|check|verify|isValid|canSubmit/i,
       'initialization': /init|create|new|construct|setup|build/i,
@@ -61,7 +58,6 @@ export class EnhancedXppParser {
       }
     }
     
-    // Tags based on code content
     const contentPatterns: Record<string, RegExp> = {
       'transaction': /\b(ttsbegin|ttscommit|ttsabort)\b/i,
       'error-handling': /\b(throw|error\(|warning\(|try|catch)\b/i,
@@ -79,7 +75,6 @@ export class EnhancedXppParser {
       }
     }
     
-    // Tags based on class name (domain context)
     const classPatterns: Record<string, RegExp> = {
       'customer': /^Cust/,
       'vendor': /^Vend/,
@@ -107,15 +102,13 @@ export class EnhancedXppParser {
    */
   calculateComplexity(source: string): number {
     const lines = source.split('\n').filter(line => line.trim().length > 0).length;
-    
-    // Count control structures
+
     const ifCount = (source.match(/\bif\s*\(/gi) || []).length;
     const loopCount = (source.match(/\b(for|while|do)\s*\(/gi) || []).length;
     const switchCount = (source.match(/\bswitch\s*\(/gi) || []).length;
     const caseCount = (source.match(/\bcase\b/gi) || []).length;
     const catchCount = (source.match(/\bcatch\b/gi) || []).length;
-    
-    // Complexity formula: lines + weighted control structures
+
     return lines + (ifCount * 2) + (loopCount * 3) + (switchCount * 2) + caseCount + (catchCount * 2);
   }
 
@@ -124,19 +117,17 @@ export class EnhancedXppParser {
    */
   extractUsedTypes(source: string): string[] {
     const types = new Set<string>();
-    
-    // Pattern: TypeName variableName or TypeName::staticMethod
+
     const patterns = [
-      /\b([A-Z][a-zA-Z0-9_]*)\s+[a-z]/g,           // TypeName varName
-      /\b([A-Z][a-zA-Z0-9_]*)::/g,                  // TypeName::
-      /new\s+([A-Z][a-zA-Z0-9_]*)\s*\(/g,          // new TypeName(
+      /\b([A-Z][a-zA-Z0-9_]*)\s+[a-z]/g,
+      /\b([A-Z][a-zA-Z0-9_]*)::/g,
+      /new\s+([A-Z][a-zA-Z0-9_]*)\s*\(/g,
     ];
     
     for (const pattern of patterns) {
       let match;
       while ((match = pattern.exec(source)) !== null) {
         const typeName = match[1];
-        // Filter out common keywords
         if (!['Int', 'String', 'Real', 'Boolean', 'Date', 'DateTime', 'Guid', 'Int64'].includes(typeName)) {
           types.add(typeName);
         }
@@ -151,11 +142,10 @@ export class EnhancedXppParser {
    */
   extractMethodCalls(source: string): string[] {
     const methods = new Set<string>();
-    
-    // Pattern: .methodName( or ::methodName(
+
     const patterns = [
-      /\.([a-z][a-zA-Z0-9_]*)\s*\(/g,              // .methodName(
-      /::([a-z][a-zA-Z0-9_]*)\s*\(/g,              // ::methodName(
+      /\.([a-z][a-zA-Z0-9_]*)\s*\(/g,
+      /::([a-z][a-zA-Z0-9_]*)\s*\(/g,
     ];
     
     for (const pattern of patterns) {
@@ -176,13 +166,11 @@ export class EnhancedXppParser {
     const lines = source.split('\n');
     
     for (const line of lines) {
-      // Single-line comments
       const commentMatch = line.match(/\/\/\s*(.+)/);
       if (commentMatch) {
         commentLines.push(commentMatch[1].trim());
       }
-      
-      // Multi-line comment blocks
+
       const blockMatch = line.match(/\/\*\s*(.+?)\s*\*\//);
       if (blockMatch) {
         commentLines.push(blockMatch[1].trim());
@@ -210,11 +198,9 @@ export class EnhancedXppParser {
    * Parse method with enhanced metadata
    */
   parseMethodEnhanced(method: XppMethodInfo, parentClass: string): EnhancedMethodInfo {
-    // method parameter is already a parsed XppMethodInfo object with lowercase properties
     const source = method.source || '';
     const methodName = method.name || 'unknown';
-    
-    // Enhanced metadata
+
     const enhanced: EnhancedMethodInfo = {
       ...method,
       sourceSnippet: this.getFirstLines(source, 10),
@@ -234,7 +220,6 @@ export class EnhancedXppParser {
   generateUsageExample(className: string, method: EnhancedMethodInfo): string | undefined {
     const isStatic = method.isStatic;
     const params = method.parameters.map(p => {
-      // Generate example values based on type
       if (p.type.toLowerCase().includes('int')) return '0';
       if (p.type.toLowerCase().includes('str')) return '""';
       if (p.type.toLowerCase().includes('bool')) return 'false';
@@ -254,16 +239,13 @@ export class EnhancedXppParser {
    */
   extractClassDependencies(classInfo: XppClassInfo): string[] {
     const dependencies = new Set<string>();
-    
-    // Add inherited class
+
     if (classInfo.extends) {
       dependencies.add(classInfo.extends);
     }
-    
-    // Add implemented interfaces
+
     classInfo.implements?.forEach(i => dependencies.add(i));
-    
-    // Extract from all methods
+
     for (const method of classInfo.methods) {
       const types = this.extractUsedTypes(method.source);
       types.forEach(t => dependencies.add(t));
@@ -277,8 +259,7 @@ export class EnhancedXppParser {
    */
   generateClassTags(classInfo: XppClassInfo): string[] {
     const tags = new Set<string>();
-    
-    // Based on class name
+
     if (/Controller|Engine|Service|Manager/i.test(classInfo.name)) {
       tags.add('business-logic');
     }
@@ -294,16 +275,14 @@ export class EnhancedXppParser {
     if (/Handler/i.test(classInfo.name)) {
       tags.add('event-handler');
     }
-    
-    // Based on class attributes
+
     if (classInfo.isAbstract) {
       tags.add('abstract');
     }
     if (classInfo.isFinal) {
       tags.add('final');
     }
-    
-    // Based on methods
+
     const hasMainMethod = classInfo.methods.some(m => m.name === 'main' && m.isStatic);
     if (hasMainMethod) {
       tags.add('runnable');
@@ -316,7 +295,6 @@ export class EnhancedXppParser {
    * Detect pattern type for a class
    */
   detectClassPatternType(className: string, methods: XppMethodInfo[]): string {
-    // Pattern detection based on class name suffix
     if (className.endsWith('Helper')) return 'Helper';
     if (className.endsWith('Service')) return 'Service';
     if (className.endsWith('Controller')) return 'Controller';
@@ -329,23 +307,19 @@ export class EnhancedXppParser {
     if (className.endsWith('Validator')) return 'Validator';
     if (className.endsWith('Provider')) return 'Provider';
     if (className.endsWith('Adapter')) return 'Adapter';
-    
-    // Pattern detection based on method patterns
+
     const methodNames = methods.map(m => m.name.toLowerCase());
-    
-    // Repository pattern: find, get, save, update, delete
+
     const repoMethods = ['find', 'get', 'save', 'update', 'delete', 'insert'];
     if (methodNames.filter(n => repoMethods.some(rm => n.includes(rm))).length >= 3) {
       return 'Repository';
     }
-    
-    // Service pattern: process, execute, handle, run
+
     const serviceMethods = ['process', 'execute', 'handle', 'run', 'perform'];
     if (methodNames.filter(n => serviceMethods.some(sm => n.includes(sm))).length >= 2) {
       return 'Service';
     }
-    
-    // Validator pattern: validate, check, verify, isValid
+
     const validatorMethods = ['validate', 'check', 'verify', 'isvalid'];
     if (methodNames.filter(n => validatorMethods.some(vm => n.includes(vm))).length >= 2) {
       return 'Validator';
@@ -359,21 +333,18 @@ export class EnhancedXppParser {
    */
   generateTypicalUsages(className: string, methods: XppMethodInfo[]): string[] {
     const usages: string[] = [];
-    
-    // Look for static methods - these are common entry points
+
     const staticMethods = methods.filter(m => m.isStatic);
     for (const method of staticMethods.slice(0, 3)) {
       const params = method.parameters.map(p => this.generateExampleValue(p.type)).join(', ');
       usages.push(`${className}::${method.name}(${params});`);
     }
-    
-    // Look for main/run methods
+
     const mainMethod = methods.find(m => m.name === 'main' && m.isStatic);
     if (mainMethod) {
       usages.push(`${className}::main(args);`);
     }
-    
-    // Instance usage pattern
+
     const publicMethods = methods.filter(m => !m.isStatic && m.visibility === 'public');
     if (publicMethods.length > 0) {
       const method = publicMethods[0];
@@ -406,16 +377,14 @@ export class EnhancedXppParser {
    */
   generateRelatedMethods(method: XppMethodInfo, allMethods: XppMethodInfo[]): string[] {
     const related = new Set<string>();
-    
-    // Methods that share similar names (prefix/suffix)
+
     const baseMethodName = method.name.replace(/(get|set|is|has|can|validate|check)/, '');
     for (const other of allMethods) {
       if (other.name !== method.name && other.name.includes(baseMethodName)) {
         related.add(other.name);
       }
     }
-    
-    // Methods called by this method
+
     if (method.methodCalls) {
       for (const call of method.methodCalls) {
         const found = allMethods.find(m => m.name === call);
@@ -424,8 +393,7 @@ export class EnhancedXppParser {
         }
       }
     }
-    
-    // Methods with similar tags
+
     if (method.tags) {
       for (const other of allMethods) {
         if (other.name !== method.name && other.tags) {
@@ -451,16 +419,14 @@ export class EnhancedXppParser {
     };
     
     const source = method.source;
-    
-    // Detect initialization patterns
+
     if (source.includes('new ')) {
       const initMatch = source.match(/new\s+\w+\s*\([^)]*\)/g);
       if (initMatch) {
         patterns.initialization = initMatch.slice(0, 3);
       }
     }
-    
-    // Detect method call sequences
+
     const lines = source.split('\n');
     const sequences: string[] = [];
     for (let i = 0; i < lines.length - 1; i++) {
@@ -471,8 +437,7 @@ export class EnhancedXppParser {
       }
     }
     patterns.commonSequences = sequences.slice(0, 3);
-    
-    // Detect error handling patterns
+
     if (source.includes('try') || source.includes('catch')) {
       const tryMatch = source.match(/try\s*{[^}]+}\s*catch[^{]*{[^}]+}/s);
       if (tryMatch) {

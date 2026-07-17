@@ -7,12 +7,20 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
 import { tryBridgeSecurityArtifact } from '../bridge/index.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 
 const SecurityArtifactInfoArgsSchema = z.object({
   name: z.string().describe('Name of the security privilege, duty, or role'),
   artifactType: z.enum(['privilege', 'duty', 'role']).describe('Type of security artifact'),
   includeChain: z.boolean().optional().default(true).describe('Walk the full hierarchy (role→duties→privileges→entry points)'),
 });
+
+/** Symbol type backing each artifactType. */
+const SYMBOL_TYPE = {
+  privilege: 'security-privilege',
+  duty: 'security-duty',
+  role: 'security-role',
+} as const;
 
 export async function securityArtifactInfoTool(
   request: CallToolRequest,
@@ -21,21 +29,31 @@ export async function securityArtifactInfoTool(
   try {
     const args = SecurityArtifactInfoArgsSchema.parse(request.params.arguments);
 
-    // ── Bridge fast-path (C# IMetadataProvider) ──
+    // Resolve the caller's casing to the canonical AOT name before anything else
+    // (#686) — the bridge matches by exact name too, so canonicalizing here fixes
+    // the bridge path as well as the SQLite fallback below.
+    let name = args.name;
+    try {
+      name = canonicalSymbolName(
+        context.symbolIndex.getReadDb(), args.name, [SYMBOL_TYPE[args.artifactType]],
+      ) ?? args.name;
+    } catch { /* DB not available — bridge may still resolve it */ }
+
+    // Bridge fast-path (C# IMetadataProvider)
     const bridgeResult = await tryBridgeSecurityArtifact(
-      context.bridge, args.name, args.artifactType, args.includeChain ?? true,
+      context.bridge, name, args.artifactType, args.includeChain ?? true,
     );
     if (bridgeResult) return bridgeResult;
 
-    // ── Fallback: SQLite index ──
+    // Fallback: SQLite index
     const rdb = context.symbolIndex.getReadDb();
 
     if (args.artifactType === 'privilege') {
-      return getPrivilegeInfo(rdb, args.name, args.includeChain ?? true);
+      return getPrivilegeInfo(rdb, name, args.includeChain ?? true);
     } else if (args.artifactType === 'duty') {
-      return getDutyInfo(rdb, args.name, args.includeChain ?? true);
+      return getDutyInfo(rdb, name, args.includeChain ?? true);
     } else {
-      return getRoleInfo(rdb, args.name, args.includeChain ?? true);
+      return getRoleInfo(rdb, name, args.includeChain ?? true);
     }
   } catch (error) {
     return {
@@ -51,7 +69,6 @@ export async function securityArtifactInfoTool(
 }
 
 function getPrivilegeInfo(db: any, name: string, _includeChain: boolean) {
-  // Get the privilege symbol
   const symbol = db.prepare(
     `SELECT name, description, signature, model, file_path FROM symbols WHERE name = ? AND type = 'security-privilege' LIMIT 1`
   ).get(name) as any;
@@ -63,12 +80,10 @@ function getPrivilegeInfo(db: any, name: string, _includeChain: boolean) {
     };
   }
 
-  // Get entry points
   const entryPoints = db.prepare(
     `SELECT entry_point_name, object_type, access_level FROM security_privilege_entries WHERE privilege_name = ? ORDER BY entry_point_name`
   ).all(name) as any[];
 
-  // Find which duties use this privilege
   const duties = db.prepare(
     `SELECT DISTINCT duty_name FROM security_duty_privileges WHERE privilege_name = ? ORDER BY duty_name`
   ).all(name) as any[];
@@ -122,7 +137,7 @@ function getDutyInfo(db: any, name: string, includeChain: boolean) {
     output += `\nPrivileges (${privileges.length}):\n`;
 
     if (includeChain) {
-      // A4: Batched query — fetch ALL entry points for all privileges in one query
+      // Batched query — fetch all entry points for all privileges in one query
       const privNames = privileges.map((p: any) => p.privilege_name);
       const ph = privNames.map(() => '?').join(',');
       const allEps = db.prepare(
@@ -184,7 +199,7 @@ function getRoleInfo(db: any, name: string, includeChain: boolean) {
     output += `\nDuties (${duties.length}):\n`;
 
     if (includeChain) {
-      // A4: Batched query — fetch ALL privileges for all duties in one query
+      // Batched query — fetch all privileges for all duties in one query
       const dutyNames = duties.map((d: any) => d.duty_name);
       const ph = dutyNames.map(() => '?').join(',');
       const allPrivs = db.prepare(
@@ -207,7 +222,7 @@ function getRoleInfo(db: any, name: string, includeChain: boolean) {
         output += '\n';
       }
 
-      // Batched: count total entry points across all duties' privileges
+      // Count total entry points across all duties' privileges
       const allPrivNames = [...new Set(allPrivs.map(p => p.privilege_name))];
       if (allPrivNames.length > 0) {
         const ph2 = allPrivNames.map(() => '?').join(',');

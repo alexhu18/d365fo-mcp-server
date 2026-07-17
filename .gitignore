@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build outputs
 dist/
@@ -50,6 +49,7 @@ test-model-tags*/
 
 # MCP Configuration
 .mcp.json
+mcp-config-suggestion.json
 
 # OS
 .DS_Store
@@ -84,3 +84,6 @@ bridge/D365MetadataBridge/bridge-stderr.log
 .cache/
 deployment.zip
 .claude/settings.local.json
+
+# Transient git worktrees created by Claude Code subagents
+.claude/worktrees/

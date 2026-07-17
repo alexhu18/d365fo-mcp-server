@@ -10,31 +10,14 @@
  */
 
 /**
- * Tools that require local Windows VM filesystem access (K:\ drive) or read
- * local server state not available from Azure (e.g. in-memory config, .mcp.json).
+ * Tools that need local Windows VM filesystem access (K:\ drive) or local server
+ * state not reachable from Azure. Excluded in 'read-only' mode; the only tools
+ * exposed in 'write-only' (local companion) mode. These skip the dbReady await
+ * since they don't need the symbol database.
  *
- * These tools have three properties in common:
- *  1. They access local paths (K:\PackagesLocalDirectory, K:\VSProjects, .mcp.json)
- *     that are NOT reachable from an Azure-hosted instance.
- *  2. They do NOT need the symbol database — they skip the dbReady await.
- *  3. They are the tools available in 'write-only' (local companion) mode.
- *
- * The set also includes the bridge-backed READ surface (get_object_info, get_method_source,
- * get_method_signature) which works in write-only mode via IMetadataProvider — no SQLite needed.
- * This allows Copilot to verify objects it just created without an Azure re-deploy.
- *
- * - Excluded in 'read-only' mode (Azure deployment can't access local K:\ paths)
- * - The only tools exposed in 'write-only' mode (lightweight local companion)
- *
- * Members:
- *  create_d365fo_file   — writes XML to K:\PackagesLocalDirectory
- *  modify_d365fo_file   — edits XML on K:\PackagesLocalDirectory
- *  labels (write actions — create/rename) — writes to / rewrites K:\PackagesLocalDirectory label files + source references
- *  verify_d365fo_project — reads .rnrproj from K:\VSProjects
- *  get_workspace_info   — scans .rnrproj via D365FO_SOLUTIONS_PATH (K:\); reads
- *                         .mcp.json + in-memory config/stdio session state;
- *                         on Azure would return irrelevant server info, not dev
- *                         workspace info — so it's excluded from read-only mode
+ * Also includes the bridge-backed read surface (get_method) which works via
+ * IMetadataProvider without SQLite, so Copilot can verify objects it just
+ * created without an Azure re-deploy.
  */
 export const LOCAL_TOOLS = new Set([
   'verify_d365fo_project',
@@ -46,36 +29,22 @@ export const LOCAL_TOOLS = new Set([
   'review_workspace_changes',
   'undo_last_modification',
   'get_workspace_info',
-  // Bridge-backed member reader: works in write-only mode via IMetadataProvider
-  // (no SQLite needed — bridge reads directly from disk). get_method unifies the
-  // former get_method_signature + get_method_source via the `include` discriminator.
-  // The bridge-backed OBJECT readers (class/table/form/…) are now reached through
-  // get_object_info, which is in ALWAYS_TOOLS so it stays available in every mode.
   'get_method',
 ]);
 
 /**
- * Tools exposed in EVERY server mode (full / read-only / write-only), bypassing
- * the LOCAL_TOOLS partition.
- *
- * get_object_info dispatches to both bridge-backed types (class/table/… — usable
- * on the local VM / write-only companion) and SQLite-backed types
- * (service/map/config-key/security-policy/macro — usable on Azure read-only).
- * Because it spans both localities it cannot live in a single partition, so it is
- * always published; per-type it returns a clear message when its backing source
- * is unavailable in the current mode.
+ * Tools exposed in EVERY server mode, bypassing the LOCAL_TOOLS partition,
+ * because each spans both localities and gates unavailable actions at runtime:
+ *  - get_object_info: dispatches to bridge-backed types (local VM) and
+ *    SQLite-backed types (Azure read-only).
+ *  - labels: read actions (search/info) work on Azure; write actions
+ *    (create/rename) need K:\ and error clearly when unreachable.
+ *  - d365fo_file: generate works on Azure; create/modify need K:\ and error
+ *    clearly when unreachable.
  */
 export const ALWAYS_TOOLS = new Set([
   'get_object_info',
-  // `labels` mixes read (search/info) and write (create/rename) actions.
-  // The read actions must work on Azure read-only; the write actions need K:\
-  // access and are gated at runtime by the underlying handler returning a clear
-  // error when the local filesystem isn't reachable.
   'labels',
-  // `d365fo_file` mixes a read-capable action (generate → XML text, works on
-  // Azure read-only) with write actions (create/modify → need K:\). Same gating
-  // approach as `labels`: the create/modify handlers return a clear error when
-  // the local filesystem isn't reachable.
   'd365fo_file',
 ]);
 
@@ -99,3 +68,14 @@ export const SERVER_MODE: ServerMode = (() => {
   if (raw === 'write-only' || raw === 'writeonly') return 'write-only';
   return 'full';
 })();
+
+/**
+ * Single source of truth for whether a tool is callable in a given server mode.
+ * Used by BOTH the ListTools filter (mcpServer) and the runtime call gate
+ * (toolHandler) so the advertised tool list and call-time enforcement can
+ * never drift apart. ALWAYS_TOOLS bypass the LOCAL_TOOLS partition in every mode.
+ */
+export function isToolAllowedInMode(mode: ServerMode, toolName: string): boolean {
+  if (mode === 'full' || ALWAYS_TOOLS.has(toolName)) return true;
+  return mode === 'read-only' ? !LOCAL_TOOLS.has(toolName) : LOCAL_TOOLS.has(toolName);
+}

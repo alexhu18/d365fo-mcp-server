@@ -22,7 +22,7 @@ export const fieldsFieldGroups: SubPatternSpec = {
       id: 'FieldGroup',
       controlTypes: ['Group'],
       occurrence: 'zeroOrMore',
-      // Only one level of group depth is allowed — nested groups are rejected
+      // Only one level of group depth is allowed.
       extraChildren: INPUT_CONTROL_TYPES,
     },
   ],
@@ -99,7 +99,7 @@ export const fieldsSubPatterns: SubPatternSpec[] = [
   imagePreview,
 ];
 
-// ── Additional mined sub-patterns ─────────────────────────────────────────────
+// Additional mined sub-patterns
 
 /** Sentinel for containers with no standard sub-pattern. Suppresses FP001. */
 export const customSubPattern: SubPatternSpec = {

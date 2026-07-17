@@ -23,10 +23,8 @@ interface DownloadOptions {
 async function validateDatabase(filePath: string): Promise<boolean> {
   try {
     const db = new Database(filePath, { readonly: true });
-    
-    // Use quick_check instead of integrity_check for faster startup
-    // quick_check: 10-100x faster, still validates most corruption issues
-    // integrity_check: thorough but very slow (minutes on large DBs)
+
+    // quick_check is much faster than integrity_check and sufficient here.
     const result = db.pragma('quick_check') as Array<{ quick_check: string }>;
     db.close();
     
@@ -45,12 +43,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Remove a SQLite temp file together with its companion WAL files.
- * When validateDatabase() opens a file SQLite creates <file>-shm and <file>-wal
- * alongside it.  If the main file is later deleted (e.g. on validation failure)
- * those WAL files become orphaned.  On the next download attempt SQLite finds the
- * orphaned WAL for the NEW temp file and tries to replay it — causing
- * "unable to open database" / deserialization errors.
+ * Remove a SQLite temp file together with its companion -shm/-wal files, so a
+ * stale WAL is never replayed against a later temp file of the same name.
  */
 async function cleanupTempFiles(tmpPath: string): Promise<void> {
   for (const suffix of ['', '-shm', '-wal']) {
@@ -69,7 +63,7 @@ export async function downloadDatabaseFromBlob(options?: DownloadOptions): Promi
   const localPath = options?.localPath || process.env.DB_PATH || './data/xpp-metadata.db';
   const labelsDbPath = localPath.replace('.db', '-labels.db');
   const maxRetries = options?.maxRetries || 3;
-  const timeoutMs = options?.timeoutMs || 300000; // 5 minutes default
+  const timeoutMs = options?.timeoutMs || 300000;
 
   if (!connectionString) {
     throw new Error('Azure Storage connection string not configured');
@@ -82,40 +76,32 @@ export async function downloadDatabaseFromBlob(options?: DownloadOptions): Promi
   console.log(`   Labels path: ${labelsDbPath}`);
   console.log(`   Timeout: ${timeoutMs / 1000}s`);
 
-  // Ensure directory exists
   const dir = path.dirname(localPath);
   await fs.mkdir(dir, { recursive: true });
 
   const tmpPath = `${localPath}.tmp`;
-  
-  // Retry loop
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`   Attempt ${attempt}/${maxRetries}...`);
-      
-      // Clean up temp file + companion SQLite WAL files if they exist
+
       await cleanupTempFiles(tmpPath);
 
-      // Create blob service client
       const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
       const containerClient = blobServiceClient.getContainerClient(containerName);
       const blobClient = containerClient.getBlobClient(blobName);
 
-      // Check if blob exists
       const exists = await blobClient.exists();
       if (!exists) {
         throw new Error(`Blob "${blobName}" not found in container "${containerName}"`);
       }
 
-      // Get blob properties
       const properties = await blobClient.getProperties();
       const sizeInMB = ((properties.contentLength || 0) / (1024 * 1024)).toFixed(2);
       console.log(`   Size: ${sizeInMB} MB`);
 
-      // Download to temporary file with timeout.
-      // AbortController cancels the underlying stream so it stops writing to
-      // tmpPath after the deadline fires (unlike Promise.race which leaves the
-      // stream running and producing a corrupted temp file).
+      // AbortController stops the stream from writing past the deadline
+      // (Promise.race would leave it running and produce a corrupted temp file).
       const startTime = Date.now();
       const abortCtrl = new AbortController();
       const timeoutId = setTimeout(() => abortCtrl.abort(), timeoutMs);
@@ -205,17 +191,14 @@ export async function downloadDatabaseFromBlob(options?: DownloadOptions): Promi
     } catch (error) {
       console.error(`   ❌ Attempt ${attempt} failed:`, error);
       
-      // Clean up temp file + companion SQLite WAL files
+      // Clean up temp file + companion SQLite WAL files.
+      // NEVER touch localPath here: the download writes only to tmpPath and
+      // renames after validation, so on any failure the previous database at
+      // localPath is still the last known-good copy — deleting it would turn a
+      // transient network outage into total data loss.
       await cleanupTempFiles(tmpPath);
-      
-      // If this was the last attempt, also clean up potentially corrupted final file
+
       if (attempt === maxRetries) {
-        console.log(`   🧹 Cleaning up potentially corrupted database file...`);
-        try {
-          await fs.unlink(localPath);
-        } catch {
-          // Ignore if doesn't exist
-        }
         throw error;
       }
       

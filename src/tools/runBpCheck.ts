@@ -30,7 +30,6 @@ export const runBpCheckTool = async (params: any, _context: any) => {
     const configManager = getConfigManager();
     await configManager.ensureLoaded();
 
-    // Resolve model name
     const modelName = params.modelName || configManager.getModelName();
     if (!modelName) {
       return {
@@ -39,21 +38,14 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       };
     }
 
-    // Resolve project path — optional in UDE environments where xppbp no longer requires -vsproj
+    // Optional in UDE environments, where xppbp no longer requires -vsproj
     const resolvedProjectPath = params.projectPath || await configManager.getProjectPath();
 
-    // In UDE the custom packages path (ModelStoreFolder) is the metadata root,
-    // while the framework packages path (FrameworkDirectory) is the binaries root.
-    // For traditional environments both roles are served by packagesRoot.
-    //
-    // Path resolution — intentionally mirrors build_d365fo_project:
-    //   Priority 1: XPP config file (UDE — authoritative when present).
-    //               Note: when an XPP config exists, any customPackagesPath /
-    //               microsoftPackagesPath values in .mcp.json are NOT consulted.
-    //               Use params.packagePath to override the final packagesRoot.
-    //   Priority 2: configManager methods (.mcp.json context overrides, then
-    //               XPP config auto-detection as a second chance for CHE).
-    //   Priority 3: Well-known PackagesLocalDirectory probe (CHE fallback).
+    // Path resolution mirrors build_d365fo_project: (1) XPP config file if present — authoritative,
+    // .mcp.json custom/microsoft packages paths are ignored in that case; (2) configManager
+    // (.mcp.json overrides, then XPP auto-detection); (3) well-known PackagesLocalDirectory probe (CHE).
+    // In UDE, customPackagesPath (ModelStoreFolder) is metadata root, microsoftPackagesPath
+    // (FrameworkDirectory) is binaries root; in CHE both roles share packagesRoot.
     let customPackagesPath: string | null = null;
     let microsoftPackagesPath: string | null = null;
     const xppConfig = await configManager.getActiveXppConfig();
@@ -62,11 +54,9 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       microsoftPackagesPath = xppConfig.microsoftPackagesPath;
     }
 
-    // Priority 2: configManager explicit methods (.mcp.json overrides)
     if (!customPackagesPath)    customPackagesPath    = await configManager.getCustomPackagesPath();
     if (!microsoftPackagesPath) microsoftPackagesPath = await configManager.getMicrosoftPackagesPath();
 
-    // Priority 3: probe well-known PackagesLocalDirectory locations (CHE)
     if (!microsoftPackagesPath) {
       for (const candidate of [
         'C:\\AOSService\\PackagesLocalDirectory',
@@ -78,17 +68,16 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       }
     }
 
-    // In CHE, custom and Microsoft packages share the same PackagesLocalDirectory
     if (!customPackagesPath && microsoftPackagesPath) customPackagesPath = microsoftPackagesPath;
 
-    // Final packagesRoot: explicit param override → microsoft path → custom path → legacy env var → hardcoded default
+    // packagesRoot priority: explicit param → microsoft path → custom path → legacy env var → hardcoded default
     const packagesRoot = params.packagePath
       || microsoftPackagesPath
       || customPackagesPath
       || configManager.getPackagePath()
       || 'K:\\AosService\\PackagesLocalDirectory';
 
-    // Locate xppbp.exe — always in the Microsoft/framework packages Bin, not the custom model folder.
+    // xppbp.exe always lives in the Microsoft/framework packages Bin, not the custom model folder.
     const xppbpPath = path.join(packagesRoot, 'Bin', 'xppbp.exe');
     try {
       await fs.access(xppbpPath);
@@ -99,30 +88,16 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       };
     }
 
-    // metadataPath: where X++ source XML lives (custom model metadata)
+    // metadataPath: X++ source XML (custom model metadata). compilerMetadataPath: compiled
+    // binaries + framework metadata (UDE: Microsoft packages root; CHE: same as metadataPath).
     const metadataPath = customPackagesPath || packagesRoot;
-    // compilerMetadataPath: where compiled binaries and framework metadata live.
-    // In UDE: the framework/Microsoft packages root
-    // In CHE: same as metadataPath (both roles in one PackagesLocalDirectory)
     const compilerMetadataPath = microsoftPackagesPath || packagesRoot;
 
     /**
-     * xppbp.exe CLI flag styles observed across versions:
-     *
-     *   Style A — colon separator (older):
-     *     -metadata:<path>  -module:<name>  -model:<name>  -compilerMetadata:<path>  -all
-     *     -filter:<name>  (filter by element name)
-     *
-     *   Style B — equals separator (newer, 10.0.24+):
-     *     -metadata=<path>  -module=<name>  -model=<name>  -compilerMetadata=<path>  -all
-     *     class:<Name>  (positional element-type filter, e.g. "class:MyClass")
-     *
-     *   Style C — fallback (when -compilerMetadata is not recognized):
-     *     -metadata:<path>  -packagesRoot:<path>  -module:<name>  -model:<name>  -all
-     *
-     * We try A → B → C in order, stopping at the first that doesn't return help text.
-     * In UDE, metadataPath and compilerMetadataPath are different directories.
-     * In CHE, they may be the same (both in PackagesLocalDirectory).
+     * xppbp.exe CLI flag styles vary by version — tried in order (A → B → C), stopping at
+     * the first that doesn't return help text: A) colon separator (older), B) equals
+     * separator with positional "type:Name" filter (10.0.24+), C) -packagesRoot fallback
+     * when -compilerMetadata is not recognized.
      */
 
     // Style A — colon separator with -compilerMetadata
@@ -183,7 +158,7 @@ export const runBpCheckTool = async (params: any, _context: any) => {
     const { combined, lastStdout, lastStderr } = await withOperationLock(
       `bp:${modelName}`,
       async () => {
-        // --- Attempt 1: colon style with -compilerMetadata: (UDE: separates custom and framework paths) ---
+        // Attempt 1: colon style with -compilerMetadata: (UDE: separates custom and framework paths)
         const args1 = buildArgsColonStyle('-metadata:', '-compilerMetadata:');
         console.error(`[run_bp_check] Attempt 1 (-compilerMetadata: colon): "${xppbpPath}" ${args1.join(' ')}`);
         try {
@@ -194,7 +169,7 @@ export const runBpCheckTool = async (params: any, _context: any) => {
         }
         let localCombined = [stdout, stderr].filter(Boolean).join('\n').trim();
 
-        // --- Attempt 2: equals style with -compilerMetadata= (xppbp 10.0.24+) ---
+        // Attempt 2: equals style with -compilerMetadata= (xppbp 10.0.24+)
         if (HELP_TEXT_PATTERN.test(localCombined) || localCombined === '') {
           const args2 = buildArgsEqStyle({ compilerMetadata: true });
           console.error(`[run_bp_check] Attempt 2 (-compilerMetadata= equals): "${xppbpPath}" ${args2.join(' ')}`);
@@ -207,7 +182,7 @@ export const runBpCheckTool = async (params: any, _context: any) => {
           localCombined = [stdout, stderr].filter(Boolean).join('\n').trim();
         }
 
-        // --- Attempt 3: equals style with -packagesRoot= (fallback for older xppbp) ---
+        // Attempt 3: equals style with -packagesRoot= (fallback for older xppbp)
         if (HELP_TEXT_PATTERN.test(localCombined) || localCombined === '') {
           const args3 = buildArgsEqStyle({ compilerMetadata: false });
           console.error(`[run_bp_check] Attempt 3 (-packagesRoot= equals fallback): "${xppbpPath}" ${args3.join(' ')}`);
@@ -220,7 +195,7 @@ export const runBpCheckTool = async (params: any, _context: any) => {
           localCombined = [stdout, stderr].filter(Boolean).join('\n').trim();
         }
 
-        // --- Attempt 4: colon style with -packagesRoot: (oldest fallback) ---
+        // Attempt 4: colon style with -packagesRoot: (oldest fallback)
         if (HELP_TEXT_PATTERN.test(localCombined) || localCombined === '') {
           const args4 = buildArgsFallbackStyle();
           console.error(`[run_bp_check] Attempt 4 (-packagesRoot: colon fallback): "${xppbpPath}" ${args4.join(' ')}`);
@@ -251,15 +226,11 @@ export const runBpCheckTool = async (params: any, _context: any) => {
       };
     }
 
-    // Use stdout/stderr directly — xppbp prints violations as plain text.
-    // (-car: generates an Excel file which is not human-readable as text.)
+    // xppbp prints violations as plain text on stdout/stderr (-car: generates an Excel file instead).
     const logContent = combined;
 
-    // Detect violations in output.
-    // xppbp emits two distinct line patterns:
-    //   Errors:   "BPError..." or XML <Diagnostic severity="error">
-    //   Warnings: "BestPractices Warning: ..." or "BestPractices Error: ..."
-    // Both must trigger the warning status — a warning is still a violation.
+    // xppbp emits either "BPError..."/XML <Diagnostic severity="error"> or
+    // "BestPractices Warning/Error: ..." — both count as a violation.
     const hasIssues = /BPError|<Diagnostic|severity="error"|BestPractices (Warning|Error):/i.test(logContent)
       || /BPError|severity\s*[:=]\s*error/i.test(combined)
       || /^Warnings:\s*[1-9]/m.test(combined)

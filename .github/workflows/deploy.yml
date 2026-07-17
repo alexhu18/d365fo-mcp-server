@@ -6,7 +6,10 @@ on:
       - main
     tags:
       - 'v*'
-      
+
+permissions:
+  contents: read
+
 env:
   AZURE_WEBAPP_NAME: d365fo-mcp-server  # Replace with your app name
   NODE_VERSION: '24.x'
@@ -21,10 +24,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'

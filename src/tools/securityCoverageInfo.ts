@@ -7,6 +7,7 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 
 const SecurityCoverageInfoArgsSchema = z.object({
   objectName: z.string().describe('Name of the form, table, class, or menu item to check security coverage for'),
@@ -14,13 +15,46 @@ const SecurityCoverageInfoArgsSchema = z.object({
     .describe('Type of the object (auto=detect from symbol index)'),
 });
 
+const MENU_ITEM_TYPES = ['menu-item-display', 'menu-item-action', 'menu-item-output'];
+
+/** Symbol types a given objectType arg could resolve to. */
+function candidateTypes(objectType: string): string[] {
+  if (objectType === 'menu-item') return MENU_ITEM_TYPES;
+  if (objectType === 'auto') return ['form', 'table', 'class', ...MENU_ITEM_TYPES];
+  return [objectType];
+}
+
+/**
+ * Rendered instead of silence when no OLS policies can be found AND none are
+ * indexed at all — an XDS-constrained table would otherwise look identical to an
+ * unconstrained one, turning a security question into a false negative (#690).
+ */
+const OLS_UNKNOWN =
+  `Row-level security (OLS): ⚠️ unknown — AxSecurityPolicy objects are not indexed in this database.\n` +
+  `  This is NOT the same as "no row-level security": a policy constraining this table would not be visible here.\n` +
+  `  Rebuild the metadata database with a current extractor to index security policies.\n\n`;
+
+/**
+ * Whether the security_policies table holds any row at all.
+ *
+ * `LIMIT 1` with no WHERE stops at the first row, so this reads a single page
+ * and cannot degrade into the kind of scan #686 documents — it stays O(1)
+ * regardless of how many policies are indexed. Throws when the table is absent;
+ * callers treat that the same as empty.
+ */
+function policiesIndexed(db: { prepare(sql: string): { get(...p: unknown[]): unknown } }): boolean {
+  return db.prepare('SELECT 1 FROM security_policies LIMIT 1').get() !== undefined;
+}
+
 export async function securityCoverageInfoTool(request: CallToolRequest, context: XppServerContext) {
   try {
     const args = SecurityCoverageInfoArgsSchema.parse(request.params.arguments);
     const db = context.symbolIndex.getReadDb();
-    const objName = args.objectName;
+    // Resolve the caller's casing to the canonical AOT name once (#686) — every
+    // probe and side-table join below keys off this name.
+    const objName = canonicalSymbolName(db, args.objectName, candidateTypes(args.objectType))
+      ?? args.objectName;
 
-    // ── Step 1: Detect object type ──
     let resolvedType = args.objectType;
     if (resolvedType === 'auto') {
       const sym = db.prepare(
@@ -36,8 +70,7 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
     if (resolvedType !== 'auto') output += ` (${resolvedType})`;
     output += '\n\n';
 
-    // ── Row-level security (OLS) policies constraining this object's table ──
-    // AxSecurityPolicy applies to a primary table; surface any that name this object.
+    // AxSecurityPolicy (row-level security / OLS) applies to a primary table; surface any that name this object.
     let olsSection = '';
     if (resolvedType === 'table' || resolvedType === 'auto') {
       try {
@@ -55,15 +88,18 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
             olsSection += '\n';
           }
           olsSection += '\n';
+        } else if (!policiesIndexed(db)) {
+          olsSection += OLS_UNKNOWN;
         }
       } catch (e) {
-        // security_policies table may not exist in older databases — non-fatal
+        // security_policies missing entirely (databases built before the
+        // extractor landed) — same unknown as an empty table, not "none".
         if (process.env.DEBUG_LOGGING === 'true') console.warn('[securityCoverageInfo] security_policies query failed:', e);
+        olsSection += OLS_UNKNOWN;
       }
     }
 
-    // ── Step 2: Find menu items targeting this object ──
-    // From menu_item_targets table
+    // Find menu items targeting this object
     let menuItems: any[] = [];
     try {
       menuItems = db.prepare(
@@ -112,11 +148,9 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
     const allDuties = new Set<string>();
     const allRoles = new Set<string>();
 
-    // ── Steps 3-5: Batch-fetch entire privilege→duty→role chain in 3 queries ──
-    // This replaces the previous O(N·M·K) nested-loop pattern where each
-    // privilege and duty triggered individual DB round-trips.
+    // Batch-fetch entire privilege→duty→role chain in 3 queries (avoids per-privilege/per-duty round-trips).
 
-    // 3. All privileges for all menu items at once
+    // All privileges for all menu items at once
     const miNames = menuItems.map(mi => mi.menu_item_name);
     const miPH = miNames.map(() => '?').join(',');
     const allPrivEntries = db.prepare(
@@ -132,7 +166,7 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
       privilegesByMi.get(pe.entry_point_name)!.push(pe);
     }
 
-    // 4. All duties for all privilege names at once
+    // All duties for all privilege names at once
     const allPrivNames = [...new Set(allPrivEntries.map(pe => pe.privilege_name))];
     const dutiesByPrivilege = new Map<string, string[]>();
     const dutiesCounts = new Map<string, number>();
@@ -156,7 +190,7 @@ export async function securityCoverageInfoTool(request: CallToolRequest, context
         dutiesByPrivilege.set(k, v.slice(0, 5));
       }
 
-      // 5. All roles for all duty names at once
+      // All roles for all duty names at once
       const allDutyNames = [...new Set(allDutyRows.map(d => d.duty_name))];
       if (allDutyNames.length > 0) {
         const dutyPH = allDutyNames.map(() => '?').join(',');

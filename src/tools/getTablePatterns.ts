@@ -7,6 +7,7 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
+import { canonicalSymbolName } from '../utils/symbolLookup.js';
 
 const GetTablePatternsArgsSchema = z.object({
   tableGroup: z.enum(['Main', 'Transaction', 'Parameter', 'Group', 'Reference', 'Miscellaneous', 'WorksheetHeader', 'WorksheetLine'])
@@ -94,15 +95,19 @@ export async function getTablePatternsTool(request: CallToolRequest, context: Xp
   }
 }
 
-async function analyzeSimilarTable(symbolIndex: any, tableName: string, limit: number): Promise<string> {
+async function analyzeSimilarTable(symbolIndex: any, requestedName: string, limit: number): Promise<string> {
   const rdb = symbolIndex.getReadDb();
+  // Resolve the caller's casing to the canonical AOT name once (#686), so the
+  // field/relation probes below stay BINARY and on-index.
+  const tableName = canonicalSymbolName(rdb, requestedName, ['table']) ?? requestedName;
+
   // Get table info
   const tableRow = rdb.prepare(`
     SELECT * FROM symbols WHERE type = 'table' AND name = ? LIMIT 1
   `).get(tableName);
 
   if (!tableRow) {
-    throw new Error(`Table "${tableName}" not found`);
+    throw new Error(`Table "${requestedName}" not found`);
   }
 
   // Get fields
@@ -196,7 +201,7 @@ async function analyzeTableGroup(symbolIndex: any, tableGroup: string, limit: nu
 
   output += `**Sample Tables Found:** ${sampleTables.length}\n\n`;
 
-  // ── BATCHED field query: fetch all fields for all sample tables in ONE query ──
+  // Batched field query: fetch all fields for all sample tables in one query
   const tableNames = sampleTables.map(t => t.name);
   const placeholders = tableNames.map(() => '?').join(',');
   const allFields = rdb.prepare(`
@@ -242,7 +247,7 @@ async function analyzeTableGroup(symbolIndex: any, tableGroup: string, limit: nu
     output += `| ${fieldName} | ${data.edt} | ${frequency} |\n`;
   }
 
-  // ── BATCHED relation query: fetch all relations for all sample tables in ONE query ──
+  // Batched relation query: fetch all relations for all sample tables in one query
   const allRelations = rdb.prepare(`
     SELECT source_table, target_table FROM table_relations WHERE source_table IN (${placeholders})
   `).all(...tableNames) as Array<{ source_table: string; target_table: string }>;
