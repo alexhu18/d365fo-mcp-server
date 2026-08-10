@@ -32,7 +32,7 @@ export const supportsUnicode: boolean = (() => {
  * Whether to emit ANSI colour codes. Disabled for non-TTY (pipes/redirects),
  * NO_COLOR, and dumb terminals; FORCE_COLOR=1 forces it on.
  */
-export const supportsColor: boolean = (() => {
+const supportsColor: boolean = (() => {
   if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== '0') return true;
   if ('NO_COLOR' in process.env) return false;
   if (process.env.TERM === 'dumb') return false;
@@ -86,6 +86,11 @@ const EMOJI_TAGS: Array<[RegExp, string]> = [
 ];
 // Decorative emoji / pictographs (+ variation selector & ZWJ) plus any spaces
 // immediately following them, so real indentation is preserved after stripping.
+// U+FE0F (variation selector) and U+200D (ZWJ) are combining characters ON
+// PURPOSE — they are the glue in emoji sequences, and stripping them alongside
+// the base pictograph is the whole point. Matching only whole grapheme clusters
+// would leave orphaned joiners behind, which is what mojibakes on cp852/cp1250.
+// biome-ignore lint/suspicious/noMisleadingCharacterClass: combining chars are intentional, see above
 const EMOJI_STRIP = /(?:[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{2190}-\u{21FF}\u{2300}-\u{23FF}])+ */gu;
 
 // Fancy punctuation that also mojibakes on legacy code pages (cp852/cp1250); transliterate to plain ASCII.
@@ -112,10 +117,11 @@ export function sanitize(text: string): string {
 }
 
 // Layout helpers
+// biome-ignore lint/suspicious/noControlCharactersInRegex: ESC is what an ANSI SGR sequence IS — no non-control spelling exists
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
 /** Visible length of a string, ignoring ANSI colour codes. */
-export function visibleLen(s: string): number {
+function visibleLen(s: string): number {
   return s.replace(ANSI_RE, '').length;
 }
 

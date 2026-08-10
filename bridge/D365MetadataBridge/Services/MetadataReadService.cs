@@ -125,11 +125,34 @@ namespace D365MetadataBridge.Services
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var factory = new MetadataProviderFactory();
+            var previous = _provider;
             _provider = CreatePrimaryProvider(factory, _packagesPath, _referencePackagesPath);
+            // Hand the new provider over BEFORE releasing the old one, so nothing is
+            // holding a provider that is about to be disposed.
             OnProviderRefreshed?.Invoke(_provider);
+            // Every write auto-refreshes (HandleWrite refreshAfterSuccess), so a long
+            // authoring session builds one DiskProvider per write. Dropping the old one
+            // on the floor kept its file handles and per-package metadata caches alive
+            // over the whole PackagesLocalDirectory until GC felt like it — the bridge
+            // grew until it stopped answering, which is the state the client sees as a
+            // wedged process.
+            DisposeProvider(previous);
             sw.Stop();
             Console.Error.WriteLine($"[MetadataService] Provider refreshed in {sw.ElapsedMilliseconds}ms");
             return new { refreshed = true, elapsedMs = sw.ElapsedMilliseconds };
+        }
+
+        /// <summary>
+        /// Releases a superseded provider. Whether DiskProvider implements IDisposable
+        /// varies across metamodel versions, so this asks rather than assumes; a failure
+        /// to release is logged and swallowed because the replacement is already live and
+        /// the refresh itself succeeded.
+        /// </summary>
+        private static void DisposeProvider(IMetadataProvider? provider)
+        {
+            if (provider is not IDisposable disposable) return;
+            try { disposable.Dispose(); }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] Failed to dispose superseded metadata provider: {ex.Message}"); }
         }
 
         /// <summary>
@@ -144,10 +167,22 @@ namespace D365MetadataBridge.Services
                 switch (objectType.ToLowerInvariant())
                 {
                     case "table":
-                    case "table-extension":
                         if (!_provider.Tables.Exists(objectName)) return new { valid = false, reason = $"Table '{objectName}' not found by IMetadataProvider after refresh" };
                         var t = _provider.Tables.Read(objectName);
                         return new { valid = true, objectType, objectName, fieldCount = t?.Fields?.Count ?? 0, methodCount = t?.Methods?.Count ?? 0, indexCount = t?.Indexes?.Count ?? 0 };
+
+                    // Extensions live in their OWN provider collection, keyed by the dotted
+                    // "Base.ModelExtension" name. Tables/Forms are keyed by plain names, so
+                    // looking an extension up there always misses — a false negative on every
+                    // extension write, regardless of refresh.
+                    case "table-extension":
+                    {
+                        var tx = _provider.TableExtensions.Read(objectName);
+                        if (tx == null) return new { valid = false, reason = $"TableExtension '{objectName}' not found by IMetadataProvider after refresh" };
+                        int txMethods = 0;
+                        try { dynamic dtx = tx; if (dtx?.Methods != null) foreach (var _ in dtx.Methods) txMethods++; } catch { }
+                        return new { valid = true, objectType, objectName, fieldCount = tx.Fields?.Count ?? 0, methodCount = txMethods, indexCount = tx.Indexes?.Count ?? 0 };
+                    }
 
                     case "class":
                     case "class-extension":
@@ -167,8 +202,11 @@ namespace D365MetadataBridge.Services
                         return new { valid = true, objectType, objectName };
 
                     case "form":
-                    case "form-extension":
                         if (!_provider.Forms.Exists(objectName)) return new { valid = false, reason = $"Form '{objectName}' not found by IMetadataProvider after refresh" };
+                        return new { valid = true, objectType, objectName };
+
+                    case "form-extension":
+                        if (_provider.FormExtensions.Read(objectName) == null) return new { valid = false, reason = $"FormExtension '{objectName}' not found by IMetadataProvider after refresh" };
                         return new { valid = true, objectType, objectName };
 
                     case "query":
@@ -235,12 +273,22 @@ namespace D365MetadataBridge.Services
                 switch (objectType.ToLowerInvariant())
                 {
                     case "table":
-                    case "table-extension":
                     {
                         var prov = PickProvider(p => p.Tables.Exists(objectName));
                         if (prov == null) return null;
                         string? model = null;
                         try { var mi = prov.Tables.GetModelInfo(objectName); if (mi?.Count > 0) model = mi.First().Name; } catch { }
+                        return new { exists = true, objectType, objectName, model };
+                    }
+                    // Probed against TableExtensions/FormExtensions, not Tables/Forms — see
+                    // the note in ValidateObject: the dotted extension name is never a key
+                    // in the base collection, so probing there never resolves an extension.
+                    case "table-extension":
+                    {
+                        var prov = PickProvider(p => p.TableExtensions.Read(objectName) != null);
+                        if (prov == null) return null;
+                        string? model = null;
+                        try { var mi = prov.TableExtensions.GetModelInfo(objectName); if (mi?.Count > 0) model = mi.First().Name; } catch { }
                         return new { exists = true, objectType, objectName, model };
                     }
                     case "class":
@@ -269,12 +317,19 @@ namespace D365MetadataBridge.Services
                         return new { exists = true, objectType, objectName, model };
                     }
                     case "form":
-                    case "form-extension":
                     {
                         var prov = PickProvider(p => p.Forms.Exists(objectName));
                         if (prov == null) return null;
                         string? model = null;
                         try { var mi = prov.Forms.GetModelInfo(objectName); if (mi?.Count > 0) model = mi.First().Name; } catch { }
+                        return new { exists = true, objectType, objectName, model };
+                    }
+                    case "form-extension":
+                    {
+                        var prov = PickProvider(p => p.FormExtensions.Read(objectName) != null);
+                        if (prov == null) return null;
+                        string? model = null;
+                        try { var mi = prov.FormExtensions.GetModelInfo(objectName); if (mi?.Count > 0) model = mi.First().Name; } catch { }
                         return new { exists = true, objectType, objectName, model };
                     }
                     case "query":
@@ -335,6 +390,7 @@ namespace D365MetadataBridge.Services
                 Extends = Safe(() => table.Extends),
                 SaveDataPerCompany = Safe(() => table.SaveDataPerCompany.ToString()),
                 SupportInheritance = Safe(() => table.SupportInheritance.ToString()),
+                InstanceRelationType = Safe(() => table.InstanceRelationType),
             };
 
             try { var mi = prov.Tables.GetModelInfo(tableName); if (mi?.Count > 0) result.Model = mi.First().Name; } catch { }

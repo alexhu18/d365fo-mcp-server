@@ -39,6 +39,12 @@ export interface XppMethodInfo {
   visibility: 'public' | 'private' | 'protected';
   returnType: string;
   parameters: XppParameterInfo[];
+  /**
+   * Declaration unparseable, so `parameters` is empty for lack of evidence
+   * rather than because the method takes none. Arity checks must skip, not
+   * assume zero.
+   */
+  parametersUnknown?: boolean;
   isStatic: boolean;
   source: string;
   documentation?: string;
@@ -54,6 +60,8 @@ export interface XppMethodInfo {
 export interface XppParameterInfo {
   name: string;
   type: string;
+  /** Default as declared; a dropped default makes an optional parameter look required. */
+  defaultValue?: string;
 }
 
 export interface XppTableInfo {
@@ -145,7 +153,7 @@ export interface XppSymbol {
       | 'security-duty-extension' | 'security-role-extension'
       | 'menu-item-display-extension' | 'menu-item-action-extension'
       | 'menu-item-output-extension'
-      | 'service' | 'service-group'
+      | 'menu' | 'service' | 'service-group'
       | 'map' | 'configuration-key' | 'license-code' | 'security-policy' | 'macro';
   parentName?: string;
   signature?: string;
@@ -172,6 +180,12 @@ export interface XppSymbol {
   /** JSON array of typical usage examples. */
   typicalUsages?: string;
   usageFrequency?: number;
+  /**
+   * Set by `search` when this row's file is gone from disk (see
+   * indexedPathIsMissing). Not a stored column — a rendering flag, so the reader
+   * sees both the hit and the fact that it is a cache row.
+   */
+  staleIndexRow?: boolean;
   calledByCount?: number;
   /** Comma-separated related methods. */
   relatedMethods?: string;
@@ -179,125 +193,3 @@ export interface XppSymbol {
   apiPatterns?: string;
 }
 
-export interface XppFormInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  label?: string;
-  caption?: string;
-  /** E.g. 'DetailsTransaction', 'ListPage', 'SimpleList'. */
-  formPattern?: string;
-  dataSources: XppFormDataSource[];
-  design: XppFormControl[];
-  methods: XppMethodInfo[];
-}
-
-export interface XppFormDataSource {
-  name: string;
-  table: string;
-  allowEdit: boolean;
-  allowCreate: boolean;
-  allowDelete: boolean;
-  fields: string[];
-  methods: string[];
-}
-
-export interface XppFormControl {
-  name: string;
-  /** E.g. 'ActionPane', 'Grid', 'Group', 'String', 'Button'. */
-  type: string;
-  properties: Record<string, string>;
-  children: XppFormControl[];
-}
-
-export interface XppEdtInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  extends?: string;
-  enumType?: string;
-  referenceTable?: string;
-  relationType?: string;
-  stringSize?: string;
-  displayLength?: string;
-  label?: string;
-  helpText?: string;
-  formHelp?: string;
-  configurationKey?: string;
-  alignment?: string;
-  decimalSeparator?: string;
-  signDisplay?: string;
-  noOfDecimals?: string;
-  additionalProperties: Record<string, string>;
-}
-
-export interface CodePattern {
-  patternName: string;
-  patternType: string;
-  commonMethods: string[];
-  dependencies: string[];
-  usageExamples: string[];
-  frequency: number;
-  domain?: string;
-  characteristics?: string[];
-}
-
-export interface XppSecurityEntryPoint {
-  name: string;
-  /** MenuItemDisplay / MenuItemAction / MenuItemOutput / WebActionItem. */
-  objectType: string;
-  /** Read / Update / Create / Delete / Correct / Invoke. */
-  accessLevel: string;
-}
-
-export interface XppSecurityPrivilegeInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  label?: string;
-  entryPoints: XppSecurityEntryPoint[];
-}
-
-export interface XppSecurityDutyInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  label?: string;
-  privileges: string[];
-}
-
-export interface XppSecurityRoleInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  label?: string;
-  description?: string;
-  duties: string[];
-}
-
-export interface XppMenuItemInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  label?: string;
-  menuItemType: 'display' | 'action' | 'output';
-  targetObject?: string;
-  /** Form / Class / Query / Report. */
-  targetType?: string;
-  securityPrivilege?: string;
-}
-
-export interface XppExtensionInfo {
-  name: string;
-  model: string;
-  sourcePath: string;
-  extensionType: string;
-  baseObjectName: string;
-  addedFields?: string[];
-  addedMethods?: string[];
-  addedIndexes?: string[];
-  /** Methods wrapped via CoC (call next). */
-  cocMethods?: string[];
-  /** Events subscribed to via [SubscribesTo]. */
-  eventSubscriptions?: string[];
-}

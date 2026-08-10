@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { xppKnowledgeTool } from '../../src/tools/xppKnowledge';
+import { xppKnowledgeTool } from '../../src/tools/knowledge/xppKnowledge';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
 const req = (args: Record<string, unknown> = {}): CallToolRequest => ({
@@ -79,6 +79,25 @@ describe('get_xpp_knowledge', () => {
     expect(text).not.toContain('❌ No matching');
   });
 
+  it('no longer mandates the deprecated SysEntryPointAttribute for custom services', async () => {
+    // Finding B (KNOWLEDGE_GAP): the custom-services entry used to state every
+    // operation MUST carry [SysEntryPointAttribute(true)], but xppc flags that
+    // attribute as "obsolete: deprecated in AX7" — anyone following the KB got a
+    // BP warning (bp_clean:0). Custom services must OMIT it; SysOperation entry
+    // points still use it.
+    // Corpus: eval/corpus/runs/2026-07-21T__L3-custom-service-basic__a2a4131.json
+    const result = await xppKnowledgeTool(req({ topic: 'custom service', format: 'detailed' }));
+    const text = getText(result);
+    expect(text).not.toContain('❌ No matching');
+    // Must not mandate the attribute any more.
+    expect(text).not.toMatch(/MUST carry \[SysEntryPointAttribute/i);
+    // Must flag it as deprecated for custom services.
+    expect(text).toMatch(/deprecated/i);
+    expect(text).toContain('SysEntryPointAttribute');
+    // The example operation must no longer be decorated with the attribute.
+    expect(text).not.toContain('[SysEntryPointAttribute(true)]');
+  });
+
   it('returns detailed format with code examples', async () => {
     const result = await xppKnowledgeTool(req({ topic: 'transactions', format: 'detailed' }));
     const text = getText(result);
@@ -133,7 +152,8 @@ describe('get_xpp_knowledge', () => {
     const result = await xppKnowledgeTool(req({ topic: 'ssrs report' }));
     const text = getText(result);
     expect(text).toContain('SSRS');
-    expect(text).toContain('SRSReportDataProviderBase');
+    // AOT casing, as the knowledge audit pins it (Srs…, not SRS…).
+    expect(text).toContain('SrsReportDataProviderBase');
   });
 
   it('handles security query', async () => {

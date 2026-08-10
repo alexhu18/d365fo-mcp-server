@@ -1,0 +1,31 @@
+{
+  "id": "L4-ssrs-report-multidataset",
+  "title": "Multi-dataset SSRS report via generate_object additionalDatasets (detail + summary datasets, two TempDB tmp tables, two DP getters)",
+  "tier": 4,
+  "instruction": "In the sandbox model, use generate_object(mode=\"scaffold\", objectType=\"report\", name=\"DemoNoteReportMulti\", caption=\"@TaxTransactionInquiry:HeaderNote\", fieldsHint=\"NoteId, Subject\", additionalDatasets=[{name:\"Summary\", fieldsHint:\"Subject, LineCount\"}], generateController=true) to scaffold a multi-dataset SSRS report. The scaffold must produce TWO TempDB tmp tables (DemoNoteReportMultiTmp for the detail rows and DemoNoteReportMultiSummaryTmp for the summary rows), a DataContract, a Data Provider carrying a [SRSReportDataSetAttribute] getter for EACH tmp table, a Controller, an output menu item, and an AxReport whose design references both datasets. Then fill in processReport(): populate the detail tmp table with NoteId/Subject from a local ConDemoNoteHeader variable via insert_recordset, and populate the summary tmp table with one row per distinct Subject plus its count (declare a local table variable before using it in any select -- the bare table name is not a valid select source). All 7 objects must build clean.",
+  "target_artifact_types": [
+    "AxTable",
+    "AxTable",
+    "AxClass",
+    "AxClass",
+    "AxClass",
+    "AxMenuItemOutput",
+    "AxReport"
+  ],
+  "golden_path": "eval/goldens/L4-ssrs-report-multidataset/",
+  "golden_pending": false,
+  "ignore": [
+    "**/@Id",
+    "**/ModelSaveInfo",
+    "AxReport/Designs/AxReportDesign/Text"
+  ],
+  "tags": [
+    "ssrs",
+    "report",
+    "multi-dataset",
+    "additional-datasets",
+    "menu-item-output",
+    "multi-artifact"
+  ],
+  "split": "holdout"
+}

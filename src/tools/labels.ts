@@ -14,10 +14,13 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../types/context.js';
-import { searchLabelsTool } from './searchLabels.js';
-import { getLabelInfoTool } from './getLabelInfo.js';
-import { createLabelTool } from './createLabel.js';
-import { renameLabelTool } from './renameLabel.js';
+import {
+  searchLabelsTool, REUSABLE_MARKER, NO_HITS_MARKER, NO_REUSE_ADVICE, SOME_REUSE_ADVICE,
+} from './analysis/searchLabels.js';
+import { repeatSearchNotice } from './analysis/labelSearchHistory.js';
+import { getLabelInfoTool } from './readers/getLabelInfo.js';
+import { createLabelTool } from './write/createLabel.js';
+import { renameLabelTool } from './write/renameLabel.js';
 
 export type LabelsTool = (request: CallToolRequest, context: XppServerContext) => Promise<any>;
 
@@ -62,7 +65,18 @@ const ACTION_ALIASES: Record<string, LabelAction> = {
 const LABEL_FILE_ACTIONS = new Set(['create-label-file', 'create-file', 'create-labelfile', 'new-label-file']);
 
 export async function labelsTool(request: CallToolRequest, context: XppServerContext) {
-  const rawArgs = { ...(request.params.arguments ?? {}) } as Record<string, any>;
+  // Write plumbing (packagePath, languages, sortLabels, …) left the wire schema —
+  // it is auto-resolved on the normal path, so publishing all thirteen knobs cost
+  // ~1.7 KB on every request to serve the rare call that overrides one. They are
+  // still accepted, flat or nested in `params`, exactly like d365fo_file's
+  // resolution overrides; contract via get_knowledge(kind="op-spec", topic="labels").
+  const incoming = { ...(request.params.arguments ?? {}) } as Record<string, any>;
+  const nested = (incoming.params && typeof incoming.params === 'object' && !Array.isArray(incoming.params))
+    ? incoming.params as Record<string, any>
+    : {};
+  delete incoming.params;
+  // Flat keys win: an explicit top-level value is the more specific statement.
+  const rawArgs = { ...nested, ...incoming };
   const rawAction = typeof rawArgs.action === 'string' ? rawArgs.action.trim().toLowerCase() : rawArgs.action;
 
   if (typeof rawAction === 'string') {
@@ -117,10 +131,13 @@ export async function labelsTool(request: CallToolRequest, context: XppServerCon
     const r = rest as Record<string, unknown>;
     if (r.query === undefined) {
       const alt = r.searchText ?? r.text ?? r.q;
-      if (typeof alt === 'string') {
+      if (typeof alt === 'string' || Array.isArray(alt)) {
         r.query = alt;
         delete r.searchText; delete r.text; delete r.q;
       }
+    }
+    if (Array.isArray(r.query)) {
+      return batchSearch(r, dispatch.tool, context);
     }
   }
 
@@ -131,5 +148,163 @@ export async function labelsTool(request: CallToolRequest, context: XppServerCon
   return dispatch.tool(subRequest, context);
 }
 
-// Tool registration (name, description, inputSchema) lives inline in
-// src/server/mcpServer.ts — the single source of truth for tool instructions.
+/** Most phrasings one call will try — beyond this the answer is "create your own". */
+const MAX_BATCH_QUERIES = 12;
+
+/**
+ * How many of the batch's searches are in flight at once.
+ *
+ * They are independent reads, so running them one after another made the batch
+ * cost the SUM of its queries when it only needs to cost the slowest — the very
+ * latency batching exists to remove. Bounded rather than unbounded because they
+ * all land on the same SQLite connection: twelve concurrent FTS queries buy
+ * nothing over a handful and only lengthen the queue behind them.
+ */
+const BATCH_CONCURRENCY = 4;
+
+/** Run `fn` over `items` with at most `limit` in flight, preserving input order. Exported for tests. */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Run several label searches in one call.
+ *
+ * Looking for a reusable label is inherently a guessing game — the caller does not
+ * know the wording Microsoft used — and one query per call turned that into a
+ * round trip per guess: 19 of them in a single benchmark run, ~150 s of wall clock,
+ * for an answer ("no reusable label exists, create your own") that was already
+ * determined by the first. Batching collapses the guesses into one call and, when
+ * none of them hits, says so once instead of leaving the caller to conclude it.
+ */
+async function batchSearch(
+  args: Record<string, unknown>,
+  search: LabelsTool,
+  context: XppServerContext,
+): Promise<any> {
+  const all = (args.query as unknown[]).map(q => String(q).trim()).filter(q => q !== '');
+  // Fold phrasings that differ only in case or surrounding space: the index is
+  // case-insensitive, so ["customer","customer","Customer"] is one query printed
+  // three times — and passing near-duplicates is exactly the guessing behaviour
+  // this feature exists to absorb. First spelling wins, so the sections still read
+  // back in the caller's own words.
+  const seen = new Set<string>();
+  const unique = all.filter(q => {
+    const key = q.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const duplicates = all.length - unique.length;
+  const queries = unique.slice(0, MAX_BATCH_QUERIES);
+  if (queries.length === 0) {
+    return {
+      content: [{ type: 'text', text: `❌ labels(action="search"): query[] is empty — pass at least one search text.` }],
+      isError: true,
+    };
+  }
+
+  const runs = await mapWithConcurrency(queries, BATCH_CONCURRENCY, async (query) => {
+    let result: any;
+    try {
+      result = await search(
+        { method: 'tools/call', params: { name: 'search_labels', arguments: { ...args, query } } },
+        context,
+      );
+    } catch (error) {
+      // A handler that throws is a failure like any other — it must not read back
+      // as "this phrasing found nothing".
+      return { query, text: `❌ ${error instanceof Error ? error.message : String(error)}`, failed: true };
+    }
+    const text = (result?.content ?? [])
+      .map((c: any) => (typeof c?.text === 'string' ? c.text : ''))
+      .join('\n');
+    return { query, text, failed: result?.isError === true };
+  });
+
+  const failed = runs.filter(r => r.failed);
+  const searched = runs.length - failed.length;
+  const foundReusable = runs.some(r => !r.failed && r.text.includes(REUSABLE_MARKER));
+
+  // A miss carries one bit of information wrapped in the same "create your own
+  // label" paragraph as every other miss, so a batch of them buries both the
+  // verdict and any section that DID hit. Name the misses in a line; keep the
+  // full section for the runs that carry something — hits and failures.
+  const missed = runs.filter(r => !r.failed && r.text.includes(NO_HITS_MARKER));
+  const missedSet = new Set(missed.map(r => r.query));
+  const sections = runs
+    .filter(r => !missedSet.has(r.query))
+    .map(r => `## "${r.query}"${r.failed ? ' — ❌ SEARCH FAILED' : ''}\n\n${r.text}`);
+  if (missed.length > 0) {
+    sections.push(
+      `## No match — ${missed.length} phrasing(s)\n\n` +
+      `${missed.map(r => `"${r.query}"`).join(' · ')}\n\n` +
+      `Nothing in the index matches any of them. The advice below is the same for all of them, ` +
+      `so it is stated once.`,
+    );
+  }
+
+  const notes = [
+    duplicates > 0 ? `${duplicates} duplicate phrasing(s) folded` : '',
+    unique.length > queries.length ? `${unique.length - queries.length} beyond the ${MAX_BATCH_QUERIES}-query cap were not run` : '',
+  ].filter(Boolean);
+  const header = `# Label search — ${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}` +
+    (notes.length > 0 ? ` (${notes.join('; ')})` : '') + '\n';
+
+  // The per-query sections each carry their own advice; the verdict is what the
+  // caller actually needs, so state it once, up front, rather than making them
+  // read every section to work out that no phrasing hit.
+  //
+  // A failed sub-search is NOT a miss, and the two used to be indistinguishable:
+  // isError was dropped on the floor, so a batch in which every query blew up
+  // returned a clean report whose verdict said "no label exists — create your own".
+  // That is the one thing this line exists to state unambiguously, so failures
+  // either replace the verdict or are named alongside it.
+  const verdict = searched === 0
+    ? `**Verdict:** NONE of these ${runs.length} searches ran — every one failed (see the sections below). ` +
+      `This says nothing about whether a reusable label exists; fix the error and search again ` +
+      `rather than creating a label on the strength of this answer.\n`
+    : foundReusable
+      // "Reusable" only ever meant "this model can resolve it" — the index
+      // matches words, not meaning. Overstating that sent callers back to
+      // rephrase and search again, so the verdict states what was established
+      // and carries the create call.
+      ? `**Verdict:** ${searched} search(es) ran and at least one label this model can resolve came back — ` +
+        `see the section(s) marked "${REUSABLE_MARKER}". Read the TEXT of those hits before adopting one: ` +
+        `the index matches wording, not meaning, so a hit is a candidate, not a verdict. ` +
+        `If none of them says what you need, do NOT rephrase and search again — nothing new will surface.\n` +
+        `\n${SOME_REUSE_ADVICE}`
+      : `**Verdict:** none of these ${searched} phrasings found a label this model can resolve. ` +
+        `Stop searching and create your own.\n` +
+        (failed.length > 0
+          ? `\n⚠️ ${failed.length} of ${runs.length} searches FAILED and were not part of that verdict: ` +
+            `${failed.map(f => `"${f.query}"`).join(', ')}.\n`
+          : '') +
+        // Excludes this batch's own phrasings — they are the current answer, not
+        // evidence of repetition. What is left is what earlier calls already asked.
+        (repeatSearchNotice(queries) ? `\n${repeatSearchNotice(queries)}` : '') +
+        `\n${NO_REUSE_ADVICE}`;
+
+  return {
+    content: [{ type: 'text', text: `${header}\n${verdict}\n---\n\n${sections.join('\n\n---\n\n')}` }],
+    ...(searched === 0 ? { isError: true } : {}),
+  };
+}
+
+// Tool registration (name, description, inputSchema) lives in
+// src/server/toolSchemas/labels.ts — the single source of truth for tool
+// instructions. It is NOT in mcpServer.ts; that file only spreads the
+// aggregated toolSchemas array into the ListTools response.

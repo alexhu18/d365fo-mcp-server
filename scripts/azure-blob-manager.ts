@@ -5,12 +5,13 @@
 
 console.log('📦 Loading azure-blob-manager.ts...');
 
-import { loadEnv } from '../src/utils/loadEnv.js';
-loadEnv(import.meta.url);
+// Load configuration onto process.env — MUST stay the first import (see src/bootstrapEnv.ts).
+import '../src/bootstrapEnv.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { BlobServiceClient, ContainerClient } from '@azure/storage-blob';
 import { isCustomModel } from '../src/utils/modelClassifier.js';
+import { writeBlobDownloadMarker } from '../src/utils/blobDownloadMarker.js';
 
 console.log('✅ Imports loaded');
 console.log(`🔑 Connection string configured: ${process.env.AZURE_STORAGE_CONNECTION_STRING ? 'YES' : 'NO'}`);
@@ -35,12 +36,6 @@ const RETRY_BASE_DELAY_MS = 500;
 // /metadata/standard/{ModelName}/...  - Standard metadata (změna párkrát ročně)
 // /metadata/custom/{ModelName}/...    - Custom metadata (denní změny)
 // /databases/xpp-metadata-latest.db   - Compiled database
-
-interface BlobManagerOptions {
-  operation: 'upload' | 'download' | 'delete-custom' | 'sync';
-  modelType?: 'standard' | 'custom' | 'all';
-  specificModels?: string[];
-}
 
 export class AzureBlobMetadataManager {
   private blobServiceClient: BlobServiceClient;
@@ -82,7 +77,6 @@ export class AzureBlobMetadataManager {
     
     // Filter and prepare models for parallel upload
     const uploadPromises: Promise<{ modelName: string; count: number }>[] = [];
-    let queuedCount = 0;
     
     for (const modelName of models) {
       const modelPath = path.join(localPath, modelName);
@@ -98,8 +92,6 @@ export class AzureBlobMetadataManager {
         // Skip if not matching requested type
         if (modelType === 'custom' && !isCustomModel) continue;
         if (modelType === 'standard' && isCustomModel) continue;
-        
-        queuedCount++;
         
         // Add to parallel upload queue
         uploadPromises.push(
@@ -134,7 +126,12 @@ export class AzureBlobMetadataManager {
    */
   async downloadMetadata(modelType: 'standard' | 'custom' | 'all', specificModels?: string[]): Promise<void> {
     console.log(`\n📥 Downloading ${modelType} metadata from Azure Blob Storage`);
-    
+
+    // Which models this download populated. Recorded in the marker below so a later
+    // `extract-metadata` run can name the interaction between its orphan sweep and
+    // this download instead of leaving it to be discovered as apparent data loss.
+    const downloadedModels = new Set<string>();
+
     const prefixes: string[] = [];
     if (modelType === 'all' || modelType === 'standard') {
       prefixes.push('metadata/standard/');
@@ -170,6 +167,8 @@ export class AzureBlobMetadataManager {
           }
         }
         
+        const blobModel = this.extractModelNameFromBlobPath(blob.name);
+        if (blobModel) downloadedModels.add(blobModel);
         blobsToDownload.push({ name: blob.name, size: blob.properties.contentLength });
       }
       
@@ -234,6 +233,20 @@ export class AzureBlobMetadataManager {
       console.log(`   ✅ Completed: ${blobsToDownload.length} files`);
     }
     
+    // Leave the note extract-metadata reads. Best-effort: a failure here must not turn
+    // a completed download into an error — the marker only affects what a later run
+    // can EXPLAIN, never what it does.
+    try {
+      writeBlobDownloadMarker(LOCAL_METADATA_PATH, {
+        downloadedAt: new Date().toISOString(),
+        modelType,
+        models: [...downloadedModels].sort(),
+        fileCount: downloadCount,
+      });
+    } catch (error) {
+      console.warn(`   ⚠️  Could not record the blob-download marker (non-fatal): ${error instanceof Error ? error.message : error}`);
+    }
+
     console.log(`\n✅ Download complete! Total files: ${downloadCount}`);
   }
 
@@ -584,25 +597,29 @@ async function main() {
       await manager.downloadMetadata('all');
       break;
       
-    case 'delete-custom':
+    case 'delete-custom': {
       const modelsToDelete = args[1]?.split(',').map(m => m.trim());
       await manager.deleteCustomMetadata(modelsToDelete);
       break;
+    }
       
-    case 'delete-local-custom':
+    case 'delete-local-custom': {
       const localModelsToDelete = args[1]?.split(',').map(m => m.trim());
       await manager.deleteLocalCustomMetadata(localModelsToDelete);
       break;
+    }
       
-    case 'upload-database':
+    case 'upload-database': {
       const dbPath = args[1] || process.env.DB_PATH || './data/xpp-metadata.db';
       await manager.uploadDatabase(dbPath);
       break;
+    }
       
-    case 'download-database':
+    case 'download-database': {
       const localDbPath = args[1] || process.env.DB_PATH || './data/xpp-metadata.db';
       await manager.downloadDatabase(localDbPath);
       break;
+    }
       
     default:
       console.log('Usage:');

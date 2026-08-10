@@ -1,11 +1,18 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import realFs from 'fs';
+import os from 'os';
+import nodePath from 'path';
+import { recordBuild } from '../../src/utils/buildMarker';
 
 // --- hoisted mocks -----------------------------------------------------------
 const {
   accessMock, execFileMock,
   cfgEnsureLoaded, cfgGetModelName, cfgGetProjectPath, cfgGetPackagePath,
   cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath, cfgGetActiveXppConfig,
+  detectedRoots,
 } = vi.hoisted(() => {
+  // Mutable stand-in for the AosService drive scan (src/utils/packagesRoot).
+  const detectedRoots: string[] = [];
   const accessMock = vi.fn();
   // execFile needs a callback-style API for util.promisify
   const execFileMock: any = vi.fn((_file: string, _args: string[], _opts: any, cb: Function) => {
@@ -22,6 +29,7 @@ const {
     accessMock, execFileMock,
     cfgEnsureLoaded, cfgGetModelName, cfgGetProjectPath, cfgGetPackagePath,
     cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath, cfgGetActiveXppConfig,
+    detectedRoots,
   };
 });
 
@@ -46,9 +54,17 @@ vi.mock('../../src/utils/configManager.js', () => ({
 vi.mock('../../src/utils/operationLocks.js', () => ({
   withOperationLock: (_key: string, fn: () => any) => fn(),
 }));
+// The drive scan reads the real filesystem, which the fs/promises mock above
+// does not serve — feed it the roots each test wants found instead.
+vi.mock('../../src/utils/packagesRoot.js', () => ({
+  packagesRoots: () => [...detectedRoots],
+  findPackagesRoot: () => detectedRoots[0] ?? null,
+  defaultPackagesRoot: () => detectedRoots[0] ?? 'C:\\AosService\\PackagesLocalDirectory',
+  describePackagesRootScan: () => `Detected packages roots: ${detectedRoots.join(', ')}`,
+}));
 
 import path from 'path';
-import { runBpCheckTool } from '../../src/tools/runBpCheck';
+import { runBpCheckTool } from '../../src/tools/sdlc/runBpCheck';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,6 +98,7 @@ function capturedArgs(callIndex = 0): string[] {
 describe('run_bp_check — path resolution', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
     cfgEnsureLoaded.mockResolvedValue(undefined);
     cfgGetModelName.mockReturnValue('MyModel');
     cfgGetProjectPath.mockResolvedValue(null);
@@ -123,9 +140,10 @@ describe('run_bp_check — path resolution', () => {
       expect(compArg).toContain(CHE_PKG);
     });
 
-    it('probes K:\\AOSService\\PackagesLocalDirectory when C:\\ variant absent', async () => {
-      const K_PKG   = 'K:\\AOSService\\PackagesLocalDirectory';
+    it('follows the drive scan onto K: when C: has no AosService', async () => {
+      const K_PKG   = 'K:\\AosService\\PackagesLocalDirectory';
       const K_XPPBP = path.join(K_PKG, 'Bin', 'xppbp.exe');
+      detectedRoots.splice(0, detectedRoots.length, K_PKG);
       allowPaths([K_PKG, K_XPPBP]);
 
       const result = await runBpCheckTool({ modelName: 'MyModel' }, {});
@@ -133,6 +151,21 @@ describe('run_bp_check — path resolution', () => {
       expect(result.isError).toBeFalsy();
       const [exe] = execFileMock.mock.calls[0];
       expect(exe).toBe(K_XPPBP);
+    });
+
+    // #769: the candidate list used to be hardcoded to C:/K:/J:/I:, so a VM
+    // image that put AosService anywhere else resolved no xppbp at all.
+    it('follows the drive scan onto J: — the drive newer VM images use', async () => {
+      const J_PKG   = 'J:\\AosService\\PackagesLocalDirectory';
+      const J_XPPBP = path.join(J_PKG, 'Bin', 'xppbp.exe');
+      detectedRoots.splice(0, detectedRoots.length, J_PKG);
+      allowPaths([J_PKG, J_XPPBP]);
+
+      const result = await runBpCheckTool({ modelName: 'MyModel' }, {});
+
+      expect(result.isError).toBeFalsy();
+      const [exe] = execFileMock.mock.calls[0];
+      expect(exe).toBe(J_XPPBP);
     });
   });
 
@@ -266,6 +299,7 @@ describe('run_bp_check — CLI flag style fallback chain', () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
     cfgEnsureLoaded.mockResolvedValue(undefined);
     cfgGetModelName.mockReturnValue('MyModel');
     cfgGetProjectPath.mockResolvedValue(null);
@@ -404,6 +438,7 @@ describe('run_bp_check — CLI flag style fallback chain', () => {
 describe('run_bp_check — violation detection', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
     cfgEnsureLoaded.mockResolvedValue(undefined);
     cfgGetModelName.mockReturnValue('MyModel');
     cfgGetProjectPath.mockResolvedValue(null);
@@ -451,10 +486,600 @@ describe('run_bp_check — violation detection', () => {
       cb(null, { stdout: '✅', stderr: '' });
     });
 
-    const result = await runBpCheckTool({ modelName: 'MyModel', targetFilter: 'MyClass' }, {});
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'MyClass', targetElementType: 'class' },
+      {},
+    );
 
-    expect(result.content[0].text).toContain('Filter: MyClass');
+    expect(result.content[0].text).toContain('Filter: class:MyClass');
     const args = capturedArgs(0);
     expect(args.some(a => a.includes('MyClass'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding #25 (2026-07-21 sweep): run_bp_check(targetFilter=…) does not scope
+//
+// `targetFilter=ConDemoCompanyReader, targetElementType=class` still processed
+// 2 elements and returned only TABLE warnings — attribution had to be done by
+// reading rule names. Two causes in the very first attempt, which is the one
+// that succeeds on this VM:
+//   • it passed `-all` (check the whole model) alongside the filter, and
+//   • it expressed the filter as `-filter:<name>`, which this xppbp does not
+//     recognise, so the scope was silently dropped — and targetElementType was
+//     not carried at all outside the equals style.
+// ---------------------------------------------------------------------------
+describe('run_bp_check — targetFilter actually scopes (#25)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: '✅', stderr: '' });
+    });
+  });
+
+  it('does NOT pass -all together with a filter (that is what checked the whole model)', async () => {
+    await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'ConDemoCompanyReader', targetElementType: 'class' },
+      {},
+    );
+
+    const args = capturedArgs(0);
+    expect(args).not.toContain('-all');
+    expect(args).toContain('class:ConDemoCompanyReader');
+  });
+
+  it('carries targetElementType in the very first attempt, not only in the equals style', async () => {
+    await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'ConDemoTicket', targetElementType: 'table' },
+      {},
+    );
+
+    expect(capturedArgs(0)).toContain('table:ConDemoTicket');
+    // The unrecognised flag form is gone.
+    expect(capturedArgs(0).some(a => a.startsWith('-filter'))).toBe(false);
+  });
+
+  it('still passes -all when no filter is requested', async () => {
+    await runBpCheckTool({ modelName: 'MyModel' }, {});
+    expect(capturedArgs(0)).toContain('-all');
+  });
+
+  it('reports honestly when xppbp returned findings for other elements', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, {
+        stdout:
+          'BPErrorTableMissingFormRef: K:\\Pkg\\Contoso\\Contoso\\AxTable\\ConDemoTicket.xml\n' +
+          'BPErrorTableFieldGroupEmpty: K:\\Pkg\\Contoso\\Contoso\\AxTable\\ConDemoLine.xml\n',
+        stderr: '',
+      });
+    });
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'ConDemoCompanyReader', targetElementType: 'class' },
+      {},
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).toContain('Scope NOT honoured');
+    expect(text).toContain('ConDemoTicket');
+    expect(text).toContain('ConDemoLine');
+  });
+
+  it('confirms the scope when every finding belongs to the filtered element', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, {
+        stdout: 'BPErrorXmlDocMissing: K:\\Pkg\\Contoso\\Contoso\\AxClass\\ConDemoCompanyReader.xml\n',
+        stderr: '',
+      });
+    });
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'ConDemoCompanyReader', targetElementType: 'class' },
+      {},
+    );
+
+    expect(result.content[0].text as string).toContain('Scope: honoured');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #828: batch form + no silent `class` default
+//
+// Checking three objects used to cost four sequential calls (~64 s, 4 round
+// trips) and repeated the whole xppbp preamble each time — and the one call
+// that omitted targetElementType silently checked `class:<Table>`.
+// ---------------------------------------------------------------------------
+
+/** Minimal symbol-index stand-in that serves lookupSymbolsNocase queries. */
+function fakeContext(rows: Array<{ name: string; type: string }>) {
+  const db = {
+    prepare: (sql: string) => ({
+      get: () => undefined,
+      all: (...params: any[]) => {
+        // Exact probe: (name, ...types, limit). FTS probe: (matchExpr, name, ...types, limit).
+        const isFts = /symbols_fts/.test(sql);
+        const name = String(isFts ? params[1] : params[0]);
+        const types = params.slice(isFts ? 2 : 1, -1) as string[];
+        return rows
+          .filter(r => r.name.toLowerCase() === name.toLowerCase())
+          .filter(r => types.length === 0 || types.includes(r.type))
+          .map(r => ({ name: r.name, type: r.type, model: 'MyModel', extends_class: null, file_path: null }));
+      },
+    }),
+  };
+  return { symbolIndex: { getReadDb: () => db } };
+}
+
+/** The positional `<type>:<Name>` selector xppbp was invoked with. */
+function selectorOf(args: string[]): string {
+  return args.find(a => !a.startsWith('-')) ?? '-all';
+}
+
+describe('run_bp_check — batch objects[] (#828)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: '✅', stderr: '' });
+    });
+  });
+
+  it('checks every object in one call, one xppbp run each', async () => {
+    const result = await runBpCheckTool(
+      {
+        modelName: 'MyModel',
+        objects: [
+          { objectType: 'table', objectName: 'ConDemoTicket' },
+          { objectType: 'class', objectName: 'ConDemoTicket_Extension' },
+          { objectType: 'enum',  objectName: 'ConDemoStatus' },
+        ],
+      },
+      {},
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(execFileMock).toHaveBeenCalledTimes(3);
+    expect(selectorOf(capturedArgs(0))).toBe('table:ConDemoTicket');
+    expect(selectorOf(capturedArgs(1))).toBe('class:ConDemoTicket_Extension');
+    expect(selectorOf(capturedArgs(2))).toBe('enum:ConDemoStatus');
+
+    const text = result.content[0].text as string;
+    expect(text).toContain('3 objects checked');
+    expect(text).toContain('── table:ConDemoTicket ──');
+    expect(text).toContain('── class:ConDemoTicket_Extension ──');
+    expect(text).toContain('── enum:ConDemoStatus ──');
+  });
+
+  it('emits the repeated xppbp preamble once and groups findings per object', async () => {
+    const preamble = (mb: number) =>
+      'Microsoft (R) X++ Best Practice Tool\n' +
+      `Memory usage at start of execution is ${mb} MB\n` +
+      'Enabled rules: ALL\n';
+    execFileMock.mockImplementation((_f: string, a: string[], _o: any, cb: Function) => {
+      const sel = selectorOf(a);
+      const finding = sel.startsWith('table')
+        ? 'BPErrorTableMissingFormRef: K:\\Pkg\\M\\M\\AxTable\\ConDemoTicket.xml\nErrors: 1'
+        : 'Errors: 0\nWarnings: 0';
+      cb(null, { stdout: preamble(sel.startsWith('table') ? 27 : 28) + finding, stderr: '' });
+    });
+
+    const result = await runBpCheckTool(
+      {
+        modelName: 'MyModel',
+        objects: [
+          { objectType: 'table', objectName: 'ConDemoTicket' },
+          { objectType: 'enum',  objectName: 'ConDemoStatus' },
+        ],
+      },
+      {},
+    );
+
+    const text = result.content[0].text as string;
+    // Banner and enabled-rules line appear exactly once, in the shared block…
+    expect(text.match(/Microsoft \(R\) X\+\+ Best Practice Tool/g)).toHaveLength(1);
+    expect(text.match(/Enabled rules: ALL/g)).toHaveLength(1);
+    // …even though the memory counter differed by a megabyte between runs.
+    expect(text.match(/Memory usage at start of execution/g)).toHaveLength(1);
+    expect(text).toContain('Shared xppbp preamble');
+    // The findings themselves stay attached to their object.
+    expect(text).toContain('BPErrorTableMissingFormRef');
+    expect(text).toContain('⚠️ BP Check completed with issues');
+    expect(text).toContain('2 objects checked, 1 with findings');
+  });
+
+  it('reuses the flag style that worked, instead of re-walking the fallback chain', async () => {
+    const HELP_OUTPUT = 'X++ Best Practice Options:\n  -metadata:<path>\n';
+    execFileMock.mockImplementation((_f: string, a: string[], _o: any, cb: Function) => {
+      // Only the equals style is understood by this xppbp.
+      if (a.some(x => /^-metadata:/.test(x))) cb(null, { stdout: HELP_OUTPUT, stderr: '' });
+      else                                    cb(null, { stdout: '✅', stderr: '' });
+    });
+
+    await runBpCheckTool(
+      {
+        modelName: 'MyModel',
+        objects: [
+          { objectType: 'table', objectName: 'A' },
+          { objectType: 'table', objectName: 'B' },
+          { objectType: 'table', objectName: 'C' },
+        ],
+      },
+      {},
+    );
+
+    // Object 1 pays attempts 1+2; objects 2 and 3 start straight at attempt 2.
+    expect(execFileMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('accepts bare strings as one-element entries when the type is resolvable', async () => {
+    const ctx = fakeContext([{ name: 'ConDemoTicket', type: 'table' }]);
+
+    const result = await runBpCheckTool({ modelName: 'MyModel', objects: ['ConDemoTicket'] }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(selectorOf(capturedArgs(0))).toBe('table:ConDemoTicket');
+  });
+
+  it('rejects an objects[] with no usable entry', async () => {
+    const result = await runBpCheckTool({ modelName: 'MyModel', objects: [{ objectType: 'table' }] }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('no usable entry');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the single-target form working and unchanged', async () => {
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', targetFilter: 'ConDemoTicket', targetElementType: 'table' },
+      {},
+    );
+
+    const text = result.content[0].text as string;
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain('Filter: table:ConDemoTicket');
+    expect(text).not.toContain('objects checked');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The build-freshness line, with the object paths it needs to be true.
+//
+// Passing no paths left describeBuildFreshness unable to compare "last built"
+// against "last written", so it reported the newest recorded success as-is —
+// a green verdict for objects written long after that build.
+// ---------------------------------------------------------------------------
+
+describe('run_bp_check — build freshness reflects THESE objects', () => {
+  let dataDir: string;
+  let objectPath: string;
+
+  /** Symbol index that answers the path probe and carries a marker directory. */
+  const contextWithPath = () => ({
+    symbolIndex: {
+      dataDir,
+      getReadDb: () => ({
+        prepare: (sql: string) => ({
+          get: () => undefined,
+          all: (...params: any[]) => {
+            const isFts = /symbols_fts/.test(sql);
+            const name = String(isFts ? params[1] : params[0]);
+            return name === 'ConDemoTicket'
+              ? [{ name, type: 'table', model: 'MyModel', extends_class: null, file_path: objectPath }]
+              : [];
+          },
+        }),
+      }),
+    },
+  });
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: '✅', stderr: '' });
+    });
+
+    dataDir = realFs.mkdtempSync(nodePath.join(os.tmpdir(), 'd365fo-bpfresh-'));
+    objectPath = nodePath.join(dataDir, 'ConDemoTicket.xml');
+  });
+
+  afterEach(() => {
+    realFs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('calls a green build STALE when the object was written after it', async () => {
+    recordBuild(dataDir, 'MyModel', {
+      builtAt: new Date(Date.now() - 60_000).toISOString(),
+      fullBuild: true,
+      succeeded: true,
+    });
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    );
+
+    const text = result.content[0].text as string;
+    expect(text).toContain('Stale');
+    expect(text).not.toContain('✅ Compiled');
+  });
+
+  it('still confirms a build that came after the write', async () => {
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+    recordBuild(dataDir, 'MyModel', {
+      builtAt: new Date(Date.now() + 60_000).toISOString(),
+      fullBuild: true,
+      succeeded: true,
+    });
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    );
+
+    expect(result.content[0].text as string).toContain('✅ Compiled');
+  });
+});
+
+describe('run_bp_check — omitted element type never defaults to class (#828)', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: '✅', stderr: '' });
+    });
+  });
+
+  it('resolves the type from the symbol index — a table checks as table, not class', async () => {
+    const ctx = fakeContext([{ name: 'ConDemoTicket', type: 'table' }]);
+
+    const result = await runBpCheckTool({ modelName: 'MyModel', targetFilter: 'ConDemoTicket' }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(selectorOf(capturedArgs(0))).toBe('table:ConDemoTicket');
+    expect(result.content[0].text).toContain('Filter: table:ConDemoTicket');
+  });
+
+  it('resolves a class extension (an AxClass carrying [ExtensionOf]) as class', async () => {
+    const ctx = fakeContext([{ name: 'ConDemoTicket_Extension', type: 'class-extension' }]);
+
+    await runBpCheckTool({ modelName: 'MyModel', objects: [{ objectName: 'ConDemoTicket_Extension' }] }, ctx);
+
+    expect(selectorOf(capturedArgs(0))).toBe('class:ConDemoTicket_Extension');
+  });
+
+  it('errors instead of guessing when the name is not indexed', async () => {
+    const ctx = fakeContext([]);
+
+    const result = await runBpCheckTool({ modelName: 'MyModel', targetFilter: 'Unknown' }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Cannot determine the element type');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('errors when the name is ambiguous across element kinds', async () => {
+    const ctx = fakeContext([
+      { name: 'ConDemo', type: 'table' },
+      { name: 'ConDemo', type: 'class' },
+    ]);
+
+    const result = await runBpCheckTool({ modelName: 'MyModel', targetFilter: 'ConDemo' }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('ambiguous');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('errors when no symbol index is available at all', async () => {
+    const result = await runBpCheckTool({ modelName: 'MyModel', targetFilter: 'ConDemoTicket' }, {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('symbol index is not available');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('reports every unresolvable object of a batch in one error', async () => {
+    const ctx = fakeContext([{ name: 'ConDemoTicket', type: 'table' }]);
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', objects: ['ConDemoTicket', 'Ghost1', 'Ghost2'] },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text as string;
+    expect(text).toContain('Ghost1');
+    expect(text).toContain('Ghost2');
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('still runs the whole model when neither objects nor targetFilter is given', async () => {
+    const result = await runBpCheckTool({ modelName: 'MyModel' }, {});
+
+    expect(result.isError).toBeFalsy();
+    expect(capturedArgs(0)).toContain('-all');
+  });
+});
+
+describe('splitSharedPreamble (#828 helper)', () => {
+  it('returns a single output untouched — there is nothing to share', async () => {
+    const { splitSharedPreamble } = await import('../../src/tools/sdlc/runBpCheck');
+    const { preamble, bodies } = splitSharedPreamble(['banner\nErrors: 0']);
+    expect(preamble).toEqual([]);
+    expect(bodies[0].join('\n')).toBe('banner\nErrors: 0');
+  });
+
+  it('stops at the first finding line even when it is common to every output', async () => {
+    const { splitSharedPreamble } = await import('../../src/tools/sdlc/runBpCheck');
+    const out = 'banner\nBPErrorXmlDocMissing: same\ntail';
+    const { preamble, bodies } = splitSharedPreamble([out, out]);
+    expect(preamble).toEqual(['banner']);
+    expect(bodies[0].join('\n')).toContain('BPErrorXmlDocMissing');
+  });
+});
+
+describe('extractReportedElements (#25 helper)', () => {
+  it('reads element names out of AOT paths and quoted references', async () => {
+    const { extractReportedElements } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(extractReportedElements('warn K:\\Pkg\\M\\M\\AxTable\\ConDemoTicket.xml')).toContain('ConDemoTicket');
+    expect(extractReportedElements("BPError: table 'ConDemoLine' is bad")).toContain('ConDemoLine');
+    expect(extractReportedElements('no elements here')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit of run 810e9f6e: a check that never ran, reported as a pass.
+//
+// The call asked for objectType "table-extension" — the same kebab-case
+// vocabulary verify_d365fo_project documents. It was lowercased and handed
+// straight to xppbp, which answered "The element type 'table-extension' is
+// invalid" and evaluated nothing. That output has no BPError and no non-zero
+// counter, so hasIssues() said false and the object rendered as `✅ clean`.
+// Two extensions were declared BP-clean without a single rule running.
+// ---------------------------------------------------------------------------
+
+describe('normalizeElementType', () => {
+  it('translates the kebab-case objectType the other tools take', async () => {
+    const { normalizeElementType } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(normalizeElementType('table-extension')).toBe('tableextension');
+    expect(normalizeElementType('form-extension')).toBe('formextension');
+  });
+
+  it('keeps a class extension checking as a class', async () => {
+    const { normalizeElementType } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(normalizeElementType('class-extension')).toBe('class');
+  });
+
+  it("accepts xppbp's own spelling unchanged", async () => {
+    const { normalizeElementType } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(normalizeElementType('TableExtension')).toBe('tableextension');
+    expect(normalizeElementType('Class')).toBe('class');
+  });
+});
+
+describe('describeNonRun', () => {
+  it('recognises a rejected element type', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    const out = "The element type 'table-extension' is invalid. Supported types are Class, Table.";
+    expect(describeNonRun(out)).toMatch(/rejected the element type "table-extension"/);
+  });
+
+  it('recognises a filter that matched nothing', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(describeNonRun('0 elements processed')).toMatch(/not evidence of a clean object/);
+  });
+
+  it('stays quiet on a real run', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(describeNonRun('1 elements processed\nWarnings: 0\nErrors: 0')).toBe('');
+  });
+});
+
+describe('run_bp_check — a check that did not run is never a pass', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+  });
+
+  it('reports a rejected element type as NOT CHECKED, not as passed', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: "The element type 'tableextension' is invalid. Supported types are Class.", stderr: '' });
+    });
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table-extension', objectName: 'MyTable.MyExt' }] },
+      {},
+    );
+
+    expect(result.content[0].text).not.toContain('✅ BP Check passed');
+    expect(result.content[0].text).toContain('did NOT run');
+    expect(result.isError).toBe(true);
+  });
+
+  it('marks only the rejected object in a batch and keeps the rest', async () => {
+    execFileMock.mockImplementation((_f: string, a: string[], _o: any, cb: Function) => {
+      const rejected = a.some(x => x.includes('Rejected'));
+      cb(null, {
+        stdout: rejected
+          ? "The element type 'nope' is invalid. Supported types are Class."
+          : '1 elements processed\nWarnings: 0\nErrors: 0',
+        stderr: '',
+      });
+    });
+
+    const result = await runBpCheckTool(
+      {
+        modelName: 'MyModel',
+        objects: [
+          { objectType: 'class', objectName: 'GoodOne' },
+          { objectType: 'class', objectName: 'Rejected' },
+        ],
+      },
+      {},
+    );
+
+    const text = result.content[0].text;
+    expect(text).toContain('❌ BP Check incomplete');
+    expect(text).toMatch(/Rejected ── ❌ NOT CHECKED/);
+    expect(text).toMatch(/GoodOne ── ✅ clean/);
+    expect(result.isError).toBe(true);
+  });
+
+  it('sends the translated element type to xppbp', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: '1 elements processed\nErrors: 0', stderr: '' });
+    });
+
+    await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table-extension', objectName: 'MyTable.MyExt' }] },
+      {},
+    );
+
+    const args = capturedArgs(0);
+    expect(args.join(' ')).toContain('tableextension');
+    expect(args.join(' ')).not.toContain('table-extension');
   });
 });

@@ -11,6 +11,13 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel a superseded PR run instead of letting two full suites race — the jobs
+# are pure functions of the tree, so the older one's result is already stale.
+# Pushes to `main` are never cancelled: their result is the branch's record.
+concurrency:
+  group: eval-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,6 +25,29 @@ env:
   NODE_VERSION: '24.x'
 
 jobs:
+  # The one thing this workflow CANNOT do is compile the C# bridge: it references
+  # Microsoft.Dynamics.AX.Metadata assemblies that exist only on a D365FO development
+  # machine, the repo is public so they cannot be vendored, and there is no self-hosted
+  # runner. Worth stating out loud, because the repo's CodeQL setup contributes a green
+  # `Analyze (csharp)` check that runs build-mode:none and compiles nothing — it is easy
+  # to read that as C# coverage.
+  #
+  # So the gate is an attestation instead: `npm run bridge:build` writes a hash of the
+  # sources it compiled, and this job fails when bridge/ moved without it. Cheap, and it
+  # runs unconditionally — no path filter to get wrong.
+  bridge-attestation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Bridge sources match their attested build
+        run: node scripts/bridgeAttest.mjs check
+
   build-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +67,17 @@ jobs:
       # `npm test` is vitest in watch mode — use the one-shot runner for CI.
       - name: Unit tests + golden regression gate
         run: npx vitest run
+
+      # Knowledge content is gated the same fail-closed way generated code is:
+      # every named AOT type/API in KNOWLEDGE_BASE must be covered by a
+      # snapshot captured against the real symbol index on the VM.
+      - name: Knowledge audit (snapshot verify)
+        run: npm run eval:knowledge-audit
+
+      # Published reliability metric: a new AOT type or topic without K∧E∧T
+      # visibly drops the number, and stale artifacts fail the build (P4).
+      - name: Coverage matrix up to date
+        run: npm run eval:coverage -- --check
 
       - name: Eval scoreboard (informational)
         if: always()

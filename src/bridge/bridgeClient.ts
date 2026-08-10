@@ -54,6 +54,7 @@ import type {
   BridgeEventSubscriberResult,
   BridgeApiUsageCallersResult,
 } from './bridgeTypes.js';
+import { packagesRoots } from '../utils/packagesRoot.js';
 
 // Re-export types for convenience
 export type { BridgeReadyPayload, BridgeInfoPayload } from './bridgeTypes.js';
@@ -78,7 +79,9 @@ function envIntZero(name: string, fallback: number): number {
 }
 
 // Configurable via env so large installations / slow VMs can raise the limits.
-const READY_TIMEOUT_MS = envInt('BRIDGE_READY_TIMEOUT_MS', 30_000); // 30s for metadata provider init
+// Exported so the readiness gate (bridgeReadiness.ts) bounds its wait by the
+// same budget the child process is actually given to come up.
+export const READY_TIMEOUT_MS = envInt('BRIDGE_READY_TIMEOUT_MS', 30_000); // 30s for metadata provider init
 const CALL_TIMEOUT_MS = envInt('BRIDGE_CALL_TIMEOUT_MS', 60_000);   // 60s per call (large searches can take time)
 const MAX_RETRIES = envIntZero('BRIDGE_MAX_RETRIES', 2);            // retries for READ calls only (0 = disabled)
 const HEALTHCHECK_MS = envIntZero('BRIDGE_HEALTHCHECK_MS', 0);      // idle ping interval (0 = disabled)
@@ -86,6 +89,8 @@ const MAX_RESTARTS = envInt('BRIDGE_MAX_RESTARTS', 3);              // max child
 const RESTART_WINDOW_MS = 60_000;
 const PING_TIMEOUT_MS = 5_000;
 const RETRY_BASE_DELAY_MS = 250;
+const KILL_GRACE_MS = envInt('BRIDGE_KILL_GRACE_MS', 2_000);        // stdin-end → SIGTERM
+const KILL_HARD_MS = envInt('BRIDGE_KILL_HARD_MS', 3_000);          // SIGTERM → SIGKILL, and SIGKILL → give up
 
 /**
  * Methods safe to auto-retry on timeout/pipe error: idempotent READS only.
@@ -102,13 +107,23 @@ const RETRYABLE_METHODS = new Set([
   'findApiUsageCallers', 'resolveObjectInfo', 'validateObject', 'discoverFormPatterns',
 ]);
 
-/** Errors that indicate a transient transport problem (vs. a deterministic bridge error). */
-function isTransientError(err: unknown): boolean {
+/**
+ * Errors that indicate a transient transport problem (vs. a deterministic bridge error).
+ *
+ * Exported for the lifecycle test, which derives the message the child-exit handler
+ * actually produces and checks it lands here: the two used to disagree. This matched
+ * only the phrase "exited unexpectedly", which no code path ever emitted — the exit
+ * handler said "Bridge process exited before becoming ready", so a child that crashed
+ * with a READ in flight (the AOS metadata provider dying mid-query is the common case)
+ * was classified as a deterministic failure and thrown at the caller instead of being
+ * retried against a respawned child.
+ */
+export function isTransientError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return (
     msg.includes('timed out') ||
     msg.includes('Bridge is not ready') ||
-    msg.includes('exited unexpectedly') ||
+    msg.includes('Bridge process exited') ||
     msg.includes('Bridge process error') ||
     msg.includes('Failed to write to bridge stdin') ||
     msg.includes('Bridge restarting')
@@ -119,10 +134,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * True when `promise` settled within `ms`. The timer is cleared on the fast path so
+ * a pending kill-escalation deadline cannot hold the event loop open after the child
+ * has already exited.
+ */
+async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => true), expired]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export interface BridgeClientOptions {
   /** Path to the D365MetadataBridge.exe (auto-detected if omitted) */
   bridgeExePath?: string;
-  /** K:\AosService\PackagesLocalDirectory */
+  /** e.g. K:\AosService\PackagesLocalDirectory — the volume varies by VM image */
   packagesPath: string;
   /**
    * Optional secondary packages path.
@@ -236,7 +268,9 @@ export class BridgeClient extends EventEmitter {
     return new Promise<BridgeReadyPayload>((resolve, reject) => {
       const timeout = setTimeout(() => {
         // Kill only the child; the client stays usable for a later restart()/dispose().
-        this.killChild();
+        // Not awaited — this rejects the ready promise now and lets the escalation
+        // run behind it; a later dispose() has nothing left to wait for either way.
+        void this.killChild();
         reject(new Error(`Bridge process did not become ready within ${this.options.readyTimeoutMs ?? READY_TIMEOUT_MS}ms`));
       }, this.options.readyTimeoutMs ?? READY_TIMEOUT_MS);
 
@@ -306,7 +340,7 @@ export class BridgeClient extends EventEmitter {
                 pending.resolve(msg.result);
               }
             }
-          } catch (parseErr) {
+          } catch {
             console.error(`[BridgeClient] Failed to parse line: ${line.substring(0, 200)}`);
           }
         }
@@ -342,9 +376,14 @@ export class BridgeClient extends EventEmitter {
         clearTimeout(timeout);
         this._isReady = false;
         console.error(`[BridgeClient] Process exited: code=${code}, signal=${signal}`);
-        const exitErr = new Error(`Bridge process exited before becoming ready: code=${code}, signal=${signal}`);
-        this.rejectAllPending(exitErr);
-        reject(exitErr);
+        // Two different audiences, two different truths. The spawn promise only
+        // matters before ready, so "before becoming ready" is right there. In-flight
+        // calls are the opposite case — the child was up and serving them — and they
+        // must get a message isTransientError() recognises, or a read that was in the
+        // pipe when the child crashed is reported as a hard failure instead of being
+        // retried against a respawned child.
+        this.rejectAllPending(new Error(`Bridge process exited unexpectedly: code=${code}, signal=${signal}`));
+        reject(new Error(`Bridge process exited before becoming ready: code=${code}, signal=${signal}`));
       });
     });
   }
@@ -462,7 +501,9 @@ export class BridgeClient extends EventEmitter {
     this.restartPromise = (async () => {
       console.error('[BridgeClient] Restarting bridge child process…');
       this.rejectAllPending(new Error('Bridge restarting'));
-      this.killChild();
+      // Awaited: respawning while the old child still holds the packages directory
+      // is what a restart exists to get away from.
+      await this.killChild();
       this._isReady = false;
       this.readyPayload = null;
       this.buffer = '';
@@ -494,8 +535,17 @@ export class BridgeClient extends EventEmitter {
     if (typeof this.healthTimer.unref === 'function') this.healthTimer.unref();
   }
 
-  /** Gracefully shut down the bridge process */
-  dispose(): void {
+  /**
+   * Gracefully shut down the bridge process.
+   *
+   * Awaitable, and the shutdown coordinator does await it: the escalation below is
+   * driven by timers, and unref'd timers scheduled by a synchronous dispose() never
+   * get to fire — the process exits first. A child that had gone unresponsive was
+   * therefore left running with the packages directory open, so the next server start
+   * met a second bridge holding the same metadata, and the user met an orphan they
+   * had to find in Task Manager.
+   */
+  async dispose(): Promise<void> {
     if (this._disposed) return;
     this._disposed = true;
     this._isReady = false;
@@ -505,31 +555,38 @@ export class BridgeClient extends EventEmitter {
       this.healthTimer = null;
     }
     this.rejectAllPending(new Error('BridgeClient disposed'));
-    this.killChild();
+    await this.killChild();
   }
 
-  /** Kill the current child process (used by dispose and restart). */
-  private killChild(): void {
-    // Capture the reference before clearing this.process so the deferred SIGTERM closure retains it.
+  /**
+   * Kill the current child process (used by dispose and restart), escalating until
+   * it is actually gone: end stdin so it can finish an in-flight AOT write, then
+   * SIGTERM, then SIGKILL. Resolves when the child exits, or after the last step's
+   * budget — shutdown must not be the thing that hangs.
+   */
+  private async killChild(): Promise<void> {
+    // Capture the reference before clearing this.process so the exit listener below
+    // (and any late event from the replaced child) cannot touch its successor.
     const child = this.process;
     this.process = null;
-    if (child) {
-      try {
-        child.stdin?.end();
-        const graceful = setTimeout(() => {
-          if (!child.killed) {
-            try { child.kill('SIGTERM'); } catch { /* already gone */ }
-          }
-        }, 2000);
-        // SIGKILL fallback if SIGTERM did not terminate within another 3s.
-        const hard = setTimeout(() => {
-          if (!child.killed) {
-            try { child.kill('SIGKILL'); } catch { /* already gone */ }
-          }
-        }, 5000);
-        if (typeof graceful.unref === 'function') graceful.unref();
-        if (typeof hard.unref === 'function') hard.unref();
-      } catch { /* ignore */ }
+    if (!child) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+
+    const exited = new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+    });
+
+    try { child.stdin?.end(); } catch { /* pipe already gone */ }
+    if (await settledWithin(exited, KILL_GRACE_MS)) return;
+
+    console.error('[BridgeClient] Child did not exit on stdin close — sending SIGTERM');
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    if (await settledWithin(exited, KILL_HARD_MS)) return;
+
+    console.error('[BridgeClient] Child survived SIGTERM — sending SIGKILL');
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    if (!(await settledWithin(exited, KILL_HARD_MS))) {
+      console.error(`[BridgeClient] Child pid=${child.pid} did not die after SIGKILL — abandoning it`);
     }
   }
 
@@ -712,9 +769,13 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeWriteResult>('addMethod', { objectType, objectName, methodName, sourceCode });
   }
 
-  /** Add a field to a table via IMetadataProvider.Update() */
-  async addField(objectName: string, fieldName: string, fieldType: string, edt?: string, mandatory?: boolean, label?: string): Promise<BridgeWriteResult> {
-    return this.call<BridgeWriteResult>('addField', { objectName, fieldName, fieldType, edt, mandatory, label });
+  /**
+   * Add a field to a table, table-extension or data-entity-view-extension via
+   * IMetadataProvider.Update(). dataField/dataSource select the data-entity mapped-field
+   * path on the bridge side; fieldGroupName additionally appends it to a base-entity group.
+   */
+  async addField(objectName: string, fieldName: string, fieldType: string, edt?: string, mandatory?: boolean, label?: string, dataField?: string, dataSource?: string, fieldGroupName?: string): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addField', { objectName, fieldName, fieldType, edt, mandatory, label, dataField, dataSource, fieldGroupName });
   }
 
   /** Set a property on any object via IMetadataProvider.Update() */
@@ -742,9 +803,54 @@ export class BridgeClient extends EventEmitter {
     return this.call<BridgeWriteResult>('removeIndex', { objectName: tableName, indexName });
   }
 
-  /** Add a relation to a table */
-  async addRelation(tableName: string, relationName: string, relatedTable: string, constraints?: Array<{ field?: string; relatedField?: string }>): Promise<BridgeWriteResult> {
-    return this.call<BridgeWriteResult>('addRelation', { objectName: tableName, relationName, relatedTable, constraints });
+  /** Add a full-text index to a table or table-extension (a separate collection from Indexes) */
+  async addFullTextIndex(tableName: string, indexName: string, fields?: string[]): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addFullTextIndex', { objectName: tableName, indexName, fields });
+  }
+
+  /** Remove a full-text index from a table or table-extension */
+  async removeFullTextIndex(tableName: string, indexName: string): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('removeFullTextIndex', { objectName: tableName, indexName });
+  }
+
+  /** Add a Map membership to a table or table-extension */
+  async addTableMapping(
+    tableName: string,
+    mapName: string,
+    mappingTable?: string,
+    connections?: Array<{ mapField?: string; mapFieldTo?: string }>,
+  ): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addTableMapping', { objectName: tableName, mapName, mappingTable, connections });
+  }
+
+  /** Remove a Map membership from a table or table-extension */
+  async removeTableMapping(tableName: string, mapName: string): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('removeTableMapping', { objectName: tableName, mapName });
+  }
+
+  /**
+   * Add a relation to a table.
+   *
+   * `properties` carries Cardinality / RelatedTableCardinality / RelationshipType —
+   * real AxTableRelation properties the bridge now sets through the provider. They
+   * used to be dropped on both sides, which is what raised
+   * BPErrorTableRelationshipPropertiesCompleteness on a relation reported as added
+   * (findings #5 / #35). An invalid value is rejected by the bridge with the list of
+   * legal ones rather than silently ignored.
+   */
+  async addRelation(
+    tableName: string,
+    relationName: string,
+    relatedTable: string,
+    constraints?: Array<{ field?: string; relatedField?: string }>,
+    properties?: { relationCardinality?: string; relatedTableCardinality?: string; relationshipType?: string },
+  ): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addRelation', {
+      objectName: tableName, relationName, relatedTable, constraints,
+      relationCardinality: properties?.relationCardinality,
+      relatedTableCardinality: properties?.relatedTableCardinality,
+      relationshipType: properties?.relationshipType,
+    });
   }
 
   /** Remove a relation from a table */
@@ -763,8 +869,8 @@ export class BridgeClient extends EventEmitter {
   }
 
   /** Add a field reference to an existing field group */
-  async addFieldToFieldGroup(tableName: string, groupName: string, fieldName: string): Promise<BridgeWriteResult> {
-    return this.call<BridgeWriteResult>('addFieldToFieldGroup', { objectName: tableName, fieldGroupName: groupName, fieldName });
+  async addFieldToFieldGroup(tableName: string, groupName: string, fieldName: string, extendBaseFieldGroup?: boolean): Promise<BridgeWriteResult> {
+    return this.call<BridgeWriteResult>('addFieldToFieldGroup', { objectName: tableName, fieldGroupName: groupName, fieldName, extendBaseFieldGroup });
   }
 
   /** Modify properties of an existing field on a table */
@@ -845,12 +951,27 @@ export class BridgeClient extends EventEmitter {
 
   // Private helpers
 
+  /**
+   * Locate the bridge binary.
+   *
+   * An explicit path wins and is not second-guessed: it is how an npm install
+   * finds a binary built outside the package (updating the package deletes
+   * anything inside it, and the bridge has to be built per environment — see
+   * the metamodel version check in Program.cs), and how one machine can point
+   * several configurations at different builds.
+   *
+   * Everything else falls back to the in-installation search, unchanged.
+   */
   private resolveBridgeExe(): string {
-    if (this.options.bridgeExePath) {
-      if (!fs.existsSync(this.options.bridgeExePath)) {
-        throw new Error(`Bridge exe not found at: ${this.options.bridgeExePath}`);
+    const configured = this.options.bridgeExePath?.trim() || process.env.D365FO_BRIDGE_EXE_PATH?.trim();
+    if (configured) {
+      if (!fs.existsSync(configured)) {
+        throw new Error(
+          `Bridge exe not found at the configured path: ${configured}\n` +
+          '  Set bridge.exePath (D365FO_BRIDGE_EXE_PATH) to the built binary, or clear it to auto-detect.'
+        );
       }
-      return this.options.bridgeExePath;
+      return configured;
     }
 
     const __filename = fileURLToPath(import.meta.url);
@@ -859,7 +980,7 @@ export class BridgeClient extends EventEmitter {
       // Development: built in-tree
       path.resolve(__dirname, '../../bridge/D365MetadataBridge/bin/Release', BRIDGE_EXE_NAME),
       // Production: alongside the server
-      path.resolve(__dirname, '../bridge', BRIDGE_EXE_NAME),
+      path.resolve(__dirname, './', BRIDGE_EXE_NAME),
       path.resolve(__dirname, BRIDGE_EXE_NAME),
     ];
 
@@ -925,7 +1046,7 @@ export async function createBridgeClient(options: {
     return client;
   } catch (err) {
     console.error(`[BridgeClient] Initialization failed: ${err}`);
-    client.dispose();
+    await client.dispose();
     return null;
   }
 }
@@ -938,11 +1059,8 @@ function detectPackagesPath(): string | null {
   const candidates = [
     process.env.D365FO_PACKAGE_PATH ?? '',
     process.env.PACKAGES_PATH ?? '',
-    // Well-known fallback locations (traditional D365FO VM layouts)
-    'C:\\AosService\\PackagesLocalDirectory',
-    'C:\\AOSService\\PackagesLocalDirectory',
-    'J:\\AosService\\PackagesLocalDirectory',
-    'K:\\AosService\\PackagesLocalDirectory',
+    // Whatever AosService volumes this machine actually has (C:, J:, K:, …)
+    ...packagesRoots(),
   ].filter(Boolean);
 
   for (const p of candidates) {

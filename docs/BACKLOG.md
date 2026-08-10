@@ -8,6 +8,13 @@ the design.
 > Add a new item when you defer something during a PR. Move it to a commit (and
 > delete it here) when it ships. Keep entries small and honest about the unknowns.
 
+> **Restored 2026-08-08.** This file was deleted by `5ef1413` ("clean up repo and
+> consolidate docs") with all three items still open and not migrated anywhere —
+> so the deferral rationale, the triggers and the design sketches were lost. It is
+> back because that context is the whole point of the file: without it, the next
+> person re-derives (or silently re-litigates) a decision that was already made.
+> Editorial notes added on restore are marked *[2026-08]*.
+
 ---
 
 ## Context pipeline — Phase 3b: live editor focus
@@ -55,7 +62,7 @@ the design.
 
 ## Context ranker in `search`
 
-**Status:** deferred · **Area:** `src/tools/search.ts`, `src/workspace/contextRanker.ts` · **Depends on:** Phase 2 (shipped)
+**Status:** deferred · **Area:** `src/tools/analysis/search.ts`, `src/workspace/contextRanker.ts` · **Depends on:** Phase 2 (shipped)
 
 **What**
 - Optionally let `search` re-rank / append a `rankContext()` "related" block when
@@ -64,9 +71,12 @@ the design.
 **Why deferred**
 - `search` already returns FTS5-ranked results, so the ranker is largely
   redundant there — and `search` is the hottest, most-tested path. Adding a new
-  param means threading it through the large inline schema in
-  [`src/server/mcpServer.ts`](../src/server/mcpServer.ts) plus `searchUnified` and
-  tests, for marginal gain.
+  param means threading it through the schema plus `searchUnified` and tests, for
+  marginal gain.
+  - *[2026-08] The cost argument is weaker than when this was written: commit
+    `a49488a` moved the schema out of the large inline block in `mcpServer.ts`
+    into its own file, [`src/server/toolSchemas/search.ts`](../src/server/toolSchemas/search.ts).
+    The "search is the hottest path" half of the rationale still stands.*
 
 **Trigger to pick this up**
 - A concrete case where plain FTS ordering misses relevance that the xref/usage

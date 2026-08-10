@@ -2,44 +2,51 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
-import { SERVER_MODE, LOCAL_TOOLS, isToolAllowedInMode } from '../server/serverMode.js';
-import { searchUnifiedTool } from './searchUnified.js';
-import { batchGetInfoTool } from './batchGetInfo.js';
-import { getObjectInfoTool } from './getObjectInfo.js';
-import { findReferencesTool } from './findReferences.js';
-import { getMethodTool } from './getMethod.js';
-import { analyzeCodeTool } from './analyzeCode.js';
+import {
+  SERVER_MODE, LOCAL_TOOLS, TOOL_PROFILE,
+  isToolAllowedInMode, isToolInProfile,
+} from '../server/serverMode.js';
+import { BRIDGE_BACKED_TOOLS, awaitBridgeReady } from '../bridge/bridgeReadiness.js';
+import {
+  BRIDGE_FAILURE_MARKER, runWithBridgeFailureScope, renderBridgeFailureNote,
+} from '../bridge/bridgeFailure.js';
+import type { BridgeFailure } from '../bridge/bridgeFailure.js';
+import * as debouncedRefresh from '../bridge/debouncedRefresh.js';
+import { searchUnifiedTool } from './analysis/searchUnified.js';
+import { getObjectInfoTool } from './readers/getObjectInfo.js';
+import { findReferencesTool } from './analysis/findReferences.js';
+import { getMethodTool } from './readers/getMethod.js';
+import { analyzeCodeTool } from './analysis/analyzeCode.js';
 import { d365foFileTool } from './d365foFile.js';
 import { labelsTool } from './labels.js';
-import { objectPatternsTool } from './objectPatterns.js';
+import { objectPatternsTool } from './knowledge/objectPatterns.js';
 import { generateObjectTool } from './generateObject.js';
-import { handleSuggestEdt } from './suggestEdt.js';
-import { securityInfoTool } from './securityInfo.js';
-import { extensionInfoTool } from './extensionInfo.js';
-import { getKnowledgeTool } from './getKnowledge.js';
-import { validateObjectNamingTool } from './validateObjectNaming.js';
-import { verifyD365ProjectTool } from './verifyD365Project.js';
-import { resolveObjectPrefix, isCustomModel, getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix } from '../utils/modelClassifier.js';
-import { getStdioSessionInfo } from '../utils/stdioSessionInfo.js';
-import { updateSymbolIndexTool } from './updateSymbolIndex.js';
-import { buildProjectTool } from './buildProject.js';
-import { dbSyncTool } from './dbSync.js';
-import { runBpCheckTool } from './runBpCheck.js';
-import { sysTestRunnerTool } from './sysTestRunner.js';
-import { reviewWorkspaceChangesTool } from './reviewWorkspaceChanges.js';
-import { undoLastModificationTool } from './undoLastModification.js';
-import { validateCodeTool } from './validateCode.js';
-import { prepareTool } from './prepare.js';
-import { recordToolStart, startMetricsLogging, recordCallSequence } from '../utils/toolMetrics.js';
+import { handleSuggestEdt } from './smart/suggestEdt.js';
+import { securityInfoTool } from './readers/securityInfo.js';
+import { extensionInfoTool } from './readers/extensionInfo.js';
+import { getKnowledgeTool } from './knowledge/getKnowledge.js';
+import { validateObjectNamingTool } from './analysis/validateObjectNaming.js';
+import { verifyD365ProjectTool } from './sdlc/verifyD365Project.js';
+import { updateSymbolIndexTool } from './sdlc/updateSymbolIndex.js';
+import { buildProjectTool } from './sdlc/buildProject.js';
+import { dbSyncTool } from './sdlc/dbSync.js';
+import { runBpCheckTool } from './sdlc/runBpCheck.js';
+import { sysTestRunnerTool } from './sdlc/sysTestRunner.js';
+import { reviewWorkspaceChangesTool } from './sdlc/reviewWorkspaceChanges.js';
+import { undoLastModificationTool } from './sdlc/undoLastModification.js';
+import { validateCodeTool } from './analysis/validateCode.js';
+import { prepareTool } from './prepare/prepare.js';
+import { getWorkspaceInfoTool } from './readers/getWorkspaceInfo.js';
+import { recordToolStart, startMetricsLogging, recordCallSequence, reportSlowCall } from '../utils/toolMetrics.js';
 import {
   DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
   dedupKey, getDedupedResult, storeDedupResult, appendNote,
   getInFlight, registerInFlight, clearInFlight,
 } from '../utils/callDedup.js';
-import { checkIndexStaleness } from '../utils/indexStaleness.js';
-import { buildContextSnapshot, renderContextSnapshotSection } from '../workspace/contextSnapshot.js';
-import * as nodePath from 'path';
+import { truncateOnBlockBoundary } from '../utils/payloadBudget.js';
 import { buildProgressMessage } from '../utils/toolProgressMessage.js';
+import { createProgressReporter } from '../utils/progressReporter.js';
+
 
 /**
  * Extract workspace path from GitHub Copilot _meta.
@@ -97,6 +104,10 @@ const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
   build_d365fo_project:             'uncapped', // compiler errors can appear late in long logs
   security_info:                    8000,
   extension_info:                   6000,
+  // Default output is ~1 KB. The higher cap exists for diagnostics=true, whose
+  // whole point is the full dump — truncating that at 5000 hid the stdio
+  // handshake section behind the project table.
+  get_workspace_info:               20000,
   default:                          5000,
 };
 
@@ -105,16 +116,23 @@ function getCapForTool(toolName: string): number | 'uncapped' {
 }
 
 
-function capToolResponse(toolName: string, result: any): any {
+export function capToolResponse(toolName: string, result: any): any {
   const cap = getCapForTool(toolName);
   if (cap === 'uncapped' || !result?.content) return result;
   const content = result.content.map((item: any) => {
     if (item.type !== 'text' || typeof item.text !== 'string') return item;
     if (item.text.length <= (cap as number)) return item;
+    // Cut on a block boundary: a raw slice ended responses mid-XML-element
+    // (`<AxTableField Nam`), which reads as corrupt metadata, not truncated.
+    const kept = truncateOnBlockBoundary(item.text, cap as number);
     return {
       ...item,
-      text: item.text.slice(0, cap as number) +
-        `\n\n> ✂️ Response truncated at ${cap} chars. Use more specific parameters (e.g. methodOffset, compact=false for one class) to get remaining content.`,
+      // The advice used to say `compact=false`, which makes the response BIGGER
+      // — the caller followed it and hit the cap again with more content cut.
+      text: kept +
+        `\n\n> ✂️ Response truncated at ${cap} chars (${item.text.length - kept.length} omitted). ` +
+        `Ask for LESS, not more: page with methodOffset/fieldsOffset, narrow with fieldFilter/searchControl/prefix, ` +
+        `keep compact=true, and read one object per call instead of objects[].`,
     };
   });
   return { ...result, content };
@@ -135,6 +153,16 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
     if (workspacePath && !configManager.hasRequestContext()) {
       configManager.setRuntimeContext({ workspacePath });
     }
+
+    // The C# bridge starts out-of-band, so the tool list can be live while
+    // `context.bridge` is still undefined. Wait for a startup that is in flight
+    // before the tool decides anything — otherwise a 2-second cold-start race is
+    // reported as "the object does not exist" / "check your config" (issue #826).
+    // Started here, awaited after the dbReady block, so the two waits overlap and
+    // a cold start costs max(db, bridge) rather than their sum.
+    const bridgeWait = BRIDGE_BACKED_TOOLS.has(toolName)
+      ? { t0: Date.now(), outcome: awaitBridgeReady(context) }
+      : null;
 
     // ctx.dbReady resolves once the real symbol database is loaded; await it so
     // tools use the real index instead of silently returning empty results.
@@ -167,6 +195,29 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       }
     }
 
+    // Collect the bridge wait started above. Every outcome falls through to the
+    // tool: `ready` is the point of the wait, `unavailable`/`not-tracked` mean
+    // the symbol-index and disk fallbacks are the answer, and even on `timeout`
+    // the tool may still resolve the object from the index — it just gets to
+    // describe the bridge as "still starting" instead of "not connected".
+    if (bridgeWait) {
+      const outcome = await bridgeWait.outcome;
+      const elapsed = Date.now() - bridgeWait.t0;
+      if (elapsed > 200) {
+        console.error(`[toolHandler] ⏳ ${toolName}: bridge was starting, waited ${elapsed} ms → ${outcome}`);
+      }
+
+      // Settle any provider rebuild a previous write scheduled but did not wait
+      // for. Writers now schedule the rebuild instead of awaiting it (so it
+      // leaves the response path), which means the freshness guarantee has to be
+      // re-established by the READER — otherwise a get_object_info issued right
+      // after a create could see a provider up to SETTLE_MS staler than before.
+      // Every bridge-backed tool passes through here, so this is the one place
+      // that covers reads and writes alike; it is a synchronously-resolved
+      // no-op when nothing is outstanding, so it costs a tick, not 400 ms.
+      await debouncedRefresh.flush();
+    }
+
     // Enforce server mode: block local tools in read-only (Azure) mode, block search/analysis
     // tools in write-only mode. isToolAllowedInMode is the same predicate the ListTools filter
     // uses (ALWAYS_TOOLS included), so a tool is refused here iff it is not advertised.
@@ -179,6 +230,15 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
     if (SERVER_MODE === 'write-only' && !isToolAllowedInMode(SERVER_MODE, toolName)) {
       return {
         content: [{ type: 'text', text: `⚠️ Tool '${toolName}' is not available in write-only mode.\n\nThis local MCP server only handles file operations. Search and analysis tools are provided by the Azure MCP server.` }],
+        isError: true,
+      };
+    }
+    // Breadth gate: the tool exists but this server runs the reduced 'core'
+    // profile, so it was never advertised. Name the two ways back in — an
+    // unexplained refusal just gets retried.
+    if (!isToolInProfile(TOOL_PROFILE, toolName)) {
+      return {
+        content: [{ type: 'text', text: `⚠️ Tool '${toolName}' is not published under MCP_TOOL_PROFILE=core.\n\nTo enable it, set MCP_TOOL_PROFILE=full, or add it to MCP_EXTRA_TOOLS (server.extraTools in d365fo-mcp.json) and restart the server.` }],
         isError: true,
       };
     }
@@ -214,46 +274,28 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       : null;
 
     const finishMetrics = recordToolStart(toolName);
+    const callStartedAt = Date.now();
     let result: any;
+    // Anything the C# bridge throws during this call lands here (see
+    // bridge/bridgeFailure.ts). Without it a bridge outage is invisible: the read
+    // wrappers return null, the tool serves the SQLite index instead, and the
+    // answer — including "not found" — looks like it came from live metadata.
+    const bridgeFailures: BridgeFailure[] = [];
     try {
-    result = await (async () => {
+    result = await runWithBridgeFailureScope(bridgeFailures, async () => {
       // Build the progress description for this tool call.
       const args = request.params.arguments as Record<string, any> | undefined;
       const progressMsg = buildProgressMessage(toolName, args);
 
-      // Channel 1: notifications/progress (MCP spec) — sent when the client provides a progressToken.
-      const progressToken = (extra._meta as any)?.progressToken;
-      if (progressToken !== undefined && progressToken !== null) {
-        try {
-          await extra.sendNotification({
-            method: 'notifications/progress',
-            params: {
-              progressToken,
-              progress: 0,
-              total: 1,
-              message: progressMsg,
-            } as any,
-          });
-        } catch {
-          // Non-fatal — client may not support progress notifications
-        }
-      }
-
-      // Channel 2: notifications/message (logging) — fallback for clients without progressToken support.
-      try {
-        await server.sendLoggingMessage({
-          level: 'info',
-          data: progressMsg,
-        });
-      } catch {
-        // Non-fatal — logging is best-effort, never block the tool
-      }
+      // Both notification channels (notifications/progress when the client
+      // supplied a progressToken, notifications/message otherwise) live in one
+      // reporter so long-running tools can keep using it after this first step.
+      const reportProgress = createProgressReporter(server, extra as any);
+      await reportProgress(progressMsg, 0);
 
       return (async () => { switch (toolName) {
       case 'search':
         return searchUnifiedTool(request, context);
-      case 'batch_get_info':
-        return batchGetInfoTool(request, context);
       case 'get_object_info':
         return getObjectInfoTool(request, context);
       case 'generate_object':        return generateObjectTool(request, context);
@@ -263,6 +305,11 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         return d365foFileTool(request, context);
       case 'find_references':
         return findReferencesTool(request, context);
+      // get_method and suggest_edt are no longer PUBLISHED (their contracts moved
+      // into get_object_info options.method and prepare's fieldsHint, which both
+      // already had the object in hand). The routes stay so an agent still holding
+      // the old name from an earlier session gets its answer plus a pointer,
+      // rather than an "unknown tool" it cannot recover from.
       case 'get_method':
         return getMethodTool(request, context);
       case 'labels':
@@ -285,7 +332,9 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       case 'update_symbol_index':
         return await updateSymbolIndexTool(request.params.arguments as any, context);
       case 'build_d365fo_project':
-        return await buildProjectTool(request.params.arguments as any, context);
+        // Streams progress while xppc runs, so a build longer than any timeout
+        // still completes inside this one call instead of handing back a stub.
+        return await buildProjectTool(request.params.arguments as any, context, reportProgress);
       case 'trigger_db_sync':
         return await dbSyncTool(request.params.arguments as any, context);
       case 'run_bp_check':
@@ -301,255 +350,8 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       case 'validate_code':        return validateCodeTool(request, context);
       case 'prepare':
         return prepareTool(request, context);
-      case 'get_workspace_info': {
-        const args = (request as any).params?.arguments || {};
-
-        // projectName: resolve by name from known projects list (user-friendly switch)
-        if (args.projectName && !args.projectPath) {
-          const needle = (args.projectName as string).toLowerCase();
-          const allProjects = configManager.getAllDetectedProjects();
-          const match = allProjects.find(p => p.modelName.toLowerCase() === needle)
-            ?? allProjects.find(p => p.modelName.toLowerCase().includes(needle));
-          if (!match) {
-            const names = allProjects.map(p => p.modelName).join(', ') || '(none — set D365FO_SOLUTIONS_PATH)';
-            return {
-              content: [{ type: 'text', text: `❌ No project found matching "${args.projectName}".\nAvailable: ${names}` }],
-              isError: true,
-            };
-          }
-          args.projectPath = match.projectPath;
-        }
-
-        // projectPath: force-switch to specific .rnrproj
-        if (args.projectPath) {
-          const forced = await configManager.forceProject(args.projectPath);
-          if (!forced) {
-            return {
-              content: [{ type: 'text', text: `❌ Could not read model name from: ${args.projectPath}\nMake sure the path points to a valid .rnrproj file.` }],
-              isError: true,
-            };
-          }
-        }
-
-        const {
-          modelName, modelSource, isModelSourceAutoDetected,
-          projectPath, projectSource,
-          packagePath, packageSource,
-          customPackagesPath, customPackagesSource,
-        } = await configManager.getWorkspaceInfoDiagnostics();
-        const envType = await configManager.getDevEnvironmentType();
-        const frameworkDirectory = await configManager.getMicrosoftPackagesPath();
-
-        // Prefix diagnostics
-        const extensionPrefixEnv = process.env.EXTENSION_PREFIX?.trim() || null;
-        const effectivePrefix = resolveObjectPrefix(modelName ?? '');
-        const objectSuffixEnv = process.env.EXTENSION_SUFFIX?.trim() || null;
-        const effectiveSuffix = getObjectSuffix();
-
-        const PLACEHOLDER_NAMES = new Set([
-          'mymodel', 'mypackage', 'model', 'package', 'modelname', 'packagename',
-          'yourmodel', 'yourpackage', 'custommodel', 'custompackage',
-          'testmodel', 'testpackage', 'samplemodel', 'samplepackage',
-          // Microsoft tutorial/demo models shipped with D365FO — never a valid target model.
-          'fleetmanagement', 'fleetmanagementextension',
-          'fleetmanagementunittests', 'tutorial',
-        ]);
-        const isPlaceholder = !modelName || PLACEHOLDER_NAMES.has(modelName.toLowerCase());
-        // The "Microsoft standard model" warning only applies to an auto-detected model —
-        // an explicitly configured model was named deliberately and shouldn't be second-guessed.
-        const isAutoDetectedSource = isModelSourceAutoDetected;
-        const isStandardMsModel = modelName
-          ? !isCustomModel(modelName) && !isPlaceholder && isAutoDetectedSource
-          : false;
-
-        // Effective custom write root: D365FO_CUSTOM_PACKAGES_PATH > D365FO_PACKAGE_PATH (read-only MS root).
-        const effectiveWritePath = customPackagesPath ?? packagePath;
-        const effectiveWriteSource = customPackagesPath ? customPackagesSource : packageSource;
-
-        // MS framework path shown in diagnostics; omitted for single-root traditional setups.
-        const msFrameworkPath = frameworkDirectory ?? (!customPackagesPath ? null : packagePath);
-
-        // Verbose diagnostic sections cost tokens on every call — opt-in only.
-        const diagnostics = args.diagnostics === true;
-
-        const lines: string[] = [
-          `## D365FO Workspace Configuration`,
-          ``,
-          `Model name      : ${modelName ?? '(not configured)'}  (source: ${modelSource})`,
-          `Custom write path: ${effectiveWritePath ?? '(not configured)'}  (custom metadata, source: ${effectiveWriteSource})`,
-          `Framework dir   : ${msFrameworkPath ?? '(not applicable — single-root setup)'}  (Microsoft metadata, read-only)`,
-          `Project path    : ${projectPath ?? '(not detected)'}  (source: ${projectSource})`,
-          `Env type        : ${envType}`,
-          ``,
-          `## Prefix Configuration`,
-          ``,
-          `EXTENSION_PREFIX: ${extensionPrefixEnv ?? '(not set — falling back to model name)'}`,
-          `Effective prefix: ${effectivePrefix || '(none)'}`,
-          extensionPrefixEnv
-            ? `✅ EXTENSION_PREFIX is set — all new objects will use prefix "${effectivePrefix}".`
-            : `⚠️  EXTENSION_PREFIX is not set in the server environment. The model name "${modelName}" will be used as prefix. Add EXTENSION_PREFIX=MY (or your ISV prefix) to the .env file and restart the server.`,
-          ``,
-        ];
-
-        if (diagnostics) {
-          lines.push(
-            `## Suffix Configuration`,
-            ``,
-            `EXTENSION_SUFFIX: ${objectSuffixEnv ?? '(not set)'}`,
-            `Effective suffix: ${effectiveSuffix || '(none)'}`,
-            effectiveSuffix
-              ? `✅ EXTENSION_SUFFIX is set — new objects will have suffix "${effectiveSuffix}" appended (e.g. MyTable${effectiveSuffix}).`
-              : `ℹ️  EXTENSION_SUFFIX is not set. No suffix will be applied. This is normal — most projects use prefixes only.`,
-            ``,
-          );
-        } else if (effectiveSuffix) {
-          lines.push(`Suffix          : "${effectiveSuffix}" appended to new objects (EXTENSION_SUFFIX)`, ``);
-        }
-
-        // Extension naming: prefix is the infix unless EXTENSION_NAMING_STYLE="model-name"
-        // (embeds the model name instead, VS default). Tool always normalises the token —
-        // pass the BASE object name and let the tool name it.
-        const extNamingStyle = getExtensionNamingStyle();
-        const extInfix = deriveExtensionInfix(effectivePrefix);
-        const sampleClassExt = extNamingStyle === 'model-name' && modelName
-          ? `CustTable_${modelName}_Extension`
-          : `CustTable${extInfix}_Extension`;
-        const sampleElemExt = extNamingStyle === 'model-name' && modelName
-          ? `CustTable.${modelName}`
-          : `CustTable.${extInfix}Extension`;
-        lines.push(
-          `## Extension Naming`,
-          ``,
-          `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
-          extNamingStyle === 'model-name'
-            ? `✅ model-name style — extension token is the MODEL NAME (Visual Studio default).`
-            : `ℹ️  prefix style (default) — extension token is the EXTENSION_PREFIX infix.`,
-          `  • Extension class  → ${sampleClassExt}`,
-          `  • Element extension → ${sampleElemExt}`,
-          `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,
-          ``,
-        );
-
-        if (isPlaceholder) {
-          const rawDetectedModel = await configManager.getRawAutoDetectedModelName();
-          const detectedHint = rawDetectedModel
-            ? `> ✅ Auto-detected from .rnrproj: **${rawDetectedModel}**\n` +
-              `> Update your .mcp.json: set \`modelName\` to \`"${rawDetectedModel}"\``
-            : `> ⚠️ No .rnrproj was found — make sure the MCP server is running in the right directory.`;
-          lines.push(
-            `⛔ CONFIGURATION PROBLEM — model name "${modelName}" is a placeholder, not a real D365FO model.`,
-            ``,
-            `**YOU MUST STOP** and tell the user:`,
-            `> The configured model name "${modelName}" is a placeholder.`,
-            detectedHint,
-            `>`,
-            `> Please check that:`,
-            `> 1. The MCP server is running in the correct workspace directory`,
-            `> 2. The .mcp.json / mcp.json file has the correct modelName`,
-            `> 3. The projectPath points to a valid .rnrproj file`,
-            `>`,
-            `> Do you want to fix the configuration first, or continue with built-in tools (limited functionality)?`,
-          );
-        } else if (isStandardMsModel) {
-          const allProj = configManager.getAllDetectedProjects();
-          const customCandidates = allProj.filter(p => isCustomModel(p.modelName));
-          const hint = customCandidates.length > 0
-            ? `Available custom models: ${customCandidates.map(p => p.modelName).join(', ')}\n` +
-              `Switch with: get_workspace_info(projectName="<model>")`
-            : `No custom models found under D365FO_SOLUTIONS_PATH. Check your project configuration.`;
-          lines.push(
-            `⛔ CONFIGURATION PROBLEM — model name "${modelName}" is a Microsoft standard/demo model, not a custom model.`,
-            ``,
-            `**YOU MUST STOP** and tell the user:`,
-            `> The auto-detected model "${modelName}" is a Microsoft standard model.`,
-            `> This usually happens when a new VS project was created and the default model`,
-            `> in the project wizard ("FleetManagement") was not changed to the correct custom model.`,
-            `>`,
-            `> How to fix:`,
-            `> 1. In Visual Studio, open the .rnrproj file and change <Model>FleetManagement</Model>`,
-            `>    to the correct model name (e.g. <Model>ContosoCore</Model>).`,
-            `> 2. OR explicitly switch to a known project:`,
-            `>    ${hint}`,
-            `> 3. OR add the correct modelName to .mcp.json.`,
-          );
-        } else {
-          lines.push(`✅ Configuration looks valid. Proceed with D365FO operations using model "${modelName}".`);
-        }
-
-        const allProjects = configManager.getAllDetectedProjects();
-        if (allProjects.length > 1) {
-          lines.push(``);
-          lines.push(`## Available Projects (D365FO_SOLUTIONS_PATH)`);
-          lines.push(``);
-          for (const p of allProjects) {
-            const active = p.projectPath === projectPath ? '▶ ' : '  ';
-            lines.push(`${active}${p.modelName.padEnd(40)} ${p.projectPath}`);
-          }
-          lines.push(``);
-          lines.push(`To switch project: call get_workspace_info with projectName = "<ModelName>"`);
-        }
-
-        // Index freshness — compare workspace mtimes vs last_indexed_at.
-        try {
-          const lastIndexedAt = context.symbolIndex.getLastIndexedAt?.() ?? null;
-          const modelMetadataDir = effectiveWritePath && modelName
-            ? nodePath.join(effectiveWritePath, modelName)
-            : null;
-          const staleness = checkIndexStaleness(lastIndexedAt, modelMetadataDir);
-          lines.push('', ...staleness.lines);
-        } catch {
-          // Freshness reporting is best-effort — never break get_workspace_info
-        }
-
-        // Stdio session info — what VS 2022 sent during the MCP handshake. Debugging aid only.
-        if (diagnostics) {
-        const sio = getStdioSessionInfo();
-        lines.push(``);
-        lines.push(`## Stdio Session Info`);
-        lines.push(``);
-        if (!sio.initializedAt) {
-          lines.push(`_Not in stdio mode (or initialize not yet received)._`);
-        } else {
-          lines.push(`Client name     : ${sio.clientName    ?? '(not sent)'}`);
-          lines.push(`Client version  : ${sio.clientVersion ?? '(not sent)'}`);
-          lines.push(`MCP protocol    : ${sio.protocolVersion ?? '(not sent)'}`);
-          lines.push(`Roots listChanged cap: ${sio.supportsRootsListChanged ? 'yes ✅' : 'no ❌'}`);
-          lines.push(`Initialize at   : ${sio.initializedAt}`);
-          lines.push(``);
-          if (sio.lastRoots.length === 0) {
-            lines.push(`Roots (last roots/list): _none received yet_`);
-          } else {
-            lines.push(`Roots (last roots/list) @ ${sio.rootsLastAt}:`);
-            sio.lastRoots.forEach((u, i) => lines.push(`  [${i}] ${u}`));
-          }
-          lines.push(``);
-          if (sio.rootsListChangedCount === 0) {
-            lines.push(`roots/list_changed events: 0 (VS 2022 has NOT changed solution since startup)`);
-            if (sio.supportsRootsListChanged) {
-              lines.push(`  ℹ️  Client declared roots.listChanged=true — it WILL send this notification`);
-              lines.push(`     when you open/switch a solution. Switch now and call get_workspace_info again.`);
-            } else {
-              lines.push(`  ⚠️  Client did NOT declare roots.listChanged capability — automatic`);
-              lines.push(`     solution-switch detection may not be available.`);
-            }
-          } else {
-            lines.push(`roots/list_changed events: ${sio.rootsListChangedCount} ✅`);
-            lines.push(`Last change at  : ${sio.rootsListChangedLastAt}`);
-            lines.push(`✅ VS 2022 IS sending roots/list_changed — solution switching IS detectable.`);
-          }
-        }
-        }
-
-        // Context Snapshot — recently edited objects + uncommitted X++ changes. Best-effort.
-        try {
-          const snapshot = await buildContextSnapshot(context);
-          lines.push('', ...renderContextSnapshotSection(snapshot));
-        } catch {
-          // Snapshot is additive — omit silently on failure.
-        }
-
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
-      }
+      case 'get_workspace_info':
+        return getWorkspaceInfoTool(request, context);
       default:
         return {
           content: [
@@ -561,7 +363,7 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           isError: true,
         };
     } })();
-    })();
+    });
     } catch (err) {
       // Safety net: convert any thrown error into a tool result with isError:true
       // instead of an opaque JSON-RPC protocol error.
@@ -573,25 +375,53 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       };
     }
 
-    let capped = capToolResponse(toolName, result);
-    // Record metrics: detect empty result (no content or first text item is empty)
-    const firstText = capped?.content?.[0]?.text;
-    const isEmpty = !firstText || firstText.trim().length === 0 || firstText === 'No results returned';
-    finishMetrics(isEmpty);
+    // Everything from here on runs under try/finally, because the in-flight entry
+    // MUST be settled and dropped no matter what. A throw in capToolResponse (or in
+    // the metrics/dedup bookkeeping) used to skip resolve()+clearInFlight, leaving a
+    // promise in the map that nothing would ever settle — and from that moment every
+    // identical call coalesced onto it and hung forever, for the life of the process.
+    let capped: any = result;
+    try {
+      capped = capToolResponse(toolName, result);
 
-    if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
-      storeDedupResult(callKey, capped);
+      // Appended after the cap so truncation can never eat the one line that says the
+      // answer is not authoritative. Skipped when the tool already named the failure
+      // itself (the create/resolve path does) so the response says it once.
+      if (bridgeFailures.length > 0) {
+        const alreadyReported = capped?.content?.some(
+          (item: any) => typeof item?.text === 'string' && item.text.includes(BRIDGE_FAILURE_MARKER),
+        );
+        if (!alreadyReported) {
+          capped = appendNote(capped, renderBridgeFailureNote(bridgeFailures));
+        }
+      }
+
+      // Record metrics: detect empty result (no content or first text item is empty)
+      const firstText = capped?.content?.[0]?.text;
+      const isEmpty = !firstText || firstText.trim().length === 0 || firstText === 'No results returned';
+      finishMetrics(isEmpty);
+      reportSlowCall(toolName, Date.now() - callStartedAt, request.params.arguments);
+
+      if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
+        storeDedupResult(callKey, capped);
+        // Loop hint: 3+ identical calls in the recent window means the model is cycling.
+        if (occurrences >= 3) {
+          capped = appendNote(
+            capped,
+            `> ⚠️ Loop detected: this is occurrence #${occurrences} of the exact same ${toolName} call. ` +
+            `The answer does not change between calls. If you are missing information, ` +
+            `use a DIFFERENT tool or different parameters (see suggestions above), or ask the user.`,
+          );
+        }
+      }
+    } catch (err) {
+      // The tool itself already succeeded; only the post-processing failed. Return
+      // the uncapped result rather than converting a good answer into an error.
+      console.error(`[toolHandler] ⚠️ ${toolName}: response post-processing failed: ${err}`);
+      capped = result;
+    } finally {
       inFlightHandle?.resolve(capped);
       clearInFlight(callKey);
-      // Loop hint: 3+ identical calls in the recent window means the model is cycling.
-      if (occurrences >= 3) {
-        capped = appendNote(
-          capped,
-          `> ⚠️ Loop detected: this is occurrence #${occurrences} of the exact same ${toolName} call. ` +
-          `The answer does not change between calls. If you are missing information, ` +
-          `use a DIFFERENT tool or different parameters (see suggestions above), or ask the user.`,
-        );
-      }
     }
     return capped;
   });

@@ -3,7 +3,8 @@
  * Covers: BOM preservation, ItemGroup ordering, addToProject roundtrip
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ProjectFileManager } from '../../src/tools/createD365File';
+import { ProjectFileManager } from '../../src/workspace/projectFile';
+import { _clearCreatedArtifactLedger } from '../../src/workspace/createdArtifactLedger';
 
 // We need to mock fs/promises so addToProject reads/writes in-memory
 const fileStore = new Map<string, string>();
@@ -29,6 +30,7 @@ vi.mock('../../src/utils/projectFileLock', () => ({
 
 beforeEach(() => {
   fileStore.clear();
+  _clearCreatedArtifactLedger();
 });
 
 // Realistic .rnrproj content as VS 2022 creates it (with BOM)
@@ -136,21 +138,24 @@ describe('ProjectFileManager', () => {
         ['form-extension', 'AxFormExtension', 'Form Extensions'],
         ['data-entity-extension', 'AxDataEntityViewExtension', 'Data Entity Extensions'],
         ['edt-extension', 'AxEdtExtension', 'EDT Extensions'],
-        ['enum-extension', 'AxEnumExtension', 'Enum Extensions'],
+        ['enum-extension', 'AxEnumExtension', 'Base Enum Extensions'],
         ['report', 'AxReport', 'Reports'],
-        ['menu-item-display', 'AxMenuItemDisplay', 'Menu Items Display'],
-        ['menu-item-action', 'AxMenuItemAction', 'Menu Items Action'],
-        ['menu-item-output', 'AxMenuItemOutput', 'Menu Items Output'],
-        ['menu-item-display-extension', 'AxMenuItemDisplayExtension', 'Menu Item Display Extensions'],
-        ['menu-item-action-extension', 'AxMenuItemActionExtension', 'Menu Item Action Extensions'],
-        ['menu-item-output-extension', 'AxMenuItemOutputExtension', 'Menu Item Output Extensions'],
+        ['menu-item-display', 'AxMenuItemDisplay', 'Display Menu Items'],
+        ['menu-item-action', 'AxMenuItemAction', 'Action Menu Items'],
+        ['menu-item-output', 'AxMenuItemOutput', 'Output Menu Items'],
+        ['menu-item-display-extension', 'AxMenuItemDisplayExtension', 'Display Menu Item Extensions'],
+        ['menu-item-action-extension', 'AxMenuItemActionExtension', 'Action Menu Item Extensions'],
+        ['menu-item-output-extension', 'AxMenuItemOutputExtension', 'Output Menu Item Extensions'],
         ['menu', 'AxMenu', 'Menus'],
         ['menu-extension', 'AxMenuExtension', 'Menu Extensions'],
         ['security-privilege', 'AxSecurityPrivilege', 'Security Privileges'],
         ['security-duty', 'AxSecurityDuty', 'Security Duties'],
         ['security-role', 'AxSecurityRole', 'Security Roles'],
-        ['security-duty-extension', 'AxSecurityDutyExtension', 'Security Duties'],
-        ['security-role-extension', 'AxSecurityRoleExtension', 'Security Roles'],
+        // Extensions get their OWN project folder — VS groups them under
+        // "Security Duty Extensions"/"Security Role Extensions", not under the
+        // base "Security Duties"/"Security Roles" nodes.
+        ['security-duty-extension', 'AxSecurityDutyExtension', 'Security Duty Extensions'],
+        ['security-role-extension', 'AxSecurityRoleExtension', 'Security Role Extensions'],
         ['business-event', 'AxClass', 'Classes'],
         ['tile', 'AxTile', 'Tiles'],
         ['kpi', 'AxKPI', 'KPIs'],
@@ -216,6 +221,106 @@ describe('ProjectFileManager', () => {
 
       const result = fileStore.get(projectPath)!;
       expect(result).toContain('xmlns="http://schemas.microsoft.com/developer/msbuild/2003"');
+    });
+  });
+
+  /**
+   * Regression: eval/corpus/runs/2026-07-30T11__L3-dualwrite-entity-mapping__174ac13.json
+   * — undo_last_modification pruned three <Folder Include> entries (Tables\,
+   * Data Entities\, Security Privileges\) that were already in ContosoDemo.rnrproj as
+   * orphans before the run, shrinking it 3384 B → 3268 B. The prune test was "no
+   * remaining Content of this AOT type", which cannot tell our own entry from a
+   * pre-existing one. It now also requires that THIS session added it.
+   */
+  describe('removeFromProject — folder-entry symmetry', () => {
+    /** As the eval sandbox project is: a folder entry with no Content of that type. */
+    const RNRPROJ_WITH_ORPHAN_FOLDER = '\uFEFF' +
+`<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="14.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Model>TestModel</Model>
+  </PropertyGroup>
+  <ItemGroup>
+    <Folder Include="Classes\\" />
+    <Folder Include="Tables\\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="AxClass\\ExistingClass">
+      <SubType>Content</SubType>
+      <Name>ExistingClass</Name>
+      <Link>Classes\\ExistingClass</Link>
+    </Content>
+  </ItemGroup>
+  <Import Project="$(MSBuildExtensionsPath)\\Dynamics365\\Microsoft.Dynamics.Framework.Tools.BuildTasks.Xpp.targets" />
+</Project>`;
+
+    it('leaves a pre-existing orphan folder entry alone', async () => {
+      const projectPath = 'K:\\Test\\Test.rnrproj';
+      fileStore.set(projectPath, RNRPROJ_WITH_ORPHAN_FOLDER);
+
+      const manager = new ProjectFileManager();
+      await manager.addToProject(projectPath, 'table', 'NewTable', 'K:\\Pkg\\AxTable\\NewTable.xml');
+      const removed = await manager.removeFromProject(projectPath, 'table', 'NewTable');
+
+      expect(removed).toBe(true);
+      const xml = fileStore.get(projectPath)!;
+      expect(xml).not.toContain('AxTable\\NewTable');
+      expect(xml).toContain('Folder Include="Tables\\"');
+    });
+
+    it('add + remove is a byte-identical round trip', async () => {
+      const projectPath = 'K:\\Test\\Test.rnrproj';
+      fileStore.set(projectPath, RNRPROJ_WITH_ORPHAN_FOLDER);
+
+      const manager = new ProjectFileManager();
+      // Normalise first: the xml2js round trip reformats whitespace, so compare
+      // against a project that has already been through the builder once.
+      await manager.addToProject(projectPath, 'class', 'Probe', 'K:\\Pkg\\AxClass\\Probe.xml');
+      await manager.removeFromProject(projectPath, 'class', 'Probe');
+      const baseline = fileStore.get(projectPath)!;
+
+      await manager.addToProject(projectPath, 'data-entity', 'ProbeEntity', 'K:\\Pkg\\AxDataEntityView\\ProbeEntity.xml');
+      await manager.removeFromProject(projectPath, 'data-entity', 'ProbeEntity');
+
+      expect(fileStore.get(projectPath)).toBe(baseline);
+    });
+
+    it('removes the folder entry it added itself', async () => {
+      const projectPath = 'K:\\Test\\Test.rnrproj';
+      fileStore.set(projectPath, REALISTIC_RNRPROJ_WITH_BOM);
+
+      const manager = new ProjectFileManager();
+      await manager.addToProject(projectPath, 'data-entity', 'ProbeEntity', 'K:\\Pkg\\AxDataEntityView\\ProbeEntity.xml');
+      expect(fileStore.get(projectPath)!).toContain('Folder Include="Data Entities\\"');
+
+      await manager.removeFromProject(projectPath, 'data-entity', 'ProbeEntity');
+      expect(fileStore.get(projectPath)!).not.toContain('Data Entities\\');
+    });
+
+    it('keeps a folder entry that still hosts a sibling object', async () => {
+      const projectPath = 'K:\\Test\\Test.rnrproj';
+      fileStore.set(projectPath, REALISTIC_RNRPROJ_WITH_BOM);
+
+      const manager = new ProjectFileManager();
+      await manager.addToProject(projectPath, 'table', 'TableOne', 'K:\\Pkg\\AxTable\\TableOne.xml');
+      await manager.addToProject(projectPath, 'table', 'TableTwo', 'K:\\Pkg\\AxTable\\TableTwo.xml');
+      await manager.removeFromProject(projectPath, 'table', 'TableOne');
+
+      const xml = fileStore.get(projectPath)!;
+      expect(xml).not.toContain('AxTable\\TableOne');
+      expect(xml).toContain('AxTable\\TableTwo');
+      expect(xml).toContain('Folder Include="Tables\\"');
+    });
+
+    it('returns false and rewrites nothing when the Content entry is absent', async () => {
+      const projectPath = 'K:\\Test\\Test.rnrproj';
+      fileStore.set(projectPath, REALISTIC_RNRPROJ_WITH_BOM);
+
+      const manager = new ProjectFileManager();
+      const removed = await manager.removeFromProject(projectPath, 'table', 'NeverExisted');
+
+      expect(removed).toBe(false);
+      expect(fileStore.get(projectPath)).toBe(REALISTIC_RNRPROJ_WITH_BOM);
     });
   });
 

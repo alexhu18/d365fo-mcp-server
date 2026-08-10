@@ -4,7 +4,7 @@
  */
 
 import * as fs from 'fs/promises';
-import { Parser } from 'xml2js';
+import { Parser } from '../utils/xml.js';
 import type {
   XppParseResult,
   XppClassInfo,
@@ -114,15 +114,17 @@ export function buildClassExtensionRecord(
 }
 
 export class XppMetadataParser {
-  private parser: Parser;
   private enhancedParser: EnhancedXppParser;
 
-  constructor() {
-    this.parser = new Parser({
+  private get parser(): Parser {
+    return new Parser({
       explicitArray: false,
       mergeAttrs: true,
       trim: true,
     });
+  }
+
+  constructor() {
     this.enhancedParser = new EnhancedXppParser();
   }
 
@@ -334,6 +336,7 @@ export class XppMetadataParser {
         visibility: this.parseVisibility(method.Visibility),
         returnType: decl?.returnType || method.ReturnType || 'void',
         parameters: this.toParameterInfo(decl),
+        parametersUnknown: decl === null,
         isStatic: decl?.modifiers.includes('static') ?? false,
         source: source,
         documentation: method.DeveloperDocumentation || undefined,
@@ -534,9 +537,17 @@ export class XppMetadataParser {
     return Array.isArray(value) ? value : [value];
   }
 
-  /** Declaration parameters narrowed to the shape XppMethodInfo carries. */
+  /**
+   * Declaration parameters narrowed to the shape XppMethodInfo carries.
+   * A null decl yields `[]`; the `parametersUnknown` flag set alongside is what
+   * tells that apart from a genuinely empty list, so don't read this alone.
+   */
   private toParameterInfo(decl: XppDeclaration | null): XppParameterInfo[] {
-    return decl?.parameters.map(p => ({ type: p.type, name: p.name })) ?? [];
+    return decl?.parameters.map(p => (
+      p.defaultValue
+        ? { type: p.type, name: p.name, defaultValue: p.defaultValue }
+        : { type: p.type, name: p.name }
+    )) ?? [];
   }
 
   /**
@@ -674,6 +685,7 @@ export class XppMetadataParser {
         visibility: 'public', // Forms typically have public methods
         returnType: decl?.returnType || 'void',
         parameters: this.toParameterInfo(decl),
+        parametersUnknown: decl === null,
         isStatic: decl?.modifiers.includes('static') ?? false,
         source,
         sourceSnippet: source.split('\n').slice(0, 10).join('\n'),
@@ -812,7 +824,10 @@ export class XppMetadataParser {
       const name: string = root.Name || '';
       const label: string | undefined = root.Label || undefined;
 
-      const rawPrivs = root.Privileges?.AxSecurityRolePermissionSet ??
+      // #34, same family as the role parser: a standard AxSecurityDuty lists its
+      // privileges as <AxSecurityPrivilegeReference>.
+      const rawPrivs = root.Privileges?.AxSecurityPrivilegeReference ??
+                       root.Privileges?.AxSecurityRolePermissionSet ??
                        root.Privileges?.AxSecurityPrivilegePermissionSet;
       const privArray = rawPrivs ? (Array.isArray(rawPrivs) ? rawPrivs : [rawPrivs]) : [];
       const privileges: string[] = privArray
@@ -842,7 +857,12 @@ export class XppMetadataParser {
       const label: string | undefined = root.Label || undefined;
       const description: string | undefined = root.Description || undefined;
 
-      const rawDuties = root.Duties?.AxSecurityRoleDutyPermission ??
+      // #34: a STANDARD AxSecurityRole lists its duties as <AxSecurityDutyReference>.
+      // Only the two legacy/incorrect element names were read here, so a correctly
+      // shaped role parsed as "0 duties" — which security_info(mode=artifact) then
+      // reported as "Duties: none indexed" for a freshly indexed role.
+      const rawDuties = root.Duties?.AxSecurityDutyReference ??
+                        root.Duties?.AxSecurityRoleDutyPermission ??
                         root.Duties?.AxSecurityDutyPermission;
       const dutyArray = rawDuties ? (Array.isArray(rawDuties) ? rawDuties : [rawDuties]) : [];
       const duties: string[] = dutyArray

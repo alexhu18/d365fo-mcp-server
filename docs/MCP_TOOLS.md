@@ -1,12 +1,12 @@
-# Tool Reference — 26 tools
+# Tool Reference — 23 tools
 
 Every tool the server exposes, grouped by purpose. The AI agent picks tools automatically — the *example prompts* show what to ask to trigger them; you never name tools yourself.
 
-> Several tools are **unified** behind a discriminator parameter (`action` / `mode` / `domain` / `kind` / `objectType` / `include`) instead of one tool per variant — e.g. `search`, `get_method`, `d365fo_file`, `analyze_code`, `object_patterns`, `prepare`, `security_info`, `extension_info`, `get_knowledge`, `labels`, `get_object_info`, `generate_object`, `validate_code`. Fewer tools to choose from, same coverage.
+> Several tools are **unified** behind a discriminator parameter (`action` / `mode` / `domain` / `kind` / `objectType` / `include`) instead of one tool per variant — e.g. `search`, `d365fo_file`, `analyze_code`, `object_patterns`, `prepare`, `security_info`, `extension_info`, `get_knowledge`, `labels`, `get_object_info`, `generate_object`, `validate_code`. Fewer tools to choose from, same coverage.
 
-> **C# bridge first:** on Windows D365FO VMs, the bridge-backed read tools (marked †) query the live `IMetadataProvider` (always-fresh metadata) and `DYNAMICSXREFDB` (compiler-resolved cross-references), falling back to SQLite transparently on Azure/Linux. All write operations go exclusively through the bridge. See [BRIDGE.md](BRIDGE.md) and [SQLITE_DEPENDENCY.md](SQLITE_DEPENDENCY.md).
+> **C# bridge first:** on Windows D365FO VMs, the bridge-backed read tools (marked †) query the live `IMetadataProvider` (always-fresh metadata) and `DYNAMICSXREFDB` (compiler-resolved cross-references), falling back to SQLite transparently on Azure/Linux. All write operations go exclusively through the bridge. See [ARCHITECTURE.md](ARCHITECTURE.md).
 >
-> **Server modes:** `full` = all 26 tools · `read-only` (Azure) = search/analysis only · `write-only` (hybrid companion) = file operations + bridge-backed reads. See [MCP_CONFIG.md](MCP_CONFIG.md).
+> **Server modes:** `full` = all 23 tools · `read-only` (Azure) = search/analysis only · `write-only` (hybrid companion) = file operations + bridge-backed reads. Independently, **`MCP_TOOL_PROFILE=core`** publishes only the 18-tool create-and-build loop, for workspaces that already run other MCP servers. See [MCP_CONFIG.md](MCP_CONFIG.md).
 
 ---
 
@@ -42,12 +42,11 @@ flowchart LR
 
 ---
 
-## 🔍 Search & Discovery (2)
+## 🔍 Search & Discovery (1)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
 | `search` † | Search 580K+ symbols by name or keyword (FTS5, < 10 ms). `queries[]` runs up to 10 searches in parallel; `scope="extensions"` limits to custom/ISV models (filters out Microsoft code) | *"Find classes related to sales order posting"* · *"Look up CustTable, SalesLine and PaymTerm at once"* · *"What extensions do we have on VendTable?"* |
-| `batch_get_info` | Detailed info for up to 10 known objects (any type) in one parallel call | *"Get full details of CustTable, SalesLine and CustInvoiceJour"* |
 
 † = bridge-first on Windows D365FO VMs
 
@@ -57,8 +56,7 @@ One unified reader covers every object type via `objectType`; type-specific flag
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `get_object_info` † | Read one object's metadata by `objectType`: `class`, `table`, `form`, `query`, `view`, `enum`, `edt`, `report`, `data-entity`, `menu-item`, `service`, `map`, `config-key`, `security-policy`, `macro`. Options: `{includeRdl}` (report), `{searchControl}` (form), `{compact:false}` (class), `{mode:"hierarchy"}` (edt), `{filter}` (macro). For classes, `{members:"names"}` (optional `{prefix}`) returns a fast IntelliSense-style member-name list. | *"Show the structure of SalesFormLetter"* · *"Methods on SalesTable starting with calc"* · *"Datasets of the SalesInvoice report"* |
-| `get_method` † | Method `include="signature"` (exact signature — **mandatory before CoC**), `include="source"` (full X++ body), or `include="both"` (default) | *"Signature of SalesFormLetter.run?"* · *"Show me the body of CustTable.validateWrite"* |
+| `get_object_info` † | Read object metadata by `objectType`: `class`, `table`, `form`, `query`, `view`, `enum`, `edt`, `report`, `data-entity`, `menu-item`, `service`, `map`, `config-key`, `security-policy`, `macro`. **2+ objects: pass `objects:[{objectType,objectName},…]` (max 10)** — one call, all lookups in parallel, per-object sections back (absorbs the former `batch_get_info`). Options: `{includeRdl}` (report), `{searchControl}` (form), `{compact:false}` (class), `{mode:"hierarchy"}` (edt), `{filter}` (macro); with `objects[]` a top-level `options` applies to every entry. For classes, `{members:"names"}` (optional `{prefix}`) returns a fast IntelliSense-style member-name list, and `{method:"validateWrite", include:"signature"}` returns ONE method — `include` is `signature` (exact signature, **mandatory before CoC**), `source` (full X++ body) or `both` (default). This absorbs the former `get_method`. | *"Show the structure of SalesFormLetter"* · *"Get full details of CustTable, SalesLine and CustInvoiceJour"* · *"Methods on SalesTable starting with calc"* |
 | `find_references` † | Where-used analysis, xref-enriched (reference type, caller class/method). Also does **label where-used** — `targetType="label"` or an `@…` id (e.g. `@WAX2194`, `@ApplicationPlatform:AbortButtonText`) — returning every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), grouped by source type | *"Where is updateInventory called from?"* · *"What references label @SYS9694?"* |
 
 ## 🏷️ Label Management (1)
@@ -75,15 +73,16 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `get_knowledge` | `kind="knowledge"` — queryable X++ rulebook: select grammar, CoC, SysDa, FormRun lifecycle, form patterns, reading Excel/CSV files, parallel batch, direct SQL, AX2012→D365FO migration · `kind="error"` — compiler / runtime / BP errors explained with concrete fixes | *"What are the rules for crossCompany selects?"* · *"How do I read an uploaded Excel file in X++?"* · *"Explain error 'object not initialized' in batch"* |
+| `get_knowledge` | `kind="knowledge"` — queryable X++ rulebook: select grammar, CoC, SysDa, FormRun lifecycle, form patterns, reading Excel/CSV files, parallel batch, direct SQL, AX2012→D365FO migration · `kind="error"` — compiler / runtime / BP errors explained with concrete fixes · `kind="op-spec"` — the parameter contract for one `d365fo_file` operation/objectType or one `generate_object` mode (`topic="add-index"`, `"table"`, `"scaffold:form"`, …); those two tools keep their parameters out of the wire schema, so this is where they come from | *"What are the rules for crossCompany selects?"* · *"How do I read an uploaded Excel file in X++?"* · *"Explain error 'object not initialized' in batch"* |
 | `analyze_code` † | `mode="patterns"` — common patterns for a scenario · `mode="implementations"` — real implementations of a similar method · `mode="completeness"` — missing standard methods on a class · `mode="api-usage"` — how an API is initialized and called (compiler-resolved callers) | *"How are number sequences usually implemented here?"* · *"How do other classes implement validateWrite?"* · *"What standard methods is my service class missing?"* |
 
 ## 🎨 Code Generation (2)
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `generate_object` | `mode="pattern"` — named X++ skeleton from a pattern enum (text only): SysOperation, CoC, event handler, business event, custom service, lookup form, … · `mode="scaffold"` — pattern-aware whole-object generation: `objectType=table` (EDT suggestions), `objectType=form` (**clones reference forms** via `cloneFrom` + `tableMapping`, patterns/sub-patterns preserved, optional `includeMethodStubs`), `objectType=report` (complete SSRS stack: TmpTable + Contract + DP + Controller + AxReport/RDL) · `mode="find-methods"` — static `find()`/`findRecId()`/`exists()` for a table, keyed on its primary/unique index · `mode="relation-xpp"` — a table's relations → X++ `select` + `QueryBuildRange` snippets · `mode="fields"` — a field-name list → `AxTableField` XML with auto-resolved EDTs (+ optional field group) · `mode="table-relation"` — EDT-referencing fields → `AxTableRelation` XML (the inverse of `relation-xpp`) | *"Generate a SysOperation skeleton for VendRecalc"* · *"Create an audit log table with SalesId, PostedAt, PostedBy"* · *"Create a SimpleList form for MyRentalGroup by cloning CustGroup"* · *"Add find/exists methods to MyOrderTable"* · *"Generate table relations for the EDT fields on MyOrderLine"* |
-| `suggest_edt` | EDT suggestions for a field name (fuzzy, confidence-ranked) | *"Which EDT for a field CustomerAccount?"* |
+| `generate_object` | `mode="pattern"` — named X++ skeleton from a pattern enum (text only): SysOperation, CoC, event handler, business event, custom service, lookup form, … · `mode="scaffold"` — pattern-aware whole-object generation: `objectType=table` (EDT suggestions), `objectType=form` (**clones reference forms** via `cloneFrom` + `tableMapping`, patterns/sub-patterns preserved, optional `includeMethodStubs`), `objectType=report` (complete SSRS stack: TmpTable + Contract + DP + Controller + AxReport/RDL) · `mode="find-methods"` — static `find()`/`findRecId()`/`exists()` for a table, keyed on its primary/unique index · `mode="relation-xpp"` — a table's relations → X++ `select` + `QueryBuildRange` snippets · `mode="fields"` — a field-name list → `AxTableField` XML with auto-resolved EDTs (+ optional field group) · `mode="table-relation"` — EDT-referencing fields → `AxTableRelation` XML (the inverse of `relation-xpp`). Mode-specific parameters go in a single `params` object (flat top-level keys still accepted) and come from `get_knowledge(kind="op-spec", topic="<mode>")`; a missing required one returns the complete per-mode spec (source: `generateObjectOpSpecs.ts`) | *"Generate a SysOperation skeleton for VendRecalc"* · *"Create an audit log table with SalesId, PostedAt, PostedBy"* · *"Create a SimpleList form for MyRentalGroup by cloning CustGroup"* · *"Add find/exists methods to MyOrderTable"* · *"Generate table relations for the EDT fields on MyOrderLine"* |
+
+> `suggest_edt` was retired: EDT suggestions come from `prepare(mode="create", fieldsHint=[...])`, which returns them alongside the collision check, naming and mined property defaults in the same call. Its handler stays routable under the old name.
 
 ## 📈 Pattern Analysis (1)
 
@@ -95,7 +94,7 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 
 | Tool | What it does | Example prompt |
 |------|--------------|----------------|
-| `d365fo_file` | `action=create` — create any of 32 AOT object types in the correct location + register in `.rnrproj` (gated by grounding token and form-pattern validation) · `action=modify` — safe metadata edits via the C# bridge, 25 operations: add-field, add-control, add-method, replace-code, modify-property, …; op-specific parameters go in a single `params` object (flat top-level keys still accepted) and a missing/wrong parameter returns the complete per-op spec (error-driven guidance, source: `d365foFileOpSpecs.ts`) · `action=generate` — XML preview without writing (cloud-friendly) | *"Create the class file in my project"* · *"Add the field to the General tab of the form extension"* · *"Show me the XML for this enum without creating it"* |
+| `d365fo_file` | `action=create` — create any of 39 AOT object types in the correct location + register in `.rnrproj` (gated by grounding token and form-pattern validation) · `action=modify` — safe metadata edits via the C# bridge, 31 operations: add-field, add-control, add-method, replace-code, modify-property, …; op-specific parameters go in a single `params` object (flat top-level keys still accepted) and come from `get_knowledge(kind="op-spec", topic="<operation>")` — the per-objectType `properties` contract for `action=create` from `topic="<objectType>"` — while a missing/wrong parameter returns that same complete per-op spec (error-driven guidance, source: `d365foFileOpSpecs.ts`) · `action=generate` — XML preview without writing (cloud-friendly) | *"Create the class file in my project"* · *"Add the field to the General tab of the form extension"* · *"Show me the XML for this enum without creating it"* |
 | `undo_last_modification` | Revert the last write: checkout HEAD or delete untracked file (also re-syncs the symbol index) | *"Undo that last change"* |
 
 ## 🔐 Security & Extensions (5)
@@ -116,9 +115,9 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 |------|--------------|----------------|
 | `build_d365fo_project` | MSBuild compilation with structured xppc diagnostics (severity, object, line, fix hints for the first errors) | *"Build the project and show the errors"* |
 | `trigger_db_sync` | Database sync for the current model | *"Sync the database"* |
-| `run_bp_check` | Microsoft Best Practices (xppbp.exe) analysis | *"Run a BP check on my model"* |
+| `run_bp_check` | Microsoft Best Practices (xppbp.exe) analysis — `objects: [{objectType, objectName}]` checks several objects in one call (shared preamble once, findings grouped per object) | *"Run a BP check on my model"* · *"BP check the table, its extension class and the enum"* |
 | `run_systest_class` | Execute SysTest unit tests via SysTestConsole.exe (requires an interactive console session) | *"Run the MyServiceTest class"* |
-| `update_symbol_index` | Re-index a single changed file without restart | *"Refresh the index for the table I just created"* |
+| `update_symbol_index` | Re-index file(s) changed **outside** this server, without a restart — `d365fo_file` create/modify already refresh the index themselves, so no follow-up call is needed after a write | *"I edited that table in Visual Studio — re-index it"* |
 
 ## ✅ Quality & Grounding (3)
 
@@ -140,6 +139,6 @@ One unified tool covers all label operations via `action` (mirrors the `get_obje
 
 ## Tips
 - **Describe goals, not tools.** The instruction files route requests automatically — *"add a priority field to CustTable and show it on the form"* triggers the whole chain.
-- **Let the gates work.** `GROUNDING_ENFORCE` and `FORM_PATTERN_ENFORCE` (both default on) reject ungrounded or structurally invalid writes — that's the feature, not friction.
+- **Let the gates work.** `FORM_PATTERN_ENFORCE` (default on) rejects structurally invalid form writes, and `GROUNDING_ENFORCE` (default **off** — see [CONFIGURATION.md](CONFIGURATION.md)) rejects writes that were never grounded in a `prepare` call. Turn grounding enforcement on once your workflow reliably calls `prepare` first; that's the feature, not friction.
 - **Verify after writing.** `verify_d365fo_project` confirms disk + project registration in one call.
 - **Full conversations:** [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) shows five real multi-tool scenarios end to end.

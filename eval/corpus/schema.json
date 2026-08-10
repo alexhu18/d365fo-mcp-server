@@ -49,12 +49,14 @@
       "required": ["succeeded"],
       "properties": {
         "succeeded": { "type": "boolean" },
+        "bp_checked": { "type": "boolean", "description": "Provenance flag: whether BP actually ran. Absent on every pre-2026-07-22 record, whose bp_clean provenance is unknown." },
         "errors": { "type": "array", "items": { "type": "object" } },
         "bpWarnings": { "type": "array", "items": { "type": "object" } }
       }
     },
     "golden_diff": {
-      "type": "object",
+      "type": ["object", "null"],
+      "description": "null when the golden dimension was not evaluated (golden_pending case, or no golden captured yet).",
       "additionalProperties": false,
       "required": ["matched"],
       "properties": {
@@ -81,7 +83,7 @@
       "properties": {
         "build": { "type": "integer", "enum": [0, 1] },
         "bp_clean": { "type": "integer", "enum": [0, 1] },
-        "golden_match": { "type": "integer", "enum": [0, 1] },
+        "golden_match": { "type": ["integer", "null"], "enum": [0, 1, null], "description": "null when the golden dimension was not evaluated (golden_pending, or no golden yet)." },
         "systest": { "type": ["integer", "null"], "enum": [0, 1, null] },
         "tier_weight": { "type": "integer" }
       }

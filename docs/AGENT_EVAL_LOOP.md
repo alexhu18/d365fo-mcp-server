@@ -1,8 +1,9 @@
 # Self-improving agent eval loop — design spec
 
 **Status:** implemented and in production use — see
-[eval/ROADMAP.md](../eval/ROADMAP.md) for current status and open work
-**Related:** [ARCHITECTURE.md](ARCHITECTURE.md) · [TESTING.md](TESTING.md) · [BRIDGE.md](BRIDGE.md) · [BACKLOG.md](BACKLOG.md) · [eval/README.md](../eval/README.md)
+[eval/COVERAGE.md](../eval/COVERAGE.md) for live coverage and
+[eval/README.md](../eval/README.md) for open work
+**Related:** [ARCHITECTURE.md](ARCHITECTURE.md) · [TESTING.md](TESTING.md) · [eval/README.md](../eval/README.md)
 
 ---
 
@@ -79,6 +80,7 @@ The two agents communicate **only** through the corpus — no shared in-memory s
 For each selected use-case the **implementer** runs:
 
 1. **Isolate** — provision a throwaway sandbox model/package for this run (see §8).
+1a. **Provision fixtures (§4a)** — (re)provision the shared INPUT objects this case READS (e.g. the `ConDemoNoteHeader` table) from the repo-committed definitions in `eval/fixtures/`, and reindex. These are *not* case outputs; they must exist before the case and are excluded from the rollback in step 9.
 2. **Implement** — drive the grounded path (`prepare` → query tools → `validate_code` → `generate_*` → write). The agent may use only mcp-server tools; no hand-edited XML.
 3. **Static gate** — `validate_code(references)` + `validate_code(syntax)`. Record pass/fail and any violations.
 4. **Build** — `build_d365fo_project`; capture `errors[]` and `bpWarnings[]` (structured).
@@ -86,7 +88,31 @@ For each selected use-case the **implementer** runs:
 6. **Score** — compute the scorecard (§7).
 7. **Triage** — classify any failure via the rubric (§9). The implementer records a *hypothesis*; the improver confirms.
 8. **Persist** — append a run record to the corpus (§5).
-9. **Roll back** — undo writes / wipe the sandbox model so runs never pollute each other or the index.
+9. **Roll back (fixture-aware)** — undo the objects this case wrote / wipe the sandbox model so runs never pollute each other or the index, **but never delete a fixture** (§4a). The exclusion is `partitionForRollback(written, fixtureNames())`; a whole-model wipe is acceptable because step 1a re-provisions the fixture at the start of the next dependent run.
+
+### 4a. Harness-level fixtures
+
+A few objects are **shared INPUTS**: one case creates them and other cases read
+from them. The clearest is the table `ConDemoNoteHeader` — created as artifact 1
+of `L1-form-basic` but read/bound/selected by ~18 other cases (form datasources,
+map, query/view, dimension field, business & data events, batch, custom service,
+data entity, SSRS data providers). Because step 9 rolls back every case, a shared
+object created *by* a case cannot survive — each rollback re-breaks every
+dependent case.
+
+Fix: such INPUTS live in the repo under `eval/fixtures/*.metadata.xml`,
+independent of any case. The split between INPUT fixtures and the ~90 case
+OUTPUTS that must **not** be pre-provisioned is derived and audited by
+`src/eval/fixtures/fixtures.ts` (`npm run eval:fixtures`): a demo object
+referenced by more than one case is SHARED and needs an explicit decision;
+single-case names are that case's OUTPUT. Only decisions marked `INPUT` are
+provisioned. See `eval/fixtures/README.md` for the current classification
+(including the one open call — the `ConDemoNoteHeaderList` form that
+`L4-entity-security` latently references).
+
+Provisioning is idempotent and runs at the **start of every dependent case**, so
+it survives a full wipe and restores a fixture that a case *mutated* in place
+(e.g. `L2-dimension-basic` adds a field to `ConDemoNoteHeader`).
 
 The **improver** runs asynchronously: cluster corpus failures → prioritise → reproduce as a minimal repo test → fix → validate against a held-out split → open a PR citing the corpus evidence (§10).
 
@@ -173,11 +199,25 @@ Per run, layered from cheap to expensive:
 | Signal | Meaning | Gate? |
 |--------|---------|-------|
 | `build` | xppc produced no errors | hard gate — below this, nothing else counts |
-| `bp_clean` | zero best-practice **error**-severity warnings | quality gate |
+| `bp_clean` | `1` = xppbp ran and reported zero **error**-severity warnings, `0` = it ran and reported some, **`null` = it was never run** | quality gate |
 | `golden_match` | normalised metadata == golden | **primary correctness** |
 | `systest` | runtime assertions pass (when present) | deep correctness (optional) |
 
+`bp_clean` is only scored when the capture supplies BP evidence: `tsx src/eval/oracle/cli.ts`
+without `--bp-warnings` records `bp_clean: null` and `build.bp_checked: false`. Pass
+`--bp-warnings 0` **only** when `run_bp_check` actually ran and reported none — the flag used to
+default to 0, which minted a fake `bp_clean: 1` for every capture that skipped xppbp and made the
+dimension untrendable.
+
 Aggregate metrics tracked over time, per tier: `pass@build`, `pass@bp_clean`, `pass@golden`, `pass@systest`, and the headline **tool-defect rate** (should trend down as the improver lands fixes).
+`pass@bp_clean` is averaged over **BP-verified runs only** (`build.bp_checked === true`, or a
+`bp_clean: 0` — which is only reachable from observed warnings); everything else is counted and
+reported as `unverified` instead of being blended in.
+
+The golden diff canonicalises `///` XmlDoc **prose** (a contiguous run of `///` lines collapses to
+one `/// <xmldoc/>` placeholder) — doc-comment wording is not pinned by any case instruction. The
+**presence** of a doc comment is still load-bearing, because that is exactly what
+`BPXmlDocNoDocumentationComments` measures.
 
 ---
 
@@ -245,7 +285,7 @@ Catalog discipline: maintain a **train/held-out split**. Improvements are accept
 ## 11. Isolation & safety
 
 - Every run targets a **dedicated throwaway sandbox model/package**; never a real customisation model.
-- Writes are reversible (bridge one-call undo) and the sandbox model is wiped between runs, so neither the metadata nor the SQLite index is polluted.
+- Writes are reversible (bridge one-call undo) and the sandbox model is wiped between runs, so neither the metadata nor the SQLite index is polluted. **Exception — fixtures (§4a):** shared INPUT objects from `eval/fixtures/` are excluded from rollback (`partitionForRollback`) and re-provisioned at the start of the next dependent run; they are not case residue.
 - Path-containment is already enforced (`PackagesLocalDirectory/<Package>/<Model>/Ax<Type>/`); the harness must additionally pin writes to the sandbox model.
 - Builds are **serialised** with timeouts; the VM is the throughput bottleneck (full builds are minutes, not seconds) — size cadence and batch accordingly.
 
@@ -268,8 +308,8 @@ L0–L4 across a broad set of use-cases (form patterns, extensibility
 mechanisms, OOP mechanics, SSRS, etc.).
 
 Breadth is intentionally open-ended beyond this — see
-[eval/ROADMAP.md](../eval/ROADMAP.md) for what's still uncovered and any
-remaining lower-priority work.
+[eval/COVERAGE.md](../eval/COVERAGE.md) for what's still uncovered and
+[eval/README.md](../eval/README.md) for the standing work queues.
 
 ---
 

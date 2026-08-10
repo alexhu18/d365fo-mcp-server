@@ -48,8 +48,23 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
+          # `git describe` fails when no earlier tag exists (the first release);
+          # without the guard the range collapses to HEAD..HEAD and the notes
+          # come out empty. Merge commits are dropped — the PR titles they carry
+          # are less informative than the underlying conventional commits.
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
           echo "## What's Changed" > CHANGELOG.md
-          git log $(git describe --tags --abbrev=0 HEAD^)..HEAD --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          echo "" >> CHANGELOG.md
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since $PREV_TAG:" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log "$PREV_TAG..HEAD" --no-merges --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          else
+            echo "Initial release — 30 most recent commits:" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            git log HEAD --no-merges --max-count=30 --pretty=format:"- %s (%h)" >> CHANGELOG.md
+          fi
+          echo "" >> CHANGELOG.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
@@ -62,3 +77,51 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publishes the CLI/server package as `d365fo-mcp` so `npx d365fo-mcp` works.
+  #
+  # Authenticates via npm trusted publishing (OIDC) — no NPM_TOKEN, no secret to
+  # rotate. npm matches the short-lived id-token against the trusted publisher
+  # configured on the package (org dynamics365ninja, repo d365fo-mcp-server,
+  # workflow release.yml), so renaming this file breaks publishing until the
+  # publisher entry is updated to match.
+  #
+  # Granular tokens with "bypass 2FA" are being retired instead: from early
+  # August 2026 they stop covering sensitive operations, and around January 2027
+  # they lose direct publishing entirely.
+  # https://github.blog/changelog/2026-07-08-npm-install-time-security-and-gat-bypass2fa-deprecation/
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required — this is the OIDC credential npm exchanges
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14.0; Node 24.x
+      # currently ships npm 11.16, so the bundled npm is enough. Downgrading the
+      # Node line below 22.14 would silently fall back to token auth and fail.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.x'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync package version with the tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT=$(node -p "require('./package.json').version")
+          if [ "$CURRENT" != "$TAG_VERSION" ]; then
+            npm version --no-git-tag-version "$TAG_VERSION"
+          fi
+
+      # No --provenance flag: trusted publishing attests provenance automatically
+      # for a public repo publishing a public package.
+      - name: Publish
+        run: npm publish --access public

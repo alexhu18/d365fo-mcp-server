@@ -16,6 +16,12 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
       }
       return `🔍 Searching D365FO index: "${a.query ?? ''}"${a.type ? ` [${a.type}]` : ''}`;
     case 'get_object_info':
+      if (Array.isArray(a.objects) && a.objects.length > 1) {
+        return `📦 Reading ${a.objects.length} objects: ${a.objects.map((o: any) => o.objectName ?? '').join(', ')}`;
+      }
+      if (Array.isArray(a.objects) && a.objects.length === 1) {
+        return `📦 Reading ${a.objects[0]?.objectType ?? 'object'} ${a.objects[0]?.objectName ?? ''}`;
+      }
       return `📦 Reading ${a.objectType ?? 'object'} ${a.name ?? ''}`;
     case 'get_method':
       return `📖 Reading ${a.include === 'signature' ? 'signature' : a.include === 'source' ? 'source' : 'method'} of ${a.className ?? ''}.${a.methodName ?? ''}`;
@@ -44,38 +50,52 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
       switch (a.action) {
         case 'modify': {
           const op = a.operation ?? 'modify';
-          const obj = `${a.objectType ?? 'object'} ${a.objectName ?? ''}`;
+          // Op-specific parameters (methodName, fieldName, indexName, …) may arrive
+          // nested in `params` rather than flat at top level — merge so the label
+          // reflects the real values instead of showing blanks.
+          const p = { ...a, ...(a.params ?? {}) };
+          // Callers that just created the object pass `filePath` instead of
+          // `objectName`; fall back to the file's basename so the label isn't empty.
+          const objName = a.objectName
+            ?? (typeof a.filePath === 'string'
+              ? a.filePath.replace(/\\/g, '/').split('/').pop()?.replace(/\.xml$/i, '')
+              : undefined);
+          const obj = `${a.objectType ?? 'object'} ${objName ?? ''}`.trim();
           switch (op) {
             case 'add-index':
             case 'remove-index': {
-              const fields = Array.isArray(a.indexFields)
-                ? a.indexFields.map((f: any) => f.fieldName ?? f).join(', ')
+              const fields = Array.isArray(p.indexFields)
+                ? p.indexFields.map((f: any) => f.fieldName ?? f).join(', ')
                 : '';
-              return `✏️ ${op} "${a.indexName ?? ''}"${fields ? ` [${fields}]` : ''} on ${obj}`;
+              return `✏️ ${op} "${p.indexName ?? ''}"${fields ? ` [${fields}]` : ''} on ${obj}`;
             }
             case 'add-relation':
             case 'remove-relation': {
-              const constraints = Array.isArray(a.relationConstraints)
-                ? a.relationConstraints.map((c: any) => `${c.fieldName ?? c.field} → ${c.relatedFieldName ?? c.relatedField}`).join(', ')
+              const constraints = Array.isArray(p.relationConstraints)
+                ? p.relationConstraints.map((c: any) => `${c.fieldName ?? c.field} → ${c.relatedFieldName ?? c.relatedField}`).join(', ')
                 : '';
-              return `✏️ ${op} "${a.relationName ?? ''}"${a.relatedTable ? ` → ${a.relatedTable}` : ''}${constraints ? ` [${constraints}]` : ''} on ${obj}`;
+              return `✏️ ${op} "${p.relationName ?? ''}"${p.relatedTable ? ` → ${p.relatedTable}` : ''}${constraints ? ` [${constraints}]` : ''} on ${obj}`;
             }
             case 'modify-property':
-              return `✏️ ${op} ${a.propertyPath ?? ''}${a.propertyValue !== undefined ? ` = ${String(a.propertyValue).slice(0, 40)}` : ''} on ${obj}`;
+              return `✏️ ${op} ${p.propertyPath ?? ''}${p.propertyValue !== undefined ? ` = ${String(p.propertyValue).slice(0, 40)}` : ''} on ${obj}`;
             case 'add-method':
             case 'remove-method':
             case 'add-table-method':
-            case 'add-display-method':
-              return `✏️ ${op} "${a.methodName ?? ''}" on ${obj}`;
+            case 'add-display-method': {
+              // methodName is optional for add-method — it is derived from the
+              // source signature downstream; derive it here too for the label.
+              const name = p.methodName ?? deriveMethodNameForLabel(p.sourceCode) ?? '';
+              return `✏️ ${op} "${name}" on ${obj}`;
+            }
             case 'add-field':
             case 'modify-field':
             case 'rename-field':
             case 'remove-field':
-              return `✏️ ${op} "${a.fieldName ?? ''}"${a.fieldNewName ? ` → "${a.fieldNewName}"` : ''} on ${obj}`;
+              return `✏️ ${op} "${p.fieldName ?? ''}"${p.fieldNewName ? ` → "${p.fieldNewName}"` : ''} on ${obj}`;
             case 'add-enum-value':
             case 'modify-enum-value':
             case 'remove-enum-value':
-              return `✏️ ${op} "${a.enumValueName ?? ''}" on ${obj}`;
+              return `✏️ ${op} "${p.enumValueName ?? ''}" on ${obj}`;
             default:
               return `✏️ ${op} on ${obj}`;
           }
@@ -128,7 +148,11 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
     case 'trigger_db_sync':
       return `🗄️ Triggering database sync${a.tableName ? ` for ${a.tableName}` : ''}`;
     case 'run_bp_check':
-      return `🔍 Running Best Practices check${a.targetFilter ? ` on ${a.targetFilter}` : ''}`;
+      return `🔍 Running Best Practices check${
+        Array.isArray(a.objects) && a.objects.length > 0
+          ? ` on ${a.objects.length} object${a.objects.length === 1 ? '' : 's'}`
+          : a.targetFilter ? ` on ${a.targetFilter}` : ''
+      }`;
     case 'run_systest_class':
       return `🧪 Running unit tests: ${a.className ?? ''}`;
     case 'review_workspace_changes':
@@ -138,9 +162,9 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
     case 'get_workspace_info':
       return `⚙️ Reading workspace configuration`;
     case 'get_knowledge':
-      return a.kind === 'error'
-        ? `🆘 Looking up D365FO error: "${String(a.errorText ?? '').slice(0, 80)}"`
-        : `📚 Reading X++ knowledge: "${a.topic ?? ''}"`;
+      if (a.kind === 'error') return `🆘 Looking up D365FO error: "${String(a.errorText ?? '').slice(0, 80)}"`;
+      if (a.kind === 'op-spec') return `📖 Reading parameter spec: "${a.topic ?? a.operation ?? a.mode ?? ''}"`;
+      return `📚 Reading X++ knowledge: "${a.topic ?? ''}"`;
     case 'validate_code':
       return a.mode === 'references'
         ? `🔎 Resolving symbol references in generated code`
@@ -148,4 +172,20 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
     default:
       return `⚙️ Running ${toolName}`;
   }
+}
+
+/**
+ * Best-effort method-name extraction for the progress label only, used when an
+ * add-method call omits `methodName` and relies on downstream derivation from the
+ * source. Strips line/block comments, then returns the identifier before the first
+ * '(' of the signature. Not authoritative — the bridge derives the real name.
+ */
+function deriveMethodNameForLabel(source: unknown): string | null {
+  if (typeof source !== 'string' || !source) return null;
+  const cleaned = source
+    .replace(/\/\/[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ');
+  const m = cleaned.match(/\b([A-Za-z_]\w*)\s*\(/);
+  return m ? m[1] : null;
 }

@@ -35,13 +35,18 @@ export const prepareTool = {
             'class', 'table', 'form', 'enum', 'edt', 'query', 'view',
             'data-entity', 'report', 'map', 'menu-item-display', 'menu-item-action',
             'menu-item-output', 'menu', 'security-privilege', 'security-duty', 'security-role',
-            'business-event', 'tile', 'kpi',
+            'business-event', 'tile', 'kpi', 'service', 'service-group',
+            'macro', 'configuration-key', 'security-policy', 'aggregate-measurement', 'license-code',
           ],
           description: '[change] D365FO object type — auto-detected when omitted. [create] REQUIRED — type of the new object.',
         },
         methodName: {
           type: 'string',
           description: '[change] Target method name when the change involves a specific method (CoC or event handlers). Example: "validateWrite".',
+        },
+        operation: {
+          type: 'string',
+          description: '[change] The modify operation you intend to run; its full parameter contract comes back in THIS response, so no separate op-spec call. Defaults to add-method when methodName is given.',
         },
         proposedName: {
           type: 'string',

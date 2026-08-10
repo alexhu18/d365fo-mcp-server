@@ -4,14 +4,19 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { searchLabelsTool } from '../../src/tools/searchLabels';
-import { getLabelInfoTool } from '../../src/tools/getLabelInfo';
-import { createLabelTool } from '../../src/tools/createLabel';
-import { renameLabelTool } from '../../src/tools/renameLabel';
-import { labelsTool } from '../../src/tools/labels';
+import { searchLabelsTool } from '../../src/tools/analysis/searchLabels';
+import { getLabelInfoTool } from '../../src/tools/readers/getLabelInfo';
+import { createLabelTool } from '../../src/tools/write/createLabel';
+import { renameLabelTool } from '../../src/tools/write/renameLabel';
+import { labelsTool, mapWithConcurrency } from '../../src/tools/labels';
 import { isExtensionLabelFile } from '../../src/metadata/labelParser';
+import { resetLabelSearchHistory } from '../../src/tools/analysis/labelSearchHistory';
 import type { XppServerContext } from '../../src/types/context';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
+
+// The search history is module state that deliberately outlives one call — reset
+// it per test so one suite's phrasings never become another's "you already asked".
+beforeEach(() => { resetLabelSearchHistory(); });
 
 // Mock filesystem access — label tools write to disk
 vi.mock('fs', async (orig) => {
@@ -33,7 +38,7 @@ const mockAddToProject = vi.fn(async () => true);
 const mockAddLabelToProject = vi.fn(async (_proj: string, _id: string, langs: string[]): Promise<string[]> =>
   langs.map(l => `${_id}_${l}`));
 const mockFindProjectInSolution = vi.fn(async (_sol: string, _model: string): Promise<string | null> => null);
-vi.mock('../../src/tools/createD365File', () => ({
+vi.mock('../../src/workspace/projectFile', () => ({
   ProjectFileManager: vi.fn().mockImplementation(function(this: any) {
     this.addToProject = mockAddToProject;
     this.addLabelToProject = mockAddLabelToProject;
@@ -47,6 +52,9 @@ const mockConfigMgr = {
   ensureLoaded: vi.fn(async () => {}),
   getPackagePath: vi.fn(() => 'K:\\PackagesLocalDirectory'),
   getModelName: vi.fn(() => 'MyModel'),
+  // Writes are measured against the anchor, not the active model (see getWriteAnchorModel).
+  getWriteAnchorModel: vi.fn(() => 'MyModel'),
+  getToolProjectSwitch: vi.fn(() => null),
   getPackageNameFromWorkspacePath: vi.fn(() => 'MyPackage'),
   getProjectPath: vi.fn(async () => null as string | null),
   getSolutionPath: vi.fn(async () => null as string | null),
@@ -183,6 +191,339 @@ describe('search_labels', () => {
     const result = await searchLabelsTool(req('search_labels', {}), ctx);
     expect(result.isError).toBe(true);
   });
+
+  it('tells the caller to create rather than rephrase when nothing matches', async () => {
+    // Rephrasing was the only next step the footer suggested, and one run took it
+    // 19 times for a verdict the first call had already reached.
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+    const text = (await searchLabelsTool(req('search_labels', { query: 'cannot be decreased' }), ctx))
+      .content[0].text as string;
+    expect(text).toMatch(/Rephrasing does not help/i);
+    expect(text).toContain('labels(action="create"');
+  });
+
+  it('says the same when every hit belongs to a package the model cannot resolve', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'Downgrade', text: 'Downgrade', labelFileId: 'SubBill', model: 'SubscriptionBilling' }),
+    ]);
+    const text = (await searchLabelsTool(req('search_labels', { query: 'downgrade' }), ctx))
+      .content[0].text as string;
+    expect(text).toMatch(/none is\s+recommended as-is/i);
+    expect(text).toMatch(/Rephrasing does not help/i);
+  });
+});
+
+// ─── labels(action="search") batch ───────────────────────────────────────────
+//
+// One query per call turned "find a reusable label" — inherently a guessing game —
+// into a round trip per guess. An array of phrasings resolves it in one.
+
+describe('labels(action="search") with query[]', () => {
+  let ctx: XppServerContext;
+
+  beforeEach(() => { ctx = buildContext(); });
+
+  it('runs every phrasing and reports one verdict when none is reusable', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+
+    const text = (await labelsTool(
+      req('labels', { action: 'search', query: ['cannot be decreased', 'downgrade', 'value is lower'] }),
+      ctx,
+    )).content[0].text as string;
+
+    expect((ctx.symbolIndex.searchLabels as any).mock.calls.length).toBe(3);
+    expect(text).toContain('3 queries');
+    expect(text).toMatch(/none of these 3 phrasings/i);
+    expect(text).toContain('Stop searching and create your own.');
+    // Every phrasing is still named, but a miss carries no information beyond
+    // its own name: three full "create your own label" sections were three
+    // copies of one paragraph. They collapse into one line.
+    expect(text).toContain('No match — 3 phrasing(s)');
+    for (const q of ['cannot be decreased', 'downgrade', 'value is lower']) {
+      expect(text).toContain(`"${q}"`);
+      expect(text).not.toContain(`## "${q}"`);
+    }
+    // The advice survives — once.
+    expect(text.match(/Nothing reusable here/g) ?? []).toHaveLength(1);
+  });
+
+  // "At least one reusable label was found" promised more than a hit means: the
+  // model can RESOLVE the label, not that it says what the caller needs. Callers
+  // kept rephrasing to find the label the verdict implied was there.
+  it('reports a hit as a candidate, and still hands over the create call', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'CustomerName', text: 'Customer name', labelFileId: 'MyModel', model: 'MyModel' }),
+    ]);
+
+    const text = (await labelsTool(
+      req('labels', { action: 'search', query: ['customer', 'client'] }),
+      ctx,
+    )).content[0].text as string;
+
+    expect(text).toMatch(/at least one label this model can resolve came back/i);
+    expect(text).toMatch(/a hit is a candidate, not a verdict/i);
+    // Never the flat "nothing was found" verdict — something WAS found.
+    expect(text).not.toMatch(/none of these \d+ phrasings/i);
+    // …but the fallback is right there, so "none of these fit" needs no new call.
+    expect(text).toContain('labels(action="create"');
+  });
+
+  it('caps the batch and says what it did not run', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+    const many = Array.from({ length: 15 }, (_, i) => `phrase ${i}`);
+
+    const text = (await labelsTool(req('labels', { action: 'search', query: many }), ctx))
+      .content[0].text as string;
+
+    expect((ctx.symbolIndex.searchLabels as any).mock.calls.length).toBe(12);
+    expect(text).toContain('3 beyond the 12-query cap were not run');
+  });
+
+  it('rejects an empty query array rather than reporting a clean no-match', async () => {
+    const result = await labelsTool(req('labels', { action: 'search', query: [] }), ctx);
+    expect(result.isError).toBe(true);
+  });
+
+  it('folds phrasings that differ only in case or spacing', async () => {
+    // The index is case-insensitive, so these are one query — running it three
+    // times costs three FTS scans and prints three identical sections.
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+
+    const text = (await labelsTool(
+      req('labels', { action: 'search', query: ['customer', 'customer', ' Customer ', 'client'] }),
+      ctx,
+    )).content[0].text as string;
+
+    expect((ctx.symbolIndex.searchLabels as any).mock.calls.length).toBe(2);
+    expect(text).toContain('2 duplicate phrasing(s) folded');
+    // The caller's own first spelling is what reads back.
+    expect(text).toContain('"customer"');
+    expect(text).not.toContain('"Customer"');
+  });
+
+  // Run f7130bea: six batches of phrasings, ~23 AIU, plus two raw reads of the
+  // .label.txt files — and the answer was settled by the first batch. Every result
+  // already said "rephrasing does not help"; advice stated in the abstract is easy
+  // to argue with, the same advice listing what you already asked is not.
+  it('says nothing about repetition on the first miss', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+
+    const text = (await labelsTool(
+      req('labels', { action: 'search', query: ['cannot be decreased', 'downgrade'] }),
+      ctx,
+    )).content[0].text as string;
+
+    expect(text).not.toContain('This is not new information');
+  });
+
+  it('names the earlier phrasings when the caller comes back to rephrase', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+
+    await labelsTool(req('labels', { action: 'search', query: ['cannot be decreased', 'downgrade'] }), ctx);
+    const text = (await labelsTool(
+      req('labels', { action: 'search', query: ['value must not drop'] }),
+      ctx,
+    )).content[0].text as string;
+
+    expect(text).toContain('This is not new information');
+    expect(text).toContain('2 phrasing(s) already came back empty');
+    expect(text).toContain('"cannot be decreased"');
+    // Its own phrasings are the current answer, not evidence of repetition.
+    expect(text).not.toMatch(/already came back empty here:[^\n]*value must not drop/);
+  });
+
+  it('keeps quiet about a phrasing that DID find something', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'CustomerName', text: 'Customer name', labelFileId: 'MyModel', model: 'MyModel' }),
+    ]);
+    await labelsTool(req('labels', { action: 'search', query: ['customer'] }), ctx);
+
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+    const text = (await labelsTool(req('labels', { action: 'search', query: ['nothing at all'] }), ctx))
+      .content[0].text as string;
+
+    expect(text).not.toContain('This is not new information');
+  });
+
+  it('does not report a failed batch as "no reusable label exists"', async () => {
+    // isError used to be dropped: a batch in which every query blew up returned a
+    // clean report whose verdict was "none of these phrasings found a label" —
+    // indistinguishable from a real miss, and the caller then created a duplicate.
+    (ctx.symbolIndex.searchLabels as any).mockImplementation(() => { throw new Error('labels DB is locked'); });
+
+    const result = await labelsTool(
+      req('labels', { action: 'search', query: ['customer', 'client'] }),
+      ctx,
+    );
+    const text = result.content[0].text as string;
+
+    expect(result.isError).toBe(true);
+    expect(text).toMatch(/every one failed/i);
+    expect(text).not.toContain('Stop searching and create your own.');
+    expect(text).toContain('SEARCH FAILED');
+  });
+
+  it('runs the phrasings with bounded concurrency, in order', async () => {
+    // Batching exists to turn N round trips into one; a serial loop keeps the cost
+    // at the SUM of the queries when it only needs to be the slowest of them. The
+    // bound is there because they all land on one SQLite connection.
+    let inFlight = 0;
+    let peak = 0;
+    const out = await mapWithConcurrency([1, 2, 3, 4, 5, 6, 7, 8], 4, async (n) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise(r => setTimeout(r, 5));
+      inFlight--;
+      return n * 10;
+    });
+
+    expect(out).toEqual([10, 20, 30, 40, 50, 60, 70, 80]);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps the verdict but names the queries that failed when only some did', async () => {
+    let call = 0;
+    (ctx.symbolIndex.searchLabels as any).mockImplementation(() => {
+      call++;
+      if (call === 1) throw new Error('labels DB is locked');
+      return [];
+    });
+
+    const result = await labelsTool(
+      req('labels', { action: 'search', query: ['customer', 'client'] }),
+      ctx,
+    );
+    const text = result.content[0].text as string;
+
+    expect(result.isError).toBeUndefined();
+    expect(text).toMatch(/none of these 1 phrasings/i);
+    expect(text).toMatch(/1 of 2 searches FAILED/);
+  });
+
+  it('still accepts a single string query', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([]);
+    const text = (await labelsTool(req('labels', { action: 'search', query: 'customer' }), ctx))
+      .content[0].text as string;
+    expect(text).not.toContain('# Label search —');
+  });
+});
+
+// ─── search_labels result budget (#832) ──────────────────────────────────────
+
+describe('search_labels result budget (#832)', () => {
+  let ctx: XppServerContext;
+
+  /** N hits owned by `model`, ids Label0…LabelN-1 — mimics a broad phrase query. */
+  const manyLabels = (n: number, model = 'Foundation') =>
+    Array.from({ length: n }, (_, i) => makeLabelResult({
+      labelId: `Label${i}`, labelFileId: model, model, text: `value cannot be less than ${i}`,
+      comment: 'Some developer comment that used to be printed for every single hit',
+    }));
+
+  beforeEach(() => { ctx = buildContext(); });
+
+  it('caps the listing at 10 labels by default and says how many more matched', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue(manyLabels(30));
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'lower value' }), ctx)).content[0].text as string;
+
+    expect(text).toContain('showing first 10');
+    expect(text).toContain('… and 20 more — narrow the query or raise maxResults');
+    expect(text).toContain('@Foundation:Label9');
+    expect(text).not.toContain('@Foundation:Label10');
+  });
+
+  it('honours maxResults and its legacy `limit` alias', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue(manyLabels(30));
+
+    const wide = (await searchLabelsTool(req('search_labels', { query: 'x', maxResults: 25 }), ctx)).content[0].text as string;
+    expect(wide).toContain('@Foundation:Label24');
+    expect(wide).toContain('… and 5 more');
+
+    const legacy = (await searchLabelsTool(req('search_labels', { query: 'x', limit: 3 }), ctx)).content[0].text as string;
+    expect(legacy).toContain('@Foundation:Label2');
+    expect(legacy).not.toContain('@Foundation:Label3');
+    expect(legacy).toContain('… and 27 more');
+  });
+
+  it('over-fetches past the display cap so the footer count is exact', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue(manyLabels(30));
+    await searchLabelsTool(req('search_labels', { query: 'lower value' }), ctx);
+
+    const opts = (ctx.symbolIndex.searchLabels as any).mock.calls[0][1];
+    expect(opts.limit).toBeGreaterThan(30);
+  });
+
+  it('emits no footer when everything matched fits', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue(manyLabels(4));
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'x' }), ctx)).content[0].text as string;
+
+    expect(text).toContain('Found 4 label(s)');
+    expect(text).not.toContain('more — narrow the query');
+  });
+
+  it('states the cross-model ownership warning once per result set, not once per label', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      ...manyLabels(6, 'Foundation'),
+      ...manyLabels(4, 'RevenueRecognition'),
+    ]);
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'x' }), ctx)).content[0].text as string;
+
+    // …once for the whole set, naming the models that need a package reference —
+    // and never again as the per-label sentence that used to repeat on every hit.
+    expect(text.match(/owned by other models/g) ?? []).toHaveLength(1);
+    expect(text).not.toContain('owned by model "');
+    expect(text).toContain('10 result(s) marked');
+    expect(text).toContain('Foundation, RevenueRecognition');
+  });
+
+  it('renders one line per label by default', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'CustName', labelFileId: 'MyModel', model: 'MyModel', text: 'Customer name' }),
+    ]);
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'customer' }), ctx)).content[0].text as string;
+
+    expect(text).toContain('@MyModel:CustName — "Customer name" [MyModel]');
+    expect(text).not.toContain('Text    :');
+    expect(text).not.toContain('Comment :');
+  });
+
+  it('keeps a multi-line hit on a single line', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'Multi', text: 'first line\nsecond   line' }),
+    ]);
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'x' }), ctx)).content[0].text as string;
+    const hit = text.split('\n').filter(l => l.trim().startsWith('@MyModel:Multi —'));
+
+    expect(hit).toHaveLength(1);
+    expect(hit[0]).toContain('"first line second line"');
+  });
+
+  it('verbose=true restores the multi-line block for callers that want full detail', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue([
+      makeLabelResult({ labelId: 'CustName', text: 'Customer name', comment: 'Header caption' }),
+    ]);
+
+    const text = (await searchLabelsTool(req('search_labels', { query: 'customer', verbose: true }), ctx)).content[0].text as string;
+
+    expect(text).toContain('Text    : Customer name');
+    expect(text).toContain('Comment : Header caption');
+    expect(text).toContain('Model   : MyModel  |  LabelFile: MyModel');
+  });
+
+  it('is dramatically cheaper than the verbose form for a broad query', async () => {
+    (ctx.symbolIndex.searchLabels as any).mockReturnValue(manyLabels(30));
+
+    const compact = (await searchLabelsTool(req('search_labels', { query: 'x' }), ctx)).content[0].text as string;
+    const verbose = (await searchLabelsTool(req('search_labels', { query: 'x', verbose: true, maxResults: 30 }), ctx)).content[0].text as string;
+
+    expect(compact.length).toBeLessThan(verbose.length / 3);
+  });
 });
 
 // ─── get_label_info ──────────────────────────────────────────────────────────
@@ -207,10 +548,17 @@ describe('get_label_info', () => {
   });
 
   it('returns physical file paths per language when labelFileId is given without labelId', async () => {
-    (ctx.symbolIndex.getLabelFileIds as any).mockReturnValue([
+    // Narrowing is the QUERY's job now — grouping all 1.4 M label rows and then
+    // discarding every group but one is what made a cold call take 28 s. The mock
+    // honours the argument so this pins that the tool actually passes it down.
+    const allFiles = [
       { labelFileId: 'MyModel', model: 'MyModel', languages: 'en-US,cs' },
       { labelFileId: 'SYS', model: 'ApplicationSuite', languages: 'en-US' },
-    ]);
+    ];
+    (ctx.symbolIndex.getLabelFileIds as any).mockImplementation(
+      (_model?: string, labelFileId?: string) =>
+        labelFileId ? allFiles.filter(f => f.labelFileId === labelFileId) : allFiles,
+    );
     (ctx.symbolIndex.getLabelFilePaths as any).mockReturnValue([
       { language: 'en-US', filePath: 'K:\\repos\\meta\\MyModel\\MyModel\\AxLabelFile\\LabelResources\\en-US\\MyModel.en-US.label.txt', model: 'MyModel' },
       { language: 'cs', filePath: 'K:\\repos\\meta\\MyModel\\MyModel\\AxLabelFile\\LabelResources\\cs\\MyModel.cs.label.txt', model: 'MyModel' },
@@ -222,6 +570,7 @@ describe('get_label_info', () => {
     );
 
     expect(result.isError).toBeFalsy();
+    expect(ctx.symbolIndex.getLabelFileIds as any).toHaveBeenCalledWith(undefined, 'MyModel');
     expect(ctx.symbolIndex.getLabelFilePaths as any).toHaveBeenCalledWith('MyModel', undefined);
     const text = result.content[0].text;
     // Narrowed to the requested file only — SYS must not appear.
@@ -1349,6 +1698,115 @@ describe('labels dispatcher: action aliases + errors', () => {
       ctx,
     );
     expect(r.content[0].text).toMatch(/already exists|No label text changes/i);
+  });
+
+  // ── createIfMissing (audit §3 item 10) ────────────────────────────────────
+  // The published contract mandated labels(action="search") before every create,
+  // so the common "make sure this label exists" intent cost two round trips. The
+  // flag collapses it to one without ever overwriting.
+
+  it('createIfMissing reports an existing label as reusable instead of "nothing written"', async () => {
+    await seedExistingLabel();
+    (ctx.symbolIndex.getLabelById as any).mockReturnValue([]);
+    const r: any = await labelsTool(
+      { method: 'tools/call', params: { name: 'labels', arguments: {
+        action: 'create',
+        labelId: 'MyExistingLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        createIfMissing: true,
+        translations: [{ language: 'en-US', text: 'Different text' }],
+      } } } as CallToolRequest,
+      ctx,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content[0].text).toContain('✅');
+    expect(r.content[0].text).toContain('reusing it');
+    // Must hand back the reference, or the caller still needs a second call.
+    expect(r.content[0].text).toContain('@MyModel:MyExistingLabel');
+    expect(r.content[0].text).toContain('literalStr("@MyModel:MyExistingLabel")');
+  });
+
+  it('createIfMissing never overwrites — the existing text survives and update is named', async () => {
+    await seedExistingLabel();
+    const fsMock = await import('fs');
+    (fsMock.promises.writeFile as any).mockClear();
+    (ctx.symbolIndex.getLabelById as any).mockReturnValue([]);
+    const r: any = await labelsTool(
+      { method: 'tools/call', params: { name: 'labels', arguments: {
+        action: 'create',
+        labelId: 'MyExistingLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        createIfMissing: true,
+        translations: [{ language: 'en-US', text: 'Different text' }],
+      } } } as CallToolRequest,
+      ctx,
+    );
+    // No .label.txt write at all — the whole point of "reuse, don't clobber".
+    const wrotelabelTxt = (fsMock.promises.writeFile as any).mock.calls
+      .some((c: any[]) => String(c[0]).endsWith('.label.txt'));
+    expect(wrotelabelTxt).toBe(false);
+    expect(r.content[0].text).toContain('Existing text was NOT changed');
+    expect(r.content[0].text).toContain('action="update"');
+  });
+
+  it('createIfMissing defaults off — the fail-if-exists report is unchanged', async () => {
+    await seedExistingLabel();
+    (ctx.symbolIndex.getLabelById as any).mockReturnValue([]);
+    const r: any = await labelsTool(
+      { method: 'tools/call', params: { name: 'labels', arguments: {
+        action: 'create',
+        labelId: 'MyExistingLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        translations: [{ language: 'en-US', text: 'Different text' }],
+      } } } as CallToolRequest,
+      ctx,
+    );
+    expect(r.content[0].text).toContain('No label text changes were made');
+    expect(r.content[0].text).not.toContain('reusing it');
+  });
+
+  it('createIfMissing still CREATES when the label is absent', async () => {
+    const fsMock = await import('fs');
+    (fsMock.promises.readFile as any).mockImplementation(async () => '; Label file\nSomethingElse=x\n');
+    (fsMock.promises.readdir as any).mockImplementation(async () => ['en-US']);
+    (ctx.symbolIndex.getLabelById as any).mockReturnValue([]);
+    const r: any = await labelsTool(
+      { method: 'tools/call', params: { name: 'labels', arguments: {
+        action: 'create',
+        labelId: 'BrandNewLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+        createIfMissing: true,
+        translations: [{ language: 'en-US', text: 'Brand new' }],
+      } } } as CallToolRequest,
+      ctx,
+    );
+    expect(r.isError).toBeFalsy();
+    expect(r.content[0].text).toMatch(/created successfully/i);
+  });
+
+  it('accepts createIfMissing nested in `params` like the other write plumbing', async () => {
+    await seedExistingLabel();
+    (ctx.symbolIndex.getLabelById as any).mockReturnValue([]);
+    const r: any = await labelsTool(
+      { method: 'tools/call', params: { name: 'labels', arguments: {
+        action: 'create',
+        labelId: 'MyExistingLabel',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        translations: [{ language: 'en-US', text: 'Different text' }],
+        params: { createIfMissing: true, updateIndex: false },
+      } } } as CallToolRequest,
+      ctx,
+    );
+    expect(r.content[0].text).toContain('reusing it');
   });
 
   it('names the missing field when create/update args are incomplete', async () => {

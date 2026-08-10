@@ -6,7 +6,7 @@
 import { BlobServiceClient } from '@azure/storage-blob';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import Database from 'better-sqlite3';
+import Database from './sqlite.js';
 
 interface DownloadOptions {
   connectionString?: string;
@@ -52,6 +52,39 @@ async function cleanupTempFiles(tmpPath: string): Promise<void> {
       await fs.unlink(`${tmpPath}${suffix}`);
     } catch {
       // Ignore if file does not exist
+    }
+  }
+}
+
+/**
+ * Move a validated download over the live database file.
+ *
+ * A bare rename() replaces only the .db. The PREVIOUS database's -wal and -shm are
+ * left sitting next to it, and SQLite treats a -wal it finds beside a database as
+ * that database's own journal: on the next open it replays pages from the old
+ * generation into the freshly downloaded file, which reports as corruption or, worse,
+ * as silently resurrected rows. They are removed BEFORE the rename, so a crash in
+ * the middle leaves the old database without a journal it no longer needs rather
+ * than the new database with a journal that does not belong to it.
+ *
+ * Exported for unit tests.
+ */
+export async function swapDownloadedDatabase(tmpPath: string, finalPath: string): Promise<void> {
+  for (const suffix of ['-shm', '-wal']) {
+    try {
+      await fs.unlink(`${finalPath}${suffix}`);
+    } catch {
+      // Not present — the common case for a cleanly closed database.
+    }
+  }
+  await fs.rename(tmpPath, finalPath);
+  // The integrity check opened tmpPath, which can leave its own companions behind;
+  // they would otherwise be replayed against the NEXT download of the same name.
+  for (const suffix of ['-shm', '-wal']) {
+    try {
+      await fs.unlink(`${tmpPath}${suffix}`);
+    } catch {
+      // Not present.
     }
   }
 }
@@ -131,8 +164,8 @@ export async function downloadDatabaseFromBlob(options?: DownloadOptions): Promi
       
       console.log(`   ✅ Symbols database validation passed`);
 
-      // Atomic move: rename temp to final
-      await fs.rename(tmpPath, localPath);
+      // Atomic move: rename temp to final (dropping the old database's WAL files)
+      await swapDownloadedDatabase(tmpPath, localPath);
       
       // Download labels database (separate file)
       const labelsBlobName = blobName.replace('.db', '-labels.db').replace('xpp-metadata-latest', 'xpp-metadata-labels-latest');
@@ -173,7 +206,7 @@ export async function downloadDatabaseFromBlob(options?: DownloadOptions): Promi
           console.log(`   ✅ Labels database validation passed`);
 
           // Move to final location
-          await fs.rename(labelsTmpPath, labelsDbPath);
+          await swapDownloadedDatabase(labelsTmpPath, labelsDbPath);
           console.log(`   ✅ Labels database downloaded`);
         } else {
           console.log(`   ⚠️  Labels database not found (may be old single-DB format)`);
@@ -253,7 +286,7 @@ export async function checkDatabaseVersion(localPath: string, options?: Download
       localModified,
       remoteModified,
     };
-  } catch (error) {
+  } catch {
     // If local file doesn't exist, needs download
     return { needsUpdate: true };
   }

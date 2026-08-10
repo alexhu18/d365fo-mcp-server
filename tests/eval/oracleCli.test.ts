@@ -20,7 +20,22 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+import { spawnSync } from 'child_process';
 import { buildActualArtifactsMap } from '../../src/eval/oracle/actualArtifactResolution';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HERE, '..', '..');
+const CLI = path.join(REPO_ROOT, 'src', 'eval', 'oracle', 'cli.ts');
+
+/** Run the oracle CLI (VM-free) as a subprocess; capture exit code + combined output
+ *  (the CLI prints its scorecard to stderr, so both streams are merged). */
+function runOracleCli(args: string[]): { status: number; out: string } {
+  const r = spawnSync('npx', ['tsx', CLI, ...args], {
+    cwd: REPO_ROOT, encoding: 'utf8', shell: true,
+  });
+  return { status: r.status ?? 1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+}
 
 describe('buildActualArtifactsMap', () => {
   let actualDir: string;
@@ -96,4 +111,59 @@ describe('buildActualArtifactsMap', () => {
     });
     expect(matchedActualFiles).toEqual(new Set(['DemoContract.metadata.xml']));
   });
+});
+
+/**
+ * Regression: the scorer used to crash with a raw `ENOENT: scandir eval/goldens/<caseId>`
+ * for any case whose golden dir is absent/empty — which blocks scoring EVERY `golden_pending`
+ * case, not just one. Corpus evidence:
+ *   eval/corpus/runs/2026-07-21T__L3-custom-service-basic__a2a4131.json  (finding (b),
+ *   evidence_refs -> "npm run eval:score ... -> ENOENT scandir eval/goldens/L3-custom-service-basic",
+ *   "src/eval/oracle/cli.ts:66 listGoldenArtifacts").
+ * Class: TOOL_DEFECT (harness/oracle). The scorer must degrade gracefully — score `build`
+ * and `bp_clean` normally and report golden_match: null (not 0, not a crash).
+ */
+describe('oracle CLI degrades gracefully when the golden is unavailable (golden_pending)', () => {
+  // Pick whichever case is still golden_pending rather than pinning one by name: goldens get
+  // captured on the VM one at a time (§6.4), so a hardcoded id turns every capture into a
+  // spurious test failure. The premise is "some case is pending", not "this case is pending".
+  const casesDir = path.join(REPO_ROOT, 'eval', 'cases');
+  const PENDING_CASE = fs
+    .readdirSync(casesDir)
+    .filter((f) => f.endsWith('.json') && f !== 'schema.json')
+    .sort()
+    .find((f) => JSON.parse(fs.readFileSync(path.join(casesDir, f), 'utf8')).golden_pending === true)
+    ?.replace(/\.json$/, '');
+
+  let emptyDir: string;
+
+  beforeEach(() => {
+    // Once every golden is captured this path can no longer be exercised against the real
+    // catalog. Fail loudly rather than silently passing on a premise that no longer holds.
+    expect(
+      PENDING_CASE,
+      'no case is golden_pending any more — rewrite this suite against a synthetic case spec',
+    ).toBeDefined();
+    emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-pending-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(emptyDir, { recursive: true, force: true });
+  });
+
+  it('reports golden_match: null and exits 0 (clean build) instead of throwing ENOENT scandir', () => {
+    const { status, out } = runOracleCli([PENDING_CASE, '--actual-dir', emptyDir]);
+    expect(out).not.toMatch(/ENOENT/);
+    expect(out).not.toMatch(/scandir/);
+    expect(out).toMatch(/"golden_match":null/);
+    expect(status).toBe(0);
+  }, 60_000);
+
+  it('still scores build/bp_clean (golden_match: null) and exits 1 when the build failed', () => {
+    const { status, out } = runOracleCli([PENDING_CASE, '--actual-dir', emptyDir, '--build-failed']);
+    expect(out).not.toMatch(/ENOENT/);
+    expect(out).toMatch(/"build":0/);
+    expect(out).toMatch(/"golden_match":null/);
+    expect(status).toBe(1);
+  }, 60_000);
 });

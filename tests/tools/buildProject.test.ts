@@ -2,17 +2,22 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- hoisted mocks -----------------------------------------------------------
 const {
-  accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, spawnMock, execFileMock,
+  accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, statMock, spawnMock, execFileMock,
   cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
   cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
-  cfgGetActiveXppConfig, cfgGetModelName,
+  cfgGetActiveXppConfig, cfgGetModelName, detectedRoots,
 } = vi.hoisted(() => {
+  // Mutable stand-in for the AosService drive scan (src/utils/packagesRoot).
+  const detectedRoots: string[] = [];
   const accessMock = vi.fn();
   const writeFileMock = vi.fn().mockResolvedValue(undefined);
   const appendFileMock = vi.fn().mockResolvedValue(undefined);
   const unlinkMock = vi.fn().mockResolvedValue(undefined);
   const readFileMock = vi.fn();
   const readdirMock = vi.fn().mockRejectedValue(new Error('not found'));
+  // Source-staleness scan (hasSourceChangesSince). mtimeMs 0 = "older than any
+  // build", so a mocked tree never looks modified unless a test says so.
+  const statMock = vi.fn().mockResolvedValue({ mtimeMs: 0 });
   const spawnMock = vi.fn();
   // execFile needs to call its callback for util.promisify to work
   const execFileMock: any = vi.fn((_file: string, _args: string[], _opts: any, cb: Function) => {
@@ -27,10 +32,10 @@ const {
   const cfgGetActiveXppConfig = vi.fn().mockResolvedValue(null);
   const cfgGetModelName = vi.fn().mockReturnValue(null);
   return {
-    accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, spawnMock, execFileMock,
+    accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, statMock, spawnMock, execFileMock,
     cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
     cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
-    cfgGetActiveXppConfig, cfgGetModelName,
+    cfgGetActiveXppConfig, cfgGetModelName, detectedRoots,
   };
 });
 
@@ -46,6 +51,7 @@ vi.mock('fs/promises', () => ({
   readFile: readFileMock,
   appendFile: appendFileMock,
   readdir: readdirMock,
+  stat: statMock,
 }));
 vi.mock('../../src/utils/configManager.js', () => ({
   getConfigManager: () => ({
@@ -64,9 +70,21 @@ vi.mock('../../src/utils/operationLocks.js', () => ({
   isOperationLockHeld: vi.fn().mockResolvedValue(false),
   forceReleaseLock: vi.fn().mockResolvedValue(undefined),
 }));
+// The drive scan reads the real filesystem, which the fs mocks above do not
+// serve — feed it the roots each test wants found instead.
+vi.mock('../../src/utils/packagesRoot.js', async () => {
+  const nodePath = await import('path');
+  return {
+    packagesRoots: () => [...detectedRoots],
+    findPackagesRoot: () => detectedRoots[0] ?? null,
+    packagesRootCandidates: (...rel: string[]) => detectedRoots.map(r => nodePath.join(r, ...rel)),
+    defaultPackagesRoot: () => detectedRoots[0] ?? 'C:\\AosService\\PackagesLocalDirectory',
+    describePackagesRootScan: () => `Detected packages roots: ${detectedRoots.join(', ')}`,
+  };
+});
 
 import path from 'path';
-import { buildProjectTool } from '../../src/tools/buildProject';
+import { buildProjectTool } from '../../src/tools/sdlc/buildProject';
 
 const PROJECT_PATH = 'C:\\MyProject\\MyProject.rnrproj';
 const MODEL_NAME = 'MyModel';
@@ -94,10 +112,15 @@ function allowPaths(paths: string[]) {
 describe('build_d365fo_project', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, PKG);
     writeFileMock.mockResolvedValue(undefined);
     appendFileMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
     readdirMock.mockRejectedValue(new Error('not found'));
+    // resetAllMocks() above wipes the hoisted implementation, and an unarmed
+    // stat resolves undefined — which the staleness scan reads as "unreadable,
+    // assume changed", so every finished result would be refused and rebuilt.
+    statMock.mockResolvedValue({ mtimeMs: 0 });
     cfgGetProjectPath.mockResolvedValue(PROJECT_PATH);
     cfgGetPackagePath.mockReturnValue(null);
     cfgGetContext.mockReturnValue({});
@@ -158,7 +181,8 @@ describe('build_d365fo_project', () => {
   });
 
   it('returns error when packages path cannot be resolved', async () => {
-    // No CHE candidates accessible, no configManager paths
+    // No AosService on any drive, no configManager paths
+    detectedRoots.length = 0;
     accessMock.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 
     const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
@@ -166,6 +190,25 @@ describe('build_d365fo_project', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('Cannot resolve D365FO package paths');
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  // #769: the CHE fallback used to be a hardcoded C:/K:/J:/I: list, so a VM
+  // image that put AosService on another volume found neither the packages
+  // root nor xppc.exe.
+  it('builds from whatever drive the scan found AosService on', async () => {
+    const J_PKG  = 'J:\\AosService\\PackagesLocalDirectory';
+    const J_XPPC = path.join(J_PKG, 'bin', 'xppc.exe');
+    detectedRoots.splice(0, detectedRoots.length, J_PKG);
+    const child = makeFakeChild(43);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, J_XPPC, J_PKG]);
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+    expect(result.isError).toBeFalsy();
+    const [exe, args] = spawnMock.mock.calls[0];
+    expect(exe).toBe(J_XPPC);
+    expect(args).toContain(`-metadata=${J_PKG}`);
   });
 
   it('returns error when xppc.exe is not found', async () => {
@@ -237,9 +280,17 @@ describe('build_d365fo_project', () => {
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
 
+    // Model tree readable and unchanged since the build — otherwise the result
+    // is (correctly) refused as stale and a fresh build starts.
+    readdirMock.mockResolvedValue([]);
+
     const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
 
     expect(result.content[0].text).toContain('succeeded');
+    // #829 explicitly praises this wording — a collected result must keep
+    // saying, in plain words, that this call compiled nothing.
+    expect(result.content[0].text).toContain('Collected the result of the build that ended');
+    expect(result.content[0].text).toContain('nothing was recompiled by this call');
     expect(result.isError).toBeFalsy();
     expect(spawnMock).not.toHaveBeenCalled();
     // State file should be cleared
@@ -263,6 +314,8 @@ describe('build_d365fo_project', () => {
       if (p.includes('d365build_log')) return 'error AX0001: Something broke';
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
+
+    readdirMock.mockResolvedValue([]);
 
     const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {});
 
@@ -432,6 +485,163 @@ describe('build_d365fo_project', () => {
     expect(firstPath).toBe(secondPath);
 
     vi.restoreAllMocks();
+  });
+
+  // -------------------------------------------------------------------------
+  // #829 — an explicit fullBuild:true is a request to RECOMPILE, not a request
+  // for the newest available result, and a build that outlives the wait window
+  // must not turn into a second "call me again to collect" round trip.
+  // -------------------------------------------------------------------------
+
+  /** State-file JSON for a build that has already finished. */
+  function finishedState(extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      pid: 888,
+      modelName: MODEL_NAME,
+      targetModel: MODEL_NAME,
+      projectPath: PROJECT_PATH,
+      tool: 'xppc.exe',
+      startTime: new Date(Date.now() - 49_000).toISOString(),
+      endTime: new Date().toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_prev.log',
+      status: 'succeeded',
+      exitCode: 0,
+      ...extra,
+    });
+  }
+
+  function serveState(stateJson: string) {
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return stateJson;
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      if (p.includes('d365build_log')) return 'Build complete.';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+  }
+
+  it('fullBuild:true recompiles instead of replaying a finished FULL build', async () => {
+    serveState(finishedState({ fullBuild: true }));
+    // Sources unchanged since the build ended — the cached result would
+    // otherwise be considered perfectly reusable.
+    readdirMock.mockResolvedValue([]);
+    spawnMock.mockReturnValue(makeFakeChild(4242));
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    const result = await buildProjectTool(
+      { projectPath: PROJECT_PATH, fullBuild: true, wait: false }, {},
+    );
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [, args] = spawnMock.mock.calls[0];
+    expect(args).not.toContain('-incremental');
+    expect(result.content[0].text).not.toContain('Collected the result');
+    expect(result.content[0].text).toContain('Full build started');
+  });
+
+  it('fullBuild:true recompiles instead of replaying a finished INCREMENTAL build', async () => {
+    serveState(finishedState());
+    readdirMock.mockResolvedValue([]);
+    spawnMock.mockReturnValue(makeFakeChild(4243));
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    const result = await buildProjectTool(
+      { projectPath: PROJECT_PATH, fullBuild: true, wait: false }, {},
+    );
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(result.content[0].text).not.toContain('Collected the result');
+  });
+
+  it('declines fullBuild:true while an INCREMENTAL build is running, and says why', async () => {
+    serveState(JSON.stringify({
+      pid: 777,
+      modelName: MODEL_NAME,
+      targetModel: MODEL_NAME,
+      tool: 'xppc.exe',
+      startTime: new Date(Date.now() - 20_000).toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_run.log',
+      status: 'running',
+    }));
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+    const origKill = process.kill.bind(process);
+    vi.spyOn(process, 'kill').mockImplementation((pid: any, sig: any) => {
+      if (pid === 777 && sig === 0) return true as any;
+      return origKill(pid, sig);
+    });
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH, fullBuild: true }, {});
+
+    expect(result.content[0].text).toContain('DECLINED');
+    expect(result.content[0].text).toContain('nothing was recompiled by this call');
+    expect(result.content[0].text).toContain('force: true');
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it('waits through the post-build finalizing phase instead of handing back a "still running" stub', async () => {
+    // The 185 s double-call of #829: xppc exits, the close handler is still
+    // regenerating runtime metadata, and the waiter used to read the dead PID
+    // as "orphaned/timed out" for a build that had in fact just succeeded.
+    const base = {
+      pid: 4242,
+      modelName: MODEL_NAME,
+      targetModel: MODEL_NAME,
+      tool: 'xppc.exe',
+      startTime: new Date(Date.now() - 185_000).toISOString(),
+      logFile: 'C:\\Temp\\d365build_log_fin.log',
+    };
+    let stateReads = 0;
+    readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) {
+        stateReads++;
+        return stateReads <= 2
+          ? JSON.stringify({ ...base, status: 'running', phase: 'finalizing' })
+          : JSON.stringify({ ...base, status: 'succeeded', exitCode: 0, endTime: new Date().toISOString() });
+      }
+      if (p.endsWith('.rnrproj')) return RNRPROJ_XML;
+      if (p.includes('d365build_log')) return 'Build complete.';
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+    // PID 4242 is gone — only the 'finalizing' phase says the build is alive.
+    const origKill = process.kill.bind(process);
+    vi.spyOn(process, 'kill').mockImplementation((pid: any, sig: any) => {
+      if (pid === 4242 && sig === 0) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+      return origKill(pid, sig);
+    });
+    const onProgress = vi.fn().mockResolvedValue(undefined);
+
+    const result = await buildProjectTool({ projectPath: PROJECT_PATH }, {}, onProgress);
+
+    expect(result.content[0].text).toContain('Build succeeded');
+    expect(result.content[0].text).not.toContain('timeout');
+    expect(spawnMock).not.toHaveBeenCalled();
+    // Progress streamed while blocking, naming the phase the caller cannot see.
+    expect(onProgress).toHaveBeenCalled();
+    expect(onProgress.mock.calls[0][0]).toContain('finalizing');
+    expect(typeof onProgress.mock.calls[0][1]).toBe('number');
+
+    vi.restoreAllMocks();
+  });
+
+  it('timeout message carries the elapsed/window state and a concrete waitTimeoutMs to retry with', async () => {
+    spawnMock.mockReturnValue(makeFakeChild(51));
+    allowPaths([PROJECT_PATH, XPPC, PKG]);
+
+    // 1 ms window — the wait expires before the build can possibly finish.
+    const result = await buildProjectTool(
+      { projectPath: PROJECT_PATH, waitTimeoutMs: 1 }, {},
+    );
+
+    const text = result.content[0].text;
+    expect(text).toContain('still running after');
+    expect(text).toContain('The build is NOT finished');
+    expect(text).toContain('does not start a second one');
+    const suggested = text.match(/waitTimeoutMs: (\d+)/);
+    expect(suggested).toBeTruthy();
+    expect(Number(suggested![1])).toBeGreaterThanOrEqual(600_000);
+    expect(result.isError).toBeFalsy();
   });
 
   it('uses explicit modelName param without requiring projectPath or rnrproj', async () => {

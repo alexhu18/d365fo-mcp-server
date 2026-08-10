@@ -23,10 +23,18 @@
 
   <!--
     D365FO bin directory — contains all Microsoft.Dynamics.*.dll assemblies.
-    Every D365FO development desktop has this directory available.
+    Every D365FO development desktop has this directory available, but WHICH
+    volume it sits on is decided by the VM image: K: on cloud-hosted
+    environments, C: on the downloadable VHD, J: on newer images (#769), and
+    nothing stops the next image from using another letter again.
 
-    Traditional VM:  K:\AosService\PackagesLocalDirectory\bin
-    Cloud-hosted:    C:\AosService\PackagesLocalDirectory\bin
+    So the drive is swept rather than guessed: the first
+    <drive>:\AosService\PackagesLocalDirectory\bin that exists wins, with the
+    historically standard letters tried first and the rest of the alphabet
+    after them. MSBuild has no loop at evaluation time, and the property has to
+    be resolved before Reference items are globbed — hence one line per letter.
+    A: and B: are left out on purpose (floppy letters stall the probe).
+
     UDE (Unified Developer Experience): path from .mcp.json microsoftPackagesPath/bin
 
     Override per-machine via:
@@ -36,6 +44,28 @@
   <PropertyGroup>
     <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('K:\AosService\PackagesLocalDirectory\bin')">K:\AosService\PackagesLocalDirectory\bin</D365BinPath>
     <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('C:\AosService\PackagesLocalDirectory\bin')">C:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('J:\AosService\PackagesLocalDirectory\bin')">J:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('I:\AosService\PackagesLocalDirectory\bin')">I:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('D:\AosService\PackagesLocalDirectory\bin')">D:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('E:\AosService\PackagesLocalDirectory\bin')">E:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('F:\AosService\PackagesLocalDirectory\bin')">F:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('G:\AosService\PackagesLocalDirectory\bin')">G:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('H:\AosService\PackagesLocalDirectory\bin')">H:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('L:\AosService\PackagesLocalDirectory\bin')">L:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('M:\AosService\PackagesLocalDirectory\bin')">M:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('N:\AosService\PackagesLocalDirectory\bin')">N:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('O:\AosService\PackagesLocalDirectory\bin')">O:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('P:\AosService\PackagesLocalDirectory\bin')">P:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('Q:\AosService\PackagesLocalDirectory\bin')">Q:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('R:\AosService\PackagesLocalDirectory\bin')">R:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('S:\AosService\PackagesLocalDirectory\bin')">S:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('T:\AosService\PackagesLocalDirectory\bin')">T:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('U:\AosService\PackagesLocalDirectory\bin')">U:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('V:\AosService\PackagesLocalDirectory\bin')">V:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('W:\AosService\PackagesLocalDirectory\bin')">W:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('X:\AosService\PackagesLocalDirectory\bin')">X:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('Y:\AosService\PackagesLocalDirectory\bin')">Y:\AosService\PackagesLocalDirectory\bin</D365BinPath>
+    <D365BinPath Condition="'$(D365BinPath)' == '' And Exists('Z:\AosService\PackagesLocalDirectory\bin')">Z:\AosService\PackagesLocalDirectory\bin</D365BinPath>
   </PropertyGroup>
 
   <!-- NuGet packages -->
@@ -60,5 +90,57 @@
       <Private>false</Private>
     </Reference>
   </ItemGroup>
+
+  <!--
+    Record WHICH metamodel build we compiled against, so the bridge can warn at
+    startup when it is pointed at an environment shipping a different one.
+
+    This matters because every platform build stamps the SAME assembly version
+    (7.0.0.0) and differs only in FileVersion (e.g. 7.0.7690.155 vs 7.0.7996.33).
+    The CLR binder therefore cannot tell them apart, and the AssemblyResolve →
+    LoadFrom path in Program.cs does not enforce identity — a mismatched DLL
+    loads silently and only blows up later as MissingMethodException /
+    TypeLoadException at JIT time, far from the cause.  See issue #703.
+  -->
+  <Target Name="CaptureMetamodelBuildVersion"
+          BeforeTargets="BeforeCompile"
+          Inputs="$(D365BinPath)\Microsoft.Dynamics.AX.Metadata.dll"
+          Outputs="$(IntermediateOutputPath)BuildInfo.g.cs">
+    <PropertyGroup>
+      <_MetamodelDll>$(D365BinPath)\Microsoft.Dynamics.AX.Metadata.dll</_MetamodelDll>
+    </PropertyGroup>
+    <GetFileVersion FilePath="$(_MetamodelDll)" Condition="Exists('$(_MetamodelDll)')">
+      <Output TaskParameter="Version" PropertyName="_MetamodelFileVersion" />
+    </GetFileVersion>
+    <Message Importance="high"
+             Text="Bridge compiles against metamodel $(_MetamodelFileVersion) from $(D365BinPath)"
+             Condition="'$(_MetamodelFileVersion)' != ''" />
+    <Warning Text="D365BinPath '$(D365BinPath)' has no Microsoft.Dynamics.AX.Metadata.dll — the runtime version check will be disabled."
+             Condition="'$(_MetamodelFileVersion)' == ''" />
+    <WriteLinesToFile File="$(IntermediateOutputPath)BuildInfo.g.cs" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="// &lt;auto-generated /&gt; Produced by the CaptureMetamodelBuildVersion target.;namespace D365MetadataBridge;{;    internal static class BuildInfo;    {;        /// &lt;summary&gt;FileVersion of the Microsoft.Dynamics.AX.Metadata.dll this build compiled against, or &quot;&quot; if unknown.&lt;/summary&gt;;        internal const string MetamodelFileVersion = &quot;$(_MetamodelFileVersion)&quot;%3B;        /// &lt;summary&gt;bin directory those reference assemblies came from, or &quot;&quot; if unknown.&lt;/summary&gt;;        internal const string MetamodelBinPath = @&quot;$(D365BinPath)&quot;%3B;    };}" />
+    <ItemGroup>
+      <Compile Include="$(IntermediateOutputPath)BuildInfo.g.cs" />
+      <FileWrites Include="$(IntermediateOutputPath)BuildInfo.g.cs" />
+    </ItemGroup>
+  </Target>
+
+  <!--
+    MSBuild has no built-in task for reading a file's FileVersion (GetAssemblyIdentity
+    returns the assembly version — 7.0.0.0 for every platform build, which is exactly
+    the value that cannot distinguish them).
+  -->
+  <UsingTask TaskName="GetFileVersion" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <FilePath ParameterType="System.String" Required="true" />
+      <Version ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs">
+        Version = System.Diagnostics.FileVersionInfo.GetVersionInfo(FilePath).FileVersion ?? "";
+      </Code>
+    </Task>
+  </UsingTask>
 
 </Project>

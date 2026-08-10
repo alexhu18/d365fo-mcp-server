@@ -1,0 +1,95 @@
+{
+  "run_id": "2026-07-21T12__L3-custom-service-basic__a2a4131",
+  "case_id": "L3-custom-service-basic",
+  "tier": 3,
+  "timestamp": "2026-07-21T12:00:00Z",
+  "server_git_sha": "a2a4131",
+  "platform_build": "xppc 7.0.7858.27",
+  "generated_artifacts": [
+    "K:/AosService/PackagesLocalDirectory/Contoso/Contoso/AxClass/ConDemoNoteLookupRequest.xml",
+    "K:/AosService/PackagesLocalDirectory/Contoso/Contoso/AxClass/ConDemoNoteLookupResponse.xml",
+    "K:/AosService/PackagesLocalDirectory/Contoso/Contoso/AxClass/ConDemoNoteLookupService.xml",
+    "K:/AosService/PackagesLocalDirectory/Contoso/Contoso/AxService/ConDemoNoteService.xml",
+    "K:/AosService/PackagesLocalDirectory/Contoso/Contoso/AxServiceGroup/ConDemoNoteServiceGroup.xml"
+  ],
+  "static_gate": {
+    "references": {
+      "passed": true,
+      "unresolved": [
+        "ConDemoNoteHeader (warning-level unknown-type; fixture table genuinely absent from the environment)",
+        "ConDemoNoteLookupRequest (warning-level unknown-type; created later in the same run)",
+        "ConDemoNoteLookupResponse (warning-level unknown-type; created later in the same run)"
+      ]
+    },
+    "syntax": {
+      "passed": true,
+      "violations": [
+        {
+          "rule": "SEL005",
+          "severity": "warning",
+          "line": 17,
+          "excerpt": "parmNoteId(...) inside where clause",
+          "status": "fixed before write by hoisting the call into a local variable; re-validation clean"
+        }
+      ]
+    }
+  },
+  "build": {
+    "succeeded": false,
+    "errors": [
+      {
+        "object": "ConDemoNoteLookupService.Method/lookup",
+        "line": 12,
+        "col": 9,
+        "message": "The name 'ConDemoNoteHeader' does not denote a class, a table, or an extended data type."
+      },
+      {
+        "object": "ConDemoNoteLookupService.Method/lookup",
+        "line": 15,
+        "col": 9,
+        "message": "'noteHeader' is not declared."
+      },
+      {
+        "object": "ConDemoNoteLookupService.Method/lookup",
+        "line": 18,
+        "col": 30,
+        "message": "The qualifier 'noteHeader' is not valid for field 'Subject'."
+      }
+    ],
+    "bpWarnings": [
+      {
+        "object": "ConDemoNoteLookupService.Method/lookup",
+        "line": 8,
+        "col": 6,
+        "message": "'SysEntryPointAttribute' is obsolete: 'This attribute is deprecated in AX7.'",
+        "note": "Emitted for the exact pattern the case instruction and get_knowledge(topic=custom services) both mandate."
+      },
+      {
+        "object": "ExternalReference",
+        "message": "Assembly Microsoft.Dynamics.Commerce.Runtime.Entities.AttributeBasedPricing failed to load because it was not found.",
+        "note": "Pre-existing environment warning, unrelated to this run."
+      }
+    ]
+  },
+  "systest": {
+    "ran": false,
+    "passed": null
+  },
+  "score": {
+    "build": 0,
+    "bp_clean": 0,
+    "golden_match": 0,
+    "systest": null,
+    "tier_weight": 3
+  },
+  "classification": "ENV_FLAKE",
+  "root_cause_hypothesis": "Environment/fixture blocker, not a model or tool failure. The case instruction requires the service to select from the fixture table ConDemoNoteHeader, which does not exist anywhere in K:/AosService/PackagesLocalDirectory (verified: absent from the Contoso source model, absent from every other package via a full recursive scan, and get_object_info(table) reports 'not found via bridge, symbol index, or on disk'). All 3 compiler errors are a single cascade from that one missing type. Everything else the case exercises compiled and validated clean: both DataContract classes, the AxService and the AxServiceGroup passed xppc 'Metadata: validate services' and 'validate service groups' with zero diagnostics, and the generated XML matches the documented shape (AxService: Name/Class/ExternalName/ServiceOperations with AxServiceOperation Name+Method; AxServiceGroup: AutoDeploy=Yes + Services/AxServiceGroupService Name+Service). Two secondary findings: (a) the VM-free scorer crashes with a raw ENOENT scandir on eval/goldens/L3-custom-service-basic instead of degrading gracefully for a golden_pending case, so no golden diff could be produced; (b) xppc flags SysEntryPointAttribute as deprecated in AX7 while get_knowledge(topic='custom services') states every externally callable operation MUST carry it, with no mention of the deprecation warning. Also worth noting: validate_code(mode='references') reported the genuinely-missing ConDemoNoteHeader at the same warning severity as the two sibling classes created later in the same run, so the static gate could not have caught this blocker before the 3-minute build.",
+  "suggested_fix_area": "1) Deploy the ConDemoNoteHeader fixture (definition in eval/goldens/L1-form-basic/ConDemoNoteHeader.metadata.xml) into the Contoso sandbox as a pre-run fixture step, or make the L3 case self-contained by having it create the table. 2) src/eval/oracle/cli.ts listGoldenArtifacts (line 66): handle a missing golden directory / golden_pending:true by reporting golden_match=null instead of throwing ENOENT. 3) Knowledge base 'custom services': note that SysEntryPointAttribute raises a deprecation warning on current platform builds and state whether it remains the recommended pattern. 4) validate_code(mode='references'): consider distinguishing 'unknown type that is also not a pending sibling in this session' from ordinary forward references. 5) Capture the golden for this case once the fixture exists.",
+  "evidence_refs": [
+    "eval/cases/L3-custom-service-basic.json",
+    "eval/goldens/L1-form-basic/ConDemoNoteHeader.metadata.xml",
+    "build_d365fo_project(modelName=Contoso, fullBuild=true) - 3 errors / 2 warnings, 185s",
+    "npm run eval:score -- L3-custom-service-basic --actual-dir ... -> ENOENT scandir eval/goldens/L3-custom-service-basic",
+    "src/eval/oracle/cli.ts:66 listGoldenArtifacts"
+  ]
+}

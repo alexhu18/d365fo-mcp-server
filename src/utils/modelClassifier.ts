@@ -10,6 +10,8 @@
  * - All other models are considered Microsoft standard models
  */
 
+import { getInferredModelPrefix, toExtensionInfixCase } from './modelPrefixInference.js';
+
 // Runtime registry for auto-detected custom models
 const autoDetectedCustomModels = new Set<string>();
 
@@ -32,7 +34,7 @@ export function clearAutoDetectedModels(): void {
 /**
  * Check if a model is registered as auto-detected custom
  */
-export function isAutoDetectedCustomModel(modelName: string): boolean {
+function isAutoDetectedCustomModel(modelName: string): boolean {
   return autoDetectedCustomModels.has(modelName);
 }
 
@@ -59,7 +61,7 @@ export function getExtensionPrefix(): string {
  *
  * Returns empty string when not configured.
  */
-export function getConfiguredModelName(): string {
+function getConfiguredModelName(): string {
   return process.env.D365FO_MODEL_NAME?.trim() || '';
 }
 
@@ -130,6 +132,32 @@ export function applyObjectSuffix(objectName: string, suffix: string): string {
 }
 
 /**
+ * Resolve the RAW prefix token for a model — the form that still carries a
+ * trailing underscore when the convention has one ("DEMO_", "ISV_"), because that
+ * underscore decides how every other name is built.
+ *
+ * Priority — the ACTIVE MODEL outranks configuration:
+ * 1. The prefix the model's own objects already use (see modelPrefixInference).
+ *    Development spans many models, each with its own prefix; the workspace
+ *    knows which model is open, so that is the authoritative source. A globally
+ *    configured "Isv" must not override a model whose objects all say "IsvFin".
+ * 2. EXTENSION_PREFIX from configuration — the fallback for a model with nothing
+ *    to learn from, e.g. one that is still empty.
+ * 3. modelName itself, when nothing else is configured.
+ *
+ * Set EXTENSION_PREFIX_SOURCE=config to pin step 2 above step 1.
+ */
+function resolveRawPrefix(modelName: string): string {
+  const learned = modelName ? getInferredModelPrefix(modelName) : null;
+  if (learned?.regular) return learned.regular;
+
+  const envPrefix = process.env.EXTENSION_PREFIX?.trim();
+  if (envPrefix) return envPrefix;
+
+  return modelName || '';
+}
+
+/**
  * Resolve the clean prefix to use when naming newly created D365FO objects.
  *
  * Microsoft naming guidelines (https://learn.microsoft.com/en-us/dynamics365/fin-ops-core/dev-itpro/extensibility/naming-guidelines-extensions):
@@ -138,24 +166,15 @@ export function applyObjectSuffix(objectName: string, suffix: string): string {
  *  - Extension classes   → {BaseElement}{Prefix}_Extension                     (e.g. SalesFormLetterContoso_Extension)
  *  - Fields in extensions→ {Prefix}{FieldName}                                 (e.g. WHSApprovingWorker)
  *
- * Priority (EXTENSION_PREFIX has higher priority than modelName):
- * 1. EXTENSION_PREFIX env var (trailing '_' stripped — the underscore is NOT part of the prefix)
- * 2. modelName as fallback (only if EXTENSION_PREFIX is not set)
+ * Returns the prefix with any trailing '_' stripped — the underscore is not part
+ * of the prefix itself, only of the form used for regular objects. See
+ * resolveRawPrefix() for the priority order, and resolveRegularObjectPrefixToken()
+ * for the token actually prepended to a name.
  *
- * Returns empty string when both are empty.
+ * Returns empty string when nothing resolves.
  */
 export function resolveObjectPrefix(modelName: string): string {
-  const envPrefix = process.env.EXTENSION_PREFIX?.trim();
-
-  if (envPrefix) {
-    return envPrefix.replace(/_+$/, '');
-  }
-
-  if (modelName) {
-    return modelName.replace(/_+$/, '');
-  }
-
-  return '';
+  return resolveRawPrefix(modelName).replace(/_+$/, '');
 }
 
 /**
@@ -167,16 +186,28 @@ export function resolveObjectPrefix(modelName: string): string {
  *   - Normal prefix "Contoso"                  → resolved prefix "Contoso" → infix "Contoso"
  *   - All-caps prefix "WHS" with "WHS_" in env → infix "Whs"
  *   - All-caps prefix "WHS" with "WHS" in env  → infix "WHS" (unchanged)
+ *   - Compound "ConFinSK_"                     → infix "ConFinSk" (per segment)
  *
- * Detection: if EXTENSION_PREFIX env var ends with '_', apply first-upper + rest-lower.
+ * Detection: if the winning raw prefix ends with '_', lower each PascalCase
+ * segment on its own (see toExtensionInfixCase) — flattening the whole token
+ * would turn "ConFinSK" into "Confinsk".
+ *
+ * When `modelName` is given and that model's own extensions already state their
+ * infix, it is used verbatim instead of being derived. The two are genuinely
+ * independent: model Demo names regular objects "DEMO_Foo" but its extensions
+ * "AssetBookTable.DEMOExtension" — deriving would produce "DemoExtension" and
+ * every name would silently diverge from the model's existing convention.
  */
-export function deriveExtensionInfix(resolvedPrefix: string): string {
+export function deriveExtensionInfix(resolvedPrefix: string, modelName?: string): string {
   if (!resolvedPrefix) return '';
-  const rawEnvPrefix = process.env.EXTENSION_PREFIX?.trim() ?? '';
-  const envHasUnderscore = rawEnvPrefix.endsWith('_');
-  if (envHasUnderscore) {
-    // XY_ → Xy  (first char uppercase, remaining chars lowercase)
-    return resolvedPrefix.charAt(0).toUpperCase() + resolvedPrefix.slice(1).toLowerCase();
+
+  const learned = modelName ? getInferredModelPrefix(modelName) : null;
+  if (learned?.infix) return learned.infix;
+
+  const rawPrefix = modelName ? resolveRawPrefix(modelName) : (process.env.EXTENSION_PREFIX?.trim() ?? '');
+  if (rawPrefix.endsWith('_')) {
+    // XY_ → Xy, ConFinSK_ → ConFinSk  (first char of each segment upper, rest lower)
+    return toExtensionInfixCase(resolvedPrefix);
   }
   // Normal PascalCase — just capitalize first letter, keep the rest as-is
   return resolvedPrefix.charAt(0).toUpperCase() + resolvedPrefix.slice(1);
@@ -196,11 +227,11 @@ export function deriveExtensionInfix(resolvedPrefix: string): string {
  * logic. Returns '' when no prefix is configured.
  */
 export function resolveRegularObjectPrefixToken(modelName?: string): string {
-  const resolved = resolveObjectPrefix(modelName ?? '');
-  if (!resolved) return '';
-  const rawEnvPrefix = process.env.EXTENSION_PREFIX?.trim() ?? '';
-  const envHasUnderscore = rawEnvPrefix.endsWith('_');
-  return envHasUnderscore ? rawEnvPrefix : resolved.charAt(0).toUpperCase() + resolved.slice(1);
+  const raw = resolveRawPrefix(modelName ?? '');
+  if (!raw) return '';
+  if (raw.endsWith('_')) return raw;
+  const resolved = raw.replace(/_+$/, '');
+  return resolved.charAt(0).toUpperCase() + resolved.slice(1);
 }
 
 /**
@@ -220,6 +251,16 @@ export function resolveRegularObjectPrefixToken(modelName?: string): string {
  * so it strips any existing suffix-prefix and replaces it with the current one.
  *
  * Case-insensitive check prevents double-prefixing.
+ *
+ * ALWAYS pass `modelName` when you know it. Omitting it does not merely lose the
+ * model-name naming style — it changes the regular-object result, because the raw
+ * prefix then falls back to EXTENSION_PREFIX and the model's own separator is
+ * invisible: a model whose objects are "ConSK_*" yields "ConSK_QualityTier"
+ * with the argument and "ConSKQualityTier" without it. prepare(mode="create")
+ * predicted names through the 2-arg form while d365fo_file(action="create") wrote
+ * them through the 3-arg form, so the two disagreed on every underscore-style model.
+ * Prefer normalizeObjectName() (utils/objectNaming.ts), which is the one path
+ * create/modify already share.
  */
 export function applyObjectPrefix(objectName: string, prefix: string, modelName?: string): string {
   if (!prefix) return objectName;
@@ -228,16 +269,19 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
   // elements/classes only (VS default); regular new objects are unaffected.
   const useModelName = !!modelName && getExtensionNamingStyle() === 'model-name';
 
-  // Extension infix form — PascalCase without underscore (e.g. "XY" → "Xy" when env had "XY_")
-  const extensionInfix = deriveExtensionInfix(prefix);
+  // Extension infix form — PascalCase without underscore (e.g. "XY" → "Xy" when env had "XY_"),
+  // or the model's own infix when its existing extensions state one.
+  const extensionInfix = deriveExtensionInfix(prefix, modelName);
 
-  // Regular object prefix keeps the underscore for underscore-style env prefixes
-  //   EXTENSION_PREFIX="XY_" → regularPrefix="XY_" → XY_CustTable
-  //   EXTENSION_PREFIX="Contoso" → regularPrefix="Contoso" → ContosoCustTable
-  const rawEnvPrefix = process.env.EXTENSION_PREFIX?.trim() ?? '';
-  const envHasUnderscore = rawEnvPrefix.endsWith('_');
+  // Regular object prefix keeps the underscore for underscore-style prefixes
+  //   "XY_"     → regularPrefix="XY_"     → XY_CustTable
+  //   "Contoso" → regularPrefix="Contoso" → ContosoCustTable
+  // The raw form comes from the model when one is given, so a model whose objects
+  // use "DEMO_" keeps the underscore even though EXTENSION_PREFIX says otherwise.
+  const rawPrefix = modelName ? resolveRawPrefix(modelName) : (process.env.EXTENSION_PREFIX?.trim() ?? '');
+  const envHasUnderscore = rawPrefix.endsWith('_');
   const regularPrefix = envHasUnderscore
-    ? rawEnvPrefix
+    ? rawPrefix
     : prefix.charAt(0).toUpperCase() + prefix.slice(1);
 
   // Dot-notation extension elements: BaseObject.{Infix}Extension (standard AOT naming)
@@ -304,46 +348,6 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
   return `${regularPrefix}${normalizedName}`;
 }
 
-/**
- * Build the name of an EXTENSION ELEMENT (table extension, form extension, etc.)
- * Format: {BaseElementName}.{Prefix}Extension
- * Example: HCMWorker.WHSExtension, ContactPerson.ContosoCustomizations
- *
- * Never use just {BaseElement}.Extension — the prefix/infix is required to avoid conflicts.
- */
-export function buildExtensionElementName(baseElement: string, prefix: string): string {
-  if (!prefix) {
-    throw new Error(
-      `Extension element name requires a prefix. ` +
-      `Set EXTENSION_PREFIX in .env or pass modelName. ` +
-      `Bad pattern: "${baseElement}.Extension" (too generic, risk of conflicts).`
-    );
-  }
-  const infix = deriveExtensionInfix(prefix);
-  return `${baseElement}.${infix}Extension`;
-}
-
-/**
- * Build the name of an EXTENSION CLASS (Chain of Command / augmentation class).
- * Format: {BaseElement}{Prefix}_Extension
- * Example: ContactPersonWHS_Extension, CustTableForm{Prefix}_Extension
- *
- * Never use just {BaseClass}_Extension — the infix is required.
- */
-export function buildExtensionClassName(baseClass: string, prefix: string): string {
-  if (!prefix) {
-    throw new Error(
-      `Extension class name requires a prefix/infix. ` +
-      `Set EXTENSION_PREFIX in .env or pass modelName. ` +
-      `Bad pattern: "${baseClass}_Extension" (too generic, risk of conflicts).`
-    );
-  }
-  // Derive the PascalCase infix form (e.g. "XY_" env → "Xy" infix, "Contoso" → "Contoso")
-  const infix = deriveExtensionInfix(prefix);
-  // Avoid double infix if baseClass already contains the infix
-  const infixToAdd = baseClass.toLowerCase().includes(infix.toLowerCase()) ? '' : infix;
-  return `${baseClass}${infixToAdd}_Extension`;
-}
 
 /**
  * Check if a pattern matches a model name (supports wildcards)
@@ -389,9 +393,35 @@ export function isCustomModel(modelName: string): boolean {
   const extensionPrefix = getExtensionPrefix();
 
   const isInCustomList = customModels.some(pattern => matchesPattern(pattern, modelName));
-  const hasExtensionPrefix = !!(extensionPrefix && modelName.startsWith(extensionPrefix));
+  const hasExtensionPrefix = matchesExtensionPrefix(extensionPrefix, modelName);
 
   return isInCustomList || hasExtensionPrefix;
+}
+
+/**
+ * Does `modelName` start with the configured EXTENSION_PREFIX?
+ *
+ * Two deliberate normalizations, both aligning this check with the rest of the file:
+ *
+ *  - **Case-insensitive**, like every other comparison here (CUSTOM_MODELS via
+ *    matchesPattern(), D365FO_MODEL_NAME, applyObjectPrefix()'s double-prefix guards).
+ *    EXTENSION_PREFIX=contoso now recognises a model named ContosoRobotics.
+ *
+ *  - **Trailing '_' stripped**, because getExtensionPrefix() returns EXTENSION_PREFIX raw
+ *    while resolveObjectPrefix() strips it. Model names rarely carry the underscore
+ *    (EXTENSION_PREFIX="XY_" names objects XY_CustTable but the MODEL is usually XyRobotics),
+ *    so matching the raw form only would leave those models classified as standard — the
+ *    exact silent failure this guards against. "XY_" therefore matches both XY_Robotics
+ *    and XyRobotics.
+ *
+ * A prefix of only underscores has no bare form; fall back to the raw value rather than
+ * degenerating into an empty prefix that matches every model.
+ */
+function matchesExtensionPrefix(extensionPrefix: string, modelName: string): boolean {
+  const rawPrefix = extensionPrefix.trim().toLowerCase();
+  if (!rawPrefix) return false;
+  const effective = rawPrefix.replace(/_+$/, '') || rawPrefix;
+  return modelName.toLowerCase().startsWith(effective);
 }
 
 /**
@@ -401,17 +431,4 @@ export function isCustomModel(modelName: string): boolean {
  */
 export function isStandardModel(modelName: string): boolean {
   return !isCustomModel(modelName);
-}
-
-/**
- * Filter models by type
- * @param models - Array of model names
- * @param type - 'custom' or 'standard'
- * @returns Filtered array of model names
- */
-export function filterModelsByType(models: string[], type: 'custom' | 'standard'): string[] {
-  if (type === 'custom') {
-    return models.filter(m => isCustomModel(m));
-  }
-  return models.filter(m => isStandardModel(m));
 }

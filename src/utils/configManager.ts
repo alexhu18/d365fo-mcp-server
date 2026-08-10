@@ -11,7 +11,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { autoDetectD365Project, detectD365Project, scanAllD365Projects, extractModelNameFromProject, detectGitBranch, isMicrosoftDemoModel, type D365ProjectInfo } from './workspaceDetector.js';
 import { registerCustomModel, getCustomModels } from './modelClassifier.js';
 import { XppConfigProvider, type XppEnvironmentConfig } from './xppConfigProvider.js';
+import { FALLBACK_PACKAGES_ROOT, findPackagesRoot } from './packagesRoot.js';
 import { debugLog } from './logger.js';
+import {
+  recordDetectionSuccess, reportUnresolvedDetection, resetWorkspaceDetectionStatus,
+} from './workspaceDetectionStatus.js';
 
 export interface McpContext {
   workspacePath?: string;
@@ -66,8 +70,16 @@ class ConfigManager {
   private autoDetectionAttempted: boolean = false;
   // Auto-detection results cached per workspace path.
   private autoDetectionCache = new Map<string, D365ProjectInfo | null>();
-  // All projects found when D365FO_SOLUTIONS_PATH is configured.
+  // All projects found by the D365FO_SOLUTIONS_PATH scan. Solution switching and
+  // matchProjectForWorkspace() read this, and both need the full picture across
+  // every solution — so nothing else may write to it.
   private allDetectedProjects: D365ProjectInfo[] = [];
+  // The .rnrproj files sitting in the WORKSPACE when auto-detection could not pick
+  // one of them. Kept apart from allDetectedProjects above: sharing one field made
+  // a populated candidate list look like a completed solutions-path scan, which
+  // both suppressed that scan and let its "use the first project found" fallback
+  // adopt an arbitrary workspace .rnrproj — the very bug this branch removes.
+  private workspaceProjectCandidates: D365ProjectInfo[] = [];
   // Monotonically-increasing counter identifying each background detection call;
   // a scan whose generation is stale by the time it finishes is discarded so it
   // can't overwrite a more recent, more specific scan's result.
@@ -81,6 +93,14 @@ class ConfigManager {
   private xppConfigProvider: XppConfigProvider | null = null;
   private xppConfig: XppEnvironmentConfig | null = null;
   private xppConfigLoaded: boolean = false;
+  // Set while a TOOL call (get_workspace_info projectName/projectPath) has moved the
+  // active project off the model this workspace itself resolved to. `anchorModel` is
+  // that original model and it survives further switches — see getWriteAnchorModel().
+  private toolForcedProject: { anchorModel: string; forcedModel: string } | null = null;
+  // The sources available the last time detection ran, and whether the retry that
+  // a change in them buys has been spent — see ensureProjectDetection().
+  private lastDetectionFingerprint: string | null = null;
+  private detectionRetried = false;
 
   constructor(configPath?: string) {
     // Default to .mcp.json in current directory or parent directories
@@ -136,6 +156,7 @@ class ConfigManager {
     }
 
     this.autoDetectionAttempted = true;
+    this.lastDetectionFingerprint = this.detectionSourceFingerprint(workspacePath);
 
     // .rnrproj files only exist on Windows D365FO VMs — skip scan on Azure/Linux
     if (process.platform !== 'win32') {
@@ -176,11 +197,30 @@ class ConfigManager {
             // Prefer model name already resolved via Priority 4 (from PackagesLocalDirectory regex)
             modelName: detectedProject?.modelName || pkgScan.modelName,
             packagePath: packagePathHint,
+            detectionSource: 'the configured packagePath',
           };
           console.error(`[ConfigManager] ✅ Found .rnrproj via packagePath scan: ${pkgScan.projectPath}`);
         } else {
           console.error(`[ConfigManager] No .rnrproj found in packagePath either`);
         }
+      }
+    }
+
+    // No projectPath resolved — either the workspace is ambiguous (several .rnrproj,
+    // none unambiguously "the" one) or nothing was found. Record every candidate so
+    // callers that need a project (addToProject, get_workspace_info) can name the
+    // real alternatives instead of a generic "could not resolve". Only runs on this
+    // failure path, once per workspace, and into its own field: allDetectedProjects
+    // belongs to the solutions-path scan below, which must neither be skipped
+    // because this list is non-empty nor draw its fallback project from it.
+    if (!detectedProject?.projectPath && workspacePath) {
+      const candidates = await scanAllD365Projects(workspacePath);
+      if (candidates.length > 0) {
+        this.workspaceProjectCandidates = candidates;
+        console.error(
+          `[ConfigManager] No project auto-selected — ${candidates.length} candidate(s) in workspace: ` +
+          candidates.map(c => c.modelName).join(', ')
+        );
       }
     }
 
@@ -201,13 +241,30 @@ class ConfigManager {
     } else if (detectedProject) {
       this.autoDetectedProject = detectedProject;
       console.error('[ConfigManager] ✅ Auto-detection successful:');
-      console.error(`   ProjectPath: ${detectedProject.projectPath}`);
+      console.error(
+        detectedProject.ambiguousProjects
+          ? `   ProjectPath: (not auto-selected — ${detectedProject.ambiguousProjects.length} candidates share this model; pass projectPath explicitly)`
+          : `   ProjectPath: ${detectedProject.projectPath}`
+      );
       console.error(`   ModelName: ${detectedProject.modelName}`);
       console.error(`   SolutionPath: ${detectedProject.solutionPath}`);
+      if (detectedProject.detectionSource) {
+        console.error(`   Source: ${detectedProject.detectionSource}`);
+      }
+      // Recorded here rather than at each route's own return: this is the point
+      // the result survives the staleness guard and becomes the answer.
+      recordDetectionSuccess(
+        detectedProject.detectionSource ?? 'workspace auto-detection',
+        detectedProject.modelName,
+        detectedProject.projectPath ?? null,
+      );
       // ✨ Register the auto-detected model as custom
       registerCustomModel(detectedProject.modelName);
     } else {
-      console.error('[ConfigManager] ⚠️ Auto-detection failed - no .rnrproj files found');
+      // Not a warning: the D365FO_SOLUTIONS_PATH scan below still runs, and
+      // .mcp.json may name the model outright. reportUnresolvedDetection() warns
+      // once nothing has resolved it and a caller actually needs one (#833).
+      debugLog('[ConfigManager] No .rnrproj found in the workspace pass');
     }
 
     // Scan D365FO_SOLUTIONS_PATH for all available projects (for solution-switching support).
@@ -246,7 +303,72 @@ class ConfigManager {
         }
         this.autoDetectedProject = primary;
         registerCustomModel(primary.modelName);
+        recordDetectionSuccess('the D365FO_SOLUTIONS_PATH scan', primary.modelName, primary.projectPath ?? null);
         console.error(`[ConfigManager] ✅ Using first found project as primary: ${primary.modelName}`);
+      }
+    }
+  }
+
+  /**
+   * The detection sources available right now, as a comparable string.
+   *
+   * A first pass that ran before the workspace roots / packagePath arrived looked
+   * at strictly less than a later one would — that is the race behind the boot
+   * warning (#833). A change in this fingerprint is what makes a retry worth the
+   * filesystem scan; an unchanged one would repeat the same walk for the same
+   * answer.
+   */
+  private detectionSourceFingerprint(workspacePath?: string): string {
+    const ctx = this.config?.servers?.context;
+    return JSON.stringify([
+      workspacePath ?? null,
+      this.runtimeContext.workspacePath ?? null,
+      this.runtimeContext.packagePath ?? null,
+      this.runtimeContext.projectPath ?? null,
+      ctx?.workspacePath ?? null,
+      ctx?.packagePath ?? null,
+      ctx?.projectPath ?? null,
+      ctx?.modelName ?? null,
+      process.env.D365FO_SOLUTIONS_PATH ?? null,
+      this.allDetectedProjects.length,
+    ]);
+  }
+
+  /**
+   * Run workspace detection if it has not run yet, and re-run it once when the
+   * first pass came up empty and a source it needs has appeared since.
+   *
+   * The first pass fires roughly two seconds into startup, before the bridge and
+   * the workspace roots are up; treating its result as final is what made the
+   * server report "could not auto-detect" for a workspace it went on to resolve
+   * moments later (#833). Only when the retry has also failed — and a caller
+   * actually needs a project — is the warning emitted.
+   */
+  private async ensureProjectDetection(workspacePath?: string): Promise<void> {
+    if (!this.autoDetectionAttempted) {
+      await this.autoDetectProject(workspacePath);
+    } else if (
+      !this.autoDetectedProject &&
+      !this.detectionRetried &&
+      this.lastDetectionFingerprint !== null &&
+      this.detectionSourceFingerprint(workspacePath) !== this.lastDetectionFingerprint
+    ) {
+      this.detectionRetried = true;
+      this.autoDetectionAttempted = false;
+      this.autoDetectionCache.delete(workspacePath || 'default');
+      console.error('[ConfigManager] Re-running workspace detection — sources have come up since the first pass');
+      await this.autoDetectProject(workspacePath);
+    }
+
+    // A model named in .mcp.json (or D365FO_MODEL_NAME) settles the question just
+    // as well as a scan does — recorded so `doctor` reports THAT as the source
+    // that won, rather than an unresolved detection nothing was waiting for.
+    if (!this.autoDetectedProject) {
+      const configured = this.getModelNameWithSource();
+      if (configured.modelName) {
+        recordDetectionSuccess(configured.source, configured.modelName, this.runtimeContext.projectPath ?? null);
+      } else {
+        reportUnresolvedDetection();
       }
     }
   }
@@ -270,6 +392,18 @@ class ConfigManager {
       if (!this.autoDetectionCache.has(cacheKey)) {
         this.autoDetectionAttempted = false;
         this.autoDetectedProject = null;
+        // A different workspace resolves to a different project — what the last
+        // one detected, and the retry it was owed, say nothing about this one.
+        this.detectionRetried = false;
+        resetWorkspaceDetectionStatus();
+        // A workspace this server has never seen — the user moved, so the write
+        // anchor of the PREVIOUS workspace must not survive into this one. Left
+        // standing it becomes the mirror of the bug it prevents: every write into
+        // the model the new workspace actually targets gets refused, named after a
+        // model the user no longer has open. Deliberately not cleared on the cache
+        // branch above: that is the same workspace answering again, possibly with a
+        // project forceProject() pinned to it.
+        this.toolForcedProject = null;
 
         // Fast-path: try exact or close match against known projects.
         // Falls through to BFS only when nothing specific is found.
@@ -282,6 +416,7 @@ class ConfigManager {
             this.autoDetectedProject = matched;
             this.autoDetectionAttempted = true;
             this.autoDetectionCache.set(cacheKey, matched);
+            recordDetectionSuccess('a known project matching the workspace path', matched.modelName, matched.projectPath ?? null);
             console.error(`[ConfigManager] ⚡ Workspace matched known project: ${matched.modelName} (gen ${this.detectionGeneration})`);
             return;
           }
@@ -345,6 +480,9 @@ class ConfigManager {
         this.autoDetectionAttempted = true;
         this.autoDetectionCache.set(rootPath, match);
         registerCustomModel(match.modelName);
+        recordDetectionSuccess('the workspace root path', match.modelName, match.projectPath ?? null);
+        // The workspace itself resolved a project — the user moved, not the agent.
+        this.toolForcedProject = null;
         console.error(`[ConfigManager] ⚡ Root matched project: ${match.modelName} (gen ${gen}, ${match.projectPath})`);
         return;
       }
@@ -365,6 +503,8 @@ class ConfigManager {
             this.autoDetectionAttempted = true;
             this.autoDetectionCache.set(rootPath, gitMatch);
             registerCustomModel(gitMatch.modelName);
+            recordDetectionSuccess(`the git branch name "${branch}"`, gitMatch.modelName, gitMatch.projectPath ?? null);
+            this.toolForcedProject = null;   // genuine workspace move — see above
             console.error(`[ConfigManager] 🌿 Git branch "${branch}" → project: ${gitMatch.modelName} (gen ${gen})`);
             return;
           }
@@ -396,6 +536,11 @@ class ConfigManager {
         return;
       }
       console.error(`[ConfigManager] Roots ambiguous (gen ${gen}) — BFS fallback on: ${firstPath}`);
+      // Nothing cached for this root: it is a workspace this server has not resolved
+      // before, and BFS is about to resolve it from scratch. Same reasoning as the
+      // new-workspace branch of setRuntimeContext — an anchor from the previous
+      // workspace would refuse writes into the model this one targets.
+      this.toolForcedProject = null;
       // If stored workspace already equals firstPath, setRuntimeContext sees
       // workspaceChanged=false and skips detection — prevent that.
       if (this.runtimeContext.workspacePath === firstPath) {
@@ -757,25 +902,17 @@ class ConfigManager {
       return normalizePath(this.xppConfig.customPackagesPath);
     }
 
-    // Last resort (Windows only): probe well-known PackagesLocalDirectory locations.
-    // Covers the two standard D365FO installation scenarios without requiring .mcp.json config:
-    //   C:\AosService\PackagesLocalDirectory  → VHD / local developer machine
-    //   K:\AosService\PackagesLocalDirectory  → cloud-hosted VM (standard Azure Dev/Test image)
-    if (process.platform === 'win32') {
-      const wellKnownCandidates = [
-        'C:\\AosService\\PackagesLocalDirectory',
-        'J:\\AosService\\PackagesLocalDirectory',
-        'K:\\AosService\\PackagesLocalDirectory',
-      ];
-      for (const candidate of wellKnownCandidates) {
-        if (existsSync(candidate)) {
-          if (!(this as any)._packagePathLoggedOnce) {
-            console.error(`[ConfigManager] ✅ Auto-probed packagePath: ${candidate}`);
-            (this as any)._packagePathLoggedOnce = true;
-          }
-          return candidate;
-        }
+    // Last resort (Windows only): scan the machine's drives for AosService.
+    // Covers every D365FO installation layout without requiring .mcp.json config —
+    // C: (VHD / local developer machine), K: (cloud-hosted VM), J: (newer images)
+    // and any other volume the image happened to use.
+    const probed = findPackagesRoot();
+    if (probed) {
+      if (!(this as any)._packagePathLoggedOnce) {
+        console.error(`[ConfigManager] ✅ Auto-probed packagePath: ${probed}`);
+        (this as any)._packagePathLoggedOnce = true;
       }
+      return probed;
     }
 
     return null;
@@ -927,10 +1064,7 @@ class ConfigManager {
       ]);
     }
 
-    if (!this.autoDetectionAttempted) {
-      const ctx = this.config?.servers?.context;
-      await this.autoDetectProject(this.runtimeContext.workspacePath || ctx?.workspacePath);
-    } else if (!this.autoDetectedProject && this.detectionInProgress) {
+    if (this.autoDetectionAttempted && !this.autoDetectedProject && this.detectionInProgress) {
       // autoDetectionAttempted was set immediately when background scan started,
       // but the scan hasn't finished yet — wait up to 5 s for the result.
       await Promise.race([
@@ -939,6 +1073,8 @@ class ConfigManager {
       ]);
       this.detectionInProgress = null;
     }
+    const ctx = this.config?.servers?.context;
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || ctx?.workspacePath);
 
     // Model name
     const { modelName, source: modelSource } = this.getModelNameWithSource();
@@ -980,7 +1116,7 @@ class ConfigManager {
     } else if (this.autoDetectedProject?.packagePath) {
       packageSource = 'auto-detected from .rnrproj';
     } else if (packagePath) {
-      packageSource = 'well-known path probe';
+      packageSource = 'drive scan for AosService';
     }
 
     // Custom write path (D365FO_CUSTOM_PACKAGES_PATH / customPackagesPath in context)
@@ -1016,12 +1152,52 @@ class ConfigManager {
   }
 
   /**
+   * Every .rnrproj that builds `modelName`, as paths.
+   *
+   * One model is split across as many projects as its owner wants — fifteen, in
+   * the solution that surfaced this — and one object may be referenced by
+   * several of them. Anything asking "is this object registered in a project?"
+   * has to ask all of them, or a file that compiles perfectly reads as missing
+   * from the build. See workspace/projectMembership.ts.
+   */
+  getProjectsForModel(modelName: string | null | undefined): string[] {
+    if (!modelName) return [];
+    const needle = modelName.toLowerCase();
+    return this.allDetectedProjects
+      .filter(p => p.modelName.toLowerCase() === needle && p.projectPath)
+      .map(p => p.projectPath!);
+  }
+
+  /**
+   * The .rnrproj files found in the WORKSPACE when auto-detection refused to pick
+   * one of them. Empty whenever a project was resolved — these are the concrete
+   * alternatives createD365File names when addToProject has no projectPath to use.
+   *
+   * Not the same list as getAllDetectedProjects(): that one spans every solution
+   * under D365FO_SOLUTIONS_PATH and would answer "which projects exist anywhere",
+   * not "which projects is this workspace ambiguous between".
+   */
+  getWorkspaceProjectCandidates(): D365ProjectInfo[] {
+    return this.workspaceProjectCandidates;
+  }
+
+  /**
    * Explicitly force a specific .rnrproj as the active project.
    * Called when the user passes projectPath to get_workspace_info() to switch solutions.
    * Bypasses the auto-detection cache — takes effect immediately.
    */
   async forceProject(projectPath: string): Promise<D365ProjectInfo | null> {
     try {
+      // Captured BEFORE the switch: the model this workspace resolved to on its own.
+      // It becomes the write anchor, so a switch cannot silently move where writes land.
+      //
+      // Detection has to have FINISHED first. It runs in the background and only
+      // getWorkspaceInfoDiagnostics() waits for it — which the get_workspace_info
+      // handler calls after this method, not before. A switch on the very first tool
+      // call therefore used to read a null model here, store no anchor at all, and
+      // hand the caller exactly the bypass the anchor exists to deny.
+      await this.awaitPendingDetection();
+      const modelBeforeSwitch = this.getModelName();
       const normalizedPath = path.normalize(projectPath);
       const modelName = await extractModelNameFromProject(normalizedPath);
       if (!modelName) {
@@ -1053,12 +1229,90 @@ class ConfigManager {
       // the user switches git branches or opens a different workspace.
       this.runtimeContext = { ...this.runtimeContext, projectPath: normalizedPath };
       registerCustomModel(modelName);
+      // Remember what the workspace resolved to before the FIRST switch: repeated
+      // switches must not walk the anchor along with them. Switching back to the
+      // anchor clears the state — the workspace is then targeting its own model again.
+      const anchor = this.toolForcedProject?.anchorModel ?? modelBeforeSwitch;
+      this.toolForcedProject =
+        anchor && anchor.trim().toLowerCase() !== modelName.trim().toLowerCase()
+          ? { anchorModel: anchor, forcedModel: modelName }
+          : null;
       console.error(`[ConfigManager] ✅ forceProject: switched to ${modelName} (${normalizedPath})`);
       return project;
     } catch (err) {
       console.error(`[ConfigManager] forceProject error:`, err);
       return null;
     }
+  }
+
+  /**
+   * Wait for an in-flight workspace detection, so a caller that needs the
+   * workspace's OWN model does not read null while the background scan is still
+   * running. Bounded the same way getWorkspaceInfoDiagnostics() bounds it.
+   */
+  private async awaitPendingDetection(): Promise<void> {
+    if (this.autoDetectionAttempted && !this.autoDetectedProject && this.detectionInProgress) {
+      await Promise.race([
+        this.detectionInProgress,
+        new Promise<void>(resolve => setTimeout(resolve, 5_000)),
+      ]);
+      this.detectionInProgress = null;
+    }
+    const ctx = this.config?.servers?.context;
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || ctx?.workspacePath);
+  }
+
+  /**
+   * The model WRITES are anchored to — normally the active model, but after a
+   * tool-initiated project switch it stays the model the workspace resolved to
+   * on its own.
+   *
+   * A switch changes which project is ACTIVE — which one gets built, BP-checked
+   * and written into. It was never needed for reading: get_object_info, search,
+   * find_references and the rest query the symbol index across every model and
+   * never consult the active model at all.
+   *
+   * `get_workspace_info(projectName=…)` is a tool call the agent can make for
+   * itself, so letting it move the write target would hand the agent the very
+   * self-served consent the cross-model guard exists to deny: refused on
+   * "table X lives in another model" → switch project → same write, no refusal.
+   * A genuine workspace change (roots/list, git branch) clears the anchor,
+   * because then the user really did move.
+   */
+  getWriteAnchorModel(): string | null {
+    return this.toolForcedProject?.anchorModel ?? this.getModelName();
+  }
+
+  /**
+   * The same anchor, with project detection awaited first — what every write
+   * guard must use.
+   *
+   * getWriteAnchorModel() is synchronous, and in a workspace that configures no
+   * `modelName` and sits outside PackagesLocalDirectory its ONLY source is
+   * `autoDetectedProject`, a field a background .rnrproj scan fills in. Read
+   * before that scan lands it returns null — and a null anchor makes the
+   * cross-model guard stand down by design ("never block on a guess"). That
+   * leaves a guard which is present, correct, and occasionally simply absent,
+   * decided by a race nobody can see. get_workspace_info never had the problem
+   * because it awaits the scan; the guards did not.
+   *
+   * The common path costs nothing: an anchor already known short-circuits before
+   * the await.
+   */
+  async resolveWriteAnchorModel(): Promise<string | null> {
+    const known = this.getWriteAnchorModel();
+    if (known) return known;
+    try {
+      await this.awaitPendingDetection();
+    } catch {
+      /* detection is best-effort — the guard's own null-anchor path still applies */
+    }
+    return this.getWriteAnchorModel();
+  }
+
+  /** The in-effect tool project switch, or null when writes and reads agree. */
+  getToolProjectSwitch(): { anchorModel: string; forcedModel: string } | null {
+    return this.toolForcedProject;
   }
 
   /**
@@ -1078,9 +1332,7 @@ class ConfigManager {
     }
 
     // Priority 3: Auto-detection
-    if (!this.autoDetectionAttempted) {
-      await this.autoDetectProject(this.runtimeContext.workspacePath || context?.workspacePath);
-    }
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
 
     return this.autoDetectedProject?.projectPath || null;
   }
@@ -1102,9 +1354,7 @@ class ConfigManager {
     }
 
     // Priority 3: Auto-detection
-    if (!this.autoDetectionAttempted) {
-      await this.autoDetectProject(this.runtimeContext.workspacePath || context?.workspacePath);
-    }
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
 
     return this.autoDetectedProject?.solutionPath || null;
   }
@@ -1142,10 +1392,8 @@ class ConfigManager {
    * the real model to the user.
    */
   async getRawAutoDetectedModelName(): Promise<string | null> {
-    if (!this.autoDetectionAttempted) {
-      const context = this.config?.servers?.context;
-      await this.autoDetectProject(this.runtimeContext.workspacePath || context?.workspacePath);
-    }
+    const context = this.config?.servers?.context;
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
     return this.autoDetectedProject?.modelName || null;
   }
 
@@ -1161,10 +1409,8 @@ class ConfigManager {
       return alreadyKnown;
     }
 
-    if (!this.autoDetectionAttempted) {
-      const context = this.config?.servers?.context;
-      await this.autoDetectProject(this.runtimeContext.workspacePath || context?.workspacePath);
-    }
+    const context = this.config?.servers?.context;
+    await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
 
     return this.autoDetectedProject?.modelName || null;
   }
@@ -1273,15 +1519,13 @@ export async function initializeConfig(
 
 /**
  * Fallback package path when configManager.getPackagePath() returns null.
- * This only happens when no config is loaded AND none of the well-known
- * candidate paths (C:, J:, K:) exist on the filesystem.
- * The value is a safe sentinel — callers will get a clear 'file not found'
- * rather than silently defaulting to a specific drive letter.
+ * This only happens when no config is loaded AND the drive scan found no
+ * AosService\PackagesLocalDirectory on any volume. The value is a safe
+ * sentinel — callers get a clear 'file not found' naming a real D365FO
+ * location rather than an empty path, and never a silently wrong drive.
  */
-const FALLBACK_PACKAGE_PATH = 'C:\\AosService\\PackagesLocalDirectory';
-
 export function fallbackPackagePath(): string {
-  return FALLBACK_PACKAGE_PATH;
+  return FALLBACK_PACKAGES_ROOT;
 }
 
 /**

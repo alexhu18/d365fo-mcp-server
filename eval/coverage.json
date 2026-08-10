@@ -1,0 +1,1258 @@
+{
+  "core": {
+    "tier": "core",
+    "total": 44,
+    "covered": 44,
+    "percent": 100
+  },
+  "total": {
+    "tier": "all",
+    "total": 78,
+    "covered": 78,
+    "percent": 100
+  },
+  "leaves": [
+    {
+      "id": "table",
+      "label": "Table",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-table-basic",
+        "L2-table-modify-lifecycle"
+      ]
+    },
+    {
+      "id": "table-extension",
+      "label": "Table extension",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-table-extension"
+      ]
+    },
+    {
+      "id": "edt",
+      "label": "Extended data type",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L0-edt-basic"
+      ]
+    },
+    {
+      "id": "edt-extension",
+      "label": "EDT extension",
+      "domain": "Data model",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-edt-extension-basic"
+      ]
+    },
+    {
+      "id": "enum",
+      "label": "Base enum",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L0-enum-basic"
+      ]
+    },
+    {
+      "id": "enum-extension",
+      "label": "Enum extension",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-enum-extension-empty-values"
+      ]
+    },
+    {
+      "id": "view",
+      "label": "View",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-query-view-basic",
+        "L2-form-over-view"
+      ]
+    },
+    {
+      "id": "query",
+      "label": "AOT query",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-query-view-basic"
+      ]
+    },
+    {
+      "id": "map",
+      "label": "Map",
+      "domain": "Data model",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-map-basic"
+      ]
+    },
+    {
+      "id": "temp-tables",
+      "label": "Temporary tables (TempDB / InMemory)",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-basic"
+      ]
+    },
+    {
+      "id": "relations-indexes",
+      "label": "Relations, indexes, field groups",
+      "domain": "Data model",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-table-modify-lifecycle",
+        "L3-form-detailstransaction"
+      ]
+    },
+    {
+      "id": "table-inheritance",
+      "label": "Table inheritance (SupportInheritance/Extends)",
+      "domain": "Data model",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-table-inheritance-basic"
+      ]
+    },
+    {
+      "id": "class",
+      "label": "Class",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-class-basic",
+        "L2-class-method-ops"
+      ]
+    },
+    {
+      "id": "interface",
+      "label": "Interface / abstract class",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-interface-abstract-basic"
+      ]
+    },
+    {
+      "id": "class-inheritance",
+      "label": "Class inheritance (extends chain, virtual dispatch)",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-coc-inherited-method"
+      ]
+    },
+    {
+      "id": "coc-extension",
+      "label": "Chain of Command extension",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-coc-extension"
+      ]
+    },
+    {
+      "id": "event-handler",
+      "label": "Event handler subscription",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-event-handler-basic"
+      ]
+    },
+    {
+      "id": "delegate",
+      "label": "Delegate",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-delegate-basic"
+      ]
+    },
+    {
+      "id": "macro",
+      "label": "Macro",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-macro-library-flight"
+      ]
+    },
+    {
+      "id": "transactions",
+      "label": "Transactions (ttsbegin/ttscommit)",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-class-method-ops",
+        "L2-form-modify-controls",
+        "L2-table-modify-lifecycle",
+        "L3-form-add-datasource-lines",
+        "L4-master-security-slice"
+      ]
+    },
+    {
+      "id": "select-grammar",
+      "label": "X++ select grammar",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-advanced",
+        "L4-ssrs-report-basic"
+      ]
+    },
+    {
+      "id": "set-based",
+      "label": "Set-based operations",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-basic"
+      ]
+    },
+    {
+      "id": "sysda",
+      "label": "SysDa fluent query API",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-sysda-fluent-query"
+      ]
+    },
+    {
+      "id": "error-handling",
+      "label": "Error handling & infolog",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-error-handling-infolog"
+      ]
+    },
+    {
+      "id": "sysextension",
+      "label": "SysExtension plug-in pattern",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-sysextension-plugin"
+      ]
+    },
+    {
+      "id": "performance",
+      "label": "Performance patterns",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-performance-set-based"
+      ]
+    },
+    {
+      "id": "bp-rules",
+      "label": "Best-practice (BP) compliance",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L0-edt-basic",
+        "L0-enum-basic",
+        "L1-class-basic",
+        "L1-form-basic",
+        "L1-form-detailsmaster",
+        "L1-form-dialog",
+        "L1-form-listpage",
+        "L1-form-lookup",
+        "L1-form-simplelistdetails",
+        "L1-form-tableofcontents",
+        "L1-form-workspace",
+        "L1-macro-library-flight",
+        "L1-map-basic",
+        "L1-table-basic",
+        "L2-business-event-basic",
+        "L2-class-method-ops",
+        "L2-coc-inherited-method",
+        "L2-collections-map-list-container",
+        "L2-config-key-gated-table",
+        "L2-datetime-timezone-range",
+        "L2-delegate-basic",
+        "L2-dimension-basic",
+        "L2-direct-sql-connection",
+        "L2-dotnet-interop-clrerror",
+        "L2-edt-extension-basic",
+        "L2-feature-management-flight",
+        "L2-interface-abstract-basic",
+        "L2-license-code-configkey",
+        "L2-numberseq-basic",
+        "L2-occ-retry-basic",
+        "L2-reflection-dict-fieldwalk",
+        "L2-sysda-fluent-query",
+        "L2-sysextension-plugin",
+        "L2-table-caching-basic",
+        "L2-table-extension",
+        "L2-table-inheritance-basic",
+        "L2-table-modify-lifecycle",
+        "L3-custom-service-basic",
+        "L3-form-detailstransaction"
+      ]
+    },
+    {
+      "id": "deprecated-apis",
+      "label": "Deprecated APIs & migration",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L0-edt-basic",
+        "L0-enum-basic",
+        "L1-class-basic",
+        "L1-form-basic",
+        "L1-form-detailsmaster",
+        "L1-form-dialog",
+        "L1-form-listpage",
+        "L1-form-lookup",
+        "L1-form-simplelistdetails",
+        "L1-form-tableofcontents",
+        "L1-form-workspace",
+        "L1-macro-library-flight",
+        "L1-map-basic",
+        "L1-table-basic",
+        "L2-business-event-basic",
+        "L2-class-method-ops",
+        "L2-coc-inherited-method",
+        "L2-collections-map-list-container",
+        "L2-config-key-gated-table",
+        "L2-datetime-timezone-range",
+        "L2-delegate-basic",
+        "L2-dimension-basic",
+        "L2-direct-sql-connection",
+        "L2-dotnet-interop-clrerror",
+        "L2-edt-extension-basic",
+        "L2-feature-management-flight",
+        "L2-interface-abstract-basic",
+        "L2-license-code-configkey",
+        "L2-numberseq-basic",
+        "L2-occ-retry-basic",
+        "L2-reflection-dict-fieldwalk",
+        "L2-sysda-fluent-query",
+        "L2-sysextension-plugin",
+        "L2-table-caching-basic",
+        "L2-table-extension",
+        "L2-table-inheritance-basic",
+        "L2-table-modify-lifecycle",
+        "L3-custom-service-basic",
+        "L3-form-detailstransaction"
+      ]
+    },
+    {
+      "id": "occ-unitofwork",
+      "label": "Optimistic concurrency & UnitOfWork",
+      "domain": "Code",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-occ-retry-basic"
+      ]
+    },
+    {
+      "id": "caching",
+      "label": "Caching (CacheLookup, SysGlobalObjectCache, RecordViewCache)",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-table-caching-basic"
+      ]
+    },
+    {
+      "id": "xpp-collections",
+      "label": "X++ collections & containers (List/Map/Set/Struct)",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-collections-map-list-container"
+      ]
+    },
+    {
+      "id": "datetime-timezones",
+      "label": "Date/time & time zones (utcdatetime, DateTimeUtil)",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-datetime-timezone-range"
+      ]
+    },
+    {
+      "id": "dotnet-interop",
+      "label": ".NET interop (CLRInterop, using alias, CLRError)",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-dotnet-interop-clrerror"
+      ]
+    },
+    {
+      "id": "reflection-dict",
+      "label": "Reflection / Dict* metadata API",
+      "domain": "Code",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-reflection-dict-fieldwalk"
+      ]
+    },
+    {
+      "id": "form",
+      "label": "Form",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-form-basic"
+      ]
+    },
+    {
+      "id": "form-patterns",
+      "label": "Form patterns (ListPage, DetailsMaster, …)",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L1-form-detailsmaster",
+        "L1-form-dialog",
+        "L1-form-listpage",
+        "L1-form-lookup",
+        "L1-form-simplelistdetails",
+        "L1-form-tableofcontents",
+        "L1-form-workspace",
+        "L3-form-detailstransaction"
+      ]
+    },
+    {
+      "id": "form-extension",
+      "label": "Form extension",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-form-extension-basic"
+      ]
+    },
+    {
+      "id": "form-lifecycle",
+      "label": "FormRun lifecycle & data sources",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-form-modify-controls",
+        "L3-form-add-datasource-lines"
+      ]
+    },
+    {
+      "id": "menu-item",
+      "label": "Menu items (display/action/output)",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-advanced",
+        "L4-ssrs-report-multidataset"
+      ]
+    },
+    {
+      "id": "menu",
+      "label": "Menus & submenu nesting",
+      "domain": "UI",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-master-security-slice"
+      ]
+    },
+    {
+      "id": "tiles-kpis",
+      "label": "Tiles & KPIs",
+      "domain": "UI",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-tile-cue-over-query"
+      ]
+    },
+    {
+      "id": "ssrs-report",
+      "label": "SSRS report (DP + contract + controller)",
+      "domain": "Reporting",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-advanced",
+        "L4-ssrs-report-basic"
+      ]
+    },
+    {
+      "id": "ssrs-multidataset",
+      "label": "Multi-dataset SSRS report",
+      "domain": "Reporting",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-ssrs-report-multidataset"
+      ]
+    },
+    {
+      "id": "print-management",
+      "label": "Print management",
+      "domain": "Reporting",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-print-management-report"
+      ]
+    },
+    {
+      "id": "electronic-reporting",
+      "label": "Electronic Reporting (ER)",
+      "domain": "Reporting",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-electronic-reporting-integration"
+      ]
+    },
+    {
+      "id": "sysoperation",
+      "label": "SysOperation / batch",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-batch-basic"
+      ]
+    },
+    {
+      "id": "parallel-batch",
+      "label": "Parallel batch processing",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-parallel-batch-tasks"
+      ]
+    },
+    {
+      "id": "async-retryable-batch",
+      "label": "Async & retryable batch (BatchRetryable/runAsync)",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-batch-retryable-basic"
+      ]
+    },
+    {
+      "id": "number-sequences",
+      "label": "Number sequences",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-numberseq-basic"
+      ]
+    },
+    {
+      "id": "financial-dimensions",
+      "label": "Financial dimensions",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-dimension-basic"
+      ]
+    },
+    {
+      "id": "posting-engine",
+      "label": "Posting engine (LedgerVoucher)",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-posting-ledgervoucher-slice"
+      ]
+    },
+    {
+      "id": "workflow",
+      "label": "Workflow",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-workflow-document-submit"
+      ]
+    },
+    {
+      "id": "business-events",
+      "label": "Business events & alerts",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-business-event-basic"
+      ]
+    },
+    {
+      "id": "feature-management",
+      "label": "Feature management",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-feature-management-flight"
+      ]
+    },
+    {
+      "id": "configuration-keys",
+      "label": "Configuration keys",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-config-key-gated-table"
+      ]
+    },
+    {
+      "id": "multi-company",
+      "label": "Multi-company / changeCompany",
+      "domain": "Frameworks",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-multi-company-changecompany"
+      ]
+    },
+    {
+      "id": "global-address-book",
+      "label": "Global address book",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-gab-party-postaladdress"
+      ]
+    },
+    {
+      "id": "currency",
+      "label": "Currency & exchange rates",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-currency-exchange-conversion"
+      ]
+    },
+    {
+      "id": "inventory",
+      "label": "Inventory (InventTrans / InventDim)",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-inventory-inventdim-onhand"
+      ]
+    },
+    {
+      "id": "warehouse",
+      "label": "Warehouse management (WHS)",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-warehouse-work-slice"
+      ]
+    },
+    {
+      "id": "trade-agreements",
+      "label": "Trade agreements & pricing",
+      "domain": "Frameworks",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-trade-agreement-price-lookup"
+      ]
+    },
+    {
+      "id": "data-entity",
+      "label": "Data entity (OData)",
+      "domain": "Integration",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-entity-security"
+      ]
+    },
+    {
+      "id": "data-entity-extension",
+      "label": "Data entity extension",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-data-entity-extension-field"
+      ]
+    },
+    {
+      "id": "custom-service",
+      "label": "Custom services / OData actions",
+      "domain": "Integration",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-custom-service-basic"
+      ]
+    },
+    {
+      "id": "dmf",
+      "label": "Data management framework (DMF/DIXF)",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-dmf-entity-import-slice"
+      ]
+    },
+    {
+      "id": "dual-write",
+      "label": "Dual-write (Dataverse)",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-dualwrite-entity-mapping"
+      ]
+    },
+    {
+      "id": "power-platform",
+      "label": "Power Platform / virtual entities",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-virtual-entity-power-platform"
+      ]
+    },
+    {
+      "id": "file-io",
+      "label": "Reading Excel / CSV files",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 2,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-file-csv-import"
+      ]
+    },
+    {
+      "id": "direct-sql",
+      "label": "Direct SQL execution",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-direct-sql-connection"
+      ]
+    },
+    {
+      "id": "aggregate-measurements",
+      "label": "Aggregate measurements / analytics",
+      "domain": "Integration",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-aggregate-measurement-basic"
+      ]
+    },
+    {
+      "id": "security-privilege",
+      "label": "Security privilege",
+      "domain": "Security",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-entity-security",
+        "L4-master-security-slice"
+      ]
+    },
+    {
+      "id": "security-duty",
+      "label": "Security duty",
+      "domain": "Security",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-entity-security",
+        "L4-master-security-slice"
+      ]
+    },
+    {
+      "id": "security-role",
+      "label": "Security role",
+      "domain": "Security",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-entity-security",
+        "L4-master-security-slice"
+      ]
+    },
+    {
+      "id": "entity-security",
+      "label": "Data-entity security",
+      "domain": "Security",
+      "tier": "core",
+      "weight": 3,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L4-entity-security"
+      ]
+    },
+    {
+      "id": "xds",
+      "label": "Extensible data security (XDS)",
+      "domain": "Security",
+      "tier": "total",
+      "weight": 1,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L3-xds-policy-constrained-table"
+      ]
+    },
+    {
+      "id": "license-code",
+      "label": "License codes",
+      "domain": "Security",
+      "tier": "total",
+      "weight": 0,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-license-code-configkey"
+      ]
+    },
+    {
+      "id": "unit-testing",
+      "label": "SysTest unit testing",
+      "domain": "Quality",
+      "tier": "core",
+      "weight": 4,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L2-coc-extension",
+        "L2-event-handler-basic",
+        "L3-batch-basic"
+      ]
+    },
+    {
+      "id": "labels",
+      "label": "Labels & localisation",
+      "domain": "Quality",
+      "tier": "core",
+      "weight": 5,
+      "k": true,
+      "e": true,
+      "t": true,
+      "covered": true,
+      "cases": [
+        "L0-edt-basic",
+        "L0-enum-basic",
+        "L1-class-basic",
+        "L1-form-basic",
+        "L1-form-detailsmaster",
+        "L1-form-dialog",
+        "L1-form-listpage",
+        "L1-form-lookup",
+        "L1-form-simplelistdetails",
+        "L1-form-tableofcontents",
+        "L1-form-workspace",
+        "L1-macro-library-flight",
+        "L1-map-basic",
+        "L1-table-basic",
+        "L2-business-event-basic",
+        "L2-class-method-ops",
+        "L2-coc-inherited-method",
+        "L2-collections-map-list-container",
+        "L2-config-key-gated-table",
+        "L2-datetime-timezone-range",
+        "L2-delegate-basic",
+        "L2-dimension-basic",
+        "L2-direct-sql-connection",
+        "L2-dotnet-interop-clrerror",
+        "L2-edt-extension-basic",
+        "L2-feature-management-flight",
+        "L2-interface-abstract-basic",
+        "L2-license-code-configkey",
+        "L2-numberseq-basic",
+        "L2-occ-retry-basic",
+        "L2-reflection-dict-fieldwalk",
+        "L2-sysda-fluent-query",
+        "L2-sysextension-plugin",
+        "L2-table-caching-basic",
+        "L2-table-extension",
+        "L2-table-inheritance-basic",
+        "L2-table-modify-lifecycle",
+        "L3-custom-service-basic",
+        "L3-form-detailstransaction"
+      ]
+    }
+  ],
+  "orphans": {
+    "knowledge": [
+      "extensible-enums"
+    ],
+    "cases": [
+      "L0-create-readback-no-reindex",
+      "L2-batched-object-reads",
+      "L2-oracle-discriminator-random-wrapper-name",
+      "L3-enum-field-form-downgrade-guard",
+      "L4-headerlines-document-slice"
+    ]
+  }
+}

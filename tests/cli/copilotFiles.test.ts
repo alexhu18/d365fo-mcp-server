@@ -1,0 +1,114 @@
+/**
+ * The copilot-instructions half of client setup.
+ *
+ * Both files (.mcp.json and .github\copilot-instructions.md) have to be placed
+ * for Copilot to route through the MCP tools at all, so the wizard's copy step
+ * is load-bearing rather than a convenience: when it silently does nothing the
+ * user ends up with a server the agent never uses. The staging folder's README
+ * is what tells them where the files go, which makes "was a README written"
+ * part of the contract there — and "was one *not* written" part of it in the
+ * user's own solutions folder.
+ */
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import { resolve } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+let tmpRoot: string;
+let packageRoot: string;
+let installDir: string;
+let confirmAnswer = true;
+
+vi.mock('../../src/cli/context.js', () => ({
+  get repoRoot() { return packageRoot; },
+  dataRoot: () => installDir,
+  paths: { get mcpSuggestion() { return resolve(installDir, '.mcp.json'); } },
+}));
+
+vi.mock('../../src/cli/ui.js', () => ({
+  askConfirm: () => Promise.resolve(confirmAnswer),
+  p: { log: { warn: vi.fn(), info: vi.fn(), success: vi.fn(), error: vi.fn(), step: vi.fn() } },
+}));
+
+const { maybePrepareCopilotInstructions } = await import('../../src/cli/copilotFiles.js');
+
+beforeEach(() => {
+  tmpRoot = fs.mkdtempSync(resolve(os.tmpdir(), 'copilot-files-'));
+  packageRoot = resolve(tmpRoot, 'package');
+  installDir = resolve(tmpRoot, 'installation');
+  fs.mkdirSync(resolve(packageRoot, '.github'), { recursive: true });
+  fs.writeFileSync(resolve(packageRoot, '.github', 'copilot-instructions.md'), '# rules\n');
+  fs.mkdirSync(installDir, { recursive: true });
+  confirmAnswer = true;
+});
+
+afterEach(() => {
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+describe('maybePrepareCopilotInstructions', () => {
+  const stagingDir = () => resolve(installDir, 'copilot-setup');
+
+  it('copies only the instructions into the solutions folder', async () => {
+    // The solutions folder is the user's own projects directory: a README
+    // dropped next to their repos is litter, so the direct copy leaves the
+    // one file that has to be there and says the rest on the console.
+    const solutions = resolve(tmpRoot, 'repos');
+    fs.mkdirSync(solutions);
+
+    await maybePrepareCopilotInstructions(solutions);
+
+    expect(fs.existsSync(stagingDir())).toBe(false);
+    expect(fs.readFileSync(resolve(solutions, '.github', 'copilot-instructions.md'), 'utf8')).toBe('# rules\n');
+    expect(fs.existsSync(resolve(solutions, 'README.md'))).toBe(false);
+    expect(fs.readdirSync(solutions)).toEqual(['.github']);
+  });
+
+  it('creates the solutions folder when it does not exist yet', async () => {
+    const solutions = resolve(tmpRoot, 'repos', 'nested');
+
+    await maybePrepareCopilotInstructions(solutions);
+
+    expect(fs.existsSync(resolve(solutions, '.github', 'copilot-instructions.md'))).toBe(true);
+  });
+
+  it('stages the file when no solutions folder is configured', async () => {
+    await maybePrepareCopilotInstructions('   ');
+
+    expect(fs.existsSync(resolve(stagingDir(), '.github', 'copilot-instructions.md'))).toBe(true);
+    expect(fs.readFileSync(resolve(stagingDir(), 'README.md'), 'utf8')).toContain('a parent folder');
+  });
+
+  it('stages the file when the user declines the copy', async () => {
+    confirmAnswer = false;
+    const solutions = resolve(tmpRoot, 'repos');
+    fs.mkdirSync(solutions);
+
+    await maybePrepareCopilotInstructions(solutions);
+
+    expect(fs.existsSync(resolve(stagingDir(), '.github', 'copilot-instructions.md'))).toBe(true);
+    expect(fs.existsSync(resolve(solutions, '.github'))).toBe(false);
+  });
+
+  it('points the staged README at the one .mcp.json instead of copying it', async () => {
+    // The staging folder lives inside the data directory the .mcp.json is
+    // written to, so a copy would be the same file twice, one of them stale.
+    fs.writeFileSync(resolve(installDir, '.mcp.json'), '{"servers":{}}\n');
+
+    await maybePrepareCopilotInstructions('');
+
+    expect(fs.existsSync(resolve(stagingDir(), '.mcp.json'))).toBe(false);
+    expect(fs.readFileSync(resolve(stagingDir(), 'README.md'), 'utf8'))
+      .toContain(resolve(installDir, '.mcp.json'));
+  });
+
+  it('skips without asking when the installation does not ship the file', async () => {
+    // What an npm install looked like while .github was missing from `files`:
+    // the wizard asked nothing and the user never learned a file was needed.
+    fs.rmSync(resolve(packageRoot, '.github'), { recursive: true });
+
+    await maybePrepareCopilotInstructions(resolve(tmpRoot, 'repos'));
+
+    expect(fs.existsSync(stagingDir())).toBe(false);
+  });
+});

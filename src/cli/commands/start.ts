@@ -5,10 +5,11 @@
  * IDE clients use when they spawn dist/index.js directly.
  */
 import * as fs from 'node:fs';
+import { settingByPath } from '../../config/settings.js';
 import { isWindows, paths } from '../context.js';
-import { readEnvValue } from '../envFile.js';
 import { runNode, runShell } from '../exec.js';
-import { pickTarget } from '../target.js';
+import { readSetting } from '../settingsStore.js';
+import { pickTarget, targetEnv } from '../target.js';
 import { askConfirm, p } from '../ui.js';
 import { isXppConfigStale, xppConfigDir } from '../xppConfig.js';
 
@@ -30,9 +31,9 @@ export async function startCommand(instanceName: string | undefined): Promise<vo
   }
 
   // A pinned XPP config that no longer exists means the UDE was upgraded and the indexed database is stale.
-  if (isWindows && target.envFile && isXppConfigStale(target.envFile)) {
-    const configName = readEnvValue(target.envFile, 'XPP_CONFIG_NAME');
-    p.log.warn(`XPP_CONFIG_NAME '${configName}' does not match any file in ${xppConfigDir()}.\n` +
+  if (isWindows && isXppConfigStale(target.store)) {
+    const configName = readSetting(target.store, settingByPath('environment.xppConfigName')!);
+    p.log.warn(`Pinned XPP config '${configName}' does not match any file in ${xppConfigDir()}.\n` +
       `   The UDE may have been upgraded since ${target.label} was configured.\n` +
       `   Fix with: d365fo-mcp instance upgrade ${target.name}`);
     if (!await askConfirm('Continue anyway?', false)) {
@@ -41,12 +42,10 @@ export async function startCommand(instanceName: string | undefined): Promise<vo
     }
   }
 
-  const port = target.port ?? (target.envFile ? readEnvValue(target.envFile, 'PORT') : null) ?? 8080;
+  const port = target.port ?? readSetting(target.store, settingByPath('server.port')!) ?? 8080;
   p.log.step(`Starting ${target.label} — expected endpoint http://localhost:${port}/mcp (Ctrl+C stops it)`);
 
-  const code = await runNode([paths.distEntry], {
-    env: target.envFile ? { ENV_FILE: target.envFile } : undefined,
-  });
+  const code = await runNode([paths.distEntry], { env: targetEnv(target) });
   if (code !== 0) {
     p.log.error(`Server exited with code ${code}`);
     process.exitCode = code;

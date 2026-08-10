@@ -3,9 +3,10 @@
  * Main entry point
  */
 
-// Load .env — supports ENV_FILE env var for multi-instance setups (see src/utils/loadEnv.ts).
-import { loadEnv } from './utils/loadEnv.js';
-loadEnv(import.meta.url);
+// Load configuration onto process.env — MUST stay the first import: ESM
+// evaluates imports before any module body, so anything above this line is
+// evaluated before the configuration exists (see src/bootstrapEnv.ts).
+import './bootstrapEnv.js';
 import { fileURLToPath } from 'url';
 import { dirname, resolve } from 'path';
 import express from 'express';
@@ -19,10 +20,14 @@ import { WorkspaceScanner } from './workspace/workspaceScanner.js';
 import { HybridSearch } from './workspace/hybridSearch.js';
 import { initializeDatabase } from './database/download.js';
 import { initializeConfig, getConfigManager } from './utils/configManager.js';
-import { SERVER_MODE, LOCAL_TOOLS, isToolAllowedInMode } from './server/serverMode.js';
+import { SERVER_MODE, LOCAL_TOOLS, TOOL_PROFILE, EXTRA_TOOLS, isToolEnabled } from './server/serverMode.js';
 import { TOOL_ANNOTATIONS } from './server/toolAnnotations.js';
 import { apiKeyAuth } from './middleware/apiKeyAuth.js';
+import { VERSION } from './version.js';
 import { setInitializeParams } from './utils/stdioSessionInfo.js';
+import { setModelObjectNameSource } from './utils/modelPrefixInference.js';
+import { trackBridgeStartup } from './bridge/bridgeReadiness.js';
+import { createShutdownCoordinator } from './utils/gracefulShutdown.js';
 import { box, kv, sectionTitle, statusLine, spread, c, glyph, sanitize, supportsUnicode, log, shortPath, startupWarnings } from './utils/terminalUi.js';
 import * as fs from 'fs/promises';
 import * as fsSync from 'node:fs';
@@ -36,16 +41,39 @@ const DEBUG_LOGGING = process.env.DEBUG_LOGGING === 'true';
 // to a file (useful when the IDE doesn't expose MCP subprocess stderr).
 const LOG_FILE = process.env.LOG_FILE;
 let _logStream: fsSync.WriteStream | undefined;
+/** Undoes the stderr tee. Set only while the tee is installed. */
+let _restoreStderr: (() => void) | undefined;
 if (LOG_FILE) {
   try {
     _logStream = fsSync.createWriteStream(LOG_FILE, { flags: 'a', encoding: 'utf8' });
+    // The open is asynchronous, so a bad path (missing directory, no write
+    // permission) never reaches the catch below — it arrives here instead, and
+    // without a listener an 'error' event on a stream is an uncaught exception.
+    _logStream.on('error', (err) => {
+      _logStream = undefined;
+      _restoreStderr?.();
+      process.stderr.write(`[d365fo-mcp] ⚠️ LOG_FILE=${LOG_FILE} unusable, file logging off: ${err}\n`);
+    });
     const banner = `\n${'─'.repeat(72)}\n[d365fo-mcp] Started at ${new Date().toISOString()}  pid=${process.pid}\n${'─'.repeat(72)}\n`;
     _logStream.write(banner);
-    // Tee: intercept process.stderr so every write also goes to the log file
-    const origStderrWrite = process.stderr.write.bind(process.stderr);
-    (process.stderr as NodeJS.WriteStream & { write: (...args: any[]) => boolean }).write = function (chunk: any, ...rest: any[]): boolean {
-      _logStream!.write(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+    // Tee: intercept process.stderr so every write also goes to the log file.
+    // The mirror is best-effort — stderr itself must keep working even once the
+    // stream is gone, because shutdown reports its final progress through it.
+    const stderr = process.stderr as NodeJS.WriteStream & { write: (...args: any[]) => boolean };
+    const origStderrWrite = stderr.write.bind(process.stderr);
+    const teeWrite = function (chunk: any, ...rest: any[]): boolean {
+      try {
+        _logStream?.write(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+      } catch {
+        // A failed mirror must never take the real stderr write down with it.
+      }
       return origStderrWrite(chunk, ...rest) as boolean;
+    };
+    stderr.write = teeWrite;
+    _restoreStderr = () => {
+      // Only unpatch our own tee — something else may have wrapped stderr since.
+      if (stderr.write === teeWrite) stderr.write = origStderrWrite;
+      _restoreStderr = undefined;
     };
   } catch (e) {
     // Don't crash the server if the log file can't be opened
@@ -84,9 +112,20 @@ console.error = (...args: any[]) => {
 // on the first request and has to be restarted" when a background task (e.g.
 // the async DB load) rejects before any tool call awaits it. Log and keep the
 // server alive instead of dying. (stderr is already tee'd to LOG_FILE above.)
+// A throw inside either of these handlers is fatal and unrecoverable — Node has
+// no net left to catch it — so the reporting itself is wrapped: the net must not
+// be the thing that kills the process it exists to keep alive.
+function reportSafely(message: string): void {
+  try {
+    process.stderr.write(message);
+  } catch {
+    /* nothing left to report through */
+  }
+}
+
 process.on('unhandledRejection', (reason) => {
   const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
-  process.stderr.write(`[d365fo-mcp] ⚠️ Unhandled promise rejection (server staying up): ${msg}\n`);
+  reportSafely(`[d365fo-mcp] ⚠️ Unhandled promise rejection (server staying up): ${msg}\n`);
 });
 
 // Same protection for SYNCHRONOUS uncaught exceptions — a throw that escapes a
@@ -96,10 +135,10 @@ process.on('unhandledRejection', (reason) => {
 // root cause is diagnosable, then keep serving. (Genuinely fatal startup errors
 // are still surfaced via main().catch → process.exit below.)
 process.on('uncaughtException', (err) => {
-  process.stderr.write(`[d365fo-mcp] ⚠️ Uncaught exception (server staying up): ${err?.stack ?? err}\n`);
+  reportSafely(`[d365fo-mcp] ⚠️ Uncaught exception (server staying up): ${err?.stack ?? err}\n`);
 });
 
-const PORT = parseInt(process.env.PORT || '8080');
+const PORT = parseInt(process.env.PORT || '8080', 10);
 // Derive server root from this file's location so paths are absolute
 // regardless of process.cwd() — critical when VS Code launches this as stdio subprocess.
 const __serverDir = dirname(fileURLToPath(import.meta.url));
@@ -138,12 +177,19 @@ const serverState: ServerState = {
   statusMessage: 'Starting...',
 };
 
+// Graceful shutdown — see src/utils/gracefulShutdown.ts for why and how.
+const shutdownCoordinator = createShutdownCoordinator({
+  deadlineMs: Math.max(1_000, parseInt(process.env.SHUTDOWN_TIMEOUT_MS || '5000', 10) || 5_000),
+});
+const onShutdown = shutdownCoordinator.onShutdown;
+
 async function initializeServices() {
   // -----------------------------------------------------------------------
-  // write-only mode: skip all database/symbol work — LOCAL_TOOLS
-  // (create_d365fo_file, modify_d365fo_file, labels, verify_d365fo_project,
-  //  get_workspace_info etc.) only need the config manager for path resolution,
-  //  not the 1.5 GB symbol database.
+  // write-only mode: skip all database/symbol work — the LOCAL_TOOLS set
+  // (src/server/serverMode.ts; d365fo_file, build_d365fo_project,
+  //  verify_d365fo_project, undo_last_modification, get_workspace_info, …)
+  //  only needs the config manager for path resolution, not the 1.5 GB symbol
+  //  database. Read the set from serverMode.ts rather than trusting this list.
   // -----------------------------------------------------------------------
   if (SERVER_MODE === 'write-only') {
     log.info('Mode: write-only (local file-operations companion)');
@@ -227,7 +273,7 @@ async function initializeServices() {
 
     // Yield event loop so any pending MCP protocol messages (initialize exchange,
     // roots/list, first tool call) can be queued before new Database() blocks.
-    // better-sqlite3 open is synchronous — a 1.5 GB file can stall the loop for
+    // Opening a SQLite database is synchronous — a 1.5 GB file can stall the loop for
     // several seconds, causing the first client request to time out and cancel.
     await new Promise<void>(r => setImmediate(r));
 
@@ -262,6 +308,11 @@ async function initializeServices() {
       }
     }
 
+    // Let object naming learn each model's prefix from the objects that model
+    // already contains, instead of applying one configured EXTENSION_PREFIX to
+    // every model a developer works in (see utils/modelPrefixInference.ts).
+    setModelObjectNameSource(model => symbolIndex.getModelObjectNames(model));
+
     const parser = new XppMetadataParser();
 
     // Check if database needs indexing
@@ -278,10 +329,10 @@ async function initializeServices() {
         const modelNames = modelNamesStr.split(',').map(m => m.trim()).filter(Boolean);
         log.detail(`model names: ${modelNames.join(', ')}`);
 
-        for (const modelName of modelNames) {
-          log.detail(`indexing ${modelName}` + glyph.ellipsis);
-          await symbolIndex.indexMetadataDirectory(METADATA_PATH, modelName);
-        }
+        // Single pass over all requested models — the FTS index is rebuilt once at the
+        // end of the call, so looping per model would repeat a full-table rebuild.
+        log.detail(`indexing ${modelNames.join(', ')}` + glyph.ellipsis);
+        await symbolIndex.indexMetadataDirectory(METADATA_PATH, modelNames);
 
         log.ok(`Indexed ${symbolIndex.getSymbolCount().toLocaleString('en-US')} symbols from ${modelNames.length} model(s)`);
       } catch {
@@ -408,6 +459,10 @@ async function initializeBridge(targetContext: import('./types/context.js').XppS
     });
     if (bridge) {
       targetContext.bridge = bridge;
+      // dispose() ends the child's stdin and escalates to SIGTERM/SIGKILL, so the
+      // bridge gets the chance to finish an in-flight AOT write and close its own
+      // metadata handles rather than being cut off mid-file.
+      onShutdown('C# bridge', () => bridge.dispose());
       const cap = `metadata ${bridge.metadataAvailable ? 'yes' : 'no'} ${glyph.dot} xref ${bridge.xrefAvailable ? 'yes' : 'no'}`;
       return { ok: true, summary: `C# bridge connected (${devEnvType}) ${glyph.dot} ${cap}` };
     }
@@ -422,6 +477,22 @@ async function initializeBridge(targetContext: import('./types/context.js').XppS
 }
 
 async function main() {
+  // Registered first so it runs LAST (cleanups run in reverse): the log file is
+  // where the other steps report, so it has to outlive them.
+  onShutdown('log file', () => {
+    // Unpatch before closing: the coordinator still writes "[shutdown] done"
+    // after this cleanup returns, and that write must not touch a closed stream.
+    _restoreStderr?.();
+    if (_logStream) {
+      _logStream.end();
+      _logStream = undefined;
+    }
+  });
+  // Covers whichever index ended up in serverState — the real one, the in-memory
+  // stub, or the replacement built after a corrupt-DB recovery.
+  onShutdown('symbol index', () => serverState.symbolIndex?.close?.());
+  shutdownCoordinator.registerSignalHandlers({ stdio: isStdioMode });
+
   // ─────────────────────────────────────────────────────────────────────────────
   // Stdin sniffer: capture the `initialize` request params for get_workspace_info.
   // ─────────────────────────────────────────────────────────────────────────────
@@ -574,7 +645,11 @@ async function main() {
     // Step 3b: Initialize C# bridge in parallel with DB load (non-blocking)
     // The bridge provides live metadata from Microsoft's IMetadataProvider API
     // and cross-reference queries — only available on Windows VMs with D365FO.
-    void initializeBridge(stubContext).then(s => (s.ok ? log.ok(s.summary) : log.warn(s.summary)));
+    // The attempt is tracked on the context so bridge-backed tools called in the
+    // first seconds wait for it instead of reporting a phantom "not connected".
+    stubContext.bridgeStartup = trackBridgeStartup(
+      initializeBridge(stubContext).then(s => (s.ok ? log.ok(s.summary) : log.warn(s.summary))),
+    );
 
     // Step 4: load real database in the background
     const dbLoadStart = Date.now();
@@ -601,13 +676,11 @@ async function main() {
     // Log tool count immediately (transport is already connected).
     // TOOL_ANNOTATIONS is guaranteed complete by tests/utils/toolInventory.test.ts,
     // so its size tracks the real tool count without a hardcoded literal.
-    const totalTools = Object.keys(TOOL_ANNOTATIONS).length;
-    const localToolCount = LOCAL_TOOLS.size;
-    const toolCount = SERVER_MODE === 'write-only' ? localToolCount :
-                     SERVER_MODE === 'read-only' ? totalTools - localToolCount : totalTools;
+    const toolCount = Object.keys(TOOL_ANNOTATIONS).filter(name => isToolEnabled(name)).length;
     const toolDesc = SERVER_MODE === 'write-only' ? `(${Array.from(LOCAL_TOOLS).join(', ')})` :
                     SERVER_MODE === 'read-only' ? '(all except local tools)' :
-                    '(2 discovery + 1 labels + 3 object-info + 2 intelligent + 2 smart-gen + 1 file-ops + 1 pattern-analysis + 5 security-ext + 5 sdlc-build + 2 code-review + 2 code-quality)';
+                    TOOL_PROFILE === 'core' ? `(core profile${EXTRA_TOOLS.size ? ` + ${EXTRA_TOOLS.size} extra` : ''}; MCP_TOOL_PROFILE=full for all ${Object.keys(TOOL_ANNOTATIONS).length})` :
+                    '(1 discovery + 1 labels + 3 object-info + 2 intelligent + 2 smart-gen + 1 file-ops + 1 pattern-analysis + 5 security-ext + 5 sdlc-build + 2 code-review + 2 code-quality)';
     log.ok(`Registered ${toolCount} X++ MCP tools ${toolDesc}`);
     serverState.isReady = true;
     serverState.isHealthy = true;
@@ -624,7 +697,7 @@ async function main() {
     const W = 50;
     console.log('');
     for (const line of box([
-      spread(c.bold('D365 F&O MCP Server'), c.dim('v1.0.0'), W),
+      spread(c.bold('D365 F&O MCP Server'), c.dim(`v${VERSION}`), W),
       c.gray('X++ Code Intelligence'),
     ], W)) {
       console.log(line);
@@ -661,7 +734,7 @@ async function main() {
         status: ready ? 'healthy' : 'starting',
         ready,
         service: 'd365fo-mcp-server',
-        version: '1.0.0',
+        version: VERSION,
         message: serverState.statusMessage,
         // Cached-only: a health probe must never trigger a 30-60 s COUNT scan.
         symbols: serverState.symbolIndex?.getCachedSymbolCounts()?.total || 0,
@@ -687,7 +760,13 @@ async function main() {
     });
 
     // Bind port immediately — Azure requires the port to be open within ~230 s
-    await new Promise<void>(resolve => app.listen(PORT, host, () => resolve()));
+    const httpServer = await new Promise<import('http').Server>(resolve => {
+      const s = app.listen(PORT, host, () => resolve(s));
+    });
+    // Stop accepting new connections and let in-flight requests finish. Bounded
+    // by the shutdown deadline, so a held-open keep-alive socket cannot stall the
+    // exit.
+    onShutdown('HTTP server', () => new Promise<void>(resolve => httpServer.close(() => resolve())));
 
     // Initialise services in the background; register MCP routes once ready
     initializeServices().then(async ({ mcpServer, symbolIndex, parser, workspaceScanner, hybridSearch, context }) => {
@@ -706,8 +785,12 @@ async function main() {
       // never block startup, so cap the wait; it keeps connecting in the
       // background afterwards and attaches to the context once ready.
       if (context) {
+        const attempt = initializeBridge(context);
+        // Tracked before the bounded race below, so a bridge that is still
+        // connecting when the banner gives up is still awaited by tool calls.
+        context.bridgeStartup = trackBridgeStartup(attempt);
         const status = await Promise.race<BridgeStatus>([
-          initializeBridge(context),
+          attempt,
           new Promise<BridgeStatus>(r => setTimeout(
             () => r({ ok: true, summary: 'C# bridge still connecting in the background' + glyph.ellipsis }), 6000)),
         ]);
@@ -719,14 +802,12 @@ async function main() {
       const toolCatalog = [
         { icon: '🔍', category: 'Search & Discovery', tools: [
           { name: 'search',                       desc: 'Search 584K+ symbols: single, batch (queries[]) or scope=extensions' },
-          { name: 'batch_get_info',               desc: 'Get detailed info for up to 10 objects in one parallel call' },
         ]},
         { icon: '🏷️ ', category: 'Label Management', tools: [
           { name: 'labels',                       desc: 'Unified label ops: action=search|info|create|rename (read/write)' },
         ]},
         { icon: '📊', category: 'Advanced Object Info', tools: [
-          { name: 'get_object_info',              desc: 'Read any object by objectType: class/table/form/query/view/enum/edt/report/data-entity/menu-item/service/map/config-key/security-policy/macro' },
-          { name: 'get_method',                   desc: 'Method signature/source/both via include= (required before CoC extensions)' },
+          { name: 'get_object_info',              desc: 'Read one object (objectType, name) or many in one call (objects[]): class/table/form/query/view/enum/edt/report/data-entity/menu-item/service/map/config-key/security-policy/macro' },
           { name: 'find_references',              desc: 'Where-used analysis across the entire codebase' },
         ]},
         { icon: '🧠', category: 'Intelligent Code Generation', tools: [
@@ -735,7 +816,6 @@ async function main() {
         ]},
         { icon: '🎨', category: 'Smart Object Generation', tools: [
           { name: 'generate_object',                     desc: 'mode=pattern (named X++ skeleton) | scaffold (whole table/form/report)' },
-          { name: 'suggest_edt',                  desc: 'Suggest EDT for field name using fuzzy matching' },
         ]},
         { icon: '📝', category: 'File & Metadata Operations', tools: [
           { name: 'd365fo_file',                  desc: 'action=create|modify|generate — write/edit AOT objects or emit XML (cloud)' },
@@ -751,7 +831,7 @@ async function main() {
           { name: 'verify_d365fo_project',        desc: 'Verify objects exist on disk and are referenced in the .rnrproj project file' },
         ]},
         { icon: '🏗️ ', category: 'SDLC & Build Tools', tools: [
-          { name: 'update_symbol_index',          desc: 'Index a newly generated XML file immediately (no restart needed)' },
+          { name: 'update_symbol_index',          desc: 'Re-index a file changed outside this server (create/modify refresh it themselves)' },
           { name: 'build_d365fo_project',         desc: 'Run MSBuild compilation locally to capture errors' },
           { name: 'trigger_db_sync',              desc: 'Run a database sync for the current model' },
           { name: 'run_bp_check',                 desc: 'Run Microsoft Best Practices (xppbp.exe) analysis' },
@@ -772,7 +852,7 @@ async function main() {
           ...cat,
           // Same predicate as the ListTools filter and runtime gate, so the
           // startup banner matches what the server actually exposes.
-          tools: cat.tools.filter(t => isToolAllowedInMode(SERVER_MODE, t.name)),
+          tools: cat.tools.filter(t => isToolEnabled(t.name)),
         }))
         .filter(cat => cat.tools.length > 0);
 

@@ -1,83 +1,45 @@
 # Quick Start
 
-Get the D365 F&O MCP Server running with GitHub Copilot in 5 steps.
+Two very different jobs share this page. Pick yours — each path is self-contained, so you only read your own.
 
-> **Server already deployed on Azure by your team?** Skip to [Step 3](#step-3--connect-copilot) — you only need a `.mcp.json` file.
->
-> **Using Claude Code instead of Copilot?** See [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md).
+| Your situation | Path | Effort |
+|---|---|---|
+| You are setting up your own D365FO VM — **the usual case** | [**B–E — Install**](#paths-be--install-on-your-d365fo-vm) | 10 min, or ~25 with a local index |
+| Your team already runs a deployed server | [**A — Connect**](#path-a--connect-to-a-server-someone-else-deployed) | ~2 min, nothing installed |
+| One machine serving several D365FO environments | **F — Multi-instance** | [SETUP.md](SETUP.md#scenario-f--multiple-instances) |
 
----
+Both paths finish with the [instruction file](#the-instruction-file-required) and [verification](#verify) at the bottom — those two are shared.
 
-## Step 1 — Prerequisites
+> Deploying the shared Azure server for your team is a separate job: [SETUP_AZURE.md](SETUP_AZURE.md).
 
-| Requirement | Where to get it | Needed for |
-|------------|----------------|------------|
-| Visual Studio 2022 ≥ 17.14 (or 2026) | Visual Studio Installer | all scenarios |
-| GitHub Copilot extension | VS → Extensions | all scenarios |
-| Node.js 24.x LTS | [nodejs.org](https://nodejs.org) or `Install-D365SupportingSoftware -Name node.js` | local / hybrid |
-| Python 3.x | bundled with Node.js installer (check the option) | local / hybrid |
-| .NET Framework 4.8 Dev Pack | pre-installed on D365FO VMs | C# bridge (writes) |
-| Git | [git-scm.com](https://git-scm.com) | local / hybrid |
 
----
+# Path A — connect to a server someone else deployed
 
-## Step 2 — Clone and build
+Only if someone has already deployed a shared server for your team — otherwise skip to [Paths B–E](#paths-be--install-on-your-d365fo-vm).
 
-### Interactive setup (recommended)
+Nothing is installed locally: the whole configuration is one entry naming a remote URL. You need only your editor and the server URL from whoever deployed it (plus an API key, if that deployment enforces one).
 
-The first-time setup wizard walks you through everything below — scenario selection, C# bridge build, `.env` configuration, index build — and prints the `.mcp.json` block to paste in Step 3:
+### Option 1 — the CLI writes it
 
 ```powershell
-git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
-cd K:\d365fo-mcp-server
-npm install
-npm run setup        # first-time setup wizard
-npm run doctor       # health check — verifies Node, build, index, bridge
+npx d365fo-mcp connect https://your-server.azurewebsites.net
 ```
 
-If the wizard completed, skip the manual steps and continue with [Step 3](#step-3--connect-copilot).
+Asks which editor and whether a key is needed, checks the server answers before writing anything, then merges the entry into that editor's config — any other MCP servers you have are left alone. Claude Code is registered through its own `claude mcp add-json`.
 
-### Manual setup
+Scriptable: `npx d365fo-mcp connect <url> --client vs|vscode|cursor|claude --api-key <key> --yes`.
 
-```powershell
-git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
-cd K:\d365fo-mcp-server
-npm install
-cd bridge\D365MetadataBridge; dotnet build -c Release; cd ..\..   # C# bridge — required for writes
-npm run build
-```
+### Option 2 — one click
 
-**Local index** (skip for hybrid — the index lives in Azure):
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_d365fo-0098FF?style=flat-square&logo=githubcopilot&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=d365fo&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22d365fo_server_url%22%2C%22description%22%3A%22D365FO%20MCP%20server%20URL%20(e.g.%20https%3A%2F%2Fyour-server.azurewebsites.net%2Fmcp%2F)%22%7D%5D&config=%7B%22type%22%3A%22http%22%2C%22url%22%3A%22%24%7Binput%3Ad365fo_server_url%7D%22%7D)
+[![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_d365fo-24bfa5?style=flat-square&logo=githubcopilot&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=d365fo&quality=insiders&inputs=%5B%7B%22type%22%3A%22promptString%22%2C%22id%22%3A%22d365fo_server_url%22%2C%22description%22%3A%22D365FO%20MCP%20server%20URL%20(e.g.%20https%3A%2F%2Fyour-server.azurewebsites.net%2Fmcp%2F)%22%7D%5D&config=%7B%22type%22%3A%22http%22%2C%22url%22%3A%22%24%7Binput%3Ad365fo_server_url%7D%22%7D)
+[![Add to Cursor](https://img.shields.io/badge/Cursor-Add_d365fo-000000?style=flat-square&logo=cursor&logoColor=white)](https://cursor.com/install-mcp?name=d365fo&config=eyJ1cmwiOiJodHRwczovL3lvdXItc2VydmVyLmF6dXJld2Vic2l0ZXMubmV0L21jcC8ifQ%3D%3D)
 
-```powershell
-copy .env.example .env           # set PACKAGES_PATH, CUSTOM_MODELS, LABEL_LANGUAGES
-npm run extract-metadata
-npm run build-database
-```
+VS Code prompts for the URL; Cursor installs a placeholder you then edit. Visual Studio and Claude Code have no install link — use Option 1 or 3.
 
-> **UDE / Power Platform Tools?** Run `npm run select-config` instead of setting `PACKAGES_PATH` manually.
+### Option 3 — by hand
 
----
-
-## Step 3 — Connect Copilot
-
-1. [github.com/settings/copilot/features](https://github.com/settings/copilot/features) → enable **MCP servers in Copilot**
-2. Visual Studio: **Tools → Options → GitHub → Copilot** → enable **MCP server integration in agent mode**
-3. Copilot Chat → switch to **Agent Mode**
-4. Create `.mcp.json` — either `%USERPROFILE%\.mcp.json` (all solutions, recommended) or next to a specific `.sln`
-
-Pick your scenario:
-
-| Scenario | What runs where | Best for |
-|----------|----------------|----------|
-| [**A** — Azure client](#a--azure-client) | everything on Azure, read-only | team members |
-| [**B** — Hybrid](#b--hybrid-azure--local-writes) | Azure search + local writes | **teams (recommended)** |
-| [**C** — Local HTTP](#c--local-http) | `npm run dev` on the VM | single developer |
-| [**D** — Local stdio](#d--local-stdio) | VS spawns the process | single developer, zero-config |
-| **E** — UDE | stdio + XPP config auto-detection | UDE / Power Platform Tools — [SETUP.md](SETUP.md#scenario-d-ude-unified-developer-experience) |
-| **F** — Multi-instance | one machine, several clients | agencies — [SETUP.md](SETUP.md#scenario-f-multiple-instances--one-machine-multiple-d365fo-environments) |
-
-### A — Azure client
+Visual Studio reads `%USERPROFILE%\.mcp.json` (all solutions) or a `.mcp.json` next to a specific `.sln`:
 
 ```json
 {
@@ -87,9 +49,108 @@ Pick your scenario:
 }
 ```
 
-> Read-only — cannot write files on your VM. Use **B** for writes.
+With an API key, add it as a header:
 
-### B — Hybrid (Azure + local writes)
+```json
+{
+  "servers": {
+    "d365fo-mcp-tools": {
+      "url": "https://your-server.azurewebsites.net/mcp/",
+      "headers": { "X-Api-Key": "your-key" }
+    }
+  }
+}
+```
+
+Claude Code keeps its config elsewhere:
+
+```powershell
+claude mcp add-json --scope user d365fo-mcp-tools '{"type":"http","url":"https://your-server.azurewebsites.net/mcp/","alwaysLoad":true}'
+```
+
+> **Read-only.** An Azure client searches and reads your indexed metadata but cannot write files on your VM. For writes, use the hybrid setup in [Path B](#b--hybrid--azure-search--local-writes).
+
+**Using Copilot?** Also do the [Copilot switches](#enable-copilot-visual-studio) below. Then continue with the [instruction file](#the-instruction-file-required).
+
+
+# Paths B–E — install on your D365FO VM
+
+## 1. Prerequisites
+
+| Requirement | Where to get it | Needed for |
+|------------|----------------|------------|
+| Visual Studio 2026 (or 2022 ≥ 17.14) | Visual Studio Installer | all scenarios |
+| GitHub Copilot extension | VS → Extensions | Copilot users |
+| .NET SDK | pre-installed on D365FO VMs, else [dotnet.microsoft.com](https://dotnet.microsoft.com/download) | C# bridge (writes) |
+| Node.js 24.x LTS | [nodejs.org](https://nodejs.org), or `Install-D365SupportingSoftware -Name node.js` | installed for you by the one-liner |
+| Git | [git-scm.com](https://git-scm.com) | only for a git-checkout installation, or to work on the source |
+
+> **From platform update 10.0.49 (PU74), Visual Studio 2026 is the only supported IDE for X++ development** (VS 2022 is no longer supported); earlier platform versions still use VS 2022 ≥ 17.14. [Details](https://learn.microsoft.com/en-us/dynamics365/fin-ops-core/fin-ops/get-started/whats-new-platform-updates-10-0-49)
+
+## 2. Install
+
+```powershell
+irm https://raw.githubusercontent.com/dynamics365ninja/d365fo-mcp-server/main/install.ps1 | iex
+```
+
+The installer checks for Node.js (installing it if missing), installs the server with `npm install -g d365fo-mcp`, and hands off to the setup wizard — which selects your scenario, asks where the configuration and the index should live, builds the C# bridge, asks only the settings that scenario needs, builds the index if you want one, and prints the `.mcp.json` block for step 3.
+
+With Node.js 24+ already present the one-liner has nothing to bootstrap, so `npm install -g d365fo-mcp` followed by `d365fo-mcp setup` does the same thing.
+
+Safe to re-run. Installations made before the npm package became self-contained are git checkouts that hold their configuration and index inside the checkout; those are detected and updated in place (`git pull`) instead, so nothing moves and no index is rebuilt. Override with environment variables set on the same line:
+
+| Variable | Effect |
+|---|---|
+| `$env:D365FO_MCP_DIR` | where to look for an existing checkout (default `K:\d365fo-mcp-server`) |
+| `$env:D365FO_MCP_YES = '1'` | non-interactive, accept defaults |
+| `$env:D365FO_MCP_NO_WIZARD = '1'` | install only, skip the wizard |
+
+Answers are saved to `config/d365fo-mcp.json` (secrets to `config/secrets.json`) — there is no `.env` to fill in. Every key, its default and the matching environment variable: [CONFIGURATION.md](CONFIGURATION.md). An older `.env` keeps working and is imported the first time the wizard runs.
+
+<details>
+<summary>Prefer to run the steps yourself</summary>
+
+```powershell
+git clone https://github.com/dynamics365ninja/d365fo-mcp-server.git K:\d365fo-mcp-server
+cd K:\d365fo-mcp-server
+npm install
+cd bridge\D365MetadataBridge; dotnet build -c Release; cd ..\..   # required for writes
+npm run build
+npm run setup        # scenario, paths, models, prefix, label languages…
+npm run doctor       # verifies Node, build, index, bridge
+```
+
+A local index (skip it for hybrid — that index lives in Azure):
+
+```powershell
+npm run extract-metadata
+npm run build-database
+```
+
+</details>
+
+> **The npm package is the installation.** [`d365fo-mcp`](https://www.npmjs.com/package/d365fo-mcp) carries the compiled server, the index scripts and the C# bridge sources, so `npm install -g d365fo-mcp` followed by `d365fo-mcp setup` needs no clone. The one-liner above exists to install Node.js first, which npm cannot do for itself. Only `npx d365fo-mcp` without a global install stays a `connect`-only client, since it has nowhere to keep an installation.
+
+## 3. Configure your editor
+
+### Enable Copilot (Visual Studio)
+
+1. [github.com/settings/copilot/features](https://github.com/settings/copilot/features) → enable **MCP servers in Copilot**
+2. Visual Studio → **Tools → Options → GitHub → Copilot** → enable **MCP server integration in agent mode**
+3. Copilot Chat → switch to **Agent Mode**
+
+Using Claude Code instead? [SETUP.md § Claude Code CLI](SETUP.md#claude-code-cli) covers it end to end.
+
+### Then pick the scenario the wizard configured
+
+| Scenario | What runs where | Best for |
+|----------|----------------|----------|
+| [**B** — Hybrid](#b--hybrid--azure-search--local-writes) | Azure search + local writes | **teams (recommended)** |
+| [**C** — Local HTTP](#c--local-http) | `npm run dev` on the VM | single developer |
+| **D** — UDE | stdio + XPP config auto-detection | UDE / Power Platform Tools — [SETUP.md](SETUP.md#scenario-d--ude-unified-developer-experience) |
+| [**E** — Local stdio](#e--local-stdio) | VS spawns the process | single developer, zero-config |
+
+#### B — Hybrid — Azure search + local writes
 
 ```json
 {
@@ -108,7 +169,7 @@ Pick your scenario:
 }
 ```
 
-### C — Local HTTP
+#### C — Local HTTP
 
 ```json
 {
@@ -118,9 +179,9 @@ Pick your scenario:
 }
 ```
 
-Start with `cd K:\d365fo-mcp-server && npm run dev`.
+Start the server with `npx d365fo-mcp start` (or `npm run dev`) in the install directory.
 
-### D — Local stdio
+#### E — Local stdio
 
 ```json
 {
@@ -140,34 +201,41 @@ Start with `cd K:\d365fo-mcp-server && npm run dev`.
 }
 ```
 
-> Complete parameter reference (every env var, per-scenario matrix): [MCP_CONFIG.md](MCP_CONFIG.md)
+> Every environment variable and a per-scenario matrix: [MCP_CONFIG.md](MCP_CONFIG.md).
 
----
 
-## Step 4 — Place copilot-instructions.md
+# The instruction file (required)
 
 ```powershell
-# One copy in a common parent folder covers all solutions beneath it
+# One copy in a common parent folder covers every solution beneath it
 Copy-Item -Path ".github" -Destination "C:\source\repos\" -Recurse
 ```
 
-VS 2022 searches for `.github\copilot-instructions.md` upward from the solution folder. **This step is not optional** — it delivers the workflow rules (tool routing, confirm-before-write, terminal prohibition) that the agent relies on.
+VS 2022 searches upward from the solution folder for `.github\copilot-instructions.md`. **Not optional** — it carries the workflow rules the agent depends on: tool routing, confirm-before-write, and the terminal prohibition. Claude Code reads the same content as `CLAUDE.md`:
 
----
+```powershell
+Copy-Item "K:\d365fo-mcp-server\.github\copilot-instructions.md" "C:\source\repos\CLAUDE.md"
+```
 
-## Step 5 — Verify
+Path A users: take the file from [the repository](https://github.com/dynamics365ninja/d365fo-mcp-server/blob/main/.github/copilot-instructions.md) — it is the one thing you do need locally.
+
+
+# Verify
+
+Restart the editor, open the AI chat, and ask:
 
 | Test | Prompt | Confirms |
 |------|--------|----------|
-| Search | `What tables contain "CustAccount" field?` | index + connection |
-| Write | `Create a class TestHelper with a static method hello()` | C# bridge |
+| Search | `Find every table (standard + ISV) that carries the CustAccount field` | index + connection |
+| Write | `Create a class TestHelper with a static method hello()` | C# bridge (not Path A) |
 | Forms | `Which form pattern should I use for a setup table with 5 fields?` | pattern advisor |
 
-If the first prompt triggers a `search` tool call with results from your codebase, you are connected.
+The first prompt should trigger a `search` tool call returning results from **your** metadata — including ISV models no training data has ever seen. That is the signal that grounding works, not just that the server is reachable.
 
----
+On an installed server, `npx d365fo-mcp doctor` checks the same ground from the other side: Node version, build, native binding, index size, bridge, and any stale configuration. It also names the source that resolves your workspace — the workspace path, the packages path, `D365FO_SOLUTIONS_PATH`, or `workspace.modelName` in the config — and flags a prefix conflict when the model's own objects use a different prefix from `naming.prefix` (the model's own naming wins; `EXTENSION_PREFIX_SOURCE=config` pins the configured value).
 
-## Logging & Diagnostics
+
+# Logging & diagnostics
 
 Add to the `env` block in `.mcp.json` when something isn't working:
 
@@ -181,26 +249,36 @@ Add to the `env` block in `.mcp.json` when something isn't working:
 Get-Content "C:\Temp\d365fo-mcp.log" -Encoding UTF8 -Wait    # watch live
 ```
 
-Healthy startup log:
-
-```
-✅ C# bridge initialized (metadataAvailable: true, xrefAvailable: true)
-```
+A healthy startup logs `✅ C# bridge initialized (metadataAvailable: true, xrefAvailable: true)`:
 
 | Flag | Meaning |
 |------|---------|
 | `metadataAvailable: false` | D365FO DLLs not loaded — check `packagePath` and .NET 4.8 |
 | `xrefAvailable: false` | `DYNAMICSXREFDB` unreachable — non-critical, tools fall back to SQLite |
 
----
 
-## What's next
+## What a session cost
+
+`npx d365fo-mcp session <log>` reads an agent host's debug log and reports where the money went: the fitted price of cached / uncached / output tokens, how much of the total was context re-read on every round trip, and — the number that matters most — how many tool-turns issued exactly **one** tool call. Each of those is a full round trip paying the whole prompt again before it does any work.
+
+```powershell
+$log = Get-ChildItem "$env:APPDATA\Code\User\workspaceStorage\*\GitHub.copilot-chat\debug-logs\*\main.jsonl" |
+       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+npx d365fo-mcp session $log.FullName          # human-readable
+npx d365fo-mcp session $log.FullName --json   # for tracking across releases
+```
+
+GitHub Copilot Chat's `main.jsonl` is the format it reads today; the log only exists while chat debug logging is on. The command fits the host's own billing to the token counts and **refuses to print any attribution when that fit is poor** — a bad residual means the log is not what the tool assumes, and it exits 1 rather than printing a confident number. Round-trip counts do not depend on the fit and are printed either way.
+
+
+# What's next
 
 | Topic | Documentation |
 |-------|--------------|
-| All 26 tools | [MCP_TOOLS.md](MCP_TOOLS.md) |
+| All 23 tools | [MCP_TOOLS.md](MCP_TOOLS.md) |
 | Real-world tool chains (CoC, forms, security, reports) | [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) |
 | Full `.mcp.json` reference | [MCP_CONFIG.md](MCP_CONFIG.md) |
+| Every setting and its environment variable | [CONFIGURATION.md](CONFIGURATION.md) |
 | Detailed setup scenarios A–F | [SETUP.md](SETUP.md) |
-| Azure deployment | [SETUP_AZURE.md](SETUP_AZURE.md) |
-| Claude Code CLI | [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) |
+| Azure deployment (admins) | [SETUP_AZURE.md](SETUP_AZURE.md) |
+| Claude Code CLI | [SETUP.md § Claude Code CLI](SETUP.md#claude-code-cli) |

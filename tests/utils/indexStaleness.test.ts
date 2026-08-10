@@ -6,7 +6,9 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { findNewestMetadataMtime, checkIndexStaleness } from '../../src/utils/indexStaleness';
+import {
+  findNewestMetadataMtime, checkIndexStaleness, resetMetadataMtimeCache,
+} from '../../src/utils/indexStaleness';
 import { XppSymbolIndex } from '../../src/metadata/symbolIndex';
 
 let tmpDir: string;
@@ -68,6 +70,50 @@ describe('checkIndexStaleness', () => {
   it('reports unknown when the model dir cannot be resolved', () => {
     const report = checkIndexStaleness(new Date().toISOString(), null);
     expect(report.status).toBe('unknown');
+  });
+});
+
+describe('checkIndexStaleness compact lines', () => {
+  it('is one line when the index is fresh', () => {
+    // get_workspace_info's default output pays for this on every call, and a
+    // fresh index needs no scan detail — there is nothing to act on.
+    const report = checkIndexStaleness(new Date(Date.now() + 3_600_000).toISOString(), path.join(tmpDir, 'MyModel'));
+    expect(report.compactLines).toHaveLength(1);
+    expect(report.compactLines[0]).toContain('up to date');
+  });
+
+  it('keeps the fix reachable when the index is stale', () => {
+    const report = checkIndexStaleness(new Date(Date.now() - 24 * 3_600_000).toISOString(), path.join(tmpDir, 'MyModel'));
+    const text = report.compactLines.join('\n');
+    expect(report.compactLines).toHaveLength(2);
+    expect(text).toContain('STALE');
+    expect(text).toContain('update_symbol_index');
+  });
+});
+
+describe('findNewestMetadataMtime scan cache', () => {
+  // get_workspace_info ran this scan on every call: up to 5000 synchronous
+  // statSync calls, 1-3 s of blocked event loop on Windows, uncached and outside
+  // the in-flight dedup.
+  let cacheDir: string;
+
+  beforeAll(() => {
+    cacheDir = path.join(tmpDir, 'CacheModel', 'AxClass');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, 'First.xml'), '<AxClass/>');
+  });
+
+  it('does not re-walk the tree for a repeated call on the same root', () => {
+    const root = path.join(tmpDir, 'CacheModel');
+    resetMetadataMtimeCache();
+
+    expect(findNewestMetadataMtime(root)!.scannedFiles).toBe(1);
+    fs.writeFileSync(path.join(cacheDir, 'Second.xml'), '<AxClass/>');
+
+    expect(findNewestMetadataMtime(root)!.scannedFiles).toBe(1);
+
+    resetMetadataMtimeCache();
+    expect(findNewestMetadataMtime(root)!.scannedFiles).toBe(2);
   });
 });
 

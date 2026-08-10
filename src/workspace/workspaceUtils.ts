@@ -36,7 +36,7 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
           error: 'Workspace path must be a directory',
         };
       }
-    } catch (error) {
+    } catch {
       return {
         valid: false,
         error: `Workspace path does not exist or is not accessible: ${resolved}`,
@@ -59,30 +59,4 @@ export async function validateWorkspacePath(workspacePath: string): Promise<{
       error: `Error validating workspace path: ${error instanceof Error ? error.message : 'Unknown error'}`,
     };
   }
-}
-
-/**
- * Sanitize workspace path
- * Remove any potentially dangerous characters
- */
-export function sanitizeWorkspacePath(workspacePath: string): string {
-  let sanitized = path.normalize(workspacePath);
-  sanitized = sanitized.replace(/\0/g, '');
-
-  if (!path.isAbsolute(sanitized)) {
-    sanitized = path.resolve(sanitized);
-  }
-
-  return sanitized;
-}
-
-/**
- * Check if path is within allowed bounds
- */
-export function isPathWithinBounds(basePath: string, targetPath: string): boolean {
-  const normalizedBase = path.normalize(basePath);
-  const normalizedTarget = path.normalize(targetPath);
-
-  const relative = path.relative(normalizedBase, normalizedTarget);
-  return !relative.startsWith('..') && !path.isAbsolute(relative);
 }

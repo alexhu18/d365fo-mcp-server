@@ -70,7 +70,7 @@ export interface ExtractedViewMetadata {
  * Build the absolute path to an extracted-metadata JSON file.
  * Returns null if the file doesn't exist (no throw).
  */
-export async function resolveMetadataJsonPath(
+async function resolveMetadataJsonPath(
   model: string,
   objectType: ExtractedObjectType,
   name: string
@@ -82,84 +82,6 @@ export async function resolveMetadataJsonPath(
   } catch {
     return null;
   }
-}
-
-export interface ExtractedMethodParam {
-  type: string;
-  name: string;
-  defaultValue?: string;
-}
-
-export interface ExtractedMethod {
-  name: string;
-  visibility: string;
-  returnType: string;
-  parameters: ExtractedMethodParam[];
-  isStatic: boolean;
-  source?: string;
-  sourceSnippet?: string;
-}
-
-export interface ExtractedClassMetadata {
-  name: string;
-  model: string;
-  sourcePath: string;
-  declaration?: string;
-  extends?: string;
-  implements?: string[];
-  isAbstract?: boolean;
-  isFinal?: boolean;
-  methods: ExtractedMethod[];
-}
-
-/**
- * Read class metadata from extracted-metadata JSON.
- * Returns null if the file is not available.
- */
-export async function readClassMetadata(
-  model: string,
-  className: string
-): Promise<ExtractedClassMetadata | null> {
-  const filePath = await resolveMetadataJsonPath(model, 'classes', className);
-  if (!filePath) return null;
-
-  try {
-    const raw = await fs.readFile(filePath, 'utf-8');
-    const data = JSON.parse(raw) as ExtractedClassMetadata;
-
-    // Parameters may be stored as raw PowerShell-serialized strings, e.g. "@{type=RecId; name=_legalEntityRecId}"
-    for (const method of data.methods ?? []) {
-      method.parameters = (method.parameters ?? []).map((p: any) => {
-        if (typeof p === 'string') {
-          const typeMatch = p.match(/type=([^;}\s]+)/);
-          const nameMatch = p.match(/name=([^;}\s]+)/);
-          return {
-            type: typeMatch?.[1] ?? 'var',
-            name: nameMatch?.[1] ?? '_param',
-          } as ExtractedMethodParam;
-        }
-        return p as ExtractedMethodParam;
-      });
-    }
-
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read a specific method from extracted class metadata.
- */
-export async function readMethodMetadata(
-  model: string,
-  className: string,
-  methodName: string
-): Promise<ExtractedMethod | null> {
-  const classData = await readClassMetadata(model, className);
-  if (!classData) return null;
-
-  return classData.methods.find(m => m.name === methodName) ?? null;
 }
 
 /**
@@ -265,7 +187,7 @@ export async function resolveDbPathLocally(dbFilePath: string): Promise<string |
  * Query the symbol index DB to find what top-level types a given name exists as.
  * Ignores 'method' and 'field' rows — those are children, not top-level objects.
  *
- * @param db - better-sqlite3 Database instance (symbolIndex.db)
+ * @param db - SQLite Database instance (symbolIndex.db)
  * @param name - the object name to look up
  */
 export function detectObjectTypeInDb(
@@ -293,7 +215,7 @@ export function detectObjectTypeInDb(
  *
  * Returns an empty string when no mismatch is detected.
  *
- * @param db           - better-sqlite3 Database instance
+ * @param db           - SQLite Database instance
  * @param name         - the object name that was not found
  * @param expectedType - the type that was searched for (default: 'class')
  */
@@ -362,7 +284,7 @@ export function buildNotFoundGuidance(name: string, objectType: string): string 
   return (
     `\n\n---\n` +
     `🔎 **Resolve \`${name}\` (${objectType}) with the right tool — do not guess or grep the disk:**\n` +
-    `1. \`search\` / \`batch_search\` for \`${name}\` — the exact name may differ (model prefix, casing, suffix).\n` +
+    `1. \`search\` for \`${name}\` — pass \`queries[]\` to probe several spellings in ONE call; the exact name may differ (model prefix, casing, suffix).\n` +
     `2. Real object in a custom package that isn't indexed yet? Run ` +
     `\`update_symbol_index({ filePath: "<absolute path to ${name}.xml>" })\`, and confirm ` +
     `\`D365FO_CUSTOM_PACKAGES_PATH\` includes that package so the bridge + symbol index can see it.\n` +

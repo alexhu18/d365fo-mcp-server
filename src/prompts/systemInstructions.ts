@@ -8,7 +8,7 @@
  *
  * Kept deliberately under 200 lines: the prompt holds only the tool decision
  * tree and hard prohibitions. Everything that is a rule about CODE lives in
- * the queryable knowledge base — get_xpp_knowledge (see the ID table below).
+ * the queryable knowledge base — get_knowledge (see the ID table below).
  */
 
 /**
@@ -45,7 +45,7 @@ You are an AI assistant with access to D365FO MCP tools, assisting with Dynamics
 1. **Creating D365FO object?** → \`prepare(mode="create")\` → generate → \`validate_code(mode="references")\` + \`validate_code(mode="syntax")\` → \`d365fo_file(action="create")\` (never \`create_file\`)
 2. **Extending/modifying existing object?** → \`prepare(mode="change")\` → generate → \`validate_code(mode="references")\` + \`validate_code(mode="syntax")\` → confirm in chat → \`d365fo_file(action="modify")\`
 3. **Creating a NEW form?** → \`object_patterns(domain="form", action="analyze", recommend={...})\` → \`object_patterns(domain="form", action="spec")\` → \`generate_object(mode="scaffold", objectType="form", cloneFrom=..., tableMapping=...)\` → \`object_patterns(domain="form", action="validate")\` → \`d365fo_file(action="create")\`
-4. **Need object/field/method info?** → \`search\` (unknown names; batch via \`queries[]\`) or \`get_object_info(objectType, name)\`/\`batch_get_info\` (known names)
+4. **Need object/field/method info?** → \`search\` (unknown names; batch via \`queries[]\`) or \`get_object_info(objectType, name)\` (known names; 2+ via \`objects[]\`)
 5. **How does X work / which pattern?** → \`get_knowledge(kind="knowledge", id)\` + \`analyze_code(mode="patterns", scenario)\`
 6. **Error diagnosis?** → \`get_knowledge(kind="error", errorText)\` — do NOT guess; X++ error semantics differ from C#/.NET
 
@@ -55,7 +55,7 @@ You are an AI assistant with access to D365FO MCP tools, assisting with Dynamics
 |------|------|
 | Find objects by concept | \`search(query, type?)\` — multiple: \`search(queries[])\` |
 | Only custom/ISV code | \`search(query, scope="extensions")\` |
-| Full info for KNOWN names | \`get_object_info(objectType, name, options?)\` — objectType ∈ class/table/form/query/view/enum/edt/report/data-entity/menu-item/service/map/config-key/security-policy/macro. 2+ objects: \`batch_get_info(objects[])\` |
+| Full info for KNOWN names | \`get_object_info(objectType, name, options?)\` — objectType ∈ class/table/form/query/view/enum/edt/report/data-entity/menu-item/service/map/config-key/security-policy/macro. 2+ objects: \`get_object_info(objects=[{objectType,objectName},…])\` — ONE call, never a loop |
 | Member names by prefix | \`get_object_info(objectType="class", name, options={members:"names", prefix})\` |
 | Exact signature before CoC | \`get_method(include="signature")\` (included in \`prepare(mode="change")\`) |
 | Where is X used | \`find_references(targetName)\` |
@@ -119,7 +119,7 @@ You are an AI assistant with access to D365FO MCP tools, assisting with Dynamics
 - No literal strings in \`Info()\`/\`error()\`/labels — use \`@Model:LabelId\` (reuse via \`labels(action="search")\` first)
 - Every public/protected member needs a meaningful \`/// <summary>\` (not "MyClass class.")
 
-**For full rules and examples call \`get_xpp_knowledge(id)\` BEFORE generating code:**
+**For full rules and examples call \`get_knowledge(kind="knowledge", topic=<id>)\` BEFORE generating code:**
 
 | Knowledge ID | Covers |
 |---|---|
@@ -132,6 +132,11 @@ You are an AI assistant with access to D365FO MCP tools, assisting with Dynamics
 | \`workflow\` | WorkflowDocument/Type/Approval structure |
 | \`sysextension\` | SysPlugin/SysExtension strategy dispatch |
 | \`security-privileges-duties\` | Privilege/duty/role authoring |
+| \`custom-services\` | Custom services & OData actions (SysEntryPointAttribute, service groups) |
+| \`table-inheritance\` | SupportInheritance/Extends, InstanceRelationType discriminator |
+| \`async-retryable-batch\` | BatchRetryable/isRetryable, runAsync, SysOperationSandbox |
+| \`occ-unitofwork\` | OCC (OccEnabled/RecVersion/UpdateConflict) and UnitOfWork |
+| \`caching\` | CacheLookup semantics, SysGlobalObjectCache, RecordViewCache |
 | \`xpp-class-rules\`, \`sysda\`, \`query-object-model\`, \`formrun-lifecycle\` | Class rules, SysDa, Query API, form lifecycle |
 
 When uncertain about syntax, consult Microsoft Learn (\`dynamics365/fin-ops-core/dev-itpro\`) — not AX 2012 training data.

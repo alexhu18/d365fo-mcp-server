@@ -119,17 +119,15 @@ For a **manual one-time deploy** (from your Windows machine):
    cd d365fo-mcp-server
    npm install
    npm run build
-   # Include node_modules — must be compiled for Linux (native better-sqlite3 addon)
-   # If building on Windows, use WSL2 or a Linux Docker container for npm install
+   # node_modules is portable: the server has no native addons (SQLite comes from node:sqlite)
    Compress-Archive -Path dist, node_modules, package.json, package-lock.json, startup.sh `
      -DestinationPath deploy.zip
    ```
 
 2. Upload via the Portal: Web App → **Deployment Center** → **Deploy** → upload `deploy.zip`.
 
-> **Important:** `better-sqlite3` is a native module that must be compiled for Linux. `node_modules` built on Windows will crash the server.
-> Use the **Azure DevOps pipeline** (recommended) — it builds on `ubuntu-latest`, which shares the same glibc as App Service Linux, so the compiled binaries are compatible.
-> `SCM_DO_BUILD_DURING_DEPLOYMENT` is set to `false` because App Service Linux has no gcc/make to rebuild native addons.
+> **Note:** the server has no native addons, so a `node_modules` produced on Windows runs unchanged on App Service Linux — build the zip wherever is convenient.
+> `SCM_DO_BUILD_DURING_DEPLOYMENT` stays `false`: the dependencies are already in the zip and nothing needs compiling on the host.
 
 ---
 
@@ -176,14 +174,16 @@ Confirm the tool count matches `read-only` mode (all tools except the write acti
 
 ## Azure DevOps Pipelines
 
-Four ready-to-use pipelines are in `.azure-pipelines/`:
+Four ready-to-use pipelines in `.azure-pipelines/` automate extraction, database builds and deployment:
 
-| Pipeline | When to use | Duration |
-|----------|-------------|----------|
-| `d365fo-mcp-app-deploy.yml` | After any change to server code (auto-triggers on push to `main`) | ~5 min |
-| `d365fo-mcp-data-extract-and-build-custom.yml` | After any change to your custom models | ~15–30 min |
-| `d365fo-mcp-data-extract-and-build-platform.yml` | After a D365FO version upgrade or hotfix | ~60–120 min |
-| `d365fo-mcp-data-platform-upgrade.yml` | Full rebuild: standard + custom + labels | ~90–120 min |
+| Pipeline | When to use | Trigger | Duration |
+|----------|-------------|---------|----------|
+| `d365fo-mcp-app-deploy` | server code changed | auto on push to `main` | ~5–10 min |
+| `d365fo-mcp-data-extract-and-build-custom` | custom models changed | manual | ~15–30 min |
+| `d365fo-mcp-data-extract-and-build-platform` | D365FO version upgrade / hotfix | manual | ~60–120 min |
+| `d365fo-mcp-data-platform-upgrade` | full rebuild: standard + custom + labels | manual | ~90–120 min |
+
+The custom pipeline is **incremental** — it downloads the existing symbols DB and replaces only your models. Key parameters: `customModels` (comma-separated names for a targeted ~5–10 min update), `skipExtraction=true` (rebuild the DB from blob metadata only, no source extraction). The upgrade pipeline builds in two passes (symbols, then `npm run build-fts`) to stay inside the agent's 4 GB heap and requires custom metadata already in blob — run the custom pipeline first if unsure. Every data pipeline ends with an App Service restart so the fresh database is downloaded.
 
 ### Required Variable Group
 
@@ -197,10 +197,6 @@ Create a variable group named **`xpp-mcp-server-config`** in Azure DevOps Librar
 | `AZURE_SUBSCRIPTION` | No | Name of your Azure DevOps service connection |
 | `AZURE_APP_SERVICE_NAME` | No | `xpp-mcp-server` |
 
-### Uploading Standard Packages
+### Uploading standard packages
 
-The `d365fo-mcp-data-extract-and-build-platform.yml` pipeline needs the raw `PackagesLocalDirectory` from your D365FO VM as a zip in the `packages` container.
-
-On your D365FO VM, compress `K:\AosService\PackagesLocalDirectory` and upload the resulting zip as `PackagesLocalDirectory.zip` to the `packages` container using **Azure Storage Explorer**.
-
-This only needs to be re-uploaded after a D365FO version upgrade or hotfix rollup.
+The platform pipeline needs the raw `PackagesLocalDirectory` as a zip in the `packages` container. On your D365FO VM, compress `K:\AosService\PackagesLocalDirectory`, upload it as `PackagesLocalDirectory.zip` (via **Azure Storage Explorer**), and re-upload only after a version upgrade or hotfix rollup.

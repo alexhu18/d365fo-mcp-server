@@ -12,8 +12,13 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
-# Environment variables
+# Configuration written by `npm run setup` (machine-specific, may hold secrets)
+config/d365fo-mcp.json
+config/secrets.json
+
+# Environment variables (legacy configuration, still read as a fallback)
 .env
+.env.eval
 .env.local
 .env.*.local
 
@@ -59,7 +64,9 @@ Thumbs.db
 .azure/
 
 # Testing
-coverage/
+# Anchored: an unanchored "coverage/" also matches nested source directories
+# (it silently swallowed src/eval/coverage/), so only the root artifact dir.
+/coverage/
 .nyc_output/
 
 # Internal planning docs

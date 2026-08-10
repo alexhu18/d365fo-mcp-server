@@ -5,6 +5,7 @@
  */
 import * as p from '@clack/prompts';
 import type { Option } from '@clack/prompts';
+import { installOneLiner, isFullInstall } from './context.js';
 
 export { p };
 
@@ -33,4 +34,23 @@ export async function askConfirm(message: string, initialValue = true): Promise<
 
 export async function askSelect<T extends string>(message: string, options: Option<T>[], initialValue?: T): Promise<T> {
   return ensure(await p.select<T>({ message, options, initialValue }));
+}
+
+/**
+ * Guard for commands that need a full installation (setup, update, index) —
+ * a git checkout, or an npm install carrying the dist/scripts bundles. Running
+ * from the npx cache of an older release has neither, so point the user at the
+ * installer instead of failing halfway through a rebuild.
+ */
+export function requireFullInstall(): boolean {
+  if (isFullInstall) return true;
+  p.log.error('This copy of d365fo-mcp is not a full installation — it can only run `connect`.');
+  p.log.info(
+    'Install the server with PowerShell:\n' +
+    `  ${installOneLiner}\n` +
+    'or update this copy in place:\n' +
+    '  npm install -g d365fo-mcp@latest',
+  );
+  process.exitCode = 1;
+  return false;
 }

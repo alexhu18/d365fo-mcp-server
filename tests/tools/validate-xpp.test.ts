@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { validateXppTool } from '../../src/tools/validateXpp';
+import { validateXppTool } from '../../src/tools/analysis/validateXpp';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
 const req = (args: Record<string, unknown> = {}): CallToolRequest => ({
@@ -163,6 +163,43 @@ describe('COC rules', () => {
     expect(getText(result)).toContain('COC001');
   });
 
+  // Access modifiers are optional in X++ (members default to public), and
+  // get_method's CoC template deliberately omits them — so the modifier-anchored
+  // form of this rule missed the single most likely source of the defect: an
+  // agent pasting that template verbatim.
+  it('COC001: flags a default param on a wrapper with no access modifier', async () => {
+    const code = `
+[ExtensionOf(classStr(SalesFormLetter))]
+final class SalesFormLetter_MyExt_Extension
+{
+    void run(boolean _validate = false)
+    {
+        next run(_validate);
+    }
+}
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).toContain('COC001');
+  });
+
+  // A call statement whose arguments contain '=' inside a string is not a
+  // declaration. Guarding the widened regex against that false positive.
+  it('COC001: does not flag a call statement containing "=" inside parens', async () => {
+    const code = `
+[ExtensionOf(classStr(SalesFormLetter))]
+final class SalesFormLetter_MyExt_Extension
+{
+    void run()
+    {
+        next run();
+        info(strFmt("count = %1", this.count()));
+    }
+}
+    `;
+    const result = await validateXppTool(req({ code, codeType: 'xpp' }));
+    expect(getText(result)).not.toContain('COC001');
+  });
+
   it('COC002: flags [ExtensionOf] class that is not final', async () => {
     const code = `
       [ExtensionOf(classStr(SalesFormLetter))]
@@ -231,6 +268,29 @@ describe('XML rules', () => {
     `;
     const result = await validateXppTool(req({ code: xml, codeType: 'xml-table' }));
     expect(getText(result)).toContain('XML001');
+  });
+
+  it('XML001: is a warning, not a hard error (eval #7)', async () => {
+    // xppbp reports BPCheckAlternateKeyAbsent as a warning and the table builds.
+    // As an error, a case that legitimately mandates one index could never pass.
+    const xml = `
+      <AxTable>
+        <Name>ConDemoAsset</Name>
+        <Label>@Contoso:AssetLabel</Label>
+        <TableGroup>Main</TableGroup>
+        <Indexes>
+          <AxTableIndex>
+            <Name>AssetIdx</Name>
+            <AlternateKey>No</AlternateKey>
+          </AxTableIndex>
+        </Indexes>
+      </AxTable>
+    `;
+    const result = await validateXppTool(req({ code: xml, codeType: 'xml-table' }));
+    expect(getText(result)).toContain('XML001');
+    expect(getText(result)).toContain('[XML001] — WARNING');
+    expect(result.isError).toBeFalsy();
+    expect(getText(result)).toContain('0 error(s)');
   });
 
   it('XML001: passes when AlternateKey is Yes', async () => {

@@ -4,16 +4,13 @@
  * tools/list payload and is covered by tests.
  */
 import { searchTool } from './search.js';
-import { batchGetInfoTool } from './batchGetInfo.js';
 import { generateObjectTool } from './generateObject.js';
 import { analyzeCodeTool } from './analyzeCode.js';
 import { d365foFileTool } from './d365foFile.js';
 import { findReferencesTool } from './findReferences.js';
-import { getMethodTool } from './getMethod.js';
 import { getObjectInfoTool } from './getObjectInfo.js';
 import { labelsTool } from './labels.js';
 import { objectPatternsTool } from './objectPatterns.js';
-import { suggestEdtTool } from './suggestEdt.js';
 import { securityInfoTool } from './securityInfo.js';
 import { extensionInfoTool } from './extensionInfo.js';
 import { validateObjectNamingTool } from './validateObjectNaming.js';
@@ -32,16 +29,13 @@ import { prepareTool } from './prepare.js';
 
 export const toolSchemas = [
   searchTool,
-  batchGetInfoTool,
   generateObjectTool,
   analyzeCodeTool,
   d365foFileTool,
   findReferencesTool,
-  getMethodTool,
   getObjectInfoTool,
   labelsTool,
   objectPatternsTool,
-  suggestEdtTool,
   securityInfoTool,
   extensionInfoTool,
   validateObjectNamingTool,

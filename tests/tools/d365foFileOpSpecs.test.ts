@@ -14,7 +14,7 @@ import {
   OP_PARAM_ALIASES,
   getRequiredParams,
   renderOpSpec,
-} from '../../src/tools/d365foFileOpSpecs';
+} from '../../src/tools/specs/d365foFileOpSpecs';
 import { d365foFileTool as d365foFileSchema } from '../../src/server/toolSchemas/d365foFile';
 
 describe('d365fo_file op-spec registry', () => {
@@ -22,7 +22,10 @@ describe('d365fo_file op-spec registry', () => {
     const publishedOps: string[] =
       (d365foFileSchema.inputSchema.properties as any).operation.enum;
     expect(new Set(Object.keys(D365FO_FILE_OP_SPECS))).toEqual(new Set(publishedOps));
-    expect(publishedOps).toHaveLength(25);
+    // Bump deliberately when an operation is added — the count is here so a new op
+    // cannot slip in unnoticed, and because each one is also paid for out of the
+    // ListTools token budget (tests/utils/toolSchemaBudget.test.ts).
+    expect(publishedOps).toHaveLength(31);
   });
 
   it('every required/optional param has a param-spec entry with type and description', () => {

@@ -5,9 +5,12 @@
  */
 
 import { FormPatternTemplates, FormPattern } from './formPatternTemplates.js';
+import { escapeXml as escapeXmlText } from './xmlEscape.js';
 import { ensureXppDocComment } from './xppDocGen.js';
-import { decodeXmlEntitiesFromXppSource } from '../tools/modifyD365File.js';
+import { decodeXmlEntitiesFromXppSource } from './xmlEscape.js';
 import { type FieldControlMap, controlForField } from './fieldControlTypes.js';
+import { renderAxTableProperties } from './axTablePropertyOrder.js';
+import { axTableFieldElement, baseTypeFromEdtName, normalizeFieldBaseType } from './axFieldTypes.js';
 
 export interface TableFieldSpec {
   name: string;
@@ -125,10 +128,6 @@ export class SmartXmlBuilder {
     }
     xml += `\t</SourceCode>\n`;
 
-    if (label) {
-      xml += `\t<Label>${this.escapeXml(label)}</Label>\n`;
-    }
-
     // 'RegularTable' is the default and is omitted from XML.
     const normalizedTableType = tableType && tableType.toLowerCase() !== 'regulartable' ? tableType : '';
     const isTempTable = normalizedTableType === 'TempDB' || normalizedTableType === 'InMemory';
@@ -153,49 +152,47 @@ export class SmartXmlBuilder {
       || (isTempTable ? 'Main' : this.minedMajority('AxTable', 'TableGroup'))
       || 'Main';
 
-    // BP rule: CacheLookup must be set to avoid the "CacheLookup should be set" BP warning.
-    // TempDB/InMemory tables are session-scoped, not in SQL Server → never cached.
-    if (isTempTable) {
-      xml += `\t<CacheLookup>None</CacheLookup>\n`;
-    } else {
-      const cacheLookupMap: Record<string, string> = {
-        Parameter:       'Found',
-        Group:           'Found',
-        Main:            'Found',
-        Transaction:     'None',
-        WorksheetHeader: 'None',
-        WorksheetLine:   'None',
-        Miscellaneous:   'NotInTTS',
-        Framework:       'Found',
-      };
-      const cacheLookup = cacheLookupMap[effectiveTableGroup] || 'Found';
-      xml += `\t<CacheLookup>${cacheLookup}</CacheLookup>\n`;
-    }
-
-    // BP rule: TempDB/InMemory tables are session-scoped, not company-scoped.
-    xml += `\t<SaveDataPerCompany>${isTempTable ? 'No' : 'Yes'}</SaveDataPerCompany>\n`;
-
-    xml += `\t<TableGroup>${effectiveTableGroup}</TableGroup>\n`;
-
-    if (normalizedTableType) {
-      xml += `\t<TableType>${normalizedTableType}</TableType>\n`;
-    }
+    // BP rule: CacheLookup must be set to avoid the "CacheLookup should be set" BP
+    // warning. TempDB/InMemory tables are session-scoped, not in SQL Server → never cached.
+    const cacheLookupMap: Record<string, string> = {
+      Parameter:       'Found',
+      Group:           'Found',
+      Main:            'Found',
+      Transaction:     'None',
+      WorksheetHeader: 'None',
+      WorksheetLine:   'None',
+      Miscellaneous:   'NotInTTS',
+      Framework:       'Found',
+    };
+    const cacheLookup = isTempTable
+      ? 'None'
+      : (cacheLookupMap[effectiveTableGroup] || 'Found');
 
     const titleCandidates = fields.filter(f => f.name !== 'RecId').slice(0, 2);
-    if (titleCandidates[0]) xml += `\t<TitleField1>${titleCandidates[0].name}</TitleField1>\n`;
-    if (titleCandidates[1]) xml += `\t<TitleField2>${titleCandidates[1].name}</TitleField2>\n`;
-
     const uniqueIdx = indexes?.find(i => i.unique);
-    if (uniqueIdx) {
-      xml += `\t<PrimaryIndex>${uniqueIdx.name}</PrimaryIndex>\n`;
-      xml += `\t<ReplacementKey>${uniqueIdx.name}</ReplacementKey>\n`;
-    }
-
     // BP rule: a table needs a ClusteredIndex to avoid the "no clustered index" warning.
     const clusteredIdx = indexes?.find(i => i.clustered) || uniqueIdx;
-    if (clusteredIdx) {
-      xml += `\t<ClusteredIndex>${clusteredIdx.name}</ClusteredIndex>\n`;
-    }
+
+    // The property block is rendered in CANONICAL ORDER. It used to be written in the
+    // order the BP rules were reasoned about (CacheLookup and SaveDataPerCompany
+    // before TableGroup/TitleField1, ClusteredIndex after ReplacementKey) — and
+    // AxTable XML DROPS a misordered property SILENTLY, so the very BP defaults this
+    // builder exists to set were at risk of being discarded
+    // (docs/eval-sweep-findings-2026-07-21.md #13; canonical order proven by the
+    // VM-captured golden eval/goldens/L1-table-basic).
+    xml += renderAxTableProperties({
+      Label: label ? this.escapeXml(label) : undefined,
+      TableGroup: effectiveTableGroup,
+      TitleField1: titleCandidates[0]?.name,
+      TitleField2: titleCandidates[1]?.name,
+      CacheLookup: cacheLookup,
+      ClusteredIndex: clusteredIdx?.name,
+      PrimaryIndex: uniqueIdx?.name,
+      ReplacementKey: uniqueIdx?.name,
+      // BP rule: TempDB/InMemory tables are session-scoped, not company-scoped.
+      SaveDataPerCompany: isTempTable ? 'No' : 'Yes',
+      TableType: normalizedTableType || undefined,
+    });
 
     // BP rule: relations require matching DeleteActions to avoid a BP warning.
     if (relations && relations.length > 0) {
@@ -412,38 +409,12 @@ export class SmartXmlBuilder {
    *  2. EDT name heuristics — fallback when type is not known
    */
   private getAxTableFieldType(edt?: string, type?: string): string {
-    if (type) {
-      const typeMap: Record<string, string> = {
-        String:      'AxTableFieldString',
-        Integer:     'AxTableFieldInt',
-        Int64:       'AxTableFieldInt64',
-        Real:        'AxTableFieldReal',
-        Date:        'AxTableFieldDate',
-        DateTime:    'AxTableFieldUtcDateTime',
-        UtcDateTime: 'AxTableFieldUtcDateTime',
-        Enum:        'AxTableFieldEnum',
-        Container:   'AxTableFieldContainer',
-        Guid:        'AxTableFieldGuid',
-        GUID:        'AxTableFieldGuid',
-      };
-      const mapped = typeMap[type];
-      if (mapped) return mapped;
-    }
+    const explicit = normalizeFieldBaseType(type);
+    if (explicit) return axTableFieldElement(explicit);
 
     // Fall back to EDT name heuristics
-    if (edt) {
-      const e = edt.toLowerCase();
-      if (e === 'recid' || e.endsWith('recid') || e.includes('refrecid')) return 'AxTableFieldInt64';
-      if (e.includes('utcdatetime') || (e.includes('datetime') && !e.includes('transdate'))) return 'AxTableFieldUtcDateTime';
-      if ((e.includes('date') && !e.includes('time') && !e.includes('update'))) return 'AxTableFieldDate';
-      if (e.includes('amount') || e.includes('mst') || e.includes('price') || e.includes('qty')
-          || e.includes('percent') || e === 'real') return 'AxTableFieldReal';
-      if (e === 'noyesid' || e.endsWith('noyesid') || e === 'noyes') return 'AxTableFieldEnum';
-      if ((e.endsWith('int') || e.includes('count') || e.includes('level'))
-          && !e.includes('account') && !e.includes('name')) return 'AxTableFieldInt';
-    }
-
-    return 'AxTableFieldString';
+    const heuristic = baseTypeFromEdtName(edt);
+    return heuristic ? axTableFieldElement(heuristic) : 'AxTableFieldString';
   }
 
   /**
@@ -572,15 +543,13 @@ export class SmartXmlBuilder {
   }
 
   /**
-   * Escape XML special characters
+   * Escape XML special characters. Delegates to the shared escaper — every one
+   * of these call sites writes TEXT content, where the Microsoft serializer
+   * leaves quotes alone, so the old local `&quot;`/`&apos;` handling only made
+   * our files differ from shipped ones.
    */
   private escapeXml(text: string): string {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&apos;');
+    return escapeXmlText(text);
   }
 
   /**

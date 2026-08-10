@@ -9,10 +9,10 @@
  *                         (L3/L4 cases that produce several objects). Mutually
  *                         exclusive with the single <actualXml> positional/--golden.
  *     --build-failed      mark build as failed (default: succeeded)
- *     --bp-warnings <n>   number of BP warnings (default: 0)
+ *     --bp-warnings <n>   number of BP warnings xppbp reported (OMIT = BP not checked -> bp_clean: null)
  *     --systest <file>    text file with the `run_systest_class` output (runtime oracle)
  *     --classification <C> rubric class for the record (default: derived)
- *     --golden-prefix <p> EXTENSION_PREFIX the golden was captured under (default: GOLDEN_CAPTURE_PREFIX, "Contoso")
+ *     --golden-prefix <p> EXTENSION_PREFIX the golden was captured under (default: every GOLDEN_CAPTURE_PREFIXES token)
  *     --actual-prefix <p> EXTENSION_PREFIX the actual was produced under (default: read from THIS
  *                         process's EXTENSION_PREFIX env var — the session that ran the case)
  *     --write             append a corpus record to eval/corpus/runs/
@@ -33,7 +33,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import {
   evaluate, evaluateMulti, renderDiff, renderNormalized, normalizeAotXml, parseSysTestResult,
-  GOLDEN_CAPTURE_PREFIX, type CaseSpec,
+  scoreRun, GOLDEN_CAPTURE_PREFIXES, type CaseSpec, type GoldenDiff, type Score,
 } from './index.js';
 import { resolveRegularObjectPrefixToken } from '../../utils/modelClassifier.js';
 import { buildActualArtifactsMap } from './actualArtifactResolution.js';
@@ -53,23 +53,27 @@ function goldenDir(caseId: string): string {
   return path.join(REPO_ROOT, 'eval', 'goldens', caseId);
 }
 
-function findGolden(caseId: string): string {
-  const dir = goldenDir(caseId);
-  const file = fs.readdirSync(dir).find(f => f.endsWith('.metadata.xml'));
-  if (!file) throw new Error(`No *.metadata.xml golden in ${dir}`);
-  return path.join(dir, file);
-}
-
-/** All *.metadata.xml golden filenames for a case, e.g. for a multi-artifact L3/L4 case. */
+/** *.metadata.xml golden filenames present for a case, or [] if the golden dir is absent/empty.
+ *  Never throws ENOENT: a `golden_pending` case (§6.4) legitimately has no golden dir yet. */
 function listGoldenArtifacts(caseId: string): string[] {
   const dir = goldenDir(caseId);
+  if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).filter(f => f.endsWith('.metadata.xml')).sort();
+}
+
+function findGolden(caseId: string): string {
+  const file = listGoldenArtifacts(caseId)[0];
+  if (!file) throw new Error(`No *.metadata.xml golden in ${goldenDir(caseId)}`);
+  return path.join(goldenDir(caseId), file);
 }
 
 function shortSha(): string {
   try { return execSync('git rev-parse --short HEAD', { cwd: REPO_ROOT }).toString().trim(); }
   catch { return 'unknown'; }
 }
+
+/** The rubric classes of eval/corpus/schema.json — the record is rejected by any other. */
+const CLASSIFICATIONS = ['PASS', 'TOOL_DEFECT', 'KNOWLEDGE_GAP', 'VALIDATOR_GAP', 'MODEL_ERROR', 'ENV_FLAKE'];
 
 /** Flags that consume the following argv element as their value. */
 const VALUE_FLAGS = [
@@ -103,11 +107,27 @@ async function main(): Promise<void> {
 
   const caseSpec = JSON.parse(
     fs.readFileSync(path.join(REPO_ROOT, 'eval', 'cases', `${caseId}.json`), 'utf8'),
-  ) as CaseSpec & { ignore?: string[] };
+  ) as CaseSpec & { ignore?: string[]; golden_pending?: boolean };
 
   const buildSucceeded = !flagSet('--build-failed');
-  const bpCount = Number(arg('--bp-warnings') ?? '0');
-  const build = { succeeded: buildSucceeded, bpWarnings: Array.from({ length: bpCount }, () => ({})) };
+  // `--bp-warnings` ABSENT means xppbp was not run for this capture — NOT "ran and
+  // found nothing". It used to default to 0, which silently minted `bp_clean: 1`
+  // for every run whose operator forgot the flag and made the dimension
+  // untrendable (docs/eval-sweep-findings-2026-07-21.md #3). Leave bpWarnings
+  // undefined so the score records `bp_clean: null` (BP not checked), and say so.
+  const bpArg = arg('--bp-warnings');
+  const bpChecked = bpArg !== undefined;
+  const bpCount = Number(bpArg ?? '0');
+  const build = {
+    succeeded: buildSucceeded,
+    bpWarnings: bpChecked ? Array.from({ length: bpCount }, () => ({})) : undefined,
+  };
+  if (!bpChecked) {
+    console.error(
+      'note: --bp-warnings not supplied → bp_clean: null (BP NOT CHECKED). ' +
+      'Pass `--bp-warnings 0` only if run_bp_check actually ran and reported none.',
+    );
+  }
 
   const systestFile = arg('--systest');
   const systest = systestFile
@@ -120,12 +140,49 @@ async function main(): Promise<void> {
   // (e.g. a local self-check comparing a golden against itself/another golden-shaped fixture,
   // no VM session involved) fall back to the golden's own prefix so that unprefixed-env usage
   // keeps matching exactly as before. Either is overridable for edge cases.
-  const goldenPrefix = arg('--golden-prefix') ?? GOLDEN_CAPTURE_PREFIX;
-  const actualPrefix = arg('--actual-prefix') ?? (resolveRegularObjectPrefixToken() || GOLDEN_CAPTURE_PREFIX);
+  //
+  // Both defaults are the WHOLE set of capture prefixes (`GOLDEN_CAPTURE_PREFIXES`,
+  // currently ["Contoso","Con"]) rather than the single `GOLDEN_CAPTURE_PREFIX`: the
+  // committed corpus is `Con`-prefixed, which "Contoso" can never match, so the old
+  // single-token default left the golden side un-canonicalised and forced operators to
+  // hand-pass `--golden-prefix Con --actual-prefix Con` (docs/eval-sweep-findings-2026-07-21.md #2).
+  const goldenPrefix: string | readonly string[] = arg('--golden-prefix') ?? GOLDEN_CAPTURE_PREFIXES;
+  const actualPrefix: string | readonly string[] =
+    arg('--actual-prefix') ?? (resolveRegularObjectPrefixToken() || GOLDEN_CAPTURE_PREFIXES);
 
-  let goldenDiff, score, systestOut, generatedArtifacts: string[], debugLabel: string;
+  let goldenDiff: GoldenDiff | null;
+  let score: Score;
+  let systestOut, generatedArtifacts: string[], debugLabel: string;
 
-  if (actualDir) {
+  // Golden may legitimately be unavailable: the case is `golden_pending` (authored, golden
+  // captured later on the VM — §6.4) or its golden dir has no *.metadata.xml yet. In that case
+  // degrade gracefully — score `build` and `bp_clean` normally, report golden_match: null
+  // (neither a fabricated pass nor a fail on the golden dimension) — instead of crashing with a
+  // raw ENOENT scandir. An explicit `--golden <path>` that exists still forces normal evaluation.
+  // (Corpus: eval/corpus/runs/2026-07-21T__L3-custom-service-basic__a2a4131.json, finding (b).)
+  const explicitGolden = arg('--golden');
+  const explicitGoldenExists = !!explicitGolden && fs.existsSync(path.resolve(explicitGolden));
+  const goldenUnavailable =
+    !explicitGoldenExists && (caseSpec.golden_pending === true || listGoldenArtifacts(caseId).length === 0);
+
+  if (goldenUnavailable) {
+    const reason = caseSpec.golden_pending === true
+      ? 'golden_pending'
+      : `no *.metadata.xml golden in ${path.relative(REPO_ROOT, goldenDir(caseId))}`;
+    goldenDiff = null;
+    // Reuse scoreRun for the build/bp/systest logic, then null out the un-evaluated golden dim.
+    score = { ...scoreRun({ build, goldenDiff: { matched: false, missing: [], extra: [], changed: [] }, tier: caseSpec.tier, systest }), golden_match: null };
+    systestOut = systest && 'ran' in systest ? systest : { ran: false as const, passed: null, failures: [] as [] };
+    if (actualDir) {
+      const resolvedActualDir = path.resolve(actualDir);
+      generatedArtifacts = fs.existsSync(resolvedActualDir)
+        ? fs.readdirSync(resolvedActualDir).filter(f => f.endsWith('.metadata.xml')).sort()
+        : [];
+    } else {
+      generatedArtifacts = actualPath ? [path.basename(actualPath)] : [];
+    }
+    debugLabel = `not evaluated — ${reason}`;
+  } else if (actualDir) {
     const resolvedActualDir = path.resolve(actualDir);
     const artifactNames = listGoldenArtifacts(caseId);
     if (artifactNames.length === 0) throw new Error(`No *.metadata.xml goldens in ${goldenDir(caseId)}`);
@@ -162,13 +219,34 @@ async function main(): Promise<void> {
   }
 
   console.error(`# Oracle: ${caseId}  (golden: ${debugLabel})`);
-  console.error(renderDiff(goldenDiff));
+  if (goldenDiff) console.error(renderDiff(goldenDiff));
+  else console.error('golden_match: null — golden not evaluated (build and bp_clean scored; golden diff skipped).');
   if (systestFile) console.error(`SysTest: ran=${systestOut.ran} passed=${systestOut.passed} failures=${systestOut.failures.length}`);
   console.error(`\nScore: ${JSON.stringify(score)}`);
 
   if (flagSet('--write')) {
-    const classification = arg('--classification')
-      ?? (score.build === 1 && score.golden_match === 1 ? (score.bp_clean === 1 ? 'PASS' : 'KNOWLEDGE_GAP') : 'TOOL_DEFECT');
+    // With no golden diff there is no correctness signal, so don't infer a defect from it:
+    // fall back to the caller-supplied --classification (the implementer sets one), else a
+    // neutral ENV_FLAKE (matches how such inconclusive runs are triaged) rather than a
+    // spurious TOOL_DEFECT.
+    // The caller-supplied class goes straight into the record, so validate it against the
+    // schema enum here — an invented class (CASE_DESIGN, seen in the
+    // L2-license-code-configkey run) otherwise produces a record that fails validation
+    // only much later, in the corpus reader.
+    const suppliedClassification = arg('--classification');
+    if (suppliedClassification && !CLASSIFICATIONS.includes(suppliedClassification)) {
+      console.error(
+        `--classification "${suppliedClassification}" is not one of ${CLASSIFICATIONS.join(', ')} ` +
+        `(eval/corpus/schema.json). Pick the closest class and put the nuance in root_cause_hypothesis.`
+      );
+      process.exit(2);
+    }
+    const classification = suppliedClassification
+      ?? (score.golden_match === null
+        ? 'ENV_FLAKE'
+        // bp_clean === null means BP was NOT CHECKED — that is an absence of evidence,
+        // not evidence of a knowledge gap, so only an explicit 0 downgrades to KNOWLEDGE_GAP.
+        : (score.build === 1 && score.golden_match === 1 ? (score.bp_clean === 0 ? 'KNOWLEDGE_GAP' : 'PASS') : 'TOOL_DEFECT'));
     const ts = new Date().toISOString().replace(/[:.]/g, '').slice(0, 13);
     const sha = shortSha();
     const record = {
@@ -178,7 +256,10 @@ async function main(): Promise<void> {
       timestamp: new Date().toISOString(),
       server_git_sha: sha,
       generated_artifacts: generatedArtifacts,
-      build: { succeeded: build.succeeded, errors: [], bpWarnings: build.bpWarnings },
+      // `bp_checked` is the provenance flag that makes bp_clean trendable: a record
+      // WITHOUT it (every pre-2026-07-22 record) has unknown BP provenance and is
+      // reported separately rather than averaged in (#3).
+      build: { succeeded: build.succeeded, errors: [], bp_checked: bpChecked, bpWarnings: build.bpWarnings ?? null },
       golden_diff: goldenDiff,
       systest: systestOut,
       score,
@@ -190,7 +271,10 @@ async function main(): Promise<void> {
     console.error(`\nWrote corpus record: ${path.relative(REPO_ROOT, outFile)}`);
   }
 
-  process.exit(goldenDiff.matched && score.build === 1 ? 0 : 1);
+  // Exit 0 on a real golden match, OR when the golden was not evaluated (goldenDiff === null)
+  // and the build passed — a golden_pending case must not fail the scorer's exit code.
+  const ok = goldenDiff ? (goldenDiff.matched && score.build === 1) : score.build === 1;
+  process.exit(ok ? 0 : 1);
 }
 
 main().catch(e => { console.error(e); process.exit(2); });

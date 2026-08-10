@@ -4,45 +4,49 @@
  * instances/rebuild-instance.ps1 minus the git-pull step (that lives in
  * `d365fo-mcp update`).
  */
-import * as fs from 'node:fs';
-import { isWindows, paths } from '../context.js';
-import { missingVars } from '../envFile.js';
+import { dataRoot, installMode, isWindows, paths } from '../context.js';
 import { runNode } from '../exec.js';
 import { listInstances } from '../instances.js';
-import { instanceTarget, pickTarget, rootTarget, Target } from '../target.js';
-import { askConfirm, askSelect, p } from '../ui.js';
+import { instanceTarget, pickTarget, rootTarget, targetEnv, Target } from '../target.js';
+import { askSelect, p, requireFullInstall } from '../ui.js';
 import { normalizeXppConfigName } from '../xppConfig.js';
 
-/** Warn about vars added to .env.example since this .env was created. */
-function warnMissingSettings(envFile: string | null, label: string): boolean {
-  if (!envFile || !fs.existsSync(envFile) || !fs.existsSync(paths.envExample)) return false;
-  const missing = missingVars(
-    fs.readFileSync(paths.envExample, 'utf8'),
-    fs.readFileSync(envFile, 'utf8'),
-  );
-  if (missing.length === 0) return false;
-  p.log.warn(`New settings in .env.example not present in ${label}:\n` +
-    missing.map(m => `   ${m.name}=${m.value}`).join('\n'));
-  return true;
+/**
+ * Node arguments that run one index script.
+ *
+ * A checkout runs the TypeScript through tsx; an npm install has neither the
+ * sources nor tsx and runs the esbuild bundle instead. The bundle sits one
+ * level deeper than the sources, so its `loadEnv(import.meta.url)` would look
+ * for dist/.env — harmless, because `targetEnv` names the config explicitly
+ * whenever one exists, and before that there is nothing to find either way.
+ */
+function scriptArgs(tsSource: string, bundle: string): string[] {
+  return installMode === 'git' ? ['--import', 'tsx/esm', tsSource] : [bundle];
 }
 
 /** Run extract + build-database for one target. Returns true on success. */
 export async function rebuildIndex(target: Target): Promise<boolean> {
-  const env = target.envFile ? { ENV_FILE: target.envFile } : undefined;
+  const env = targetEnv(target);
+  // Run from the target's own directory, not the package: the index scripts
+  // fall back to relative literals ('./data/xpp-metadata.db') whenever a
+  // setting is absent AND no config file exists to anchor it, and the default
+  // cwd of runNode is repoRoot — which for an npm install is the package npm
+  // replaces on every update, on whatever drive npm happens to live on.
+  const cwd = target.instance?.dir ?? dataRoot();
 
-  if (isWindows && target.envFile) {
-    const expanded = normalizeXppConfigName(target.envFile);
-    if (expanded) p.log.info(`Expanded XPP_CONFIG_NAME: ${expanded.from} → ${expanded.to}`);
+  if (isWindows) {
+    const expanded = normalizeXppConfigName(target.store);
+    if (expanded) p.log.info(`Expanded XPP config name: ${expanded.from} → ${expanded.to}`);
   }
 
   p.log.step(`[1/2] Extracting metadata (${target.label})…`);
-  if (await runNode(['--import', 'tsx/esm', paths.extractScript], { env }) !== 0) {
+  if (await runNode(scriptArgs(paths.extractScript, paths.extractScriptDist), { cwd, env }) !== 0) {
     p.log.error(`Metadata extraction failed for ${target.label}`);
     return false;
   }
 
   p.log.step(`[2/2] Building database (${target.label})…`);
-  if (await runNode(['--max-old-space-size=6144', '--import', 'tsx/esm', paths.buildDbScript], { env }) !== 0) {
+  if (await runNode(['--max-old-space-size=6144', ...scriptArgs(paths.buildDbScript, paths.buildDbScriptDist)], { cwd, env }) !== 0) {
     p.log.error(`Database build failed for ${target.label}`);
     return false;
   }
@@ -53,6 +57,7 @@ export async function rebuildIndex(target: Target): Promise<boolean> {
 
 export async function indexCommand(instanceName: string | undefined, opts: { all?: boolean; yes?: boolean }): Promise<void> {
   p.intro('d365fo-mcp index');
+  if (!requireFullInstall()) return;
 
   let targets: Target[];
   if (opts.all) {
@@ -77,16 +82,6 @@ export async function indexCommand(instanceName: string | undefined, opts: { all
       : [await pickTarget(undefined, 'Which target?')];
   } else {
     targets = [await pickTarget(instanceName, 'Which target?')];
-  }
-
-  const hasNewSettings = targets
-    .map(t => warnMissingSettings(t.envFile, `${t.label} .env`))
-    .some(Boolean);
-  if (hasNewSettings && !opts.yes) {
-    if (!await askConfirm('Some .env files are missing new settings (see above). Continue anyway?', false)) {
-      p.cancel('Aborted — update the .env files first.');
-      return;
-    }
   }
 
   const failed: string[] = [];

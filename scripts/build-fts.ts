@@ -9,8 +9,9 @@
  *
  * Relevant env vars:
  *   DB_PATH          Path to the SQLite database  (default: ./data/xpp-metadata.db)
- *   PACKAGES_PATH    Path to PackagesLocalDirectory for label indexing
- *                    (default: K:\AosService\PackagesLocalDirectory)
+ *   D365FO_PACKAGE_PATH  Path to PackagesLocalDirectory for label indexing
+ *                    (PACKAGES_PATH is the legacy name, still honoured;
+ *                     default: the AosService volume detected on this machine)
  *   INCLUDE_LABELS   Set to 'false' to skip label indexing  (default: true)
  *   EXTRACT_MODE     'all' | 'standard' | 'custom' — controls which model labels to index
  *                    (default: 'all')
@@ -22,12 +23,13 @@
  *           Upload final xpp-metadata.db to Blob Storage
  */
 
-import { loadEnv } from '../src/utils/loadEnv.js';
-loadEnv(import.meta.url);
+// Load configuration onto process.env — MUST stay the first import (see src/bootstrapEnv.ts).
+import '../src/bootstrapEnv.js';
 import * as fsSync from 'fs';
 import { XppSymbolIndex } from '../src/metadata/symbolIndex.js';
 import { indexAllLabels } from '../src/metadata/labelParser.js';
 import { isCustomModel, isStandardModel } from '../src/utils/modelClassifier.js';
+import { defaultPackagesRoot } from '../src/utils/packagesRoot.js';
 import { fileURLToPath } from 'url';
 import * as path from 'path';
 
@@ -36,7 +38,11 @@ const __dirname = path.dirname(__filename);
 
 const OUTPUT_DB     = process.env.DB_PATH       || './data/xpp-metadata.db';
 const OUTPUT_LABELS_DB = process.env.LABELS_DB_PATH || './data/xpp-metadata-labels.db';
-const PACKAGES_PATH = process.env.PACKAGES_PATH || 'K:\\AosService\\PackagesLocalDirectory';
+// D365FO_PACKAGE_PATH first, PACKAGES_PATH second — same order as
+// build-database.ts. Reading only the legacy name meant a configured
+// D365FO_PACKAGE_PATH was ignored here, and phase 2 fell back to drive
+// detection and skipped labels on any machine where that guess was wrong.
+const PACKAGES_PATH = process.env.D365FO_PACKAGE_PATH || process.env.PACKAGES_PATH || defaultPackagesRoot();
 const INCLUDE_LABELS = process.env.INCLUDE_LABELS !== 'false'; // default: true
 const EXTRACT_MODE  = process.env.EXTRACT_MODE  || 'all';
 
@@ -86,7 +92,7 @@ async function buildFts(): Promise<void> {
     console.log(`\n🏷️  Indexing AxLabelFile labels from: ${PACKAGES_PATH}/{Model}/{Model}/AxLabelFile/...`);
     if (!fsSync.existsSync(PACKAGES_PATH)) {
       console.log(`   ⚠️  PackagesLocalDirectory not found at "${PACKAGES_PATH}" — skipping labels.`);
-      console.log(`   ℹ️  Set PACKAGES_PATH env var to the correct path, or INCLUDE_LABELS=false to suppress.`);
+      console.log(`   ℹ️  Set D365FO_PACKAGE_PATH env var to the correct path, or INCLUDE_LABELS=false to suppress.`);
     } else {
       const labelStart = Date.now();
 

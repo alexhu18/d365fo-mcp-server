@@ -14,8 +14,10 @@
  *                        open internet
  *
  * Per MCP spec these are HINTS for display/UX, not security boundaries.
- * Every tool in mcpServer.ts MUST have an entry here — enforced by
- * tests/utils/toolInventory.test.ts.
+ * Every tool in src/server/toolSchemas/index.ts MUST have an entry here —
+ * enforced by tests/utils/toolInventory.test.ts, which iterates that array.
+ * (This map's size is also what src/index.ts derives the runtime tool count
+ * from, so a missing entry undercounts the startup log as well.)
  */
 
 export interface ToolAnnotations {
@@ -48,18 +50,15 @@ function write(
 export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   // Search & discovery
   search:                           read('Search D365FO index'),
-  batch_get_info:                   read('Batch read object info'),
   find_references:                  read('Find references'),
   extension_info:                    read('Extensibility (coc/events/points/strategy)'),
 
   // Object inspection
   get_object_info:                  read('Read object info'),
-  get_method:                       read('Read method signature/source'),
   security_info:                    read('Security info (artifact/coverage)'),
 
   // Analysis & guidance
   analyze_code:                     read('Analyze code (patterns/impl/completeness/API)'),
-  suggest_edt:                      read('Suggest EDT for field'),
   object_patterns:                         read('Patterns (table/form)'),
   get_knowledge:                    read('X++ knowledge / error help'),
   validate_object_naming:           read('Validate object naming'),

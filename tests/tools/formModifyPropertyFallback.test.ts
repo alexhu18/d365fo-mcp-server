@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { modifyD365FileTool } from '../../src/tools/modifyD365File';
+import { modifyD365FileTool } from '../../src/tools/write/modifyD365File';
 import type { XppServerContext } from '../../src/types/context';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
@@ -65,6 +65,13 @@ vi.mock('fs/promises', () => ({
   access: vi.fn(async () => {}),
   stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
   readdir: vi.fn(async () => []),
+  // modify_d365fo_file forces a backup for edits outside git (0432c5d) —
+  // without this the tool fails before it ever reaches the bridge.
+  copyFile: vi.fn(async () => {}),
+  // The direct-XML writes go through writeFileAtomic: a temp sibling written with
+  // writeFile, then renamed over the target (rm cleans the temp up on failure).
+  rename: vi.fn(async () => {}),
+  rm: vi.fn(async () => {}),
 }));
 
 vi.mock('../../src/utils/configManager', () => ({
@@ -72,6 +79,9 @@ vi.mock('../../src/utils/configManager', () => ({
     ensureLoaded: vi.fn(async () => {}),
     getPackagePath: vi.fn(() => 'K:\\PackagesLocalDirectory'),
     getModelName: vi.fn(() => 'MyModel'),
+    // Writes are measured against the anchor, not the active model (see getWriteAnchorModel).
+    getWriteAnchorModel: vi.fn(() => 'MyModel'),
+    getToolProjectSwitch: vi.fn(() => null),
     getPackageNameFromWorkspacePath: vi.fn(() => 'MyPackage'),
     getProjectPath: vi.fn(async () => null),
     getSolutionPath: vi.fn(async () => null),
@@ -161,14 +171,17 @@ describe('modify-property direct-XML fallback for forms (regression)', () => {
     );
 
     expect(result.isError).toBeFalsy();
-    expect(result.content[0].text).toMatch(/direct XML fallback/i);
+    expect(result.content[0].text).toMatch(/direct XML/i);
     expect(mockWriteFile).toHaveBeenCalledTimes(1);
     const [, writtenContent] = mockWriteFile.mock.calls[0];
     expect(writtenContent).toContain('<Caption xmlns="">@MyModel:HeaderNote</Caption>');
     expect(writtenContent).not.toContain('Note headers');
   });
 
-  it('refuses to guess when the property element appears more than once', async () => {
+  // Was "refuses to guess when the property element appears more than once".
+  // A Design property is no longer ambiguous: #37 added a Design-scoped upsert,
+  // so a Caption elsewhere in the form (a Part, a control) is simply not the target.
+  it('targets the Design property and leaves same-named elements elsewhere alone', async () => {
     currentFormXml = FORM_XML_TWO_CAPTIONS;
 
     const result = await modifyD365FileTool(
@@ -178,6 +191,37 @@ describe('modify-property direct-XML fallback for forms (regression)', () => {
         operation: 'modify-property',
         propertyPath: 'Caption',
         propertyValue: '@MyModel:HeaderNote',
+        filePath: FORM_FILE_PATH,
+      }),
+      ctx,
+    );
+
+    expect(result.isError).toBeFalsy();
+    const [, written] = mockWriteFile.mock.calls[0];
+    expect(written).toContain('<Caption xmlns="">@MyModel:HeaderNote</Caption>');
+    expect(written).toContain('<Caption xmlns="">Second</Caption>');
+    expect(written).not.toContain('<Caption xmlns="">First</Caption>');
+  });
+
+  it('still refuses to guess for a non-Design property that appears more than once', async () => {
+    currentFormXml = `<?xml version="1.0" encoding="utf-8"?>
+<AxForm>
+\t<Design>
+\t\t<Caption xmlns="">First</Caption>
+\t</Design>
+\t<Parts>
+\t\t<Part><HelpText>a</HelpText></Part>
+\t\t<Part><HelpText>b</HelpText></Part>
+\t</Parts>
+</AxForm>`;
+
+    const result = await modifyD365FileTool(
+      req('modify_d365fo_file', {
+        objectType: 'form',
+        objectName: 'ContosoXyzNoteHeaderList',
+        operation: 'modify-property',
+        propertyPath: 'HelpText',
+        propertyValue: 'c',
         filePath: FORM_FILE_PATH,
       }),
       ctx,

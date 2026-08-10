@@ -8,7 +8,11 @@
  */
 import * as fs from 'node:fs';
 import { join } from 'node:path';
-import { getValue, readDevEnvType, readEnvValue, setValue } from './envFile.js';
+import { settingByPath } from '../config/settings.js';
+import { readSetting, saveStore, writeSetting, type SettingsStore } from './settingsStore.js';
+
+const xppConfigNameSetting = settingByPath('environment.xppConfigName')!;
+const envTypeSetting = settingByPath('environment.type')!;
 
 export interface XppConfig {
   /** Filename without .json, e.g. "contoso-dev___10.0.2428.63" */
@@ -57,40 +61,43 @@ export function listXppConfigs(): XppConfig[] {
   return configs.sort((a, b) => b.mtimeMs - a.mtimeMs);
 }
 
+/** Pinned config name of a target, from its JSON config or legacy .env. */
+function pinnedConfigName(store: SettingsStore): string | null {
+  const value = readSetting(store, xppConfigNameSetting);
+  return typeof value === 'string' && value ? value : null;
+}
+
 /**
- * Expand a short XPP_CONFIG_NAME (e.g. "myenv-dev") in an .env file to the
- * newest full versioned name ("myenv-dev___10.0.2345.153") so a later
- * staleness check is a plain file-exists test. No-op for traditional
+ * Expand a short config name (e.g. "myenv-dev") to the newest full versioned
+ * name ("myenv-dev___10.0.2345.153") so a later staleness check is a plain
+ * file-exists test, and persist the expansion. No-op for traditional
  * environments, full names, or when nothing matches.
  * Returns the expansion that happened, or null.
  */
-export function normalizeXppConfigName(envFile: string): { from: string; to: string } | null {
-  if (readDevEnvType(envFile) === 'traditional') return null;
-  const current = readEnvValue(envFile, 'XPP_CONFIG_NAME');
+export function normalizeXppConfigName(store: SettingsStore): { from: string; to: string } | null {
+  if (readSetting(store, envTypeSetting) === 'traditional') return null;
+  const current = pinnedConfigName(store);
   if (!current || /___/.test(current)) return null;
 
   const match = listXppConfigs().filter(c => c.name === current);
   if (match.length === 0) return null;
 
   const full = match[0].fullName;
-  const content = fs.readFileSync(envFile, 'utf8');
-  fs.writeFileSync(envFile, setValue(content, 'XPP_CONFIG_NAME', full));
+  writeSetting(store, xppConfigNameSetting, full);
+  saveStore(store);
   return { from: current, to: full };
 }
 
 /**
- * True when the pinned XPP_CONFIG_NAME no longer resolves to a file —
- * i.e. the UDE was upgraded since the instance was configured and its
- * database is stale. Only meaningful after normalizeXppConfigName.
+ * True when the pinned config name no longer resolves to a file — i.e. the UDE
+ * was upgraded since the instance was configured and its database is stale.
+ * Only meaningful after normalizeXppConfigName.
  */
-export function isXppConfigStale(envFile: string): boolean {
-  if (readDevEnvType(envFile) === 'traditional') return false;
-  const configName = readEnvValue(envFile, 'XPP_CONFIG_NAME');
+export function isXppConfigStale(store: SettingsStore): boolean {
+  if (readSetting(store, envTypeSetting) === 'traditional') return false;
+  const configName = pinnedConfigName(store);
   if (!configName) return false;
   const dir = xppConfigDir();
   if (!dir || !fs.existsSync(dir)) return false;
   return !fs.existsSync(join(dir, `${configName}.json`));
 }
-
-// Re-export for callers that work on content strings in tests.
-export { getValue as _getValue };

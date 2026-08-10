@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { handleCreateD365File } from '../../src/tools/createD365File';
+import { handleCreateD365File } from '../../src/tools/write/createD365File';
 import { FormPatternTemplates } from '../../src/utils/formPatternTemplates';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
@@ -28,6 +28,10 @@ vi.mock('fs/promises', () => ({
   }),
   stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false, size: 1024 })),
   readdir: vi.fn(async () => []),
+  // The direct-XML writes go through writeFileAtomic: a temp sibling written with
+  // writeFile, then renamed over the target (rm cleans the temp up on failure).
+  rename: vi.fn(async () => {}),
+  rm: vi.fn(async () => {}),
 }));
 
 vi.mock('../../src/utils/configManager', () => ({
@@ -35,6 +39,9 @@ vi.mock('../../src/utils/configManager', () => ({
     ensureLoaded: vi.fn(async () => {}),
     getPackagePath: vi.fn(() => 'K:\\PackagesLocalDirectory'),
     getModelName: vi.fn(() => 'ContosoExt'),
+    // Writes are measured against the anchor, not the active model (see getWriteAnchorModel).
+    getWriteAnchorModel: vi.fn(() => 'ContosoExt'),
+    getToolProjectSwitch: vi.fn(() => null),
     getPackageNameFromWorkspacePath: vi.fn(() => 'ContosoExt'),
     getProjectPath: vi.fn(async () => null),
     getSolutionPath: vi.fn(async () => null),

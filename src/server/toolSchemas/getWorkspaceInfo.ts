@@ -6,13 +6,13 @@
 
 export const getWorkspaceInfoTool = {
     name: 'get_workspace_info',
-    description: `ALWAYS call FIRST at session start. Returns model name, package path, framework directory, project path, environment type, and EXTENSION_PREFIX. Flags placeholder model names and missing prefix. Use projectName/projectPath params for solution switching. This is the authoritative source for target model — not search results.`,
+    description: `ALWAYS call FIRST at session start. Returns model name, package path, framework directory, project path, environment type, and EXTENSION_PREFIX. Flags placeholder model names and missing prefix. projectName/projectPath ONLY when the USER changed project. This is the authoritative source for target model — not search results.`,
     inputSchema: {
       type: 'object',
       properties: {
         projectName: {
           type: 'string',
-          description: 'Preferred way to switch projects. Just the model name, e.g. "ContosoEDS" or "ContosoBank". The server resolves the full path from D365FO_SOLUTIONS_PATH automatically. Use this when the user says "switch to <project>" or opens a different solution.',
+          description: 'Only when the USER says "switch to <project>". The PROJECT file name, e.g. "Contoso - FeatureManagement". NOT a model name: one model is built by many projects, so naming it selects none and the call is refused. Reads span every model already.',
         },
         projectPath: {
           type: 'string',
@@ -21,7 +21,7 @@ export const getWorkspaceInfoTool = {
         diagnostics: {
           type: 'boolean',
           default: false,
-          description: 'Include verbose diagnostic sections (suffix breakdown, stdio session/handshake dump). Use when debugging client-server connectivity.',
+          description: 'Include verbose sections (config sources, suffix, project paths, index scan, stdio handshake). Use when debugging config or connectivity.',
         },
       },
       required: [],

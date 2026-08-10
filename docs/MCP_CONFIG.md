@@ -71,9 +71,11 @@ Set in the `env` block. The legacy `"context": {...}` block is **deprecated** �
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MCP_SERVER_MODE` | `full` | `full` (26 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
+| `MCP_SERVER_MODE` | `full` | `full` (23 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
+| `MCP_TOOL_PROFILE` | `full` | `full` (all 23) / `core` (18-tool create-and-build loop) — shrinks the catalogue when the workspace already runs other MCP servers |
+| `MCP_EXTRA_TOOLS` | — | comma-separated tool names added back on top of `core` (e.g. `security_info,run_systest_class`) |
 | `DB_PATH` / `LABELS_DB_PATH` | repo `data/` | absolute paths to the SQLite databases — **required in stdio mode** |
-| `GROUNDING_ENFORCE` | on | fail-closed grounding gate for write tools |
+| `GROUNDING_ENFORCE` | off | fail-closed grounding gate for write tools — opt in |
 | `GROUNDING_SECRET` | — | shared secret → HMAC-signed portable grounding tokens; required for enforcement in hybrid / scaled-out deployments |
 | `FORM_PATTERN_ENFORCE` | on | block form writes on structural pattern violations (FP001–FP010) |
 | `DEBUG_LOGGING` | off | verbose JSON-RPC trace (`[VS→MCP]` / `[MCP→VS]`) on stderr |
@@ -97,7 +99,9 @@ Get-Content "C:\Temp\d365fo-bridge.log" -Encoding UTF8 -Wait -Tail 50
 
 ## Path resolution order
 
-**Write target (traditional):** tool argument `packagePath` → `D365FO_PACKAGE_PATH` → derived from `D365FO_WORKSPACE_PATH` → fallback `K:\AosService\PackagesLocalDirectory`
+**Write target (traditional):** tool argument `packagePath` → `D365FO_PACKAGE_PATH` → derived from `D365FO_WORKSPACE_PATH` → drive scan for `<drive>:\AosService\PackagesLocalDirectory`
+
+The drive scan walks C: to Z: and keeps every volume that has an `AosService\PackagesLocalDirectory`, preferring one that looks populated over an empty stub. That is what makes the server work unconfigured on any VM image — K: on cloud-hosted environments, C: on the downloadable VHD, J: on newer images — without a hardcoded drive letter anywhere. `d365fo-mcp doctor` prints what it found.
 
 **Write target (UDE):** explicit env paths → XPP config auto-detection (`%LOCALAPPDATA%\Microsoft\Dynamics365\XPPConfig\`, selected by `XPP_CONFIG_NAME` or newest) → `PACKAGES_PATH` fallback
 
@@ -177,6 +181,16 @@ Notes:
 | Expecting workspace context over HTTP | use the hybrid stdio companion |
 | `modify` fails with "outside package roots" but `create` works | metadata is junctioned into PLD — add the junction target as `D365FO_CUSTOM_PACKAGES_PATH` and restart ([details](#symlink--junction-layouts)) |
 
+## Automatic workspace detection
+
+When you open a D365FO solution in VS 2022/2026 over **stdio**, the server detects your model automatically — no manual config:
+
+1. After the handshake the client sends a `roots/list` response with the open folder URI.
+2. The server finds the nearest `.rnrproj` (≤ 6 levels deep) and reads its `<Model>` element.
+3. All writes target that model. Fallback chain: `VSCODE_WORKSPACE_FOLDER_PATHS` → `process.cwd()`.
+
+Set `D365FO_SOLUTIONS_PATH` to the folder holding your `.rnrproj` files so the server lists every project and can switch between them without a restart — say *"switch to ContosoEDS project"* (Copilot calls `get_workspace_info` with `projectName`), or pass an exact `projectPath`. Over **HTTP** there is no subprocess, so pass the two-level `D365FO_WORKSPACE_PATH` (`…\PackagesLocalDirectory\<Package>\<Model>`) instead. Every resolved value and its source is shown by `get_workspace_info`.
+
 ## See also
 
-[SETUP.md](SETUP.md) · [BRIDGE.md](BRIDGE.md) · [WORKSPACE_DETECTION.md](WORKSPACE_DETECTION.md) · [SETUP_AZURE.md](SETUP_AZURE.md)
+[SETUP.md](SETUP.md) · [ARCHITECTURE.md](ARCHITECTURE.md) · [SETUP_AZURE.md](SETUP_AZURE.md)

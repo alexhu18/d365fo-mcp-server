@@ -15,7 +15,18 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
+import { settingByEnv } from '../config/settings.js';
 import type { XppSymbolIndex } from './symbolIndex.js';
+
+/**
+ * Fallback when LABEL_LANGUAGES is unset, taken from the registry rather than
+ * spelled out here. This used to be the literal 'en-US,cs,sk,de' while
+ * docs/CONFIGURATION.md documented 'en-US', so an unconfigured build quietly
+ * indexed four language tables (~125 MB each) instead of one. Every deployment
+ * that actually wants the extra languages sets LABEL_LANGUAGES explicitly —
+ * infrastructure/azuredeploy.json and .github/workflows/infrastructure.yml both do.
+ */
+const DEFAULT_LABEL_LANGUAGES = (settingByEnv('LABEL_LANGUAGES')!.default as string[]).join(',');
 
 export interface ParsedLabel {
   labelId: string;
@@ -115,7 +126,7 @@ export async function discoverLabelFiles(
   }
 
   // Restrict indexing to configured languages to keep the label table small; LABEL_LANGUAGES=all indexes everything.
-  const langConfig = process.env.LABEL_LANGUAGES || 'en-US,cs,sk,de';
+  const langConfig = process.env.LABEL_LANGUAGES || DEFAULT_LABEL_LANGUAGES;
   const SUPPORTED_LANGUAGES = langConfig.toLowerCase() === 'all'
     ? null  // null = index all languages
     : new Set(langConfig.split(',').map(l => l.trim()));
@@ -178,11 +189,11 @@ export async function discoverLabelFiles(
  * the caller is responsible for calling `symbolIndex.rebuildLabelsFts()` once
  * after all models have been indexed.
  */
-export async function indexModelLabels(
+async function indexModelLabels(
   symbolIndex: XppSymbolIndex,
   modelDir: string,
   model: string,
-  opts?: { skipFtsRebuild?: boolean },
+  opts?: { skipFtsRebuild?: boolean; keepTriggers?: boolean },
 ): Promise<number> {
   const labelFiles = await discoverLabelFiles(modelDir);
   if (labelFiles.length === 0) return 0;
@@ -226,7 +237,12 @@ export async function indexAllLabels(
   symbolIndex: XppSymbolIndex,
   packagesPath: string,
   modelFilter?: (modelName: string) => boolean,
+  opts?: { ftsStrategy?: 'rebuild' | 'incremental' },
 ): Promise<{ totalLabels: number; modelsIndexed: number }> {
+  // 'incremental' keeps the labels_fts triggers live so only the scanned models' labels are
+  // tokenised, instead of re-inserting every label in the database afterwards. Only
+  // worth it when modelFilter narrows the scan to a small set (a custom-model build).
+  const incrementalFts = opts?.ftsStrategy === 'incremental';
   let totalLabels = 0;
   let modelsIndexed = 0;
 
@@ -245,11 +261,6 @@ export async function indexAllLabels(
   let skippedNoLabels = 0;
 
   for (const packageOrModel of models) {
-    if (modelFilter && !modelFilter(packageOrModel)) {
-      skippedByFilter++;
-      continue;
-    }
-
     const packageDir = path.join(packagesPath, packageOrModel);
 
     // A package dir can contain multiple model subdirectories, each with its own AxLabelFile.
@@ -288,7 +299,19 @@ export async function indexAllLabels(
     }
 
     for (const { modelDir, modelName } of modelDirs) {
-      const count = await indexModelLabels(symbolIndex, modelDir, modelName, { skipFtsRebuild: true });
+      // Keyed on the resolved MODEL name (e.g. "Docentric AX"), not the top-level PACKAGE
+      // folder name (e.g. "DocentricAX") — the two can differ, and clearLabelsForModels()
+      // deletes by the same model name, so filtering here on anything else silently drops
+      // that model's labels on every subsequent incremental build (#802).
+      if (modelFilter && !modelFilter(modelName)) {
+        skippedByFilter++;
+        continue;
+      }
+
+      const count = await indexModelLabels(symbolIndex, modelDir, modelName, {
+        skipFtsRebuild: true,
+        keepTriggers: incrementalFts,
+      });
       if (count > 0) {
         totalLabels += count;
         modelsIndexed++;
@@ -299,7 +322,8 @@ export async function indexAllLabels(
   }
 
   // Rebuild FTS once for all models rather than per-model (avoids O(n^2) rebuild cost).
-  if (totalLabels > 0) {
+  // Skipped under 'incremental': the triggers already kept labels_fts in sync per row.
+  if (totalLabels > 0 && !incrementalFts) {
     symbolIndex.rebuildLabelsFts();
   }
 
