@@ -85,6 +85,9 @@ vi.mock('../../src/utils/packagesRoot.js', async () => {
   };
 });
 
+const { pruneMock } = vi.hoisted(() => ({ pruneMock: vi.fn() }));
+vi.mock('../../src/tools/sdlc/compilerMetadataPrune.js', () => ({ pruneStaleCompilerMetadata: pruneMock }));
+
 import path from 'path';
 import { buildProjectTool, readFullLog, renderFailureLog, trimSucceededLog } from '../../src/tools/sdlc/buildProject';
 
@@ -182,6 +185,7 @@ describe('build_d365fo_project', () => {
     // stat resolves undefined — which the staleness scan reads as "unreadable,
     // assume changed", so every finished result would be refused and rebuilt.
     statMock.mockResolvedValue({ mtimeMs: 0 });
+    pruneMock.mockResolvedValue({ stale: [], phantoms: [], skippedModels: [], errors: [], scanned: 0 });
     cfgGetProjectPath.mockResolvedValue(PROJECT_PATH);
     cfgGetPackagePath.mockReturnValue(null);
     cfgGetContext.mockReturnValue({});
@@ -525,6 +529,65 @@ describe('build_d365fo_project', () => {
       await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
 
       expect(rmMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // The model's own compiler metadata (xppc's write-back leaves removals stale)
+  // ---------------------------------------------------------------------------
+  describe('stale compiler metadata of the model being built', () => {
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT   = 'C:\\AOSService\\PackagesLocalDirectory';
+    const XPPC_UDE = path.join(MSFT, 'bin', 'xppc.exe');
+    const TREE   = path.join(CUSTOM, MODEL_NAME, 'XppMetadata');
+
+    beforeEach(() => {
+      cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+      cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+      spawnMock.mockReturnValue(makeFakeChild(59));
+    });
+
+    it('clears the whole tree before a full build, and does not prune', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false, fullBuild: true }, {});
+
+      expect(rmMock).toHaveBeenCalledWith(TREE, { recursive: true, force: true });
+      expect(pruneMock).not.toHaveBeenCalled();
+      const [, args] = spawnMock.mock.calls[0];
+      expect(args).not.toContain('-incremental');
+    });
+
+    it('builds anyway when the tree cannot be cleared', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+      rmMock.mockRejectedValue(Object.assign(new Error('EBUSY: locked'), { code: 'EBUSY' }));
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false, fullBuild: true }, {});
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('prunes file by file — never clears the tree — before an incremental build', async () => {
+      // An incremental build writes back only what it recompiles: a cleared tree would
+      // lose every unchanged element.
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(pruneMock).toHaveBeenCalledWith(CUSTOM, CUSTOM, MODEL_NAME);
+      expect(rmMock).not.toHaveBeenCalledWith(TREE, expect.anything());
+      const [, args] = spawnMock.mock.calls[0];
+      expect(args).toContain('-incremental');
+      expect(pruneMock.mock.invocationCallOrder[0]).toBeLessThan(spawnMock.mock.invocationCallOrder[0]);
+    });
+
+    it('builds anyway when the prune throws', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE]);
+      pruneMock.mockRejectedValue(new Error('boom'));
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
     });
   });
 

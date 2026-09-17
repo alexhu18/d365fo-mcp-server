@@ -12,6 +12,7 @@ import { forceReleaseLock } from '../../utils/operationLocks.js';
 import { lookupErrorFix } from '../knowledge/d365foErrorHelp.js';
 import { generateRuntimeMetadata } from '../xml/generateMetadata.js';
 import { compileModelLabels, type CompileLabelsResult } from '../write/compileLabels.js';
+import { pruneStaleCompilerMetadata } from './compilerMetadataPrune.js';
 import { readModuleReferences } from '../../metadata/modelDescriptor.js';
 import { recordBuild } from '../../utils/buildMarker.js';
 import type { ProgressReporter } from '../../utils/progressReporter.js';
@@ -733,6 +734,7 @@ function samePath(a: string, b: string): boolean {
  * Full builds only. `-incremental` deliberately compares against this baseline to decide what to
  * recompile, so clearing it there would defeat the point of an incremental build; a full build is
  * already the "make it correct from scratch" path and pays ~6s more on a model this size.
+ * Incremental builds get the per-file version instead: pruneModelCompilerMetadata.
  */
 async function removeModelCompilerMetadata(
   ctx: XppcBuildContext,
@@ -758,6 +760,47 @@ async function removeModelCompilerMetadata(
       'WARN',
       `Could not clear ${xppMetadataDir} (${err?.message ?? err}) — runtime .md manifests may be stale for changed elements`,
     );
+  }
+}
+
+/**
+ * Incremental counterpart of removeModelCompilerMetadata: drop only the XppMetadata files that are
+ * stale or orphaned, so this build rewrites them — see pruneStaleCompilerMetadata for why a
+ * whole-tree clear is wrong here and why the source is touched. Runs for every model the queue
+ * compiles incrementally, dependencies included: their metadata is what the target compiles against.
+ * Never fails the build; the worst outcome of a failure is the pre-existing stale metadata.
+ */
+async function pruneModelCompilerMetadata(
+  ctx: XppcBuildContext,
+  modelName: string,
+): Promise<void> {
+  const started = Date.now();
+  try {
+    const r = await pruneStaleCompilerMetadata(ctx.compilerMetadataPath, ctx.customPackagesPath, modelName);
+    const elapsed = Date.now() - started;
+    if (r.stale.length > 0 || r.phantoms.length > 0) {
+      const names = (files: string[]) =>
+        files.slice(0, 10).map(f => path.basename(path.dirname(f)) + '/' + path.basename(f, '.xml')).join(', ') +
+        (files.length > 10 ? `, … (+${files.length - 10})` : '');
+      await buildLog(
+        'INFO',
+        `Incremental build of ${modelName}: dropped stale compiler metadata so xppc rewrites it — ` +
+        `${r.stale.length} changed [${names(r.stale)}], ${r.phantoms.length} deleted [${names(r.phantoms)}] ` +
+        `(${r.scanned} scanned, ${elapsed}ms)`,
+      );
+    }
+    if (r.skippedModels.length > 0) {
+      await buildLog('INFO', `Compiler metadata of ${modelName} left alone for models with no source: ${r.skippedModels.join(', ')}`);
+    }
+    if (r.errors.length > 0) {
+      await buildLog(
+        'WARN',
+        `Could not check ${r.errors.length} compiler-metadata file(s) of ${modelName} — runtime .md manifests may be stale for them: ` +
+        r.errors.slice(0, 5).join('; '),
+      );
+    }
+  } catch (err: any) {
+    await buildLog('WARN', `Compiler-metadata check for ${modelName} failed (${err?.message ?? err}) — runtime .md manifests may be stale for changed elements`);
   }
 }
 
@@ -838,11 +881,14 @@ async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): P
 
   await removeStaleFrameworkCompilerMetadata(ctx, modelName);
 
-  // Only for the model actually being fully rebuilt — see removeModelCompilerMetadata. Without
-  // this, xppc's write-back can leave changed elements stale in XppMetadata, and the runtime .md
-  // manifests generated from it then contradict the compiled netmodule.
+  // Without this, xppc's write-back can leave changed elements stale in XppMetadata, and the
+  // runtime .md manifests generated from it then contradict the compiled netmodule. A full build
+  // clears the model's whole tree (removeModelCompilerMetadata); an incremental one may only drop
+  // the stale files (pruneModelCompilerMetadata), or unchanged elements would vanish with them.
   if (useFullBuild) {
     await removeModelCompilerMetadata(ctx, modelName);
+  } else {
+    await pruneModelCompilerMetadata(ctx, modelName);
   }
 
   const outputPath = path.join(customPackagesPath, modelName, 'bin');
