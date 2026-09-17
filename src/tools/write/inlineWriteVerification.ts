@@ -16,7 +16,7 @@
 
 import * as fs from 'fs/promises';
 import {
-  resolveMembership, renderMembership, axFolderForObjectType, type Membership,
+  resolveMembership, renderMembership, axFolderForObjectType, hasAxFolder, type Membership,
 } from '../../workspace/projectMembership.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import {
@@ -53,7 +53,15 @@ export function membershipOf(
   objectType: string,
   objectName: string,
   modelName: string | null | undefined,
-): { axFolder: string; objectName: string; siblingProjectPaths: string[] } {
+): { axFolder: string; objectName: string; siblingProjectPaths: string[] } | undefined {
+  // A type with no Ax* folder has no membership question to answer. Gating HERE
+  // rather than at each call site is deliberate: the first fix for this put the
+  // guard in modifyD365File's single-operation path only, and the batch wrapper
+  // in d365foFile.ts asked the same question again and reported the same
+  // invented "no .rnrproj references AxClass\<Model>" on the very next run.
+  // verifyWrittenFile already takes this optional, so returning undefined
+  // silences every caller at once — present and future.
+  if (!hasAxFolder(objectType)) return undefined;
   return {
     axFolder: axFolderForObjectType(objectType),
     objectName,

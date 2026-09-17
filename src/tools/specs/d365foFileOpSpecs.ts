@@ -453,6 +453,15 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'add-diagnostic-suppression: emit the <ItemSpecific> block — rare, only for element-specific rules ' +
       '(BPErrorUnknownLabel, BPXmlDoc*, BPErrorPrivilegeNotCoveredByDuty, …). Requires diagnosticElementName.',
   },
+  // Model descriptor module references
+  moduleReference: {
+    type: 'string',
+    description:
+      'add-module-reference / remove-module-reference: REQUIRED — the module to add to or remove from the ' +
+      'descriptor\'s <ModuleReferences>, spelled exactly as the PACKAGE FOLDER is (e.g. "ApplicationSuite", ' +
+      '"Ledger", "ApplicationFoundation", or an ISV package name). Matched case-insensitively against what ' +
+      'is already there, so a re-run is a reported duplicate rather than a second entry.',
+  },
   // Alias spellings (see OP_PARAM_ALIASES). They never appear as their own line
   // in a rendered spec - renderOpSpec walks required/optional only - but every
   // alias must be describable, so the registry guard can prove none is a typo.
@@ -792,6 +801,36 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       'suppressed anything before, {Model}_BPSuppressions.xml does not exist yet — this creates it and its ' +
       'AxIgnoreDiagnosticList folder, in the shape real shipped suppression lists have, and says so in the ' +
       'reply so you can add it to the model\'s .rnrproj if Visual Studio does not pick it up.',
+  },
+  'add-module-reference': {
+    required: ['moduleReference'],
+    optional: [],
+    note:
+      'objectType="model-descriptor". Adds one <d2p1:string> to the model descriptor\'s ' +
+      '<ModuleReferences> — the ONLY statement of what your model may see, since xppc resolves types ' +
+      'against the referenced packages and not against everything installed. Do this BEFORE writing code ' +
+      'that names a type from another model: a missing entry is a classStr/delegateStr/"type not found" ' +
+      'error at COMPILE time, not a code bug, and the code itself will look correct. ' +
+      'objectName is not needed — a descriptor is named for its model, so modelName alone identifies it ' +
+      '(or pass filePath). NOTHING is created implicitly: a model with no descriptor, or a descriptor with ' +
+      'no <ModuleReferences> element, is REPORTED rather than invented, because a <d2p1:string> entry needs ' +
+      'the arrays-namespace prefix bound by an xmlns:d2p1 attribute and guessing where that declaration ' +
+      'belongs writes a file Visual Studio rewrites on the next save. Refuses a duplicate (case-insensitive) ' +
+      'rather than writing a second entry. The module is probed as a package folder under every configured ' +
+      'root and a miss is WARNED about, not refused — a package can be absent on a dev box and present on ' +
+      'the build agent — but a typo produces exactly that warning. ' +
+      'A descriptor change needs a FULL build of the model to take effect. ' +
+      'Read the current list with get_workspace_info.',
+  },
+  'remove-module-reference': {
+    required: ['moduleReference'],
+    optional: [],
+    note:
+      'objectType="model-descriptor". Removes one <d2p1:string> from the descriptor\'s <ModuleReferences>. ' +
+      'This is the one direction that BREAKS a build that currently passes — every type the model resolved ' +
+      'through that module goes invisible to xppc at once — so run a full build of the model afterwards. ' +
+      'A module that is not referenced comes back as not-found WITH the list that is there, rather than as ' +
+      'a silent success. The <ModuleReferences> element is kept when its last entry goes, not collapsed.',
   },
   'add-enum-value': {
     required: ['enumValueName'],

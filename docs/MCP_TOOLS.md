@@ -128,10 +128,21 @@ Mode-specific parameters go in a single `params` object (flat top-level keys sti
 `d365fo_file` actions:
 
 - **`create`** — create any of 39 AOT object types in the correct location + register in `.rnrproj` (gated by grounding token and form-pattern validation).
-- **`modify`** — safe metadata edits via the C# bridge, 39 operations: add-field, add-control, remove-control, add-entry-point, add-method, replace-code, modify-property, report-design, …
+- **`modify`** — safe metadata edits via the C# bridge, 41 operations: add-field, add-control, remove-control, add-entry-point, add-method, replace-code, modify-property, report-design, … plus the ones the bridge has no concept of and a direct-XML writer serves: `add-`/`remove-diagnostic-suppression` on `objectType="ignore-diagnostic-list"`, and `add-`/`remove-module-reference` on `objectType="model-descriptor"`.
 - **`delete`** — remove an object's XML and un-register it from every `.rnrproj` of the model that lists it (irreversible; guarded against standard-model and cross-model targets).
 - **`undo`** — roll `filePath` back: git-tracked → `git checkout HEAD`, which discards ALL uncommitted changes to that file, not just the last edit; untracked → deleted; the symbol/label index is re-synced either way.
 - **`generate`** — XML preview without writing (cloud-friendly).
+
+**Non-AOT write targets.** Two files under `src/Metadata/{Model}/` are not AOT objects and have no C# bridge path — they are written straight to XML through the same `action="modify"` gate:
+
+| objectType | File | Operations |
+|---|---|---|
+| `ignore-diagnostic-list` | `{Model}/AxIgnoreDiagnosticList/{Model}_BPSuppressions.xml` | `add-diagnostic-suppression`, `remove-diagnostic-suppression` |
+| `model-descriptor` | `{Package}/Descriptor/{Model}.xml` | `add-module-reference`, `remove-module-reference` |
+
+`<ModuleReferences>` is the only statement of what a model may see — xppc resolves types against the referenced packages and nothing else — so adding an entry is a mandatory step BEFORE writing code that names a type from another model; a missing one is a `classStr`/`delegateStr`/"type not found" error at compile time, not a code bug. Add is idempotent by refusal (a duplicate is reported, never written twice), the referenced package is probed on disk and a miss is warned about rather than refused, and NOTHING is created implicitly: a model with no descriptor, or a descriptor with no `<ModuleReferences>` element, is reported as such. A descriptor change needs a **full** build to take effect. Read the current list with `get_workspace_info(diagnostics=true)`.
+
+Neither type participates in grounding: `prepare` has no mode that produces a token for a file with no base object, so gating them would make them unreachable under `GROUNDING_ENFORCE=true`. Both are still held to path containment, and only the active model's own descriptor is writable.
 
 Two things shared by `create` and `modify`:
 
@@ -145,7 +156,7 @@ Two things shared by `create` and `modify`:
 | `security_info` | `mode="artifact"` — privilege / duty / role details + full hierarchy · `mode="coverage"` — which roles reach a form/table/menu item (Role → Duty → Privilege → Entry Point) + OLS policies | *"What does the duty VendPaymentTermsMaintain contain?"* · *"Who has access to the VendPaymTerms form?"* |
 | `extension_info` † | Unified extensibility analyzer. `mode="coc"` — existing CoC wrappers of a method (**check before writing a new one**) · `mode="events"` — all `[SubscribesTo]` handlers for an event · `mode="table-merge"` — all extensions of a table (fields, indexes, methods) + effective merged schema · `mode="points"` — CoC-eligible methods, delegates, events on an object · `mode="strategy"` — best extensibility mechanism for a goal | *"Is SalesFormLetter.run already wrapped by CoC?"* · *"What subscribes to CustTable onInserted?"* · *"What fields have we added to CustTable?"* · *"What can I extend on SalesFormLetter?"* · *"How should I customize sales confirmation posting?"* |
 | `validate_object_naming` | Naming conventions + symbol-index collision check. For `objectType="report"` it also warns when the AxReport name carries a companion-class suffix (DP/Contract/Controller/UIBuilder/Tmp) and hands back the full companion roster | *"Is MY_VendPaymTermsMaintain a valid name?"* · *"Is MyAgingReportDP a good name for the report itself?"* |
-| `get_workspace_info` | Detected paths, model, project, server mode + **index staleness warning** — call first in every session · `changes: true` returns the uncommitted X++ diff (`git diff HEAD`) plus per-file rollback hints instead of the configuration, and says so plainly when the workspace is not a git work tree | *"Check my workspace configuration"* · *"Review my changes"* |
+| `get_workspace_info` | Detected paths, model, project, server mode + **index staleness warning** — call first in every session · `diagnostics: true` additionally lists the model's `<ModuleReferences>` — the packages xppc will resolve types against · `changes: true` returns the uncommitted X++ diff (`git diff HEAD`) plus per-file rollback hints instead of the configuration, and says so plainly when the workspace is not a git work tree | *"Check my workspace configuration"* · *"Review my changes"* |
 | `verify_d365fo_project` | Objects exist on disk and in the `.rnrproj` | *"Verify everything we created is in the project"* |
 
 ## 🏗️ SDLC & Build (4)

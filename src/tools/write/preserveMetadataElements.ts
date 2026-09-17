@@ -77,6 +77,7 @@ const REMOVING_OPERATIONS = new Set([
   'remove-delete-action', 'remove-field-group', 'remove-control',
   'remove-entry-point', 'remove-enum-value', 'remove-query-range',
   'remove-table-mapping', 'remove-full-text-index', 'remove-diagnostic-suppression',
+  'remove-module-reference',
   'replace-all-fields', 'rename-field', 'replace-code',
 ]);
 

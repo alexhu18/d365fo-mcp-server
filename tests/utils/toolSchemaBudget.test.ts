@@ -177,8 +177,15 @@ const CHARS_PER_TOKEN = 4;
 // carried a cross-reference to d365fo_file that an agent at that point in the
 // flow does not need. ~100 chars of new enum, ~150 of restatement and prose
 // removed. Measured payload after: 44_951.
-const TOTAL_BUDGET = 45_000;
-const LARGEST_TOOL_BUDGET = 5_700;
+//
+// Then d365fo_file published objectType "model-descriptor" and the operations
+// add-/remove-module-reference: +67 serialized chars (5_640 -> 5_707), the cost
+// of giving the model descriptor a write path at all. It was the ONE file under
+// src/Metadata the server could read and not write, so every <ModuleReferences>
+// entry — a mandatory step before code that names a type from another model —
+// was a hand-edited XML carve-out. Parameters stay in the op-spec registry.
+const TOTAL_BUDGET = 45_100;
+const LARGEST_TOOL_BUDGET = 5_780;
 
 async function getTools(): Promise<Array<{ name: string }>> {
   const ctx: any = { symbolIndex: {}, parser: {} };
@@ -225,7 +232,14 @@ describe('tool schema token budget', () => {
     const tools = await getTools();
     const byName = new Map(tools.map(t => [t.name, t]));
 
-    for (const [name, cap] of [['d365fo_file', 5_700], ['generate_object', 3_400]] as const) {
+    // d365fo_file's cap moved 5,700 -> 5,780 when objectType "model-descriptor"
+    // and operations add-/remove-module-reference were published (5,640 -> 5,707
+    // serialized chars: 19 for the objectType, 48 for the two operations). That
+    // is ~67 chars on EVERY request, for the write path that closes the last
+    // hand-edited-XML hole under src/Metadata — a model descriptor was the only
+    // file the server could read but not write. The parameters stay out of the
+    // schema, in the op-spec registry, like every other operation's.
+    for (const [name, cap] of [['d365fo_file', 5_780], ['generate_object', 3_400]] as const) {
       const tool: any = byName.get(name);
       expect(tool, `${name} is not published`).toBeDefined();
       const chars = JSON.stringify(tool).length;

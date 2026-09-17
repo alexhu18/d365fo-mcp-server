@@ -1476,6 +1476,9 @@ const BRIDGE_MODIFY_OPS = new Set([
   // no concept of it — so this is XML-only for the same structural reason as the
   // two above.
   'remove-diagnostic-suppression', 'add-diagnostic-suppression',
+  // A model descriptor is not an AOT object either — it is the package's own
+  // manifest, outside the AOT entirely — so the same XML-only reasoning applies.
+  'add-module-reference', 'remove-module-reference',
   'add-display-method', 'add-table-method',
   'add-field-modification', 'add-menu-item-to-menu',
   // No C# op exists for query ranges on entities — served entirely by a
@@ -1520,6 +1523,8 @@ const XML_ONLY_MODIFY_PAIRS: Record<string, ReadonlySet<string>> = {
   'remove-entry-point': new Set(['security-privilege']),
   'remove-diagnostic-suppression': new Set(['ignore-diagnostic-list']),
   'add-diagnostic-suppression': new Set(['ignore-diagnostic-list']),
+  'add-module-reference': new Set(['model-descriptor']),
+  'remove-module-reference': new Set(['model-descriptor']),
   // An AxReport has no bridge write path at all — IMetadataProvider cannot express
   // a dataset field or a report parameter through a Dictionary<string,string> — and
   // `report` is deliberately absent from BRIDGE_MODIFY_TYPES for that reason. Without

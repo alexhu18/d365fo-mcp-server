@@ -62,6 +62,10 @@ export function buildProgressMessage(toolName: string, args: Record<string, any>
               : undefined);
           const obj = `${a.objectType ?? 'object'} ${objName ?? ''}`.trim();
           switch (op) {
+            case 'add-module-reference':
+              return `🔗 Referencing module "${p.moduleReference ?? ''}" from model ${a.modelName ?? objName ?? ''}`.trim();
+            case 'remove-module-reference':
+              return `🔗 Removing module reference "${p.moduleReference ?? ''}" from model ${a.modelName ?? objName ?? ''}`.trim();
             case 'add-index':
             case 'remove-index': {
               const fields = Array.isArray(p.indexFields)
