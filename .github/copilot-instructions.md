@@ -74,6 +74,7 @@ PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integra
    - `model-name` → class `{Target}_{ModelName}_Extension`, element `{Target}.{ModelName}`
 
    Pass the BASE object name to `d365fo_file(action="create")` and let the tool inject the token — don't hand-build the infix.
+   These patterns describe how the tool names extensions, and the tool applies them itself — editing them here does not change the names it writes. Change the style with `d365fo-mcp config naming`.
 
 ### Reuse & diff safety
 

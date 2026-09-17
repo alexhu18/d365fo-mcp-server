@@ -171,6 +171,13 @@ EXTENSION_NAMING_STYLE=prefix        # default — or "model-name"
 
 Run `get_workspace_info` to see the active style and worked examples of exactly what the tools will emit.
 
+**There is no custom naming template.** The name is normalised in code on every create and modify:
+
+- An **element extension** always gets the style's token after the dot — `ProdTable.BKU_TableExtension` is written as `ProdTable.BKUExtension`.
+- An **extension class** given a bare base name gets `{Base}{Infix}_Extension` (`ProdTable` → `ProdTableBKU_Extension`). A full name whose part before `_Extension` already *ends* with the infix is kept as passed, so `ProdTable_BKU_Extension` survives — but only when the agent passes that exact name.
+
+The extension patterns in `copilot-instructions.md` (or any other rules file) only *describe* this behaviour: editing them does not change what the tool writes, and it leaves the agent's instructions contradicting the tool. To switch styles, run `d365fo-mcp config naming` (or set `EXTENSION_NAMING_STYLE`) and restart the server. With `prefix`, the infix follows `EXTENSION_PREFIX`, or the spelling the model's existing extensions already use.
+
 ---
 
 ## Searching Custom Extensions
