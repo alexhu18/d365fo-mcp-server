@@ -28,6 +28,15 @@ those are called out explicitly below.
 
 ## [Unreleased]
 
+### Dependencies
+- Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
+  1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →
+  26.6.1, `zod` 4.6.1 → 4.6.5, `hono` 4.13.7 → 4.13.8, plus transitive updates
+  (`package-lock.json` only). `@clack/prompts` 1.8.1 now types a cancelled
+  prompt as `typeof CANCEL_SYMBOL` instead of `symbol`, which broke the
+  type-check of every CLI prompt; the CLI's `ensure()` helper now strips any
+  symbol from the result type. No runtime change.
+
 ### Fixed
 - **An incremental build still shipped runtime metadata for code that no longer
   existed.** xppc's metadata write-back rewrites an element's
