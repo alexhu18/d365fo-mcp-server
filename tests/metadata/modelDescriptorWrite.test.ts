@@ -21,6 +21,7 @@ import {
   removeModuleReference,
   parseModuleReferences,
   findDescriptorPath,
+  isValidModuleReferenceName,
 } from '../../src/metadata/modelDescriptor';
 
 /** A real descriptor's shape: d2p1 on the root, nil sibling, two-space indent. */
@@ -37,6 +38,26 @@ const descriptor = (refs: string[]) =>
     : `  <ModuleReferences />\n`) +
   `  <Publisher>Contoso</Publisher>\n` +
   `</AxModelInfo>`;
+
+describe('module reference name validation', () => {
+  // Each of these used to be written verbatim into <d2p1:string>: a space made
+  // an entry parseModuleReferences cannot read back, a blank made an empty
+  // entry, and & or < made the descriptor malformed.
+  it.each(['Application Suite', '', '   ', 'A&B', 'A<B', '..', '.hidden', '..\\Other', 'a/b'])(
+    'refuses %j without writing',
+    name => {
+      expect(isValidModuleReferenceName(name.trim())).toBe(false);
+      expect(addModuleReference(descriptor(['Ledger']), name)).toEqual({ kind: 'invalid-name' });
+    },
+  );
+
+  // Every package folder shape on a real install: plain, underscored, and the
+  // hyphenated custom one (fm-mcp).
+  it.each(['ApplicationSuite', 'Tax_Core', 'fm-mcp', 'Isv.Core'])('accepts %j', name => {
+    expect(isValidModuleReferenceName(name)).toBe(true);
+    expect(addModuleReference(descriptor(['Ledger']), name).kind).toBe('added');
+  });
+});
 
 describe('addModuleReference', () => {
   it('adds one entry and leaves every other line byte-identical', () => {

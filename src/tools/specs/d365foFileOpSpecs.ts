@@ -830,7 +830,8 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       'This is the one direction that BREAKS a build that currently passes — every type the model resolved ' +
       'through that module goes invisible to xppc at once — so run a full build of the model afterwards. ' +
       'A module that is not referenced comes back as not-found WITH the list that is there, rather than as ' +
-      'a silent success. The <ModuleReferences> element is kept when its last entry goes, not collapsed.',
+      'a silent success. Removing the last entry collapses the element to the self-closing ' +
+      '<ModuleReferences /> a model that references nothing ships with.',
   },
   'add-enum-value': {
     required: ['enumValueName'],

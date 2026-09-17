@@ -28,7 +28,7 @@ import { upsertAxFormDesignProperty } from '../../utils/axFormDesignProperties.j
 import { buildAxDataEntityViewFieldXml } from '../xml/dataEntityViewExtensionXml.js';
 import { escapeXml } from '../../utils/xmlEscape.js';
 import {
-  addModuleReference, removeModuleReference, parseModuleReferences,
+  addModuleReference, removeModuleReference, parseModuleReferences, invalidateModelVisibility,
 } from '../../metadata/modelDescriptor.js';
 
 /**
@@ -1941,9 +1941,17 @@ export const directXmlAddModuleReference = serializedOnFile(async (
             `reviewer.` +
             (outcome.existing === moduleName ? '' : ` (Spelled '${outcome.existing}' in the file.)`),
         };
+      case 'invalid-name':
+        return {
+          success: false,
+          message:
+            `'${moduleName}' is not a package folder name — nothing was written. A module reference ` +
+            `is spelled exactly as the package folder is: letters, digits, '_', '-' or '.', no spaces.`,
+        };
     }
 
     await writeFileAtomic(filePath, withBomOf(rawContent, normalizeD365Xml(outcome.xml)));
+    invalidateModelVisibility(path.basename(filePath, '.xml'));
     console.error(`[modify_d365fo_file] ✅ directXmlAddModuleReference: added '${moduleName}' to ${filePath}`);
     return {
       success: true,
@@ -2002,6 +2010,7 @@ export const directXmlRemoveModuleReference = serializedOnFile(async (
     }
 
     await writeFileAtomic(filePath, withBomOf(rawContent, normalizeD365Xml(outcome.xml)));
+    invalidateModelVisibility(path.basename(filePath, '.xml'));
     console.error(`[modify_d365fo_file] ✅ directXmlRemoveModuleReference: removed '${outcome.removed}' from ${filePath}`);
     const left = parseModuleReferences(outcome.xml);
     return {
