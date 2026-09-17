@@ -35,7 +35,11 @@ function enumOf(prop: string): string[] {
 // BP-suppression list is a per-model singleton create has no reason to author).
 // Excluded here so "N AOT object types" keeps meaning "types create can make",
 // not the size of the shared enum.
-const NOT_CREATABLE_OBJECT_TYPES = new Set(['ignore-diagnostic-list']);
+// model-descriptor joins it for the stronger version of the same reason: a
+// descriptor is the package's own manifest, one per model, and this server
+// deliberately never authors one — a model without a descriptor is a wrong model
+// name, not a model waiting to be given a manifest.
+const NOT_CREATABLE_OBJECT_TYPES = new Set(['ignore-diagnostic-list', 'model-descriptor']);
 
 describe('docs/MCP_TOOLS.md counts match the published schema', () => {
   const doc = readDoc('MCP_TOOLS.md');

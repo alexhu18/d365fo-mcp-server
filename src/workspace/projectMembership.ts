@@ -105,6 +105,24 @@ export function axFolderForObjectType(objectType: string): string {
   return AX_FOLDER_BY_OBJECT_TYPE[objectType] || 'AxClass';
 }
 
+/**
+ * Does this object type live in an Ax* folder at all?
+ *
+ * The 'AxClass' fallback above is a convenience for callers that need SOME
+ * folder, and a trap for callers that need a TRUE one: `model-descriptor` is
+ * absent from the map because a descriptor is the package's manifest, sitting
+ * beside the model folder rather than in an AOT folder inside it. Asked for its
+ * folder, the fallback answers 'AxClass', and a .rnrproj membership question
+ * built on that reports a missing `AxClass\<Model>` — inventing both a location
+ * and a defect, underneath a write that succeeded.
+ *
+ * Callers deciding WHETHER to ask a membership question gate on this; callers
+ * that already know the type has a folder keep using axFolderForObjectType.
+ */
+export function hasAxFolder(objectType: string): boolean {
+  return Object.hasOwn(AX_FOLDER_BY_OBJECT_TYPE, objectType);
+}
+
 /** AOT folder name (any case) → object type. Used to read objects back out of a project. */
 export function objectTypeForAxFolder(axFolder: string): string | undefined {
   const needle = axFolder.toLowerCase();

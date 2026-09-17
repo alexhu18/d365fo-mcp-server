@@ -119,8 +119,16 @@ describe('layer direction', () => {
     // file. The writers moved to directXmlWriters.ts; this keeps the split from
     // silently undoing itself. Raise it only with a reason, the way the schema
     // budget is raised.
+    //
+    // Raised 4,600 -> 4,760 for objectType "model-descriptor" and its two
+    // module-reference operations (4,594 -> 4,710 lines). What stayed OUT is the
+    // point: the two writers went to directXmlWriters.ts and the descriptor path
+    // resolution plus the module-exists probe to utils/objectFileLookup.ts, so
+    // what landed here is only what the dispatcher itself does — the lookup
+    // branch, the standard-model guard for a path shape 1b cannot read, and the
+    // two switch arms.
     const src = readFileSync('src/tools/write/modifyD365File.ts', 'utf8');
-    expect(src.split('\n').length).toBeLessThan(4600);
+    expect(src.split('\n').length).toBeLessThan(4760);
   });
 
   it('the dispatcher routes rather than implementing', () => {

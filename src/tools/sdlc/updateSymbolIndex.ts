@@ -349,9 +349,10 @@ async function reindexExtensionMetadata(
 export async function indexOneFile(
   filePath: string,
   context: XppServerContext,
-): Promise<{ text: string; isError: boolean }> {
+): Promise<{ text: string; isError: boolean; skipped?: boolean }> {
   const ok = (text: string) => ({ text, isError: false });
   const err = (text: string) => ({ text, isError: true });
+  const skip = (text: string) => ({ text, isError: false, skipped: true });
   try {
     const { symbolIndex } = context;
     const pathParts = filePath.split(/[\\/]/);
@@ -397,6 +398,35 @@ export async function indexOneFile(
 
     // File exists: re-index
     const model = extractModelFromPath(filePath) ?? 'Unknown';
+
+    // A file in NO Ax* folder is not an AOT object and must not be indexed as
+    // one. classifyAotFolder falls back to 'class' for an unrecognised folder,
+    // which is a sane default for an unknown Ax* type and a lie for a file that
+    // has no AOT folder at all: a model descriptor
+    // (<Package>/Descriptor/<Model>.xml) was indexed as a CLASS named after the
+    // model, in model "Unknown" — a phantom that `search` then returned as an
+    // exact match, and that resolve_references would accept as a real type.
+    //
+    // Stale rows are still removed before returning, so this also CLEANS UP
+    // whatever an earlier run of the old behaviour inserted for this path:
+    // pointing update_symbol_index at such a file is what undoes the damage.
+    // Label files are exempt — they legitimately live outside Ax* folders and
+    // are handled by the branch below.
+    if (!aotFolder && !isLabelTextFile(filePath)) {
+      const { deletedCount } = symbolIndex.removeSymbolsByFile(filePath);
+      if (deletedCount > 0) symbolIndex.touchLastIndexed?.();
+      console.error(
+        `[update_symbol_index] Not an AOT object file (no Ax* folder): ${filePath}` +
+        (deletedCount > 0 ? ` — removed ${deletedCount} stale symbol(s)` : ''),
+      );
+      return skip(
+        `ℹ️ **${path.basename(filePath)}** is not an AOT object file — it is in no Ax* folder, so it ` +
+        `holds no symbol to index (a model descriptor, for example, is the package's manifest).` +
+        (deletedCount > 0
+          ? `\n\n🧹 Removed ${deletedCount} stale symbol(s) a previous run had indexed for it.`
+          : ''),
+      );
+    }
 
     // Label files are indexed in labels DB (not symbols DB).
     if (isLabelTextFile(filePath)) {

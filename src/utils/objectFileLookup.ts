@@ -11,6 +11,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { getConfigManager, fallbackPackagePath } from './configManager.js';
 import { PackageResolver } from './packageResolver.js';
+import { findDescriptorPath } from '../metadata/modelDescriptor.js';
 
 /**
  * objectType → the Ax* metadata folder its XML lives in. Module-level because
@@ -46,6 +47,101 @@ const AOT_FOLDER_BY_OBJECT_TYPE: Record<string, string> = {
   'security-role': 'AxSecurityRole',
   'ignore-diagnostic-list': 'AxIgnoreDiagnosticList',
 };
+
+/**
+ * Resolve a MODEL DESCRIPTOR's path: <root>/<Package>/Descriptor/<Model>.xml.
+ *
+ * Deliberately NOT an entry in the table above. Every type there lives at
+ * <Package>/<Model>/Ax<Type>/<Name>.xml; a descriptor is one level shallower and
+ * sits beside the model folder rather than inside it, so a 'Descriptor' entry
+ * would have both functions build a path that does not exist.
+ *
+ * The <Package> segment is resolved the same way, though — package == model is
+ * the common case, not the rule, and an ISV model inside a differently named
+ * package has its descriptor under THAT package. findDescriptorPath does that
+ * probe (and the bounded sweep behind it) against one root; this tries the
+ * caller's root, then the custom write root, then the configured one, in the
+ * same order findD365FileOnDisk prefers.
+ *
+ * Returns null when no descriptor exists under any of them — the caller reports
+ * that rather than writing one, since a model without a descriptor is a wrong
+ * path or a wrong model name, not a model waiting to be given a manifest.
+ */
+export async function findModelDescriptorPath(
+  modelName?: string,
+  explicitPackagePath?: string,
+): Promise<{ filePath: string; packageName: string; model: string } | null> {
+  const configManager = getConfigManager();
+  await configManager.ensureLoaded();
+
+  const resolvedModel =
+    (modelName && modelName !== 'any' ? modelName : null) ||
+    configManager.getModelName() ||
+    (await configManager.getAutoDetectedModelName()) ||
+    process.env.D365FO_MODEL_NAME ||
+    null;
+  if (!resolvedModel) return null;
+
+  const roots = [
+    explicitPackagePath,
+    await configManager.getCustomPackagesPath().catch(() => null),
+    configManager.getPackagePath() || fallbackPackagePath(),
+  ].filter(Boolean) as string[];
+
+  for (const root of roots) {
+    const found = findDescriptorPath(root, resolvedModel);
+    if (found) return { ...found, model: resolvedModel };
+  }
+  return null;
+}
+
+/**
+ * Does the module being referenced actually exist on this box?
+ *
+ * A `<ModuleReferences>` entry is a package FOLDER name. A typo ("ApplicationSuit",
+ * "Ledgers") is not rejected by anything: the descriptor is well-formed, xppc
+ * resolves nothing extra through it, and the failure surfaces as the very
+ * classStr/type error the reference was added to fix — with the descriptor now
+ * looking like it was already handled.
+ *
+ * So the folder is probed under every configured root. The answer is a NOTE, not
+ * a refusal: a package can legitimately be absent from a dev box and present on
+ * the build agent (an ISV model installed later in the pipeline), and refusing
+ * there would block a correct edit. When no root can be resolved at all, that is
+ * said too — "not found" and "could not look" are different claims, and only one
+ * of them is evidence of a typo.
+ */
+export async function moduleExistenceNote(
+  moduleName: string,
+  explicitPackagePath?: string,
+): Promise<string> {
+  const configManager = getConfigManager();
+  await configManager.ensureLoaded();
+  const roots = [
+    explicitPackagePath,
+    await configManager.getCustomPackagesPath().catch(() => null),
+    configManager.getPackagePath(),
+    await configManager.getMicrosoftPackagesPath().catch(() => null),
+  ].filter(Boolean) as string[];
+
+  if (roots.length === 0) {
+    return `ℹ️ Could not verify that "${moduleName}" exists — no packages root is configured, ` +
+      `so nothing was checked. Confirm the spelling matches the package folder exactly.\n`;
+  }
+
+  for (const root of roots) {
+    try {
+      await fs.access(path.join(root, moduleName));
+      return '';
+    } catch { /* try the next root */ }
+  }
+
+  return `⚠️ No package folder named "${moduleName}" exists under ${roots.length === 1 ? 'the configured root' : 'any configured root'} ` +
+    `(${roots.join(', ')}). The reference was written anyway — a package can be absent here and ` +
+    `present on the build agent — but a MISSPELLED module name produces exactly this, and it fails ` +
+    `later as the compile error the reference was meant to fix. Check the spelling against the ` +
+    `package folder name.\n`;
+}
 
 /**
  * Filesystem fallback for findD365File.

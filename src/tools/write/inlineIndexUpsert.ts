@@ -39,6 +39,11 @@ export async function upsertWrittenFileIntoIndex(
       return `\n⚠️ Written, but the symbol index could not be updated: ${result.text}\n` +
              `   Run update_symbol_index(filePath="${filePath}") before searching for it.`;
     }
+    // Nothing was indexed because there was nothing TO index — the file is in no
+    // Ax* folder (a model descriptor). Claiming "symbol index updated" there is
+    // a claim about a symbol that does not exist, on a path where the old
+    // behaviour really did invent one.
+    if (result.skipped) return '';
     return '\n🔎 Symbol index updated in place — no update_symbol_index call needed.';
   } catch (e: any) {
     return `\n⚠️ Written, but the symbol index could not be updated: ${e?.message ?? e}\n` +
