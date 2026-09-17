@@ -71,6 +71,7 @@ import {
   paramCorrectionCandidates, canonicalParamForAlias, D365FO_FILE_OP_SPECS,
 } from '../specs/d365foFileOpSpecs.js';
 import { lookupSymbolNocase } from '../../utils/symbolLookup.js';
+import { isValidModuleReferenceName } from '../../metadata/modelDescriptor.js';
 import { decodeXmlEntitiesFromXppSource } from '../../utils/xmlEscape.js';
 import {
   findD365FileOnDisk, expectedD365FilePath, findModelDescriptorPath, moduleExistenceNote,
@@ -2922,8 +2923,18 @@ export async function modifyD365FileTool(
           });
           break;
         }
-        const moduleRef = (args as any).moduleReference;
-        if (moduleRef) {
+        const moduleRef = String((args as any).moduleReference ?? '').trim();
+        if (!isValidModuleReferenceName(moduleRef)) {
+          // Refused before the existence probe, which would otherwise join an
+          // arbitrary string onto every packages root.
+          bridgeResult = viaXmlFallback({
+            success: false,
+            message:
+              `${operation} needs params.moduleReference spelled exactly as a package folder is ` +
+              `(letters, digits, '_', '-' or '.', no spaces) — got ${JSON.stringify((args as any).moduleReference ?? null)}. ` +
+              `Nothing was written.`,
+          });
+        } else {
           bridgeResult = operation === 'add-module-reference'
             ? viaXmlFallback(await directXmlAddModuleReference(
                 actualFilePath, moduleRef, await moduleExistenceNote(moduleRef, args.packagePath),

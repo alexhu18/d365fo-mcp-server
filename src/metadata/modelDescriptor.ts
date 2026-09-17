@@ -137,6 +137,22 @@ export function getModelVisibility(
   return built;
 }
 
+/**
+ * Drop the memoised visibility of `modelName` under every root.
+ *
+ * The descriptor writers call this after every successful write. Without it the
+ * oracle keeps the reference set the model had when it was first asked, so
+ * resolve_references goes on reporting `not-visible-from-model` — and telling
+ * the agent to add the very reference it has just added — until the server
+ * restarts; a remove leaves it too permissive the same way.
+ */
+export function invalidateModelVisibility(modelName: string): void {
+  const suffix = `|${modelName.toLowerCase()}`;
+  for (const key of visibilityCache.keys()) {
+    if (key.endsWith(suffix)) visibilityCache.delete(key);
+  }
+}
+
 /** Uncached form — exported for tests, which need a fresh fixture each time. */
 export function buildModelVisibility(
   packagesRoot: string | null | undefined,
@@ -250,7 +266,9 @@ export type AddModuleReferenceResult =
   /** Already referenced — refuse rather than write a second `<d2p1:string>`. */
   | { kind: 'duplicate'; existing: string }
   /** No `<ModuleReferences>` element at all; the caller declines rather than inventing one. */
-  | { kind: 'no-element' };
+  | { kind: 'no-element' }
+  /** Not a package folder name — see isValidModuleReferenceName. */
+  | { kind: 'invalid-name' };
 
 export type RemoveModuleReferenceResult =
   /** Removed. `xml` is the updated document, `removed` the entry as it was spelled. */
@@ -259,6 +277,22 @@ export type RemoveModuleReferenceResult =
   | { kind: 'not-found'; present: string[] }
   /** No `<ModuleReferences>` element at all. */
   | { kind: 'no-element' };
+
+/**
+ * Could `name` be a package folder name?
+ *
+ * Checked before anything is written, because the entry is interpolated into
+ * `<d2p1:string>…</d2p1:string>` verbatim: whitespace inside the name writes an
+ * entry parseModuleReferences cannot read back (so it is neither a detected
+ * duplicate nor removable), an all-blank name writes an empty entry, and `&`/`<`
+ * write a malformed descriptor. Package folders on a real install use letters,
+ * digits and `_`, plus `-` in custom ones (`fm-mcp`); `.` is admitted for
+ * dotted ISV names, but never leading, so the name cannot step out of a
+ * packages root when probed as a folder.
+ */
+export function isValidModuleReferenceName(name: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(name);
+}
 
 /** Escape a literal for embedding in a RegExp. */
 function escapeRe(s: string): string {
@@ -335,6 +369,7 @@ export function addModuleReference(xml: string, moduleName: string): AddModuleRe
   if (!element) return { kind: 'no-element' };
 
   const name = moduleName.trim();
+  if (!isValidModuleReferenceName(name)) return { kind: 'invalid-name' };
   const present = parseModuleReferences(element.text);
   const existing = present.find(r => r.toLowerCase() === name.toLowerCase());
   if (existing) return { kind: 'duplicate', existing };

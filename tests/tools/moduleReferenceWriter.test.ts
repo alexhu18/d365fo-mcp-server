@@ -24,6 +24,7 @@ import { D365FO_FILE_OP_SPECS, getRequiredParams } from '../../src/tools/specs/d
 import { d365foFileTool } from '../../src/server/toolSchemas/d365foFile';
 import { axFolderForObjectType, objectTypeForAxFolder, hasAxFolder } from '../../src/workspace/projectMembership';
 import { membershipOf } from '../../src/tools/write/inlineWriteVerification';
+import { getModelVisibility } from '../../src/metadata/modelDescriptor';
 
 const BOM = '﻿';
 
@@ -206,5 +207,36 @@ describe('directXmlRemoveModuleReference', () => {
     const r = await directXmlRemoveModuleReference(file, 'Ledger');
     expect(r?.success).toBe(false);
     expect(r?.message).toMatch(/references no modules at all/i);
+  });
+});
+
+describe('the visibility oracle follows a descriptor write', () => {
+  // resolve_references memoises what a model may see. Without invalidation it
+  // kept reporting not-visible-from-model — and telling the agent to add the
+  // reference it had just added — until the server restarted.
+  it('sees an added reference, then stops seeing it once removed', async () => {
+    const root = path.join(dir, 'PackagesLocalDirectory');
+    const descriptorDir = path.join(root, 'Contoso', 'Descriptor');
+    await fs.mkdir(descriptorDir, { recursive: true });
+    const target = path.join(descriptorDir, 'Contoso.xml');
+    await fs.writeFile(target, descriptorLf, 'utf-8');
+
+    expect(getModelVisibility(root, 'Contoso')?.visiblePackages.has('ledger')).toBe(false);
+
+    expect((await directXmlAddModuleReference(target, 'Ledger', ''))?.success).toBe(true);
+    expect(getModelVisibility(root, 'Contoso')?.visiblePackages.has('ledger')).toBe(true);
+
+    expect((await directXmlRemoveModuleReference(target, 'Ledger'))?.success).toBe(true);
+    expect(getModelVisibility(root, 'Contoso')?.visiblePackages.has('ledger')).toBe(false);
+  });
+});
+
+describe('directXmlAddModuleReference name validation', () => {
+  it('leaves the file BYTE-IDENTICAL for a name that is not a package folder', async () => {
+    const before = await fs.readFile(file);
+    const r = await directXmlAddModuleReference(file, 'Application Suite', '');
+    expect(r?.success).toBe(false);
+    expect(r?.message).toContain('not a package folder name');
+    expect((await fs.readFile(file)).equals(before)).toBe(true);
   });
 });

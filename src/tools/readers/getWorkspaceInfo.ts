@@ -12,6 +12,7 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../../types/context.js';
 import * as nodePath from 'path';
+import { readFile } from 'fs/promises';
 import { getConfigManager } from '../../utils/configManager.js';
 import { getStdioSessionInfo } from '../../utils/stdioSessionInfo.js';
 import { checkIndexStaleness } from '../../utils/indexStaleness.js';
@@ -26,7 +27,8 @@ import {
 import { selectProject, renderSelectionFailure } from '../../workspace/projectSelector.js';
 import { projectDisplayName } from '../../workspace/projectMembership.js';
 import { activeCrossModelAllowance } from '../../utils/crossModelWriteGuard.js';
-import { readModuleReferences } from '../../metadata/modelDescriptor.js';
+import { parseModuleReferences } from '../../metadata/modelDescriptor.js';
+import { findModelDescriptorPath } from '../../utils/objectFileLookup.js';
 
 export async function getWorkspaceInfoTool(
   request: CallToolRequest,
@@ -165,16 +167,27 @@ export async function getWorkspaceInfoTool(
   // and the same parser both of those and build_d365fo_project use — so what is
   // printed here is exactly what xppc will resolve against.
   if (diagnostics && modelName) {
+    // The writer's own lookup, so this reads the file add/remove-module-reference
+    // write: it also finds a model inside a differently-named package and tries
+    // every configured root, where a <root>/<Model>/Descriptor probe would call
+    // an ISV model's references UNKNOWN right after a successful add.
     const descriptorRoot = effectiveWritePath ?? packagePath ?? null;
-    const refs = descriptorRoot ? await readModuleReferences(descriptorRoot, modelName) : null;
+    const found = await findModelDescriptorPath(modelName, descriptorRoot ?? undefined).catch(() => null);
+    let refs: string[] | null = null;
+    if (found) {
+      try {
+        refs = parseModuleReferences(await readFile(found.filePath, 'utf-8'));
+      } catch { /* unreadable — UNKNOWN, reported below */ }
+    }
     lines.push(
       `## Module References (${modelName})`,
       ``,
+      ...(found && refs !== null ? [`Descriptor: ${found.filePath}`] : []),
       // null is UNKNOWN, never "references nothing" — the distinction the reader
       // is documented to preserve, and the difference between "add a reference"
       // and "this server is looking in the wrong place".
       refs === null
-        ? `⚠️  No readable descriptor under ${descriptorRoot ?? '(no packages root configured)'} — ` +
+        ? `⚠️  No readable descriptor for ${modelName} under ${descriptorRoot ?? 'the configured packages roots'} — ` +
           `the reference set is UNKNOWN, not empty.`
         : refs.length === 0
           ? `(none) — this model can see only its own package. Any type from another model is a ` +
