@@ -708,24 +708,6 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Delete the compiler-metadata stub an earlier build left in the framework directory.
- *
- * While `-compilermetadata` pointed at the framework directory, every build of a customer
- * model deposited `<FrameworkDirectory>\<Model>\XppMetadata` there. Now that the write-back
- * goes to the model store, those trees are never refreshed again — and the framework
- * directory is still passed as a `-referenceFolder`, so xppc keeps finding a `<Model>` folder
- * that looks like a package and holds metadata frozen at the last build before the switch.
- * That is how "has not been successfully compiled since it was last changed" gets reported
- * for source that was just compiled cleanly. Anything else enumerating the framework
- * directory keeps seeing phantom customer models for the same reason.
- *
- * Deliberately narrow, because the framework directory is shared by every environment on the
- * box: only when the two roots actually differ (UDE), only for a model that really lives in
- * the model store, and only when the folder holds nothing but XppMetadata — i.e. it is a
- * write-back stub and not a package deployed there on purpose. Anything unexpected is left
- * alone and reported; a build is never failed over it.
- */
-/**
  * Delete the target model's OWN compiler metadata so xppc regenerates it from source.
  *
  * xppc's "Metadata Write-Back" phase does not reliably refresh an existing
@@ -779,6 +761,24 @@ async function removeModelCompilerMetadata(
   }
 }
 
+/**
+ * Delete the compiler-metadata stub an earlier build left in the framework directory.
+ *
+ * While `-compilermetadata` pointed at the framework directory, every build of a customer
+ * model deposited `<FrameworkDirectory>\<Model>\XppMetadata` there. Now that the write-back
+ * goes to the model store, those trees are never refreshed again — and the framework
+ * directory is still passed as a `-referenceFolder`, so xppc keeps finding a `<Model>` folder
+ * that looks like a package and holds metadata frozen at the last build before the switch.
+ * That is how "has not been successfully compiled since it was last changed" gets reported
+ * for source that was just compiled cleanly. Anything else enumerating the framework
+ * directory keeps seeing phantom customer models for the same reason.
+ *
+ * Deliberately narrow, because the framework directory is shared by every environment on the
+ * box: only when the two roots actually differ (UDE), only for a model that really lives in
+ * the model store, and only when the folder holds nothing but XppMetadata — i.e. it is a
+ * write-back stub and not a package deployed there on purpose. Anything unexpected is left
+ * alone and reported; a build is never failed over it.
+ */
 async function removeStaleFrameworkCompilerMetadata(
   ctx: XppcBuildContext,
   modelName: string,
