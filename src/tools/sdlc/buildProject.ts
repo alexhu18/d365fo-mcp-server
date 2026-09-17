@@ -708,6 +708,60 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
+ * Delete the target model's OWN compiler metadata so xppc regenerates it from source.
+ *
+ * xppc's "Metadata Write-Back" phase does not reliably refresh an existing
+ * `<compilermetadata>\<Model>\XppMetadata` tree for elements that changed. Measured on
+ * 10.0.2527.174: a class had a field removed, `-incremental` was omitted (full build), the
+ * write-back phase ran (57ms, per the phase table) and the compiled `.netmodule` correctly
+ * dropped the field — while `XppMetadata\<Model>\AxClass\<Class>.xml` was left untouched at a
+ * previous build's timestamp, still declaring it.
+ *
+ * That matters far beyond the metadata tree, because `RuntimeMetadataWriter.WriteAll`
+ * (see generateMetadata.ts) SERIALIZES THE COMPILER METADATA into the binary `.md` manifests the
+ * AOS reads — it never looks at the authoring XML. Proof: with this tree moved aside the writer
+ * fails outright with "Compiler metadata not set before serialization to runtime format". So a
+ * stale XppMetadata silently yields a stale `.md`, and a deployed package whose runtime metadata
+ * contradicts its own IL — declaring members the compiled code no longer has. The build reports
+ * success throughout, which is what makes it dangerous: it is invisible without probing the
+ * artifacts for a symbol you know you just changed.
+ *
+ * Removing the tree makes the write-back unconditional, since there is nothing for xppc to
+ * consider current. Verified: same source, same flags, `.md` shrank by exactly the removed
+ * field's declaration and the phantom member was gone from every artifact.
+ *
+ * Full builds only. `-incremental` deliberately compares against this baseline to decide what to
+ * recompile, so clearing it there would defeat the point of an incremental build; a full build is
+ * already the "make it correct from scratch" path and pays ~6s more on a model this size.
+ */
+async function removeModelCompilerMetadata(
+  ctx: XppcBuildContext,
+  modelName: string,
+): Promise<void> {
+  const xppMetadataDir = path.join(ctx.compilerMetadataPath, modelName, 'XppMetadata');
+
+  try {
+    await access(xppMetadataDir);
+  } catch {
+    // Nothing there yet (first build of this model) — the write-back has nothing to skip.
+    return;
+  }
+
+  try {
+    await rm(xppMetadataDir, { recursive: true, force: true });
+    await buildLog('INFO', `Full build: cleared compiler metadata so xppc regenerates it — ${xppMetadataDir}`);
+  } catch (err: any) {
+    // A lock or permission problem here does not justify failing the build: the result is the
+    // pre-existing stale-metadata behaviour, not a worse one. Say so loudly instead, because it
+    // means the .md manifests this build produces may not match the compiled code.
+    await buildLog(
+      'WARN',
+      `Could not clear ${xppMetadataDir} (${err?.message ?? err}) — runtime .md manifests may be stale for changed elements`,
+    );
+  }
+}
+
+/**
  * Delete the compiler-metadata stub an earlier build left in the framework directory.
  *
  * While `-compilermetadata` pointed at the framework directory, every build of a customer
@@ -783,6 +837,13 @@ async function spawnXppcForState(ctx: XppcBuildContext, state: BuildJobState): P
   assertSafePath(compilerMetadataPath, 'Compiler metadata path');
 
   await removeStaleFrameworkCompilerMetadata(ctx, modelName);
+
+  // Only for the model actually being fully rebuilt — see removeModelCompilerMetadata. Without
+  // this, xppc's write-back can leave changed elements stale in XppMetadata, and the runtime .md
+  // manifests generated from it then contradict the compiled netmodule.
+  if (useFullBuild) {
+    await removeModelCompilerMetadata(ctx, modelName);
+  }
 
   const outputPath = path.join(customPackagesPath, modelName, 'bin');
   const xppcErrLog = state.logFile.replace('.log', '.xppc.err');
