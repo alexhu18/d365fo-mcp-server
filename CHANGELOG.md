@@ -28,6 +28,32 @@ those are called out explicitly below.
 
 ## [Unreleased]
 
+### Dependencies
+- Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
+  1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →
+  26.6.1, `zod` 4.6.1 → 4.6.5, `hono` 4.13.7 → 4.13.8, plus transitive updates
+  (`package-lock.json` only). `@clack/prompts` 1.8.1 now types a cancelled
+  prompt as `typeof CANCEL_SYMBOL` instead of `symbol`, which broke the
+  type-check of every CLI prompt; the CLI's `ensure()` helper now strips any
+  symbol from the result type. No runtime change.
+
+### Fixed
+- **An incremental build still shipped runtime metadata for code that no longer
+  existed.** xppc's metadata write-back rewrites an element's
+  `XppMetadata` file when the element gains something, but never when it loses
+  something: a removed field or a deleted class stays declared there, and the
+  binary `.md` manifests are serialized from that tree — under a green build.
+  #1026 fixed this for `fullBuild: true` by clearing the whole tree; an
+  incremental build (the default) cannot do that, because xppc then writes back
+  only what it recompiles and every unchanged element would disappear. Before
+  every incremental compile, `build_d365fo_project` now deletes only the
+  metadata files whose source is newer (and touches that source, so xppc is
+  sure to recompile it even if an earlier build already did) or whose source is
+  gone. A model folder with no source at all is left alone. Verified against
+  xppc on a UDE box: removed fields and deleted classes disappear from the
+  metadata and the `.md`, unchanged elements are untouched, and the scan takes
+  ~0.3 s for a 4,400-element package.
+
 ## [1.17.4] — 2026-09-10
 
 ### Dependencies
