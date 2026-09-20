@@ -74,21 +74,34 @@ export function readIndexedMethodSource(
 }
 
 /**
- * Every indexed method body for one owner, keyed by lowercased method name.
+ * Indexed method bodies for one owner, keyed by lowercased method name.
  *
- * Used by the class reader, which needs the whole set in one pass; a per-method
- * call would issue one statement per method on a class that can carry hundreds.
+ * One statement for the whole set, because a per-method call would issue one
+ * round trip per method on a class that can carry hundreds. `methodNames`
+ * narrows it to the ones the caller will actually render: a class reader shows
+ * a page of 15, while the owner's full set reaches 510 methods / 1.39 MB (`Tax`)
+ * on the production index — bytes that a synchronous `node:sqlite` read pays for
+ * in event-loop time. Omit it only when the whole set really is wanted.
+ *
+ * The `IN` list compares on the column's own BINARY collation, which is what the
+ * callers want: the names they pass come out of this same table, so they are
+ * already the AOT's spelling.
  */
 export function readIndexedMethodSources(
   db: DbLike,
   ownerName: string,
+  methodNames?: string[],
 ): Map<string, IndexedMethodSource> {
   const out = new Map<string, IndexedMethodSource>();
+  if (methodNames && methodNames.length === 0) return out;
   try {
+    const filter = methodNames
+      ? ` AND name IN (${methodNames.map(() => '?').join(', ')})`
+      : '';
     const rows = db.prepare(
       `SELECT name, source, signature, model FROM symbols
-       WHERE parent_name = ? AND type = 'method'`,
-    ).all(ownerName) as MethodSourceRow[];
+       WHERE parent_name = ? AND type = 'method'${filter}`,
+    ).all(ownerName, ...(methodNames ?? [])) as MethodSourceRow[];
 
     for (const row of rows) {
       if (!row?.source) continue;

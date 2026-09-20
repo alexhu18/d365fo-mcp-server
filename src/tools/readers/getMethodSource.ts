@@ -45,15 +45,27 @@ export async function getMethodSourceTool(request: CallToolRequest, context: Xpp
     if (bridgeResult) return bridgeResult;
 
     // Fallback: parse XML file from disk (same pattern as classInfo.ts)
-    const xmlResult = await tryXmlMethodSource(context, className, methodName);
-    if (xmlResult) return xmlResult;
+    const xml = await tryXmlMethodSource(context, className, methodName);
+    if (xml.status === 'hit') return xml.result;
 
     // Fallback: the body stored in the symbol index. Both readers above need the
     // Windows VM — the bridge is a .NET Framework process and the XML path reads
     // PackagesLocalDirectory — so on an Azure read-only deployment neither can
     // ever answer, and this is the only layer that can.
-    const indexResult = tryIndexMethodSource(context, className, methodName);
-    if (indexResult) return indexResult;
+    //
+    // ONLY when the file could not be read. `not-declared` means the object's
+    // own metadata was parsed and does not declare this member, which is a live
+    // fact about the model; the index is a pipeline snapshot and can still hold
+    // a method that was renamed or deleted since. Serving it there would beat a
+    // correct "not found" with a stale body AND stamp it "metadata files
+    // unavailable", which was not true. This ordering is specific to THIS
+    // reader, where the files are authoritative when reachable — elsewhere the
+    // index is deliberately consulted first for what it is good at (whole-object
+    // listings, search, anything that must answer in milliseconds).
+    if (xml.status !== 'not-declared') {
+      const indexResult = tryIndexMethodSource(context, className, methodName);
+      if (indexResult) return indexResult;
+    }
 
     // Inherited methods: all three readers above see declared members only, so a
     // class that inherits the method rather than declaring it would report a
@@ -144,10 +156,13 @@ async function tryInheritedMethodSource(
     if (fromBridge) return annotateInherited(fromBridge as any, className, ancestor, methodName);
 
     const fromXml = await tryXmlMethodSource(context, ancestor, methodName);
-    if (fromXml) return annotateInherited(fromXml, className, ancestor, methodName);
+    if (fromXml.status === 'hit') return annotateInherited(fromXml.result, className, ancestor, methodName);
 
     // Same reason as the declared-member path: on Azure the two above cannot
-    // answer, so without this an inherited method stays unreadable there.
+    // answer, so without this an inherited method stays unreadable there — and
+    // the same gate, so a live ancestor file that does not declare the member
+    // is not overruled by a stale row that says it does.
+    if (fromXml.status === 'not-declared') continue;
     const fromIndex = tryIndexMethodSource(context, ancestor, methodName);
     if (fromIndex) return annotateInherited(fromIndex, className, ancestor, methodName);
   }
@@ -211,6 +226,22 @@ function tryIndexMethodSource(
 }
 
 /**
+ * What the XML reader found, and — when it found nothing — whether that was an
+ * answer or a failure.
+ *
+ * The two are not interchangeable. `not-declared` is the object's own metadata,
+ * read just now, stating that it has no such member; `unreachable` is this
+ * reader being unable to look. Collapsing both into `null` is what let a stale
+ * indexed body answer a question the live file had already answered correctly.
+ */
+type XmlMethodLookup =
+  | { status: 'hit'; result: MethodSourceResult }
+  | { status: 'not-declared' }
+  | { status: 'unreachable' };
+
+type MethodSourceResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
+
+/**
  * Try XML file parsing for method source.
  * Fallback when C# bridge is unavailable (Azure, Linux, bridge not running).
  * Mirrors the pattern from classInfo.ts: parse XML with timeout guard.
@@ -219,9 +250,9 @@ async function tryXmlMethodSource(
   context: XppServerContext,
   className: string,
   methodName: string,
-): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean } | null> {
+): Promise<XmlMethodLookup> {
   const { parser, symbolIndex } = context;
-  if (!parser) return null;
+  if (!parser) return { status: 'unreachable' };
 
   // Locate the class file path from SQLite. `className` is already canonical
   // (resolveClassName), so this stays a BINARY probe on idx_name_type.
@@ -237,7 +268,7 @@ async function tryXmlMethodSource(
     `).get(className);
   } catch { /* DB not available */ }
 
-  if (!classRow?.file_path) return null;
+  if (!classRow?.file_path) return { status: 'unreachable' };
 
   try {
     const parseResult = await Promise.race([
@@ -246,12 +277,15 @@ async function tryXmlMethodSource(
         setTimeout(() => resolve({ success: false, error: 'timeout' }), 3000)
       ),
     ]);
-    if (!parseResult.success || !parseResult.data) return null;
+    // No file, a parse error or the 3 s timeout — this reader could not look.
+    if (!parseResult.success || !parseResult.data) return { status: 'unreachable' };
 
     const method = parseResult.data.methods.find(
       (m: any) => m.name.toLowerCase() === methodName.toLowerCase()
     );
-    if (!method?.source) return null;
+    // The file WAS read: it genuinely does not declare this member. A body with
+    // no source is the same statement — there is nothing here to show.
+    if (!method?.source) return { status: 'not-declared' };
 
     // `method.name` is the AOT's own spelling; the find above is
     // case-insensitive, so echoing `methodName` would print the caller's casing
@@ -262,10 +296,10 @@ async function tryXmlMethodSource(
       `_Source: XML file parsing (bridge unavailable)_\n` +
       obsoleteWarning(method.source) +
       `\n\`\`\`xpp\n${method.source}\n\`\`\``;
-    return { content: [{ type: 'text', text }] };
+    return { status: 'hit', result: { content: [{ type: 'text', text }] } };
   } catch (e) {
     console.error(`[getMethodSource] XML parse for ${className}.${methodName} failed: ${e}`);
-    return null;
+    return { status: 'unreachable' };
   }
 }
 

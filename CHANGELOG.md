@@ -28,6 +28,28 @@ those are called out explicitly below.
 
 ## [Unreleased]
 
+### Added
+- **Method bodies are served from the symbol index when the bridge and the
+  metadata files are both unreachable.** A read-only deployment has neither a
+  C# bridge (.NET Framework) nor a PackagesLocalDirectory, which were the only
+  two sources the body readers consulted, so every request for X++ source there
+  answered "not found" or "signatures only" — for bodies the server had already
+  indexed. `symbols.source` is populated at index time for every method-owning
+  type: measured on a production index, 639,397 method rows, 100% with a
+  non-empty body, averaging 763 characters against the 331-character
+  `source_snippet` preview. `get_object_info` (both `options:{method,
+  include:"source"}` and the `compact:false` listing) and `find_references` now
+  fall back to it, always LAST, and label the output as coming from a snapshot
+  that can lag the live model. No schema change, no re-index. What it does not
+  change: `symbols_fts` still indexes `source_snippet`, so which methods
+  `find_references` can FIND is the same — a caller that never mentions the name
+  in its first ten lines stays invisible.
+- The fallback is skipped when the object's own metadata file WAS read and does
+  not declare the method. That is a live fact about the model, and the index is
+  a snapshot that can still hold a method renamed or deleted since — serving it
+  would beat a correct "not found" with a stale body, under a line claiming the
+  metadata files were unavailable when one had just been parsed.
+
 ### Dependencies
 - Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
   1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →

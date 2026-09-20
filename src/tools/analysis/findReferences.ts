@@ -530,13 +530,20 @@ function scanDeclaringTypeSource(symbolIndex: any, methodName: string, limit: nu
 
     for (const owner of owners) {
       let source: string | undefined;
+      // "Reachable but deliberately not read" is not the same as "cannot be
+      // read": falling through to the index for an 8 MB owner would spend the
+      // very cost this guard exists to refuse, just on a different source.
+      let refusedByGuard = false;
       try {
         const stat = fs.statSync(owner.file_path);
         // An AOT class file is source; anything enormous is not worth the read.
         if (stat.isFile() && stat.size <= 8_000_000) {
           source = fs.readFileSync(owner.file_path, 'utf-8');
+        } else {
+          refusedByGuard = true;
         }
       } catch { /* not reachable from here — try the index below */ }
+      if (refusedByGuard) continue;
 
       // The file is a Windows-VM path, so on Azure the read above can never
       // succeed and this recovery returned nothing at all. The same bodies are

@@ -125,3 +125,44 @@ describe('obsoleteWarning', () => {
     expect(obsoleteWarning(BODY)).toBe('');
   });
 });
+
+describe('readIndexedMethodSources scoped to named methods', () => {
+  it('asks for exactly the names it was given', () => {
+    const captured: string[] = [];
+    const params: unknown[][] = [];
+    const db = {
+      prepare(sql: string) {
+        captured.push(sql.replace(/\s+/g, ' '));
+        return {
+          get: () => undefined,
+          all: (...p: unknown[]) => { params.push(p); return [{ name: 'find', source: BODY, signature: null, model: null }]; },
+        };
+      },
+    };
+
+    const map = readIndexedMethodSources(db as any, 'CustTable', ['find', 'initValue']);
+
+    expect(captured[0]).toContain('name IN (?, ?)');
+    expect(params[0]).toEqual(['CustTable', 'find', 'initValue']);
+    expect(map.get('find')!.source).toBe(BODY);
+  });
+
+  it('issues no query at all for an empty page', () => {
+    const db = { prepare: () => { throw new Error('should not be called'); } };
+    expect(readIndexedMethodSources(db as any, 'CustTable', []).size).toBe(0);
+  });
+
+  it('still reads the whole owner when no names are given', () => {
+    const captured: string[] = [];
+    const db = {
+      prepare(sql: string) {
+        captured.push(sql.replace(/\s+/g, ' '));
+        return { get: () => undefined, all: () => [{ name: 'find', source: BODY, signature: null, model: null }] };
+      },
+    };
+
+    readIndexedMethodSources(db as any, 'CustTable');
+
+    expect(captured[0]).not.toContain('name IN');
+  });
+});

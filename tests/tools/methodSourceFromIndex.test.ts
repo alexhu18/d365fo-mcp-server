@@ -197,3 +197,105 @@ describe('class listing with compact:false and no metadata files', () => {
     expect(bodyQueries).toHaveLength(0);
   });
 });
+
+/**
+ * The index answers where the files cannot be READ — not where they were read
+ * and said no. The XML reader returned the same `null` for both, so a method
+ * deleted or renamed since the last index run was served from the snapshot,
+ * under a line claiming the metadata files were unavailable. They were not: the
+ * file had just been parsed, and it is the live fact.
+ */
+describe('a readable metadata file that does not declare the method', () => {
+  const parsedButAbsent = {
+    parseClassFile: vi.fn(async () => ({ success: true, data: { methods: [{ name: 'stillHere', source: 'void stillHere() {}' }] } })),
+    parseTableFile: vi.fn(async () => ({ success: true, data: { methods: [{ name: 'stillHere', source: 'void stillHere() {}' }] } })),
+    parseViewFile: vi.fn(async () => ({ success: true, data: { methods: [] } })),
+  } as any;
+
+  it('reports not-found instead of serving the stale indexed body', async () => {
+    const ctx = buildContext(makeDb(), { parser: parsedButAbsent });
+
+    const result = await getMethodSourceTool(
+      req('get_method_source', { className: 'CustTable', methodName: 'find' }),
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('not found');
+    // The body the index still holds must not appear anywhere in the answer.
+    expect(result.content[0].text).not.toContain('select firstonly custTable');
+  });
+
+  it('does not claim the metadata files were unavailable when one was just parsed', async () => {
+    const ctx = buildContext(makeDb(), { parser: parsedButAbsent });
+
+    const result = await getMethodSourceTool(
+      req('get_method_source', { className: 'CustTable', methodName: 'find' }),
+      ctx,
+    );
+
+    expect(result.content[0].text).not.toContain('metadata files unavailable');
+  });
+
+  it('still serves the index when the parse FAILED — the unreachable case is untouched', async () => {
+    const ctx = buildContext(makeDb()); // parser rejects every file (Azure)
+
+    const result = await getMethodSourceTool(
+      req('get_method_source', { className: 'CustTable', methodName: 'find' }),
+      ctx,
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('select firstonly custTable');
+  });
+});
+
+describe('the indexed class listing', () => {
+  it('keeps the signature, which the 200-char body preview often cannot show', async () => {
+    // A real AOT body opens with its doc comment, so the declaration is past the
+    // ceiling — 44% of CustTable's methods, 75% of Tax's, on the production index.
+    const docComment = `/// <summary>\n${'/// padding padding padding padding padding\n'.repeat(6)}/// </summary>\nstatic CustTable find(CustAccount _a)\n{\n}`;
+    const ctx = buildContext(makeDb({
+      methods: [{ name: 'find', source: docComment, signature: 'static CustTable find()', model: 'Foundation' }],
+    }));
+
+    const result = await classInfoTool(req('class_info', { className: 'CustTable', compact: false }), ctx);
+
+    const text = result.content[0].text;
+    expect(text).toContain('static CustTable find()');
+    expect(text).not.toContain('static CustTable find(CustAccount _a)'); // truncated away
+  });
+
+  it('asks only for the methods on this page, not for every body the owner has', async () => {
+    const calls: Array<{ sql: string; params: unknown[] }> = [];
+    const db = {
+      prepare(sql: string) {
+        const flat = sql.replace(/\s+/g, ' ');
+        const isBodyQuery = flat.includes("type = 'method'") && flat.includes('parent_name = ?');
+        return {
+          get: (..._p: unknown[]) => (isBodyQuery ? undefined : { name: 'CustTable', type: 'table', model: 'Foundation', file_path: 'K:/Packages/CustTable.xml' }),
+          all: (...params: unknown[]) => {
+            if (isBodyQuery) calls.push({ sql: flat, params });
+            return [];
+          },
+          run: () => ({ changes: 0 }),
+        };
+      },
+    };
+    const ctx = buildContext(db);
+    // 40 methods, one page of 15.
+    (ctx.symbolIndex as any).getClassMethods = vi.fn(() =>
+      Array.from({ length: 40 }, (_, i) => ({ name: `method${i}`, signature: `void method${i}()` })),
+    );
+
+    await classInfoTool(req('class_info', { className: 'CustTable', compact: false }), ctx);
+
+    const bodyQuery = calls.find(c => c.sql.includes('source'));
+    expect(bodyQuery).toBeDefined();
+    expect(bodyQuery!.sql).toContain('name IN (');
+    // owner + exactly the 15 names on the page, not all 40.
+    expect(bodyQuery!.params).toHaveLength(16);
+    expect(bodyQuery!.params).toContain('method0');
+    expect(bodyQuery!.params).not.toContain('method15');
+  });
+});

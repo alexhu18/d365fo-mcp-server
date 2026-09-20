@@ -181,15 +181,22 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 }
 
 /**
- * Indexed bodies for one owner, or an empty map when the DB cannot be opened.
+ * Indexed bodies for the methods on THIS page, or an empty map when the DB
+ * cannot be opened.
+ *
+ * Scoped to `methodNames` because the owner's whole body set is far larger than
+ * one page of previews: measured on the production index, `Tax` is 510 methods /
+ * 1.39 MB and `SalesLine` 808 / 836 KB, against the ~3 KB this renderer actually
+ * prints — and `node:sqlite` is synchronous, so every byte of that is time the
+ * event loop is not running.
  *
  * `getReadDb()` throws on its own (the helper's internal guard only covers the
  * query), and this renderer is the LAST fallback — throwing here would turn a
  * degraded-but-useful listing into an error.
  */
-function readIndexedBodies(symbolIndex: any, className: string) {
+function readIndexedBodies(symbolIndex: any, className: string, methodNames: string[]) {
   try {
-    return readIndexedMethodSources(symbolIndex.getReadDb(), className);
+    return readIndexedMethodSources(symbolIndex.getReadDb(), className, methodNames);
   } catch {
     return new Map();
   }
@@ -233,8 +240,8 @@ async function buildDbOnlyResponse(
   // Bodies only when they were asked for and the file could not supply them.
   // 'compact' means the caller never wanted bodies, so the index is not
   // consulted at all and the response stays the cheap one-line-per-method view.
-  const bodies = reason === 'source-unavailable'
-    ? readIndexedBodies(symbolIndex, className)
+  const bodies = reason === 'source-unavailable' && paged.length > 0
+    ? readIndexedBodies(symbolIndex, className, paged.map(m => m.name))
     : new Map();
 
   output += `## Methods (${totalMethods} total, showing ${methodOffset + 1}–${Math.min(methodOffset + METHOD_PAGE_SIZE, totalMethods)})\n\n`;
@@ -251,7 +258,14 @@ async function buildDbOnlyResponse(
     const preview = body.source.length > BODY_PREVIEW_CHARS
       ? `${body.source.slice(0, BODY_PREVIEW_CHARS)}\n// ... (${fullBodyHint(body.name)})`
       : body.source;
-    output += `### ${body.name}\n\n\`\`\`xpp\n${preview}\n\`\`\`\n\n`;
+    // The signature stays, above the body. An AOT method's `source` opens with
+    // its `/// <summary>` doc comment, so the declaration is regularly past the
+    // 200-char ceiling — measured on the production index, 44% of CustTable's
+    // methods, 55% of SalesLine's and 75% of Tax's. Printing the body INSTEAD of
+    // the signature would have handed Azure (where this path is the only one)
+    // less than the signatures-only listing it replaced. The on-disk path above
+    // keeps its **Signature:** bullet for the same reason.
+    output += `### ${body.name}\n\n\`${sig}\`\n\n\`\`\`xpp\n${preview}\n\`\`\`\n\n`;
   }
   if (hasMore) {
     output += `\n> ⚠️ ${totalMethods - methodOffset - METHOD_PAGE_SIZE} more — call with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\`\n`;
