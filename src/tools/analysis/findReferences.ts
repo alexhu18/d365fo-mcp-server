@@ -547,27 +547,35 @@ function scanDeclaringTypeSource(symbolIndex: any, methodName: string, limit: nu
 
       // The file is a Windows-VM path, so on Azure the read above can never
       // succeed and this recovery returned nothing at all. The same bodies are
-      // in the index; concatenating the owner's methods gives the scan below
-      // the same text to walk, minus the declarative XML around it.
-      if (source === undefined) {
+      // in the index — each scanned on its own, NOT concatenated: the rows come
+      // back in no particular order, so a call on a body's first line would take
+      // its leading context line from the closing brace of an unrelated method
+      // and show the agent source that does not exist anywhere.
+      let texts: string[];
+      if (source !== undefined) {
+        texts = [source];
+      } else {
         const bodies = readIndexedMethodSources(db, owner.parent_name);
         if (bodies.size === 0) continue;
-        source = [...bodies.values()].map(m => m.source).join('\n');
+        texts = [...bodies.values()].map(m => m.source);
       }
 
-      const lines = source.split('\n');
-      for (let i = 0; i < lines.length && found.length < limit; i++) {
-        // `this.m(` and `Type::m(` are calls; `m(` alone would match the
-        // declaration and every same-named member in the file.
-        if (!/\bthis\.(\w+)\(/.test(lines[i]) && !new RegExp(`::${methodName}\\s*\\(`).test(lines[i])) continue;
-        if (!lines[i].includes(methodName + '(')) continue;
-        found.push({
-          file: owner.file_path,
-          model: '',
-          context: lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 2)).join('\n').trim(),
-          referenceType: 'call',
-          caller: owner.parent_name,
-        });
+      for (const text of texts) {
+        if (found.length >= limit) break;
+        const lines = text.split('\n');
+        for (let i = 0; i < lines.length && found.length < limit; i++) {
+          // `this.m(` and `Type::m(` are calls; `m(` alone would match the
+          // declaration and every same-named member in the file.
+          if (!/\bthis\.(\w+)\(/.test(lines[i]) && !new RegExp(`::${methodName}\\s*\\(`).test(lines[i])) continue;
+          if (!lines[i].includes(methodName + '(')) continue;
+          found.push({
+            file: owner.file_path,
+            model: '',
+            context: lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 2)).join('\n').trim(),
+            referenceType: 'call',
+            caller: owner.parent_name,
+          });
+        }
       }
     }
   } catch {

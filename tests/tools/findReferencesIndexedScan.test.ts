@@ -106,6 +106,27 @@ describe('scanDeclaringTypeSource with no readable metadata file', () => {
     expect(text).not.toContain('this.buildAdjustIn(');
   });
 
+  it('never splices two bodies into one context — the rows come back in no order', async () => {
+    // The call sits on the FIRST line of its body. Concatenated, the context
+    // line above it was the closing brace of whichever unrelated method the
+    // query happened to return first, shown as if it were contiguous source.
+    const { index } = stubIndex(path.join(dir, 'Absent.xml'), {
+      bodies: [
+        { name: 'unrelated', source: ['void unrelated()', '{', '    doSomethingElse();', '}'].join('\n') },
+        { name: 'displayForm', source: ['    ret = this.buildAdjustIn(_con);', '    return ret;'].join('\n') },
+      ],
+    });
+
+    const text = textOf(await call(
+      { targetName: 'buildAdjustIn', targetType: 'method', includeContext: true }, index,
+    ));
+
+    expect(text).toContain('this.buildAdjustIn(');
+    // Nothing from the neighbouring method may appear in the rendered context.
+    expect(text).not.toMatch(/\}\s*\n\s*ret = this\.buildAdjustIn/);
+    expect(text).not.toContain('doSomethingElse');
+  });
+
   it('falls through quietly when the index has no bodies for the owner either', async () => {
     const { index } = stubIndex(path.join(dir, 'Absent.xml'), { bodies: [] });
 

@@ -20,11 +20,17 @@
  * still run first. It answers where they cannot reach at all.
  *
  * Index safety: `parent_name = ? AND type = 'method' AND name = ? COLLATE
- * NOCASE` plans on `idx_parent_type_name(parent_name, type, name)`. The
- * NOCASE compare is confined to the already-narrow (parent, type) range, which
- * is the pattern symbolLookup.ts documents as acceptable — callers are expected
- * to canonicalize the OWNER name first (see `canonicalSymbolName`), since a
- * NOCASE compare on `parent_name` itself would scan every method row.
+ * NOCASE` plans as `SEARCH symbols USING INDEX idx_type_parent (type=? AND
+ * parent_name=?)` — measured, not assumed. `idx_parent_type_name` carries the
+ * same two columns plus `name`, but its `name` column is BINARY, so a NOCASE
+ * comparison cannot seek on it and the third column buys nothing; the planner
+ * picks either index for the (type, parent) equality and filters the rest.
+ *
+ * That is what makes this safe: the NOCASE compare runs over one owner's method
+ * rows (222 on `CustTable`, 621 on `SalesTable` — the widest shape in the
+ * index), never over all 639k. Callers are still expected to canonicalize the
+ * OWNER name first (see `canonicalSymbolName`), since a NOCASE compare on
+ * `parent_name` itself has no index to narrow it and WOULD scan every row.
  */
 
 import type { DbLike } from './symbolLookup.js';

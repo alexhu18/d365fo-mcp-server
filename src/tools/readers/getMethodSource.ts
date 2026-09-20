@@ -198,8 +198,8 @@ function annotateInherited(
  *
  * Synchronous by nature (node:sqlite) and a single indexed probe, so it costs
  * nothing worth guarding with a timeout the way the XML parse above is.
- * `className` has already been canonicalized by resolveClassName, which keeps
- * the query on idx_parent_type_name.
+ * `className` has already been canonicalized by resolveClassName, which is what
+ * keeps the owner lookup on an index (see indexedMethodSource.ts for the plan).
  */
 function tryIndexMethodSource(
   context: XppServerContext,

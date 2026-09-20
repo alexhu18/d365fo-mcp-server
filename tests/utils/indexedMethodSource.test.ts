@@ -43,7 +43,7 @@ describe('readIndexedMethodSource', () => {
     expect(hit!.model).toBe('Foundation');
   });
 
-  it('stays on idx_parent_type_name — no NOCASE compare on parent_name', () => {
+  it('keeps the NOCASE compare off parent_name, which has no index to narrow it', () => {
     const captured: string[] = [];
     const db = fakeDb([{ name: 'find', source: BODY, signature: null, model: null }], captured);
 
