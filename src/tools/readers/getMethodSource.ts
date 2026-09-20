@@ -3,6 +3,9 @@
  * Returns the full X++ source code of a method.
  *
  * PRIMARY: C# bridge (IMetadataProvider) — 100% reliable, always available on VM.
+ * Then the object's XML off disk, then the body stored in the symbol index —
+ * the last of which is the only one reachable from an Azure read-only
+ * deployment, where there is neither a bridge nor a PackagesLocalDirectory.
  * SQLite "did you mean?" kept only on error path.
  */
 
@@ -13,6 +16,7 @@ import type { XppMetadataParser } from '../../metadata/xmlParser.js';
 import { tryBridgeMethodSource } from '../../bridge/bridgeAdapter.js';
 import { canonicalSymbolName } from '../../utils/symbolLookup.js';
 import { inheritedOwnerCandidates } from '../../utils/inheritanceChain.js';
+import { readIndexedMethodSource, obsoleteWarning } from '../../utils/indexedMethodSource.js';
 
 const GetMethodSourceArgsSchema = z.object({
   className: z.string().describe('Name of the class containing the method'),
@@ -41,16 +45,35 @@ export async function getMethodSourceTool(request: CallToolRequest, context: Xpp
     if (bridgeResult) return bridgeResult;
 
     // Fallback: parse XML file from disk (same pattern as classInfo.ts)
-    const xmlResult = await tryXmlMethodSource(context, className, methodName);
-    if (xmlResult) return xmlResult;
+    const xml = await tryXmlMethodSource(context, className, methodName);
+    if (xml.status === 'hit') return xml.result;
 
-    // Inherited methods: both readers above see declared members only, so a
+    // Fallback: the body stored in the symbol index. Both readers above need the
+    // Windows VM — the bridge is a .NET Framework process and the XML path reads
+    // PackagesLocalDirectory — so on an Azure read-only deployment neither can
+    // ever answer, and this is the only layer that can.
+    //
+    // ONLY when the file could not be read. `not-declared` means the object's
+    // own metadata was parsed and does not declare this member, which is a live
+    // fact about the model; the index is a pipeline snapshot and can still hold
+    // a method that was renamed or deleted since. Serving it there would beat a
+    // correct "not found" with a stale body AND stamp it "metadata files
+    // unavailable", which was not true. This ordering is specific to THIS
+    // reader, where the files are authoritative when reachable — elsewhere the
+    // index is deliberately consulted first for what it is good at (whole-object
+    // listings, search, anything that must answer in milliseconds).
+    if (xml.status !== 'not-declared') {
+      const indexResult = tryIndexMethodSource(context, className, methodName);
+      if (indexResult) return indexResult;
+    }
+
+    // Inherited methods: all three readers above see declared members only, so a
     // class that inherits the method rather than declaring it would report a
     // false "not found". Retry against the declaring ancestor.
     const inherited = await tryInheritedMethodSource(context, className, methodName);
     if (inherited) return inherited;
 
-    // Bridge and XML both unavailable — try fuzzy name suggestions from SQLite
+    // Nothing could resolve the body — try fuzzy name suggestions from SQLite
     let hint = '';
     try {
       const db = context.symbolIndex.getReadDb();
@@ -133,7 +156,15 @@ async function tryInheritedMethodSource(
     if (fromBridge) return annotateInherited(fromBridge as any, className, ancestor, methodName);
 
     const fromXml = await tryXmlMethodSource(context, ancestor, methodName);
-    if (fromXml) return annotateInherited(fromXml, className, ancestor, methodName);
+    if (fromXml.status === 'hit') return annotateInherited(fromXml.result, className, ancestor, methodName);
+
+    // Same reason as the declared-member path: on Azure the two above cannot
+    // answer, so without this an inherited method stays unreadable there — and
+    // the same gate, so a live ancestor file that does not declare the member
+    // is not overruled by a stale row that says it does.
+    if (fromXml.status === 'not-declared') continue;
+    const fromIndex = tryIndexMethodSource(context, ancestor, methodName);
+    if (fromIndex) return annotateInherited(fromIndex, className, ancestor, methodName);
   }
   return null;
 }
@@ -163,6 +194,54 @@ function annotateInherited(
 }
 
 /**
+ * Try the symbol index for a method body.
+ *
+ * Synchronous by nature (node:sqlite) and a single indexed probe, so it costs
+ * nothing worth guarding with a timeout the way the XML parse above is.
+ * `className` has already been canonicalized by resolveClassName, which is what
+ * keeps the owner lookup on an index (see indexedMethodSource.ts for the plan).
+ */
+function tryIndexMethodSource(
+  context: XppServerContext,
+  className: string,
+  methodName: string,
+): { content: Array<{ type: 'text'; text: string }>; isError?: boolean } | null {
+  let db: any;
+  try {
+    db = context.symbolIndex.getReadDb();
+  } catch {
+    return null; // DB not available
+  }
+
+  const method = readIndexedMethodSource(db, className, methodName);
+  if (!method) return null;
+
+  // `method.name` is the AOT's own spelling — same reason as the XML path (#691).
+  const text =
+    `## ${className}.${method.name}\n\n` +
+    `_Source: symbol index (bridge and metadata files unavailable)_\n` +
+    obsoleteWarning(method.source) +
+    `\n\`\`\`xpp\n${method.source}\n\`\`\``;
+  return { content: [{ type: 'text', text }] };
+}
+
+/**
+ * What the XML reader found, and — when it found nothing — whether that was an
+ * answer or a failure.
+ *
+ * The two are not interchangeable. `not-declared` is the object's own metadata,
+ * read just now, stating that it has no such member; `unreachable` is this
+ * reader being unable to look. Collapsing both into `null` is what let a stale
+ * indexed body answer a question the live file had already answered correctly.
+ */
+type XmlMethodLookup =
+  | { status: 'hit'; result: MethodSourceResult }
+  | { status: 'not-declared' }
+  | { status: 'unreachable' };
+
+type MethodSourceResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
+
+/**
  * Try XML file parsing for method source.
  * Fallback when C# bridge is unavailable (Azure, Linux, bridge not running).
  * Mirrors the pattern from classInfo.ts: parse XML with timeout guard.
@@ -171,9 +250,9 @@ async function tryXmlMethodSource(
   context: XppServerContext,
   className: string,
   methodName: string,
-): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean } | null> {
+): Promise<XmlMethodLookup> {
   const { parser, symbolIndex } = context;
-  if (!parser) return null;
+  if (!parser) return { status: 'unreachable' };
 
   // Locate the class file path from SQLite. `className` is already canonical
   // (resolveClassName), so this stays a BINARY probe on idx_name_type.
@@ -189,7 +268,7 @@ async function tryXmlMethodSource(
     `).get(className);
   } catch { /* DB not available */ }
 
-  if (!classRow?.file_path) return null;
+  if (!classRow?.file_path) return { status: 'unreachable' };
 
   try {
     const parseResult = await Promise.race([
@@ -198,19 +277,15 @@ async function tryXmlMethodSource(
         setTimeout(() => resolve({ success: false, error: 'timeout' }), 3000)
       ),
     ]);
-    if (!parseResult.success || !parseResult.data) return null;
+    // No file, a parse error or the 3 s timeout — this reader could not look.
+    if (!parseResult.success || !parseResult.data) return { status: 'unreachable' };
 
     const method = parseResult.data.methods.find(
       (m: any) => m.name.toLowerCase() === methodName.toLowerCase()
     );
-    if (!method?.source) return null;
-
-    // Detect [SysObsolete] / [Obsolete]
-    const obsoleteMatch = method.source.match(/\[\s*SysObsolete\s*\(\s*['"]([^'"]*)['"]/i)
-      ?? method.source.match(/\[\s*Obsolete\s*\(\s*['"]([^'"]*)['"]/i);
-    const obsoleteWarning = obsoleteMatch
-      ? `\n\n> ⚠️ **This method is marked obsolete.** Do NOT generate calls to it.\n> Replacement hint from the attribute: _"${obsoleteMatch[1]}"_\n> Read the hint above and use the stated replacement instead.`
-      : '';
+    // The file WAS read: it genuinely does not declare this member. A body with
+    // no source is the same statement — there is nothing here to show.
+    if (!method?.source) return { status: 'not-declared' };
 
     // `method.name` is the AOT's own spelling; the find above is
     // case-insensitive, so echoing `methodName` would print the caller's casing
@@ -219,12 +294,12 @@ async function tryXmlMethodSource(
     const text =
       `## ${className}.${method.name}\n\n` +
       `_Source: XML file parsing (bridge unavailable)_\n` +
-      obsoleteWarning +
+      obsoleteWarning(method.source) +
       `\n\`\`\`xpp\n${method.source}\n\`\`\``;
-    return { content: [{ type: 'text', text }] };
+    return { status: 'hit', result: { content: [{ type: 'text', text }] } };
   } catch (e) {
     console.error(`[getMethodSource] XML parse for ${className}.${methodName} failed: ${e}`);
-    return null;
+    return { status: 'unreachable' };
   }
 }
 
