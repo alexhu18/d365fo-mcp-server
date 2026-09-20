@@ -50,6 +50,34 @@ those are called out explicitly below.
   would beat a correct "not found" with a stale body, under a line claiming the
   metadata files were unavailable when one had just been parsed.
 
+### Fixed
+- **The naming check no longer warns about the canonical extension-class name.**
+  `CustTableBku_Extension` is exactly what the prefix style produces and what the
+  write path returns untouched, yet the check answered "Extension name does not
+  include model's extension infix Bku" and recommended `CustTableBkuBku_Extension`.
+  When `baseObjectName` is not supplied it is derived as everything before
+  `_Extension` — `CustTableBku` — which leaves an empty middle for the infix test to
+  look at. `prepare(mode="create")` never sends `baseObjectName` and the validator's
+  parameter is optional, so the warning landed on every correctly named extension
+  class asked about through either door. The derived base now gives the token back:
+  it also fixes the reported `Base Object:` (`CustTable`, not `CustTableBku`) and the
+  suggestions built from it, which had offered `CustTableBku.BkuExtension`.
+- **The check now says when the write path will use a different name.** An assembled
+  name such as `CustTable_Bku_Table_Extension` satisfies every rule and then lands on
+  disk as `CustTable_Bku_TableBku_Extension`, because the trailing `_Extension` makes
+  the whole string read as a base class and the infix is applied a second time; the
+  caller went looking for the file under the name it asked for. `class-extension`
+  names are now compared against what `d365fo_file(action="create")` would write, and
+  a difference is reported with both names. Only when the token both paths use is the
+  same one — an explicitly passed `modelPrefix` is not what the writer reads — and not
+  on a name already rejected.
+- **Converting a model-name-styled class name to the prefix style left a stray
+  separator.** `CustTable_ContosoRobotics_Extension` under `EXTENSION_NAMING_STYLE=prefix`
+  became `CustTable_Ctso_Extension`: the model token was stripped but the underscore it
+  sat behind was kept, so the infix landed one character late. It is now
+  `CustTableCtso_Extension`, the spelling every name of this shape in
+  PackagesLocalDirectory uses.
+
 ### Dependencies
 - Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
   1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →

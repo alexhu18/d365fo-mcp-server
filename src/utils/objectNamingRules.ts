@@ -15,6 +15,7 @@
  */
 
 import { getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix } from './modelClassifier.js';
+import { normalizeObjectName } from './objectNaming.js';
 import {
   matchPrefixCandidate,
   modelWritesLandIn,
@@ -173,8 +174,10 @@ export async function checkObjectNaming(
     // check demanded a parameter the caller had no way to send: `prepare` does
     // not publish baseObjectName at all, so its answer was
     // "baseObjectName is required" with no route to supplying one.
+    let baseDerivedFromExtensionWord = false;
     if (!args.baseObjectName && /_Extension$/i.test(name)) {
       args.baseObjectName = name.slice(0, name.length - '_Extension'.length);
+      baseDerivedFromExtensionWord = true;
     }
 
     const isExtension = EXTENSION_TYPES.has(args.objectType);
@@ -249,6 +252,35 @@ export async function checkObjectNaming(
     // existing extensions state one (ContosoFinanceSK → "ContosoSK"), else derived.
     const extensionInfix = prefix ? deriveExtensionInfix(prefix, modelName) : '';
 
+    // A base derived from the name still carries the token the name embeds, and that
+    // token is exactly what the rules below look for BETWEEN the base and "_Extension".
+    // Left in place it makes the check vacuous: the canonical `CustTableBku_Extension`
+    // derives base `CustTableBku`, leaving an empty middle, and warns that the name
+    // "does not include the infix Bku" — about a name that plainly does, and that the
+    // write path returns untouched. prepare(mode="create") never sends baseObjectName
+    // (prepareCreate.ts), and validate_object_naming's parameter is optional, so that
+    // warning fired on every correctly named extension class asked about either way.
+    //
+    // Stripping the token beats special-casing the comparison, because the base is
+    // published — validate_object_naming renders "Base Object:" from it and the
+    // suggestions build on it, and the un-stripped form recommended the nonsense
+    // `CustTableBku.BkuExtension`. Matches applyObjectPrefix, which likewise reads a
+    // trailing token as "already prefixed".
+    if (baseDerivedFromExtensionWord && args.baseObjectName) {
+      // Both tokens are tried, the active style's first: a name reaching the check was
+      // written under whichever style was configured THEN, so a model-name name asked
+      // about under the prefix style must still yield the base the writer derives from
+      // it (objectNaming.ts case B), or check and writer name different targets.
+      const candidates = useModelName ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
+      const derived = args.baseObjectName;
+      for (const token of candidates) {
+        if (!token || !derived.toLowerCase().endsWith(token.toLowerCase())) continue;
+        const stripped = derived.slice(0, derived.length - token.length).replace(/_+$/, '');
+        if (stripped) args.baseObjectName = stripped;
+        break;
+      }
+    }
+
     // Rule set 1: extension naming rules
     if (isExtension) {
       const baseObjectName = args.baseObjectName;
@@ -300,6 +332,37 @@ export async function checkObjectNaming(
               ? `AOT name for an element extension instead: ${baseObjectName}.${modelToken}`
               : `AOT label for extension file: ${baseObjectName}.${extensionInfix}Extension (if creating table-extension AOT object instead)`,
           );
+
+          // Say what the write path will actually call this. The rules above judge
+          // a name; normalizeObjectName WRITES one, and for an assembled name the
+          // two part company silently — `CustTable_Bku_Table_Extension` passes every
+          // check here and lands on disk as `CustTable_Bku_TableBku_Extension`,
+          // because the trailing "_Extension" makes the whole string read as a base
+          // class and the infix is applied a second time. The caller then looks for
+          // a file under the name it asked for. Same shape as #986/#987, where the
+          // checker and the writer disagreed in the other direction.
+          //
+          // Only when the token both sides use is the same one: an explicitly passed
+          // modelPrefix is not what the writer reads, and a prefix that came from
+          // detectModelPrefix is a guess off the symbol index that resolveObjectPrefix
+          // would not make. Skipped once an error stands, so a rejected name is not
+          // also told what it would have been written as.
+          if (!explicitPrefix && resolution.prefix && errors.length === 0) {
+            const wouldWrite = normalizeObjectName(name, 'class-extension', modelName || undefined);
+            if (wouldWrite !== name) {
+              warnings.push(
+                `The write path will not use this name as given.
+` +
+                `  Asked for: ${name}
+` +
+                `  d365fo_file(action="create") writes: ${wouldWrite}
+` +
+                `  Pass the element you are extending instead — "${baseObjectName}" — and the ` +
+                `prefix is applied once: ${expectedPattern}`,
+              );
+              suggestions.push(`Name the class after its target: ${expectedPattern}`);
+            }
+          }
         } else if (useModelName) {
           // AOT extensions (table/form/enum/edt), model-name style: {Base}.{ModelToken} — bare
           // model token, no "Extension" word.

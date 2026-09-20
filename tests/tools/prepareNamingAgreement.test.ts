@@ -28,6 +28,7 @@ import { validateObjectNamingTool } from '../../src/tools/analysis/validateObjec
 import { prepareCreateTool } from '../../src/tools/prepare/prepareCreate.js';
 import { prepareChangeTool } from '../../src/tools/prepare/prepareChange.js';
 import { setModelObjectNameSource, clearInferredModelPrefixes } from '../../src/utils/modelPrefixInference.js';
+import { normalizeObjectName } from '../../src/utils/objectNaming.js';
 
 const MODEL = 'ContosoRobotics';
 const PREFIX = 'CR';
@@ -194,5 +195,111 @@ describe('prepare(mode="change") validates an extension name for real', () => {
         proposedName: '1Thing',
       }), buildContext()));
     expect(prep).toMatch(/must start with a letter/i);
+  });
+});
+
+/**
+ * The base a check DERIVES from an extension name must not still carry the token the
+ * check is about to look for.
+ *
+ * `CustTableCR_Extension` is the canonical prefix-style name and the write path returns
+ * it untouched, yet the check answered "Extension name does not include model's extension
+ * infix CR" and recommended `CustTableCRCR_Extension`. Deriving the base as everything
+ * before "_Extension" gives `CustTableCR`, which leaves an EMPTY middle for the infix
+ * test — the token was eaten by the base. prepare(mode="create") never sends
+ * baseObjectName, and the validator's parameter is optional, so the ⚠️ landed on every
+ * correctly named extension class asked about through either door. Every test above
+ * passes baseObjectName explicitly, which is why none of them saw it.
+ */
+describe('a derived base does not swallow the token the rules check for', () => {
+  it('prepare(mode="create") does not warn about the canonical class-extension name', async () => {
+    const prep = textOf(await prepareCreateTool(
+      req('prepare_create', { goal: 'agreement probe', objectName: 'CustTableCR_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(prep).not.toMatch(/does not include model/i);
+    expect(prep).not.toMatch(/CustTableCRCR_Extension/);
+  });
+
+  it('the validator agrees when baseObjectName is omitted, as prepare omits it', async () => {
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTableCR_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).not.toMatch(/does not include model/i);
+    // …and the base it reports is the class being extended, not the name minus the word.
+    expect(out).toMatch(/Base Object: CustTable$/m);
+  });
+
+  it('reports the element, not the stem, for an element-type hint name', async () => {
+    // CustTableFormCR_Extension is Microsoft's documented shape for a form CoC class
+    // (CustTableFormWHS_Extension); the element it extends is CustTableForm.
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTableFormCR_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).not.toMatch(/does not include model/i);
+    expect(out).toMatch(/Base Object: CustTableForm$/m);
+  });
+
+  it('under model-name style the same holds for the model token', async () => {
+    process.env.EXTENSION_NAMING_STYLE = 'model-name';
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTable_ContosoRobotics_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).not.toMatch(/does not embed the model/i);
+    expect(out).toMatch(/Base Object: CustTable$/m);
+  });
+
+  it('still warns when the token really is absent — the strip must not silence the rule', async () => {
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTable_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).toMatch(/does not include model/i);
+    expect(out).toMatch(/Recommended: CustTableCR_Extension/);
+  });
+});
+
+/**
+ * A name the check passes must also be the name the write path uses.
+ *
+ * An assembled name like `CustTable_CR_Table_Extension` satisfies every rule — it starts
+ * with a base, ends with _Extension, embeds CR — and then lands on disk as
+ * `CustTable_CR_TableCR_Extension`, because the trailing "_Extension" makes the whole
+ * string read as a base class and the infix is applied a second time. The caller looks
+ * for the file under the name it asked for. Same shape as #986/#987, where the checker
+ * and the writer disagreed in the other direction.
+ */
+describe('the check discloses the name the write path will actually use', () => {
+  it('names the rewritten form for an assembled extension-class name', async () => {
+    const written = normalizeObjectName('CustTable_CR_Table_Extension', 'class-extension', MODEL);
+    expect(written).toBe('CustTable_CR_TableCR_Extension');
+
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTable_CR_Table_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).toMatch(/will not use this name as given/i);
+    expect(out).toContain(written);
+  });
+
+  it('says nothing for a name the write path returns untouched', async () => {
+    expect(normalizeObjectName('CustTableCR_Extension', 'class-extension', MODEL)).toBe('CustTableCR_Extension');
+
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'CustTableCR_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).not.toMatch(/will not use this name as given/i);
+  });
+
+  it('converting a model-name name to prefix style leaves no stray separator', async () => {
+    // The strip took the token off and kept the underscore it sat behind, so the infix
+    // landed one character late: CustTable_ → CustTable_CR_Extension, where every name
+    // of this shape in PackagesLocalDirectory is spelled CustTableCR_Extension.
+    expect(normalizeObjectName('CustTable_ContosoRobotics_Extension', 'class-extension', MODEL))
+      .toBe('CustTableCR_Extension');
   });
 });
