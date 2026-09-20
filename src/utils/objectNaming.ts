@@ -116,7 +116,11 @@ export function normalizeObjectName(
   ) {
     const baseName = effective.slice(0, -'_Extension'.length);
     if (baseName.toLowerCase().endsWith(modelToken.toLowerCase())) {
-      effective = baseName.slice(0, -modelToken.length) + '_Extension';
+      // Trim the separator the token was sitting behind. Without it the stripped stem
+      // keeps the separator and the infix lands one character late:
+      // CustTable_ContosoRobotics_Extension → CustTable_ → CustTable_Ctso_Extension,
+      // where the shape this converts TO is spelled CustTableCtso_Extension.
+      effective = baseName.slice(0, -modelToken.length).replace(/_+$/, '') + '_Extension';
       onNote?.(`Stripped model name infix "${modelToken}" from extension class: ${objectName} → ${effective}`);
     }
   }
