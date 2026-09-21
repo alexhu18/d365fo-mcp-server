@@ -1223,6 +1223,13 @@ export interface ModifyOutcome {
    * model guards and the direct-XML fallbacks all still apply.
    */
   createExtensionFirst?: { objectType: string; objectName: string };
+  /**
+   * The bridge declined this operation and wrote nothing (an element of that
+   * name is already there). The call did not fail, so it is not counted as a
+   * failure — but it must not be counted as applied either, which is what
+   * "3/3 operation(s) applied" did for three writes that never landed.
+   */
+  skipped?: boolean;
 }
 
 export async function modifyD365FileTool(
@@ -1862,7 +1869,7 @@ export async function modifyD365FileTool(
     // trip plus a full rebuild. Free when no write is outstanding.
     await timer.time('provider refresh (pending writes)', () => debouncedRefresh.flush());
 
-    let bridgeResult: { success: boolean; message: string; viaXmlFallback?: boolean } | null = null;
+    let bridgeResult: { success: boolean; message: string; viaXmlFallback?: boolean; skipped?: boolean } | null = null;
     /** File content captured before a replace-code, to diff the reply against. */
     let replaceCodeBefore: string | null = null;
     /**
@@ -3385,6 +3392,7 @@ export async function modifyD365FileTool(
       outcome.objectType = objectType;
       outcome.objectName = objectName;
       outcome.modelName = modelName || getConfigManager().getModelName() || undefined;
+      outcome.skipped = bridgeResult.skipped === true;
     }
 
     // Re-index the modified object in-process. A modify changes the symbols the
@@ -3426,9 +3434,15 @@ export async function modifyD365FileTool(
         {
           type: 'text',
           text:
-            `✅ ${operation} on ${objectType} "${objectName}" — applied via ${bridgeResult.viaXmlFallback
-              ? "this server's XML writer (no bridge path for this operation)"
-              : 'IMetadataProvider.Update()'}${crossModelNotice}${autoCorrectNote}\n\n` +
+            // A skip is not an application. Saying "✅ … applied via
+            // IMetadataProvider.Update()" over a write the provider declined is
+            // how three dropped data sources read as three successes; the 🔧 API
+            // line below carries the bridge's own reason.
+            (bridgeResult.skipped
+              ? `⏭️ ${operation} on ${objectType} "${objectName}" — SKIPPED, nothing was written${crossModelNotice}${autoCorrectNote}\n\n`
+              : `✅ ${operation} on ${objectType} "${objectName}" — applied via ${bridgeResult.viaXmlFallback
+                  ? "this server's XML writer (no bridge path for this operation)"
+                  : 'IMetadataProvider.Update()'}${crossModelNotice}${autoCorrectNote}\n\n`) +
             `**File:** ${actualFilePath}${addControlNote}${generationNote}${bridgeValidation}${projectMessage}\n` +
             `🔧 API: ${bridgeResult.message}${preservationNote}${changedLinesNote}${xppLintNote}${xppRuleNote}${addFieldBpNote}${fieldGroupRenderNote}${backupNote}${verifyNote}${indexNote}${bpNote}${formOrderNote}${timer.render()}` +
             // "Review changes in Visual Studio" is not something the caller can act

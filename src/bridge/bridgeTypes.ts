@@ -455,6 +455,20 @@ export interface BridgeWriteResult {
    * create ops and on add-control; the write itself still succeeded.
    */
   unsupportedProperties?: string[];
+  /**
+   * The bridge declined the operation and changed NOTHING — an element with that
+   * name is already there. `success` stays true because nothing failed, so a
+   * caller that reads only `success` reports a write that did not happen. Render
+   * it with skippedMessage() (bridgeAdapter.ts) rather than the success branch.
+   *
+   * Returned today by add-field (table-extension), add-field-to-field-group,
+   * add-menu-item-to-menu and add-data-source. It was absent from this interface
+   * for as long as the bridge has been sending it, which is precisely why four
+   * wrappers could ignore it without so much as a type error.
+   */
+  skipped?: boolean;
+  /** Why the bridge skipped, in its own words. Only set alongside `skipped`. */
+  reason?: string;
   api?: string;
 }
 

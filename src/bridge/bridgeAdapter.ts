@@ -1547,6 +1547,38 @@ export function unappliedSuffix(result: { unsupportedProperties?: string[] }): s
   return `\n⚠️ NOT applied — this object type has nowhere to store them: ${dropped.join(', ')}`;
 }
 
+/** What a bridge write returns when it declined to do anything. */
+export interface BridgeSkippable {
+  skipped?: boolean;
+  reason?: string;
+}
+
+/**
+ * Renders a bridge result that declined the write, or null when it did write.
+ *
+ * The bridge has long been able to answer `{ success: true, skipped: true, reason }`
+ * — it did the honest thing and said it changed nothing. Nothing on this side read
+ * `skipped`, so every decline fell through the caller's `result.success` branch and
+ * was rendered "✅ … added": a write that never happened, reported as one, with the
+ * bridge's own explanation discarded on the way past.
+ *
+ * `success` from the bridge means "this did not fail", NOT "the object changed".
+ * Any wrapper whose operation can skip must ask this before claiming a write.
+ *
+ * Exactly the lesson unappliedSuffix() above was added for, one field over — which
+ * is why both live here together.
+ */
+export function skippedMessage(result: BridgeSkippable, subject: string): string | null {
+  if (result.skipped !== true) return null;
+  const reason = result.reason?.trim();
+  return (
+    `⏭️ NOT written — ${subject} was skipped by the bridge` +
+    (reason ? `: ${reason}` : ' (no reason given)') +
+    `\n   Nothing changed on disk. If you meant to replace what is already there, ` +
+    `remove or rename it first — re-sending this operation will skip again.`
+  );
+}
+
 /**
  * Checks if bridge can handle this create operation.
  */
@@ -1754,7 +1786,7 @@ export async function bridgeAddField(
   mandatory?: boolean,
   label?: string,
   mapped?: { dataField?: string; dataSource?: string; fieldGroupName?: string },
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
 
   try {
@@ -1764,9 +1796,10 @@ export async function bridgeAddField(
     );
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Field '${fieldName}'`) ?? (result.success
         ? `✅ Field '${fieldName}' added via ${result.api}`
-        : `Bridge addField returned success=false`,
+        : `Bridge addField returned success=false`),
     };
   } catch (e) {
     // Record into the per-call failure sink as well as returning the
@@ -2171,7 +2204,7 @@ export async function bridgeAddFieldToFieldGroup(
   groupName: string,
   fieldName: string,
   extendBaseFieldGroup?: boolean,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
     const result = await bridge.addFieldToFieldGroup(tableName, groupName, fieldName, extendBaseFieldGroup);
@@ -2184,9 +2217,10 @@ export async function bridgeAddFieldToFieldGroup(
       : '<FieldGroups>';
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Field '${fieldName}' → group '${groupName}'`) ?? (result.success
         ? `✅ Field '${fieldName}' added to group '${groupName}' in ${target} via ${result.api}`
-        : `Bridge addFieldToFieldGroup returned success=false`,
+        : `Bridge addFieldToFieldGroup returned success=false`),
     };
   } catch (e) {
     // Record into the per-call failure sink as well as returning the
@@ -2436,15 +2470,17 @@ export async function bridgeAddDataSource(
   table: string,
   joinSource?: string,
   linkType?: string,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
     const result = await bridge.addDataSource(objectType, objectName, dsName, table, joinSource, linkType);
+    const skip = skippedMessage(result, `DataSource '${dsName}'`);
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skip ?? (result.success
         ? `✅ DataSource '${dsName}' added via ${result.api}`
-        : `Bridge addDataSource returned success=false`,
+        : `Bridge addDataSource returned success=false`),
     };
   } catch (e) {
     // Record into the per-call failure sink as well as returning the
@@ -2499,16 +2535,17 @@ export async function bridgeAddMenuItemToMenu(
   menuName: string,
   menuItemToAdd: string,
   menuItemToAddType?: string,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
 
   try {
     const result = await bridge.addMenuItemToMenu(menuName, menuItemToAdd, menuItemToAddType);
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Menu item '${menuItemToAdd}'`) ?? (result.success
         ? `✅ Menu item '${menuItemToAdd}' added via ${result.api}`
-        : `Bridge addMenuItemToMenu returned success=false`,
+        : `Bridge addMenuItemToMenu returned success=false`),
     };
   } catch (e) {
     // Record into the per-call failure sink as well as returning the

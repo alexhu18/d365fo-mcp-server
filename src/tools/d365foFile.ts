@@ -258,7 +258,7 @@ async function runModifyBatch(
     };
   }
 
-  const results: Array<{ label: string; ok: boolean; text: string }> = [];
+  const results: Array<{ label: string; ok: boolean; text: string; skipped?: boolean }> = [];
   let stoppedAt = -1;
 
   // What each operation is travelling with. An entry runs as its own modify
@@ -344,8 +344,21 @@ async function runModifyBatch(
     const outcome: ModifyOutcome = {};
     const result = await modifyWithExtensionAutoCreate(entryArgs, context, outcome);
     const ok = !result?.isError;
-    results.push({ label: `#${i + 1} ${opName}`, ok, text: resultText(result) });
-    if (ok && outcome.filePath) written.set(outcome.filePath, outcome);
+    results.push({
+      label: `#${i + 1} ${opName}`,
+      ok,
+      // A bridge skip is neither a failure nor an application: the batch carries
+      // on (there is nothing to recover from), but the header must not fold it
+      // into "applied" the way "3/3" once did for three writes that never landed.
+      skipped: ok && outcome.skipped === true,
+      text: resultText(result),
+    });
+    // A skip wrote nothing, so it must not put the file in `written`: that set
+    // drives the per-file "✅ Verified: on disk" and index trailers, and a batch
+    // in which every operation skipped would otherwise still sign off on a file
+    // it never touched. A file that ALSO had a real write stays in, from that
+    // operation's own outcome.
+    if (ok && !outcome.skipped && outcome.filePath) written.set(outcome.filePath, outcome);
 
     // Stop on the first failure. These operations are ordered on purpose — a
     // field group references a field added two operations earlier — so carrying
@@ -354,14 +367,20 @@ async function runModifyBatch(
     if (!ok) { stoppedAt = i; break; }
   }
 
-  const succeeded = results.filter(r => r.ok).length;
-  const failed = results.length - succeeded;
-  const skipped = operations.length - results.length;
+  // `ok` covers both a real write and a bridge skip, so "applied" is the ok ones
+  // MINUS the skips — otherwise a batch in which nothing whatsoever reached disk
+  // still reported every operation applied.
+  const declined = results.filter(r => r.ok && r.skipped).length;
+  const succeeded = results.filter(r => r.ok).length - declined;
+  const failed = results.filter(r => !r.ok).length;
+  const notAttempted = operations.length - results.length;
 
   const head =
-    `${failed === 0 ? '✅' : '⚠️'} d365fo_file(action="modify") — ${succeeded}/${operations.length} operation(s) applied` +
+    `${failed === 0 ? (declined ? '⏭️' : '✅') : '⚠️'} d365fo_file(action="modify") — ` +
+    `${succeeded}/${operations.length} operation(s) applied` +
+    (declined ? `, ${declined} skipped (nothing written — see below)` : '') +
     (failed ? `, failed at #${stoppedAt + 1}` : '') +
-    (skipped ? `, ${skipped} not attempted` : '');
+    (notAttempted ? `, ${notAttempted} not attempted` : '');
 
   const body = results
     .map(r => {
@@ -371,7 +390,7 @@ async function runModifyBatch(
           `\n\n> ✂️ This operation's output was truncated at ${MAX_OPERATION_CHARS} chars ` +
           `(${text.length - MAX_OPERATION_CHARS} omitted). The operation itself is unaffected.`
         : text;
-      return `\n\n### ${r.ok ? '✅' : '❌'} ${r.label}\n${kept}`;
+      return `\n\n### ${r.ok ? (r.skipped ? '⏭️' : '✅') : '❌'} ${r.label}\n${kept}`;
     })
     .join('');
 
