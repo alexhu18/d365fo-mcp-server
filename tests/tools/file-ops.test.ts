@@ -96,19 +96,27 @@ vi.mock('../../src/utils/packageResolver', () => ({
   })),
 }));
 
-vi.mock('../../src/utils/modelClassifier', () => ({
-  registerCustomModel: vi.fn(),
-  resolveObjectPrefix: vi.fn(() => ''),
-  applyObjectPrefix: vi.fn((name: string) => name),
-  getObjectSuffix: vi.fn(() => ''),
-  applyObjectSuffix: vi.fn((name: string) => name),
-  getExtensionNamingStyle: vi.fn(() => 'prefix'),
-  // validate_object_naming derives the extension token from the model's own
-  // convention; the identity form keeps these tests on the plain prefix infix.
-  deriveExtensionInfix: vi.fn((prefix: string) => prefix),
-  isCustomModel: vi.fn(() => true),
-  isStandardModel: vi.fn(() => false),
-}));
+vi.mock('../../src/utils/modelClassifier', () => {
+  const getExtensionNamingStyle = vi.fn(() => 'prefix');
+  return {
+    registerCustomModel: vi.fn(),
+    resolveObjectPrefix: vi.fn(() => ''),
+    applyObjectPrefix: vi.fn((name: string) => name),
+    getObjectSuffix: vi.fn(() => ''),
+    applyObjectSuffix: vi.fn((name: string) => name),
+    getExtensionNamingStyle,
+    // Delegates, exactly as the real one does when EXTENSION_CLASS_NAMING_STYLE is
+    // unset. A fixed 'prefix' here would quietly change what the tests below mean:
+    // several switch getExtensionNamingStyle to 'model-name' and then assert on a
+    // CLASS extension, which now asks this function instead.
+    getExtensionClassNamingStyle: vi.fn(() => getExtensionNamingStyle()),
+    // validate_object_naming derives the extension token from the model's own
+    // convention; the identity form keeps these tests on the plain prefix infix.
+    deriveExtensionInfix: vi.fn((prefix: string) => prefix),
+    isCustomModel: vi.fn(() => true),
+    isStandardModel: vi.fn(() => false),
+  };
+});
 
 // These fixtures create into model "Contoso" while the mocked workspace targets
 // "MyModel" — a cross-model write, which d365fo_file now refuses by default. The

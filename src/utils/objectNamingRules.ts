@@ -14,7 +14,12 @@
  * ~35 existing tests are the proof that the rules did not change in the move.
  */
 
-import { getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix } from './modelClassifier.js';
+import {
+  getObjectSuffix,
+  getExtensionNamingStyle,
+  getExtensionClassNamingStyle,
+  deriveExtensionInfix,
+} from './modelClassifier.js';
 import { normalizeObjectName } from './objectNaming.js';
 import {
   matchPrefixCandidate,
@@ -127,6 +132,8 @@ export interface ObjectNamingCheck {
   extensionInfix: string;
   useModelName: boolean;
   namingStyle: string;
+  useModelNameForClass: boolean;
+  classNamingStyle: string;
   errors: string[];
   warnings: string[];
   suggestions: string[];
@@ -210,6 +217,10 @@ export async function checkObjectNaming(
       modelWritesLandIn(configManager.getWriteAnchorModel() ?? activeModel, activeModel) ||
       '';
     const useModelName = namingStyle === 'model-name' && !!modelName;
+    // Extension CLASSES may follow a different style from element extensions; the
+    // class-extension branch below asks this one, the element branch asks the above.
+    const classNamingStyle = getExtensionClassNamingStyle();
+    const useModelNameForClass = classNamingStyle === 'model-name' && !!modelName;
     // The spelling of the model name that may appear INSIDE an object name — what the
     // write path embeds (applyObjectPrefix → normalizeModelToken, #892). Comparing the
     // raw name instead flagged the very name d365fo_file(create) writes and recommended
@@ -270,8 +281,9 @@ export async function checkObjectNaming(
       // Both tokens are tried, the active style's first: a name reaching the check was
       // written under whichever style was configured THEN, so a model-name name asked
       // about under the prefix style must still yield the base the writer derives from
-      // it (objectNaming.ts case B), or check and writer name different targets.
-      const candidates = useModelName ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
+      // it (objectNaming.ts case B), or check and writer name different targets. A name
+      // ending in "_Extension" is a class, so the class style decides which goes first.
+      const candidates = useModelNameForClass ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
       const derived = args.baseObjectName;
       for (const token of candidates) {
         if (!token || !derived.toLowerCase().endsWith(token.toLowerCase())) continue;
@@ -297,10 +309,10 @@ export async function checkObjectNaming(
       } else {
         if (args.objectType === 'class-extension') {
           // prefix style → {Base}{Prefix}_Extension; model-name style → {Base}_{ModelToken}_Extension
-          const expectedPattern = useModelName
+          const expectedPattern = useModelNameForClass
             ? `${baseObjectName}_${modelToken}_Extension`
             : `${baseObjectName}${extensionInfix}_Extension`;
-          const expectedToken = useModelName ? modelToken : extensionInfix;
+          const expectedToken = useModelNameForClass ? modelToken : extensionInfix;
 
           if (!name.startsWith(baseObjectName)) {
             errors.push(
@@ -320,8 +332,8 @@ export async function checkObjectNaming(
               !middle.toLowerCase().includes(expectedToken.toLowerCase())
             ) {
               warnings.push(
-                useModelName
-                  ? `Extension name does not embed the ${modelTokenPhrase} (EXTENSION_NAMING_STYLE=model-name).\n  Current: ${name}\n  Recommended: ${expectedPattern}`
+                useModelNameForClass
+                  ? `Extension name does not embed the ${modelTokenPhrase} (${classNamingStyle === namingStyle ? 'EXTENSION_NAMING_STYLE' : 'EXTENSION_CLASS_NAMING_STYLE'}=model-name).\n  Current: ${name}\n  Recommended: ${expectedPattern}`
                   : `Extension name does not include model "${modelName || '(unknown)'}"'s extension infix "${extensionInfix}".\n  Current: ${name}\n  Recommended: ${expectedPattern}`,
               );
             }
@@ -608,6 +620,8 @@ export async function checkObjectNaming(
     extensionInfix,
     useModelName,
     namingStyle,
+    useModelNameForClass,
+    classNamingStyle,
     errors,
     warnings,
     suggestions,

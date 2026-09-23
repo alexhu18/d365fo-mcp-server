@@ -92,6 +92,8 @@ vi.mock('../../src/utils/modelClassifier', () => ({
   getObjectSuffix: vi.fn(() => ''),
   applyObjectSuffix: vi.fn((name: string) => name),
   getExtensionNamingStyle: vi.fn(() => 'prefix'),
+  // Unset EXTENSION_CLASS_NAMING_STYLE inherits the style above; these tests never switch it.
+  getExtensionClassNamingStyle: vi.fn(() => 'prefix'),
   isCustomModel: vi.fn(() => true),
   isStandardModel: vi.fn(() => false),
 }));

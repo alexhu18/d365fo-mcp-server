@@ -171,6 +171,17 @@ EXTENSION_NAMING_STYLE=prefix        # default — or "model-name"
 
 Run `get_workspace_info` to see the active style and worked examples of exactly what the tools will emit.
 
+### Classes named differently from elements
+
+Some conventions spell the two halves differently — Visual Studio element extensions (`CustTable.ContosoRobotics`) with prefix-style CoC classes (`CustTableCr_Extension`), or the reverse. A single style cannot express that: `model-name` rewrites the class to `CustTable_ContosoRobotics_Extension`, `prefix` rewrites the element to `CustTable.CrExtension`. Set the class style separately:
+
+```env
+EXTENSION_NAMING_STYLE=model-name          # element extensions
+EXTENSION_CLASS_NAMING_STYLE=prefix        # extension classes — default: inherit
+```
+
+Unset (or `inherit`), `EXTENSION_CLASS_NAMING_STYLE` follows `EXTENSION_NAMING_STYLE`, so existing setups behave exactly as before. `get_workspace_info` and `validate_object_naming` report both styles when they differ.
+
 **There is no custom naming template.** The name is normalised in code on every create and modify:
 
 - An **element extension** always gets the style's token after the dot — `ProdTable.BKU_TableExtension` is written as `ProdTable.BKUExtension`.
