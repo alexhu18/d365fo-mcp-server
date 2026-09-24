@@ -23,6 +23,7 @@ import {
   findDescriptorPath,
   isValidModuleReferenceName,
 } from '../../src/metadata/modelDescriptor';
+import { preserveDroppedProperties } from '../../src/tools/write/preserveMetadataElements';
 
 /** A real descriptor's shape: d2p1 on the root, nil sibling, two-space indent. */
 const descriptor = (refs: string[]) =>
@@ -401,5 +402,36 @@ describe('findDescriptorPath', () => {
 
   it('returns null for a model with no descriptor', () => {
     expect(findDescriptorPath(root, 'NoSuchModel')).toBeNull();
+  });
+});
+
+describe('the preservation guard after a first module reference', () => {
+  // modifyD365File runs every XML-only write through preserveDroppedProperties.
+  // Its leaf scan did not recognise </d2p1:string>, so on a descriptor with no
+  // entry anywhere before <ModuleReferences> the FIRST add pushed Publisher,
+  // SolutionId and Version* one level deeper, the guard read them as dropped and
+  // "restored" duplicates of them out of order — a corrupt descriptor under ✅.
+  const bare = (moduleRefs: string) =>
+    '<?xml version="1.0" encoding="utf-8"?>\n' +
+    '<AxModelInfo xmlns:i="http://www.w3.org/2001/XMLSchema-instance">\n' +
+    '\t<Name>Contoso</Name>\n' +
+    '\t<ModelReferences i:nil="true" />\n' +
+    moduleRefs +
+    '\t<Publisher>Contoso</Publisher>\n' +
+    '\t<SolutionId>00000000-0000-0000-0000-000000000000</SolutionId>\n' +
+    '\t<VersionMajor>1</VersionMajor>\n' +
+    '</AxModelInfo>';
+
+  it.each([
+    ['empty', '\t<ModuleReferences xmlns:d2p1="http://schemas.microsoft.com/2003/10/Serialization/Arrays" />\n'],
+    ['nil', '\t<ModuleReferences xmlns:d2p1="http://schemas.microsoft.com/2003/10/Serialization/Arrays"\n\t\ti:nil="true" />\n'],
+  ])('restores nothing for an %s element', (_shape, moduleRefs) => {
+    const before = bare(moduleRefs);
+    const r = addModuleReference(before, 'ApplicationPlatform');
+    expect(r.kind).toBe('added');
+    if (r.kind !== 'added') return;
+    const guarded = preserveDroppedProperties(before, r.xml, 'add-module-reference');
+    expect(guarded.restored).toEqual([]);
+    expect(guarded.xml.match(/<Publisher>/g)).toHaveLength(1);
   });
 });

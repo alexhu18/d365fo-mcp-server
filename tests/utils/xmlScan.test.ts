@@ -95,3 +95,26 @@ describe('scanXmlLeaves', () => {
     expect(scanXmlLeaves('</AxTable>')).toEqual([]);
   });
 });
+
+describe('namespace-prefixed elements', () => {
+  // A model descriptor's <ModuleReferences> holds <d2p1:string> entries. The
+  // end tag used to go unrecognised, so each entry raised the depth for good and
+  // every property after it was reported one level deeper than it is.
+  const DESCRIPTOR =
+    '<AxModelInfo xmlns:d2p1="x">\n' +
+    '  <ModuleReferences>\n' +
+    '    <d2p1:string>ApplicationSuite</d2p1:string>\n' +
+    '    <d2p1:string>Ledger</d2p1:string>\n' +
+    '  </ModuleReferences>\n' +
+    '  <Publisher>Contoso</Publisher>\n' +
+    '</AxModelInfo>';
+
+  it('closes a prefixed element, so later siblings keep their depth', () => {
+    expect(firstLeafText(DESCRIPTOR, 'Publisher')).toBe('Contoso');
+  });
+
+  it('reports a prefixed leaf under its full name', () => {
+    const entries = scanXmlLeaves(DESCRIPTOR).filter(l => l.name === 'd2p1:string');
+    expect(entries.map(l => [l.text, l.depth])).toEqual([['ApplicationSuite', 2], ['Ledger', 2]]);
+  });
+});

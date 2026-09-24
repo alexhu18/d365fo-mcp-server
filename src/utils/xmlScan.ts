@@ -24,9 +24,15 @@
 /**
  * One token of an XML document. Order matters: comment and CDATA (terminated,
  * then unterminated) come before anything that could match their contents.
+ *
+ * Element names include a namespace prefix (`d2p1:string`). Without `:` the
+ * start tag still matched — as `d2p1` with `:string` for attributes — but the
+ * end tag did not, so every prefixed element raised the depth for good and a
+ * model descriptor's first module reference made its top-level properties look
+ * dropped to the preservation guard.
  */
 const XML_TOKEN =
-  /<!--[\s\S]*?-->|<!--[\s\S]*$|<!\[CDATA\[[\s\S]*?\]\]>|<!\[CDATA\[[\s\S]*$|<\?[\s\S]*?\?>|<\?[\s\S]*$|<!DOCTYPE[^>]*>|<\/([A-Za-z_][\w.\-]*)\s*>|<([A-Za-z_][\w.\-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
+  /<!--[\s\S]*?-->|<!--[\s\S]*$|<!\[CDATA\[[\s\S]*?\]\]>|<!\[CDATA\[[\s\S]*$|<\?[\s\S]*?\?>|<\?[\s\S]*$|<!DOCTYPE[^>]*>|<\/([A-Za-z_][\w.:\-]*)\s*>|<([A-Za-z_][\w.:\-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>/g;
 
 /**
  * A private token scanner over the same grammar, for callers that need the raw
