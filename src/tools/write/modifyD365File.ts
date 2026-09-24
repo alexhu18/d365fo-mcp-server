@@ -22,6 +22,7 @@ import { getConfigManager, extractModelFromFilePath } from '../../utils/configMa
 import { isStandardModel, resolveRegularObjectPrefixToken, resolveObjectPrefix, deriveExtensionInfix } from '../../utils/modelClassifier.js';
 import { normalizeObjectName } from '../../utils/objectNaming.js';
 import { findBaseObjectXml, findBaseFormXml } from '../../utils/baseObjectXml.js';
+import { describeTableAlreadyBound } from './formDataSourceNote.js';
 import { assertWritePathAllowed } from '../../utils/pathContainment.js';
 import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import {
@@ -1223,6 +1224,13 @@ export interface ModifyOutcome {
    * model guards and the direct-XML fallbacks all still apply.
    */
   createExtensionFirst?: { objectType: string; objectName: string };
+  /**
+   * The bridge declined this operation and wrote nothing (an element of that
+   * name is already there). The call did not fail, so it is not counted as a
+   * failure — but it must not be counted as applied either, which is what
+   * "3/3 operation(s) applied" did for three writes that never landed.
+   */
+  skipped?: boolean;
 }
 
 export async function modifyD365FileTool(
@@ -1862,7 +1870,7 @@ export async function modifyD365FileTool(
     // trip plus a full rebuild. Free when no write is outstanding.
     await timer.time('provider refresh (pending writes)', () => debouncedRefresh.flush());
 
-    let bridgeResult: { success: boolean; message: string; viaXmlFallback?: boolean } | null = null;
+    let bridgeResult: { success: boolean; message: string; viaXmlFallback?: boolean; skipped?: boolean } | null = null;
     /** File content captured before a replace-code, to diff the reply against. */
     let replaceCodeBefore: string | null = null;
     /**
@@ -2168,7 +2176,8 @@ export async function modifyD365FileTool(
           // enumType parameter, while ModifyField does. Doing it here keeps this a
           // single tool call for the caller AND works with the bridge already deployed —
           // no rebuild, which is the part that silently keeps the old binary.
-          if (bridgeResult?.success) {
+          // Never after a skip: the rollback below would delete the EXISTING field.
+          if (bridgeResult?.success && !bridgeResult.skipped) {
             const enumSet = await bridgeModifyField(
               context.bridge,
               objectName,
@@ -3306,8 +3315,12 @@ export async function modifyD365FileTool(
     // made one: every add-field manufactured a second round trip. It now points at
     // operations[], where the group entry travels in the SAME call as the field —
     // and stays quiet when that call already carries one.
+    // A skip wrote nothing: every trailer below that describes the write would
+    // describe one that did not happen (runModifyBatch drops them the same way).
+    const wasSkipped = bridgeResult.skipped === true;
+
     let addFieldBpNote = '';
-    if (operation === 'add-field' && (objectType === 'table' || objectType === 'table-extension')) {
+    if (!wasSkipped && operation === 'add-field' && (objectType === 'table' || objectType === 'table-extension')) {
       const notes: string[] = [];
       // Silent when the group entry is already in this batch — the advice has
       // been taken, and repeating it teaches the agent that these warnings do
@@ -3350,6 +3363,7 @@ export async function modifyD365FileTool(
     // agent that does not know it goes and builds the form extension anyway.
     let fieldGroupRenderNote = '';
     if (
+      !wasSkipped &&
       (operation === 'add-field-to-field-group' || operation === 'add-field-group') &&
       (objectType === 'table' || objectType === 'table-extension') &&
       (args as any).fieldGroupName
@@ -3365,6 +3379,12 @@ export async function modifyD365FileTool(
           describeUnrenderedFieldGroup(baseTableName, groupName, symbolIndex));
       }
     }
+
+    // Written, not refused — but name the existing bindings (formDataSourceNote.ts).
+    const dataSourceTableNote = !wasSkipped && bridgeResult.success && operation === 'add-data-source'
+      ? await timer.time('data-source table probe', () => describeTableAlreadyBound(actualFilePath,
+          objectType, objectName, (args as any).dataSourceName, (args as any).dataSourceTable, symbolIndex))
+      : '';
 
     // Corrections the server applied on its own. Kept in the payload so the agent
     // learns the correct form for next time and the write stays auditable.
@@ -3385,6 +3405,7 @@ export async function modifyD365FileTool(
       outcome.objectType = objectType;
       outcome.objectName = objectName;
       outcome.modelName = modelName || getConfigManager().getModelName() || undefined;
+      outcome.skipped = wasSkipped;
     }
 
     // Re-index the modified object in-process. A modify changes the symbols the
@@ -3392,7 +3413,7 @@ export async function modifyD365FileTool(
     // making the agent spend a round trip on update_symbol_index for a file this
     // process just wrote, and another on the lookup that failed for want of it,
     // was pure waste.
-    const indexNote = inBatch ? '' : await timer.time('symbol index upsert',
+    const indexNote = inBatch || wasSkipped ? '' : await timer.time('symbol index upsert',
       () => upsertWrittenFileIntoIndex(actualFilePath, context));
 
     // Verify the write here rather than leaving the caller to spend a
@@ -3406,7 +3427,7 @@ export async function modifyD365FileTool(
     // descriptor), so no .rnrproj question is asked about one. The guard lives
     // there rather than here because this is not the only call site — the batch
     // wrapper in d365foFile.ts asks the same question.
-    const verifyNote = inBatch ? '' : renderWriteVerification(
+    const verifyNote = inBatch || wasSkipped ? '' : renderWriteVerification(
       await timer.time('write verification', () => verifyWrittenFile(
         actualFilePath,
         verifyProjectPath,
@@ -3426,11 +3447,17 @@ export async function modifyD365FileTool(
         {
           type: 'text',
           text:
-            `✅ ${operation} on ${objectType} "${objectName}" — applied via ${bridgeResult.viaXmlFallback
-              ? "this server's XML writer (no bridge path for this operation)"
-              : 'IMetadataProvider.Update()'}${crossModelNotice}${autoCorrectNote}\n\n` +
+            // A skip is not an application. Saying "✅ … applied via
+            // IMetadataProvider.Update()" over a write the provider declined is
+            // how three dropped data sources read as three successes; the 🔧 API
+            // line below carries the bridge's own reason.
+            (bridgeResult.skipped
+              ? `⏭️ ${operation} on ${objectType} "${objectName}" — SKIPPED, nothing was written${crossModelNotice}${autoCorrectNote}\n\n`
+              : `✅ ${operation} on ${objectType} "${objectName}" — applied via ${bridgeResult.viaXmlFallback
+                  ? "this server's XML writer (no bridge path for this operation)"
+                  : 'IMetadataProvider.Update()'}${crossModelNotice}${autoCorrectNote}\n\n`) +
             `**File:** ${actualFilePath}${addControlNote}${generationNote}${bridgeValidation}${projectMessage}\n` +
-            `🔧 API: ${bridgeResult.message}${preservationNote}${changedLinesNote}${xppLintNote}${xppRuleNote}${addFieldBpNote}${fieldGroupRenderNote}${backupNote}${verifyNote}${indexNote}${bpNote}${formOrderNote}${timer.render()}` +
+            `🔧 API: ${bridgeResult.message}${preservationNote}${changedLinesNote}${xppLintNote}${xppRuleNote}${addFieldBpNote}${fieldGroupRenderNote}${dataSourceTableNote}${backupNote}${verifyNote}${indexNote}${bpNote}${formOrderNote}${timer.render()}` +
             // "Review changes in Visual Studio" is not something the caller can act
             // on, and it rode along on every write.
             (ignoredParamsWarning ? `\n\n${ignoredParamsWarning}` : '') +

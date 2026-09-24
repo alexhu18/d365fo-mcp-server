@@ -51,6 +51,37 @@ those are called out explicitly below.
   metadata files were unavailable when one had just been parsed.
 
 ### Fixed
+- **A write the bridge declined is no longer reported as a write that happened.**
+  The bridge answers a skipped operation with `{ success: true, skipped: true, reason }`
+  — nothing failed, nothing changed. `BridgeWriteResult` never declared `skipped`, so
+  not one wrapper read it: all four skippable operations (`add-field` on a
+  data-entity-extension, `add-field-to-field-group`, `add-menu-item-to-menu`,
+  `add-data-source`) fell through to their success branch and rendered
+  "✅ … added" over a file the provider never opened, discarding the bridge's own
+  explanation on the way past. A batch of three such operations replied
+  "✅ 3/3 operation(s) applied" and "✅ Verified: on disk" over a byte-identical
+  file whose mtime had not moved; the caller then built and checked in against
+  metadata that did not exist. `skipped` and `reason` are now on the result type,
+  rendered by `skippedMessage()` as "⏭️ NOT written — …" with the reason, counted
+  separately in the batch header ("2/3 applied, 1 skipped"), and kept out of the
+  set of files the per-file "Verified: on disk" and symbol-index trailers sign off
+  on — in a batch and on a single operation alike. The symbol index was never at risk: it re-parses from disk, so it recorded
+  the unchanged file correctly throughout.
+- **`add-data-source` no longer drops a data source because its table is already
+  bound.** The idempotency guard skipped on a *table* match as well as a name
+  match, on the stated theory that "adding a second binding to the same table is
+  almost always an accident". A form routinely joins one table into several
+  branches of its query — Microsoft's own `PurchLineBackOrder` carries `PurchTable`
+  and `PurchTable1`, both over `PurchTable` — so the rule silently discarded
+  legitimate metadata — and not only through joins: a census of the 8,310 shipped
+  forms with data sources found 313 that bind one table in two or more *unjoined*
+  root data sources (`DocuHistoryForm`: `DocuHistoryHeaderDS` and
+  `DocuHistoryGridDS`, both over `DocuHistory`), so no join-based narrowing of the
+  rule would have been safe either. Both the `form` and `form-extension` branches
+  now skip on a name collision only. A data source whose table is already bound
+  is written and the reply names the existing bindings, so an accidental
+  duplicate of a template stub is visible without being refused. **Requires a rebuilt bridge binary**; the reporting fix
+  above is TypeScript and takes effect without one.
 - **The naming check no longer warns about the canonical extension-class name.**
   `CustTableBku_Extension` is exactly what the prefix style produces and what the
   write path returns untouched, yet the check answered "Extension name does not

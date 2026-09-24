@@ -3483,14 +3483,11 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"Form extension '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.FormExtensions, objectName);
 
-                    // Same idempotency rule as the form branch below: skip on a name match,
-                    // and on a different-named data source already bound to the same table.
+                    // Same idempotency rule as the form branch below: skip on a NAME match only.
                     foreach (AxFormDataSourceRoot existing in axExt.DataSources)
                     {
                         if (string.Equals(existing.Name, dsName, StringComparison.OrdinalIgnoreCase))
                             return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{dsName}' already exists", api = "IMetaFormExtensionProvider.Update" };
-                        if (string.Equals(existing.Table, table, StringComparison.OrdinalIgnoreCase))
-                            return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{existing.Name}' already binds table '{table}'", api = "IMetaFormExtensionProvider.Update" };
                     }
 
                     axExt.DataSources.Add((AxFormDataSourceRoot)CreateFormDataSourceRoot(dsName, table, joinSource, linkType));
@@ -3506,18 +3503,23 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"Form '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.Forms, objectName);
 
-                    // Idempotency: don't append a duplicate. If a data source with the same
-                    // NAME already exists, skip (it may be a template stub already bound to the
-                    // right table). If a DIFFERENT-named data source already binds the same
-                    // TABLE, skip too — adding a second binding to the same table is almost
-                    // always an accident (a stub the caller meant to replace, not duplicate).
+                    // Idempotency: don't append a duplicate. A data source with the same NAME
+                    // already there is a real conflict (it may be a template stub already bound
+                    // to the right table), so skip that one.
+                    //
+                    // A different-named data source already bound to the same TABLE is NOT a
+                    // conflict and must still be written. This used to skip too, on the theory
+                    // that "adding a second binding to the same table is almost always an
+                    // accident" — which is simply untrue: a form routinely joins one table into
+                    // several branches of its query. Microsoft's own PurchLineBackOrder carries
+                    // PurchTable and PurchTable1, both over PurchTable, with different link
+                    // types. The rule silently dropped three legitimate data sources and, because
+                    // `skipped` never reached the caller, reported all three as added.
                     foreach (var existing in axForm.DataSources)
                     {
                         dynamic dyn = existing;
                         if (string.Equals((string)dyn.Name, dsName, StringComparison.OrdinalIgnoreCase))
                             return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{dsName}' already exists", api = "IMetaFormProvider.Update" };
-                        if (string.Equals((string)dyn.Table, table, StringComparison.OrdinalIgnoreCase))
-                            return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{(string)dyn.Name}' already binds table '{table}'", api = "IMetaFormProvider.Update" };
                     }
 
                     axForm.AddDataSource(CreateFormDataSourceRoot(dsName, table, joinSource, linkType));
