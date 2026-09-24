@@ -155,7 +155,7 @@ Newline-delimited JSON-RPC over stdin/stdout. Read calls that time out or hit a 
 | `-32000` / `-32001` | service not available / object not found |
 | `-32603` | internal error |
 
-**Troubleshooting:** `metadataAvailable: false` → D365FO not deployed to the package path, or a DLL version mismatch (check bridge stderr). `xrefAvailable: false` (non-critical, xref falls back to FTS) → SQL Server / `DYNAMICSXREFDB` unreachable; on UDE the server reads `CrossReferencesDbServerName`/`CrossReferencesDatabaseName` from the XPP config automatically. Building on UDE needs the DLL path: `dotnet build -c Release -p:D365BinPath="<FrameworkDirectory>\bin"`.
+**Troubleshooting:** `metadataAvailable: false` → D365FO not deployed to the package path, or a DLL version mismatch (check bridge stderr). `xrefAvailable: false` (non-critical, xref falls back to FTS) → SQL Server / `DYNAMICSXREFDB` unreachable; on UDE the server reads `CrossReferencesDbServerName`/`CrossReferencesDatabaseName` from the XPP config automatically. Building on UDE needs the DLL path: `dotnet build -c Release -p:D365BinPath="<FrameworkDirectory>\bin"`. After EDITING bridge sources build with `npm run bridge:build` instead, so `bridge/build-attestation.json` is refreshed — see [SETUP.md § Changing bridge sources](SETUP.md#changing-bridge-sources--use-npm-run-bridgebuild).
 
 ---
 
