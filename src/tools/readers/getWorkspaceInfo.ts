@@ -18,6 +18,7 @@ import { getStdioSessionInfo } from '../../utils/stdioSessionInfo.js';
 import { checkIndexStaleness } from '../../utils/indexStaleness.js';
 import {
   isCustomModel, getObjectSuffix, getExtensionNamingStyle, getExtensionClassNamingStyle, deriveExtensionInfix,
+  unrecognisedNamingStyleSettings,
 } from '../../utils/modelClassifier.js';
 import { normalizeModelToken } from '../../utils/modelToken.js';
 import { buildPrefixDiagnostics, modelWritesLandIn } from '../analysis/prefixDiagnostics.js';
@@ -239,6 +240,9 @@ export async function getWorkspaceInfoTool(
   const sampleElemExt = extNamingStyle === 'model-name' && writeModelToken
     ? `CustTable.${writeModelToken}`
     : `CustTable.${extInfix}Extension`;
+  // A misspelled style falls back in silence; say so in both renderings, since the
+  // samples right below are then names under a style nobody configured.
+  const styleTypos = unrecognisedNamingStyleSettings().map(w => `⚠️  ${w}`);
   if (diagnostics) {
     lines.push(
       `## Extension Naming`,
@@ -251,6 +255,7 @@ export async function getWorkspaceInfoTool(
       extClassNamingStyle === extNamingStyle
         ? `   Extension classes follow the same style.`
         : `✅ Extension classes follow "${extClassNamingStyle}" instead — set separately.`,
+      ...styleTypos,
       `  • Extension class  → ${sampleClassExt}`,
       `  • Element extension → ${sampleElemExt}`,
       `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,
@@ -262,6 +267,7 @@ export async function getWorkspaceInfoTool(
     lines.push(
       `Extensions  : ${sampleClassExt} · ${sampleElemExt}  ` +
       `(pass the BASE name to d365fo_file(create) — the tool applies the token)`,
+      ...styleTypos,
     );
   }
 

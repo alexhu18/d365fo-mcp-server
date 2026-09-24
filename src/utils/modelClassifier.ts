@@ -121,6 +121,30 @@ export function getExtensionClassNamingStyle(): 'prefix' | 'model-name' {
 }
 
 /**
+ * The naming-style variables that hold a value neither getter above recognises.
+ *
+ * Both getters fall back without a word — getExtensionNamingStyle to 'prefix',
+ * getExtensionClassNamingStyle to inheriting it — so a typo such as "prefx" or
+ * "modelname" silently means the default, and every name written afterwards
+ * follows a convention nobody chose. get_workspace_info renders these lines.
+ */
+export function unrecognisedNamingStyleSettings(): string[] {
+  const out: string[] = [];
+  const element = process.env.EXTENSION_NAMING_STYLE?.trim();
+  if (element && !['prefix', 'model-name'].includes(element.toLowerCase())) {
+    out.push(`EXTENSION_NAMING_STYLE="${element}" is not a known value (prefix | model-name) — treated as "prefix".`);
+  }
+  const cls = process.env.EXTENSION_CLASS_NAMING_STYLE?.trim();
+  if (cls && !['inherit', 'prefix', 'model-name'].includes(cls.toLowerCase())) {
+    out.push(
+      `EXTENSION_CLASS_NAMING_STYLE="${cls}" is not a known value (inherit | prefix | model-name) — ` +
+      `treated as "inherit", i.e. "${getExtensionNamingStyle()}".`,
+    );
+  }
+  return out;
+}
+
+/**
  * Apply a configurable suffix to a NEW model element name.
  * The suffix is appended at the end of the object name.
  *

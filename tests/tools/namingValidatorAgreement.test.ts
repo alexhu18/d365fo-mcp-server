@@ -188,3 +188,28 @@ describe('get_workspace_info samples are names a write would produce', () => {
     expect(out).not.toMatch(/CustTable[._]Contoso Robotics/);
   });
 });
+
+/**
+ * A misspelled naming style falls back in silence — "prefx" means "prefix", and a bad
+ * EXTENSION_CLASS_NAMING_STYLE means "inherit" — so the samples above would be names
+ * under a style nobody configured. get_workspace_info says so instead.
+ */
+describe('get_workspace_info flags a naming style it does not recognise', () => {
+  it('names the variable, its value and what it is treated as', async () => {
+    process.env.EXTENSION_NAMING_STYLE = 'modelname';
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefx';
+    const out = String((await getWorkspaceInfoTool(req('get_workspace_info', {}), buildContext())).content[0].text);
+
+    expect(out).toContain('EXTENSION_NAMING_STYLE="modelname" is not a known value (prefix | model-name) — treated as "prefix"');
+    expect(out).toContain('EXTENSION_CLASS_NAMING_STYLE="prefx" is not a known value (inherit | prefix | model-name) — treated as "inherit", i.e. "prefix"');
+  });
+
+  it('stays quiet for every valid value, in any case', async () => {
+    for (const [el, cl] of [['model-name', 'inherit'], ['Prefix', 'MODEL-NAME'], ['prefix', 'prefix']]) {
+      process.env.EXTENSION_NAMING_STYLE = el;
+      process.env.EXTENSION_CLASS_NAMING_STYLE = cl;
+      const out = String((await getWorkspaceInfoTool(req('get_workspace_info', {}), buildContext())).content[0].text);
+      expect(out, `${el}/${cl}`).not.toContain('is not a known value');
+    }
+  });
+});
