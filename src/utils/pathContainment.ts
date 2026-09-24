@@ -200,6 +200,9 @@ async function getAllowedRoots(extraRoots?: (string | null | undefined)[]): Prom
  * and matches the canonical `<root>/<Package>/<Model>/Ax<Type>/<Name>.xml` shape,
  * or the one non-AOT write target that has its own shape — a model descriptor at
  * `<root>/<Package>/Descriptor/<Model>.xml` (see the Model descriptor branch).
+ * The descriptor shape is admitted only when the caller opts in with
+ * `allowDescriptor` — i.e. only for `objectType="model-descriptor"`, the one
+ * path that also runs the descriptor's standard-model guard.
  *
  * `modelHint` (optional) is the model name the caller expects to modify; when
  * provided we additionally require the path's model segment to match it
@@ -209,7 +212,7 @@ async function getAllowedRoots(extraRoots?: (string | null | undefined)[]): Prom
 export async function assertWritePathAllowed(
   filePath: string,
   modelHint?: string,
-  opts?: { extraRoots?: (string | null | undefined)[] },
+  opts?: { extraRoots?: (string | null | undefined)[]; allowDescriptor?: boolean },
 ): Promise<PathContainmentResult> {
   if (!filePath || typeof filePath !== 'string') {
     return { ok: false, reason: 'filePath is empty' };
@@ -291,7 +294,11 @@ export async function assertWritePathAllowed(
   // The model segment is the descriptor's own basename (the file is named for
   // the model it describes, not for its package), which is what makes the
   // modelHint cross-check below apply here too.
-  if (parts.length === 3 && parts[1].toLowerCase() === 'descriptor'
+  // Opt-in only: every other object type would reach the writer without the
+  // descriptor's standard-model guard (the AOT one keys on /<Model>/Ax<Type>/
+  // and stands down), so a "class" modify aimed at ApplicationSuite's manifest
+  // must fall through to the canonical-shape refusal below.
+  if (opts?.allowDescriptor && parts.length === 3 && parts[1].toLowerCase() === 'descriptor'
       && parts[2].toLowerCase().endsWith('.xml')) {
     const descriptorModel = parts[2].replace(/\.xml$/i, '');
     if (modelHint && modelHint.trim() && modelHint !== 'any'

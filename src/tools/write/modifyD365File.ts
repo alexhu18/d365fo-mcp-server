@@ -1657,7 +1657,10 @@ export async function modifyD365FileTool(
     //     honored as an allowed root — findD365File already resolves against it, so the
     //     containment list must include it too or valid writes get wrongly rejected.
     const extraRoots = args.packagePath ? [args.packagePath] : undefined;
-    const containment = await assertWritePathAllowed(filePath, modelName, { extraRoots });
+    const containment = await assertWritePathAllowed(filePath, modelName, {
+      extraRoots,
+      allowDescriptor: objectType === 'model-descriptor',
+    });
     if (!containment.ok) {
       throw new Error(containment.reason || 'Path containment check failed');
     }

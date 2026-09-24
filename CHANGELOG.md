@@ -59,6 +59,37 @@ those are called out explicitly below.
   a snapshot that can still hold a method renamed or deleted since — serving it
   would beat a correct "not found" with a stale body, under a line claiming the
   metadata files were unavailable when one had just been parsed.
+- **A model descriptor's `<ModuleReferences>` can be edited through the tool**
+  (#1030, #1031). New `objectType="model-descriptor"` on
+  `d365fo_file(action="modify")` with `add-module-reference` /
+  `remove-module-reference` (parameter `moduleReference`) — the last file under
+  `Metadata/` with no write path, so adding a reference before writing code that
+  names another model's type no longer means hand-editing XML. XML-only; nothing
+  is created implicitly (a missing descriptor or `<ModuleReferences>` element is
+  reported, not invented); a duplicate is refused case-insensitively; the module
+  is probed as a package folder and a miss warns rather than refuses; the entry
+  lands in sorted position when the file is sorted, indentation and BOM are kept,
+  and an `i:nil="true"` element is materialised the way Visual Studio does it. A
+  standard Microsoft model's descriptor is refused, and only
+  `objectType="model-descriptor"` may target a descriptor path at all.
+  `get_workspace_info(diagnostics=true)` lists the current references, and a
+  write refreshes the model's visibility cache so `resolve_references` sees it
+  without a restart. Before release, an audit found that the FIRST reference
+  added to a descriptor with none was followed by the write's preservation guard
+  "restoring" duplicate `Publisher`/`SolutionId`/`Version*` elements out of
+  order — its XML scan did not recognise the end tag `</d2p1:string>`.
+  Namespace-prefixed element names are now part of that grammar.
+
+### Changed
+- **The model-visibility oracle is stricter** (#1030). The descriptor parser
+  scanned the whole document for `<d2p1:string>`, so `<InternalsVisibleTo>` and
+  `<AppliedUpdates>` entries counted as module references: 112 of 176 real
+  descriptors over-reported, 606 phantom references in all. Both the build-queue
+  ordering of `build_d365fo_project` and the visibility check behind
+  `resolve_references` read that list, and every phantom made the check more
+  permissive. Only `<ModuleReferences>` is read now — so "type not visible"
+  findings that were silently waved through can appear, and under
+  `GROUNDING_ENFORCE=true` they can block a write.
 
 ### Fixed
 - **`generate_object` names an extension class what `create` will write** (#1041).
