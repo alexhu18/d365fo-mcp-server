@@ -7,7 +7,11 @@ import { atlNodesForTable, atlArrangeLine } from '../../knowledge/atlNodes.gener
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { readMethodCall } from '../../utils/methodBodyHint.js';
-import { resolveObjectPrefix, applyObjectPrefix, deriveExtensionInfix, getObjectSuffix, applyObjectSuffix } from '../../utils/modelClassifier.js';
+import {
+  resolveObjectPrefix, applyObjectPrefix, deriveExtensionInfix, getObjectSuffix, applyObjectSuffix,
+  getExtensionClassNamingStyle,
+} from '../../utils/modelClassifier.js';
+import { normalizeObjectName } from '../../utils/objectNaming.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { enforceGrounding } from '../../utils/provenanceStore.js';
 
@@ -254,18 +258,15 @@ class ${name}Service extends SysOperationServiceBase
   'er-custom-function': erCustomFunctionTemplate,
 };
 
-// Templates for EXTENSION elements: (baseName = element being extended, prefix = model/ISV infix)
-// Naming rules per https://learn.microsoft.com/en-us/dynamics365/fin-ops-core/dev-itpro/extensibility/naming-guidelines-extensions:
-//   table-extension class : {BaseTable}{Prefix}_Extension   (e.g. CustTableWHS_Extension)
-//   form-handler class    : {BaseForm}{Prefix}Form_Extension (e.g. SalesTableWHSForm_Extension)
+// Templates for EXTENSION classes: (baseName = element being extended, className = the
+// class name, computed by codeGenTool through extensionClassName() so the skeleton names
+// exactly what d365fo_file(action="create") will write — see there for why.
 
-function formHandlerTemplate(baseName: string, prefix: string): string {
-  // Class name: {BaseForm}{Prefix}Form_Extension
-  const className = baseName + prefix + 'Form_Extension';
+function formHandlerTemplate(baseName: string, className: string): string {
   return `
 /// <summary>
-/// Form extension class for ${baseName} (prefix: ${prefix})
-/// Naming: {BaseForm}{Prefix}Form_Extension per MS naming guidelines
+/// Form extension class for ${baseName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// </summary>
 [ExtensionOf(formStr(${baseName}))]
 final class ${className}
@@ -299,13 +300,11 @@ final class ${className}
 }`;
 }
 
-function tableExtensionTemplate(baseName: string, prefix: string): string {
-  // Class name: {BaseTable}{Prefix}_Extension
-  const className = baseName + prefix + '_Extension';
+function tableExtensionTemplate(baseName: string, className: string): string {
   return `
 /// <summary>
-/// Table extension class for ${baseName} (prefix: ${prefix})
-/// Naming: {BaseTable}{Prefix}_Extension per MS naming guidelines
+/// Table extension class for ${baseName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// </summary>
 [ExtensionOf(tableStr(${baseName}))]
 final class ${className}
@@ -348,13 +347,11 @@ final class ${className}
 }`;
 }
 
-function classExtensionTemplate(baseName: string, prefix: string): string {
-  // Class name: {BaseClass}{Prefix}_Extension per MS naming guidelines
-  const className = baseName + prefix + '_Extension';
+function classExtensionTemplate(baseName: string, className: string): string {
   return `
 /// <summary>
-/// Extension class for ${baseName} (prefix: ${prefix})
-/// Naming: {BaseClass}{Prefix}_Extension per MS naming guidelines
+/// Extension class for ${baseName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// </summary>
 [ExtensionOf(classStr(${baseName}))]
 final class ${className}
@@ -381,14 +378,12 @@ final class ${className}
 }`;
 }
 
-function formDataSourceExtensionTemplate(formName: string, prefix: string, dataSourceName: string): string {
-  // Class name: {FormName}_{DataSourceName}{Prefix}DS_Extension per MS naming guidelines
+function formDataSourceExtensionTemplate(formName: string, className: string, dataSourceName: string): string {
   const dsName = dataSourceName || formName;
-  const className = `${formName}_${dsName}${prefix}DS_Extension`;
   return `
 /// <summary>
-/// Form data source extension class for ${formName}.${dsName} (prefix: ${prefix})
-/// Naming: {FormName}_{DataSourceName}{Prefix}DS_Extension per MS naming guidelines
+/// Form data source extension class for ${formName}.${dsName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// Use this to wrap data source methods (init, executeQuery, write, delete, validateWrite, active).
 /// </summary>
 [ExtensionOf(formDataSourceStr(${formName}, ${dsName}))]
@@ -444,14 +439,12 @@ final class ${className}
 }`;
 }
 
-function formControlExtensionTemplate(formName: string, prefix: string, controlName: string): string {
-  // Class name: {FormName}_{ControlName}{Prefix}Ctrl_Extension per MS naming guidelines
+function formControlExtensionTemplate(formName: string, className: string, controlName: string): string {
   const ctrlName = controlName || 'ControlName';
-  const className = `${formName}_${ctrlName}${prefix}Ctrl_Extension`;
   return `
 /// <summary>
-/// Form control extension class for ${formName}.${ctrlName} (prefix: ${prefix})
-/// Naming: {FormName}_{ControlName}{Prefix}Ctrl_Extension per MS naming guidelines
+/// Form control extension class for ${formName}.${ctrlName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// Use this to wrap a specific control's methods (modified, validate, lookup, gotFocus, …).
 /// IMPORTANT: Use get_object_info(objectType="form", name="${formName}", options={searchControl:"${ctrlName}"}) first to verify the exact control name.
 /// </summary>
@@ -493,13 +486,11 @@ final class ${className}
 }`;
 }
 
-function mapExtensionTemplate(baseName: string, prefix: string): string {
-  // Class name: {MapName}{Prefix}_Extension per MS naming guidelines
-  const className = `${baseName}${prefix}_Extension`;
+function mapExtensionTemplate(baseName: string, className: string): string {
   return `
 /// <summary>
-/// Map extension class for ${baseName} (prefix: ${prefix})
-/// Naming: {MapName}{Prefix}_Extension per MS naming guidelines
+/// Map extension class for ${baseName}
+/// Named by the model's extension-class style — the exact name d365fo_file(action="create") writes.
 /// Use this to add or wrap methods on an X++ Map (InventItemOrdered, LogisticsPostalAddress, …).
 /// </summary>
 [ExtensionOf(mapStr(${baseName}))]
@@ -1137,7 +1128,8 @@ function lcFirst(name: string): string {
   return name.charAt(0).toLowerCase() + name.slice(1);
 }
 
-const extensionTemplates: Record<string, (baseName: string, prefix: string) => string> = {
+/** (baseName, className) — className unused by event-handler, which is not an extension class. */
+const extensionTemplates: Record<string, (baseName: string, className: string) => string> = {
   'form-handler': formHandlerTemplate,
   'table-extension': tableExtensionTemplate,
   'event-handler': eventHandlerTemplate,
@@ -2737,6 +2729,18 @@ export async function codeGenTool(request: CallToolRequest) {
     const prefix = resolveObjectPrefix(resolvedModelName);
     // Extension infix: PascalCase form without underscore (e.g. "XY" → "Xy" when env has "XY_")
     const extensionInfix = deriveExtensionInfix(prefix);
+    // The name d365fo_file(action="create") WILL write for an extension class, from the
+    // writer's own function. Assembled here by hand it disagreed with the writer in every
+    // style: the writer puts the token right before "_Extension", so the old
+    // `SalesTableCRForm_Extension` / `SalesTable_SalesLineCRDS_Extension` were written as
+    // `…CRFormCR_Extension` / `…CRDSCR_Extension`, and a model-name class style was
+    // ignored outright. Shipped code agrees with the writer's placement: of 217 form
+    // data-source extension classes, 12 carry the token after "DS" and none before it;
+    // 3 of 596 form extension classes use "{Infix}Form_Extension".
+    const extensionClassName = (stem: string) =>
+      normalizeObjectName(`${stem}_Extension`, 'class-extension', resolvedModelName || undefined);
+    const classStyleLine =
+      `  Style: ${getExtensionClassNamingStyle()} (EXTENSION_CLASS_NAMING_STYLE) — the name d365fo_file(action="create") writes.`;
 
     let code: string;
     let displayName: string;
@@ -2795,22 +2799,22 @@ export async function codeGenTool(request: CallToolRequest) {
       if (args.pattern === 'form-datasource-extension') {
         const formName = args.name;
         const dsName = args.baseName || args.name;
-        code = formDataSourceExtensionTemplate(formName, extensionInfix, dsName);
+        const className = extensionClassName(`${formName}_${dsName}DS`);
+        code = formDataSourceExtensionTemplate(formName, className, dsName);
         displayName = formName;
-        const className = `${formName}_${dsName}${extensionInfix}DS_Extension`;
         namingNote = extensionInfix
-          ? `📌 **Naming (MS guidelines):** Generated class: \`${className}\`\n  Form: \`${formName}\`, DataSource: \`${dsName}\`, Prefix infix: \`${extensionInfix}\``
-          : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${formName}_${dsName}DS_Extension\` (not MS-compliant without infix).`;
+          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, DataSource: \`${dsName}\`\n${classStyleLine}`
+          : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${className}\` (not MS-compliant without infix).`;
 
       } else if (args.pattern === 'form-control-extension') {
         const formName = args.name;
         const ctrlName = args.baseName || 'ControlName';
-        code = formControlExtensionTemplate(formName, extensionInfix, ctrlName);
+        const className = extensionClassName(`${formName}_${ctrlName}Ctrl`);
+        code = formControlExtensionTemplate(formName, className, ctrlName);
         displayName = formName;
-        const className = `${formName}_${ctrlName}${extensionInfix}Ctrl_Extension`;
         namingNote = extensionInfix
-          ? `📌 **Naming (MS guidelines):** Generated class: \`${className}\`\n  Form: \`${formName}\`, Control: \`${ctrlName}\`, Prefix infix: \`${extensionInfix}\``
-          : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${formName}_${ctrlName}Ctrl_Extension\` (not MS-compliant without infix).`;
+          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, Control: \`${ctrlName}\`\n${classStyleLine}`
+          : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${className}\` (not MS-compliant without infix).`;
 
       } else if (args.pattern === 'report-dataset-extension') {
         const dpClass = args.name;
@@ -2898,7 +2902,9 @@ export async function codeGenTool(request: CallToolRequest) {
             isError: true,
           };
         }
-        code = extTemplate(baseName, extensionInfix);
+        // event-handler is not an extension class and ignores the name.
+        const className = extensionClassName(args.pattern === 'form-handler' ? `${baseName}Form` : baseName);
+        code = extTemplate(baseName, className);
         displayName = baseName;
 
         if (args.pattern === 'event-handler') {
@@ -2906,9 +2912,8 @@ export async function codeGenTool(request: CallToolRequest) {
             `  Handles onInserted and onValidatedWrite events of \`${baseName}\`\n` +
             `  Add more handlers by repeating the [SubscribesTo] pattern.`;
         } else if (args.pattern === 'class-extension') {
-          const exampleClass = `${baseName}${extensionInfix}_Extension`;
           const namingLine = extensionInfix
-            ? `📌 **Naming (MS guidelines):** Generated class: \`${exampleClass}\`\n  Base class: \`${baseName}\`, Prefix infix: \`${extensionInfix}\``
+            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base class: \`${baseName}\`\n${classStyleLine}`
             : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` argument.\n  Generated bare name without prefix infix (e.g. \`${baseName}_Extension\`) which is **not MS-compliant**.`;
           namingNote = namingLine + '\n\n' +
             `🚨 **REQUIRED before adding CoC methods:**\n` +
@@ -2917,12 +2922,8 @@ export async function codeGenTool(request: CallToolRequest) {
             `   in the same class will always cause a compile error.\n` +
             `   The signature tool tells you whether the original is \`static\` or instance, so you generate exactly ONE CoC method.`;
         } else {
-          const exampleClass =
-            args.pattern === 'table-extension'  ? `${baseName}${extensionInfix}_Extension`
-            : args.pattern === 'map-extension'  ? `${baseName}${extensionInfix}_Extension`
-            : `${baseName}${extensionInfix}Form_Extension`;
           namingNote = extensionInfix
-            ? `📌 **Naming (MS guidelines):** Generated class: \`${exampleClass}\`\n  Base element: \`${baseName}\`, Prefix infix: \`${extensionInfix}\``
+            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base element: \`${baseName}\`\n${classStyleLine}`
             : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` argument.\n  Generated bare name without prefix infix (e.g. \`${baseName}_Extension\`) which is **not MS-compliant**.`;
         }
       }

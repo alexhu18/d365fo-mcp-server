@@ -61,6 +61,22 @@ those are called out explicitly below.
   metadata files were unavailable when one had just been parsed.
 
 ### Fixed
+- **`generate_object` names an extension class what `create` will write** (#1041).
+  The pattern generator assembled `{Base}{Infix}…_Extension` by hand, while
+  `d365fo_file(action="create")` normalises every `_Extension` name with the token
+  right before `_Extension` — so `SalesTableCRForm_Extension` and
+  `SalesTable_SalesLineCRDS_Extension` were written as `…CRFormCR_Extension` and
+  `…CRDSCR_Extension` even in the default style, and a model-name class style was
+  ignored outright. The generator now asks the writer's own `normalizeObjectName`,
+  in every style including `EXTENSION_CLASS_NAMING_STYLE`. The form-handler,
+  form-datasource and form-control skeletons therefore carry the token after
+  `Form`/`DS`/`Ctrl` (`SalesTable_SalesLineDSCR_Extension`), the placement shipped
+  code uses: of 217 form data-source extension classes, 12 put it after `DS` and
+  none before.
+- **A misspelled naming style is flagged instead of silently meaning the default.**
+  `EXTENSION_NAMING_STYLE=modelname` behaved as `prefix`, and an unknown
+  `EXTENSION_CLASS_NAMING_STYLE` as `inherit`, with nothing said. `get_workspace_info`
+  now names the variable, its value and what it is treated as.
 - **A write the bridge declined is no longer reported as a write that happened.**
   The bridge answers a skipped operation with `{ success: true, skipped: true, reason }`
   — nothing failed, nothing changed. `BridgeWriteResult` never declared `skipped`, so
