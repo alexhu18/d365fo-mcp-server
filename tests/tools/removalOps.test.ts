@@ -172,6 +172,8 @@ vi.mock('../../src/utils/modelClassifier', () => ({
   isCustomModel: vi.fn(() => true),
   isStandardModel: vi.fn(() => false),
   getExtensionNamingStyle: vi.fn(() => 'prefix'),
+  // Unset EXTENSION_CLASS_NAMING_STYLE inherits the style above; these tests never switch it.
+  getExtensionClassNamingStyle: vi.fn(() => 'prefix'),
 }));
 
 const FORM_PATH = 'K:\\PackagesLocalDirectory\\MyPackage\\MyModel\\AxForm\\ConDemoTicketTable.xml';

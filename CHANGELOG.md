@@ -29,6 +29,16 @@ those are called out explicitly below.
 ## [Unreleased]
 
 ### Added
+- **Extension classes can follow their own naming style.** `EXTENSION_NAMING_STYLE`
+  drove two independent decisions — the token of an element extension
+  (`CustTable.ContosoRobotics`) and that of a CoC class
+  (`CustTable_ContosoRobotics_Extension`) — so a convention spelling them
+  differently had to pick one and have the other rewritten on every `create`.
+  New setting `naming.extensionClassStyle` / `EXTENSION_CLASS_NAMING_STYLE`
+  (`inherit` | `prefix` | `model-name`) applies to extension classes only; the
+  default `inherit` keeps today's behaviour. `applyObjectPrefix`,
+  `normalizeObjectName`, the naming check, `validate_object_naming` and
+  `get_workspace_info` each ask the style that belongs to the name in hand.
 - **Method bodies are served from the symbol index when the bridge and the
   metadata files are both unreachable.** A read-only deployment has neither a
   C# bridge (.NET Framework) nor a PackagesLocalDirectory, which were the only

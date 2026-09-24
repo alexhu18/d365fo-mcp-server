@@ -13,7 +13,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { normalizeObjectName, isExtensionObjectType } from '../../src/utils/objectNaming.js';
 import { registerCustomModel } from '../../src/utils/modelClassifier.js';
 
-const ENV_KEYS = ['EXTENSION_PREFIX', 'EXTENSION_SUFFIX', 'EXTENSION_NAMING_STYLE', 'EXTENSION_PREFIX_SOURCE'];
+const ENV_KEYS = [
+  'EXTENSION_PREFIX',
+  'EXTENSION_SUFFIX',
+  'EXTENSION_NAMING_STYLE',
+  'EXTENSION_CLASS_NAMING_STYLE',
+  'EXTENSION_PREFIX_SOURCE',
+];
 let saved: Record<string, string | undefined>;
 
 beforeEach(() => {
@@ -105,6 +111,61 @@ describe('normalizeObjectName', () => {
     const notes: string[] = [];
     normalizeObjectName('PurchTable', 'table-extension', 'ContosoExt', n => notes.push(n));
     expect(notes.join('\n')).toMatch(/dot-notation/i);
+  });
+});
+
+/**
+ * Element extensions and CoC classes can be spelled by different conventions, and
+ * one style could not say so: 'model-name' rewrote the class, 'prefix' rewrote the
+ * element. A real model — Visual Studio elements `PurchParameters.AVAFLG` plus
+ * prefix-first classes `AVAFLGPurchParametersTbl_Extension` — was unreachable
+ * through create() by any spelling of the name, which silently produced
+ * `AVAFLGPurchParametersTbl_AVAFLG_Extension` instead.
+ */
+describe('normalizeObjectName with EXTENSION_CLASS_NAMING_STYLE', () => {
+  it('inherits EXTENSION_NAMING_STYLE when unset, so existing setups are unchanged', () => {
+    process.env.EXTENSION_NAMING_STYLE = 'model-name';
+    expect(normalizeObjectName('PurchTable', 'table-extension', 'ContosoExt'))
+      .toBe('PurchTable.ContosoExt');
+    expect(normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt'))
+      .toBe('SalesFormLetter_ContosoExt_Extension');
+  });
+
+  it('names classes by prefix while elements keep the model name', () => {
+    process.env.EXTENSION_NAMING_STYLE = 'model-name';
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix';
+    expect(normalizeObjectName('PurchTable', 'table-extension', 'ContosoExt'))
+      .toBe('PurchTable.ContosoExt');
+    expect(normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt'))
+      .toBe('SalesFormLetterCtso_Extension');
+  });
+
+  it('names elements by prefix while classes keep the model name', () => {
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'model-name';
+    expect(normalizeObjectName('PurchTable', 'table-extension', 'ContosoExt'))
+      .toBe('PurchTable.CtsoExtension');
+    expect(normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt'))
+      .toBe('SalesFormLetter_ContosoExt_Extension');
+  });
+
+  it('leaves an already-conventional class name alone when the prefix is the model name', () => {
+    // The shape that surfaced this: prefix and model are the same word, the class
+    // carries it at the START, and create() still injected a second copy.
+    process.env.EXTENSION_PREFIX = 'AVAFLG';
+    registerCustomModel('AVAFLG');
+    process.env.EXTENSION_NAMING_STYLE = 'model-name';
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix';
+    expect(normalizeObjectName('AVAFLGPurchParametersTbl_Extension', 'class', 'AVAFLG'))
+      .toBe('AVAFLGPurchParametersTbl_Extension');
+    expect(normalizeObjectName('PurchParameters', 'table-extension', 'AVAFLG'))
+      .toBe('PurchParameters.AVAFLG');
+  });
+
+  it('is idempotent — re-normalising a mixed-style name changes nothing', () => {
+    process.env.EXTENSION_NAMING_STYLE = 'model-name';
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix';
+    const once = normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt');
+    expect(normalizeObjectName(once, 'class-extension', 'ContosoExt')).toBe(once);
   });
 });
 

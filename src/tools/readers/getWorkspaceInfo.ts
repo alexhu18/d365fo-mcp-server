@@ -17,7 +17,7 @@ import { getConfigManager } from '../../utils/configManager.js';
 import { getStdioSessionInfo } from '../../utils/stdioSessionInfo.js';
 import { checkIndexStaleness } from '../../utils/indexStaleness.js';
 import {
-  isCustomModel, getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix,
+  isCustomModel, getObjectSuffix, getExtensionNamingStyle, getExtensionClassNamingStyle, deriveExtensionInfix,
 } from '../../utils/modelClassifier.js';
 import { normalizeModelToken } from '../../utils/modelToken.js';
 import { buildPrefixDiagnostics, modelWritesLandIn } from '../analysis/prefixDiagnostics.js';
@@ -230,7 +230,10 @@ export async function getWorkspaceInfoTool(
   // path embeds — the model name with non-identifier characters removed (#892). The model
   // name itself stays raw everywhere else here: the write path on disk is joined with it.
   const writeModelToken = writeModel ? normalizeModelToken(writeModel) : '';
-  const sampleClassExt = extNamingStyle === 'model-name' && writeModelToken
+  // Classes may follow their own style — the sample has to show the name a write
+  // would actually produce, which is the whole reason the two are asked separately.
+  const extClassNamingStyle = getExtensionClassNamingStyle();
+  const sampleClassExt = extClassNamingStyle === 'model-name' && writeModelToken
     ? `CustTable_${writeModelToken}_Extension`
     : `CustTable${extInfix}_Extension`;
   const sampleElemExt = extNamingStyle === 'model-name' && writeModelToken
@@ -241,9 +244,13 @@ export async function getWorkspaceInfoTool(
       `## Extension Naming`,
       ``,
       `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
+      `EXTENSION_CLASS_NAMING_STYLE: ${process.env.EXTENSION_CLASS_NAMING_STYLE?.trim() || `(not set → inherits "${extNamingStyle}")`}`,
       extNamingStyle === 'model-name'
-        ? `✅ model-name style — extension token is the MODEL NAME (Visual Studio default).`
-        : `ℹ️  prefix style (default) — extension token is the EXTENSION_PREFIX infix.`,
+        ? `✅ model-name style — element extension token is the MODEL NAME (Visual Studio default).`
+        : `ℹ️  prefix style (default) — element extension token is the EXTENSION_PREFIX infix.`,
+      extClassNamingStyle === extNamingStyle
+        ? `   Extension classes follow the same style.`
+        : `✅ Extension classes follow "${extClassNamingStyle}" instead — set separately.`,
       `  • Extension class  → ${sampleClassExt}`,
       `  • Element extension → ${sampleElemExt}`,
       `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,

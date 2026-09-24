@@ -56,7 +56,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
     const {
       errors, warnings, suggestions, exactConflict, similarSymbols,
       isExtension, prefix, modelName, modelTokenPhrase, extensionInfix,
-      useModelName, namingStyle,
+      useModelName, namingStyle, useModelNameForClass, classNamingStyle,
     } = check;
     const name = args.proposedName;
     const reinterpreted = check.reinterpretedNote ? { note: check.reinterpretedNote } : undefined;
@@ -79,11 +79,22 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       output += `Model Prefix: ${prefix}${modelName ? ` (${modelPart}${origin})` : ''}\n`;
     }
     if (isExtension) {
-      output += useModelName
+      // A class extension follows the class style, everything else the element style;
+      // the two are the same unless EXTENSION_CLASS_NAMING_STYLE says otherwise.
+      const isClassExt = args.objectType === 'class-extension';
+      const appliedUseModelName = isClassExt ? useModelNameForClass : useModelName;
+      const appliedStyle = isClassExt ? classNamingStyle : namingStyle;
+      const appliedVar = isClassExt && classNamingStyle !== namingStyle
+        ? 'EXTENSION_CLASS_NAMING_STYLE'
+        : 'EXTENSION_NAMING_STYLE';
+      output += appliedUseModelName
         ? `Extension Style: model-name (token = ${modelTokenPhrase})\n`
         : `Extension Style: prefix (token = "${extensionInfix}")\n`;
-      if (namingStyle === 'model-name' && !modelName) {
-        output += `  ⚠ EXTENSION_NAMING_STYLE=model-name but no model name could be resolved — validated structure only. Pass modelName to validate the extension token.\n`;
+      if (classNamingStyle !== namingStyle) {
+        output += `  ℹ Element extensions use "${namingStyle}", extension classes use "${classNamingStyle}" (EXTENSION_CLASS_NAMING_STYLE).\n`;
+      }
+      if (appliedStyle === 'model-name' && !modelName) {
+        output += `  ⚠ ${appliedVar}=model-name but no model name could be resolved — validated structure only. Pass modelName to validate the extension token.\n`;
       }
     }
     output += '\n';

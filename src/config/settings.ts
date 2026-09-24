@@ -360,6 +360,25 @@ export const SETTINGS: Setting[] = [
       { value: 'model-name', hint: 'CustTable.ContosoRobotics — embeds the model name (VS default)' },
     ],
   },
+  {
+    path: 'naming.extensionClassStyle',
+    env: 'EXTENSION_CLASS_NAMING_STYLE',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'enum',
+    label: 'How extension CLASSES are named',
+    description:
+      'Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. ' +
+      'Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with ' +
+      'prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one ' +
+      'or the other. Leave on inherit unless your convention names classes differently from elements.',
+    default: 'inherit',
+    choices: [
+      { value: 'inherit', hint: 'follow naming.extensionStyle — the default, behaviour unchanged' },
+      { value: 'prefix', hint: 'CustTableCtso_Extension — embeds the extension prefix' },
+      { value: 'model-name', hint: 'CustTable_ContosoRobotics_Extension — embeds the model name' },
+    ],
+  },
 
   // ── index ────────────────────────────────────────────────────────────────
   {

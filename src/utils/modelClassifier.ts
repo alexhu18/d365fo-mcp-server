@@ -98,6 +98,29 @@ export function getExtensionNamingStyle(): 'prefix' | 'model-name' {
 }
 
 /**
+ * The same choice, for extension CLASSES only.
+ *
+ * One style drove both halves of the naming, and a convention that spells them
+ * differently could not be expressed at all. It is not a hypothetical shape: a
+ * model whose element extensions are the Visual Studio `CustTable.ContosoRobotics`
+ * while its CoC classes are prefix-first `CtsoCustTableTbl_Extension` has to pick
+ * one and break the other — 'model-name' rewrites the class to
+ * `CtsoCustTableTbl_ContosoRobotics_Extension`, 'prefix' rewrites the element to
+ * `CustTable.CtsoExtension`. Splitting the knob is the whole fix; each branch of
+ * applyObjectPrefix now asks the question that belongs to it.
+ *
+ * Configured via EXTENSION_CLASS_NAMING_STYLE. Unset — or any value that is
+ * neither 'prefix' nor 'model-name' — inherits getExtensionNamingStyle(), so a
+ * setup that never sets it behaves exactly as before.
+ */
+export function getExtensionClassNamingStyle(): 'prefix' | 'model-name' {
+  const configured = process.env.EXTENSION_CLASS_NAMING_STYLE?.trim().toLowerCase();
+  if (configured === 'prefix') return 'prefix';
+  if (configured === 'model-name') return 'model-name';
+  return getExtensionNamingStyle();
+}
+
+/**
  * Apply a configurable suffix to a NEW model element name.
  * The suffix is appended at the end of the object name.
  *
@@ -268,7 +291,11 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
 
   // model-name style embeds the model name instead of the prefix infix for extension
   // elements/classes only (VS default); regular new objects are unaffected.
-  const useModelName = !!modelName && getExtensionNamingStyle() === 'model-name';
+  // Elements and classes are asked separately: a convention may spell one with the
+  // model name and the other with the prefix, and EXTENSION_CLASS_NAMING_STYLE is
+  // what lets it say so. Unset, both resolve identically and nothing changes.
+  const useModelNameForElement = !!modelName && getExtensionNamingStyle() === 'model-name';
+  const useModelNameForClass = !!modelName && getExtensionClassNamingStyle() === 'model-name';
 
   // The model name as it may appear inside an object name — identical to modelName
   // unless the name carries characters an AOT identifier cannot (see #892).
@@ -297,7 +324,7 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
     const suffixPart = objectName.slice(dotIdx + 1);
 
     // Replaces whatever follows the dot, so re-running is idempotent.
-    if (useModelName) {
+    if (useModelNameForElement) {
       return `${basePart}.${modelToken}`;
     }
 
@@ -318,7 +345,7 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
 
     // Strip any trailing model-name token first so re-running stays idempotent
     // (avoids Base_ModelName_ModelName_Extension).
-    if (useModelName) {
+    if (useModelNameForClass) {
       let cleanBase = baseName.replace(/_+$/, '');
       // Match on the TOKEN, not the raw model name: the token is what an existing
       // name can contain, so comparing against "contoso robotics" never fired and

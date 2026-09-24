@@ -20,6 +20,7 @@ import {
   deriveExtensionInfix,
   getObjectSuffix,
   getExtensionNamingStyle,
+  getExtensionClassNamingStyle,
 } from './modelClassifier.js';
 import { normalizeModelToken } from './modelToken.js';
 
@@ -79,7 +80,10 @@ export function normalizeObjectName(
   onNote?: (note: string) => void,
 ): string {
   const objectPrefix = resolveObjectPrefix(modelName ?? '');
-  const namingStyle = getExtensionNamingStyle();
+  // Elements and classes carry their own style: a convention may spell one with the
+  // model name and the other with the prefix. Case A is an element, Case B a class.
+  const elementNamingStyle = getExtensionNamingStyle();
+  const classNamingStyle = getExtensionClassNamingStyle();
   let effective = objectName;
 
   // Cases A and B below strip a model-name token off a name that already carries
@@ -94,7 +98,7 @@ export function normalizeObjectName(
   // "CustTable.MyModelExtension" → "CustTable.Extension", so applyObjectPrefix
   // can put the right token back.
   if (
-    namingStyle !== 'model-name' &&
+    elementNamingStyle !== 'model-name' &&
     effective.includes('.') &&
     effective.toLowerCase().endsWith('extension') &&
     modelDiffersFromPrefix
@@ -110,7 +114,7 @@ export function normalizeObjectName(
 
   // Case B: the same, for extension classes ending in "_Extension".
   if (
-    namingStyle !== 'model-name' &&
+    classNamingStyle !== 'model-name' &&
     effective.endsWith('_Extension') &&
     modelDiffersFromPrefix
   ) {
