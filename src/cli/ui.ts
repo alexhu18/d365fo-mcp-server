@@ -9,13 +9,20 @@ import { installOneLiner, isFullInstall } from './context.js';
 
 export { p };
 
-/** Unwrap a clack result; exit gracefully when the user cancelled. */
-export function ensure<T>(value: T | symbol): T {
+/**
+ * Unwrap a clack result; exit gracefully when the user cancelled.
+ *
+ * Typed as `Exclude<T, symbol>` rather than `(value: T | symbol): T`: since
+ * @clack/prompts 1.8.1 the prompts return `T | typeof CANCEL_SYMBOL`, a
+ * `unique symbol` that the `T | symbol` form no longer peeled off T, so every
+ * caller got the cancel symbol back in its type.
+ */
+export function ensure<T>(value: T): Exclude<T, symbol> {
   if (p.isCancel(value)) {
     p.cancel('Cancelled.');
     process.exit(0);
   }
-  return value as T;
+  return value as Exclude<T, symbol>;
 }
 
 export async function askText(opts: { message: string; placeholder?: string; initialValue?: string; required?: boolean }): Promise<string> {

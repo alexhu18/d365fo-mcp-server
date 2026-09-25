@@ -243,3 +243,301 @@ describe('generate_object(scaffold, report) EDT/field-type reconciliation', () =
     expect(text).not.toMatch(/<Name>LineCount<\/Name>[\s\S]{0,300}?System\.String/);
   });
 });
+
+/**
+ * Phase D: uiBuilder=true emits the UI-builder class and binds it on the
+ * Contract via [SysOperationContractProcessing] — and stays absent otherwise,
+ * so the default scaffold shape (compile-proven by the L4 goldens) is unchanged.
+ */
+describe('generate_object(scaffold, report) uiBuilder option', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('emits <Name>UIBuilder and the SysOperationContractProcessing binding', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'CustAgingReport',
+        fieldsHint: 'CustAccount, Balance',
+        contractParams: [{ name: 'CustGroup', type: 'CustGroupId' }],
+        uiBuilder: true,
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).toContain('CustAgingReportUIBuilder');
+    expect(text).toContain('extends SrsReportDataContractUIBuilder');
+    expect(text).toContain('SysOperationContractProcessing(classStr(CustAgingReportUIBuilder))');
+    // build() calls super() first, per the ssrs-ui-builder topic
+    expect(text).toContain('public void build()');
+    expect(text).toContain('parmCustGroup');
+  });
+
+  it('default scaffold carries no UI builder and a plain [DataContractAttribute]', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'PlainReport',
+        fieldsHint: 'ItemId, Qty',
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).not.toContain('UIBuilder');
+    expect(text).not.toContain('SysOperationContractProcessing');
+    expect(text).toContain('[DataContractAttribute]');
+  });
+});
+
+describe('generate_object(scaffold, report) preProcess option — Phase F VM-verified shape', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('pairs the TempDB tmp table with SrsReportDataProviderPreProcessTempDB, keeps the parameter attribute and invents no hook', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'HeavyLedgerRecap',
+        fieldsHint: 'AccountNum, Amount',
+        contractParams: [{ name: 'FromDate', type: 'TransDate' }],
+        preProcess: true,
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    // 332 of the 370 shipped pre-processed DPs pair a TempDB staging table with this base;
+    // SrsReportDataProviderPreProcess is the regular-table (createdTransactionId) variant.
+    expect(text).toContain('extends SrsReportDataProviderPreProcessTempDB');
+    expect(text).not.toMatch(/extends SrsReportDataProviderPreProcess(?!TempDB)/);
+    expect(text).toContain('<TableType>TempDB</TableType>');
+    // Every shipped pre-processed DP binds its contract this way (AssetCardDP, AgreementFollowUpDP …).
+    expect(text).toContain('SRSReportParameterAttribute(classStr(HeavyLedgerRecapContract))');
+    expect(text).toContain('parmFromDate()');
+    // SrsReportDataProviderPreProcessInterface has only cleanUp/initialize/parm* members —
+    // processReport() IS the pre-processing step, so no invented preProcess() method.
+    expect(text).not.toContain('void preProcess()');
+  });
+});
+
+describe('generate_object(scaffold, report) controllerType="printMgmt" — Phase F VM-verified shape', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('implements the abstract runPrintMgmt, constructs the PrintMgmtReportRun in initPrintMgmtReportRun, and never calls parmPrintMgmtDocType', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'ConsignmentNote',
+        fieldsHint: 'SalesId, CustAccount',
+        controllerType: 'printMgmt',
+        generateController: true,
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).toContain('extends SrsPrintMgmtController');
+    // xppc on the VM: "Class 'X' does not implement the abstract method 'runPrintMgmt'"
+    expect(text).toContain('protected void runPrintMgmt()');
+    expect(text).toContain('this.outputReports();');
+    expect(text).toContain('protected void initPrintMgmtReportRun()');
+    expect(text).toContain('PrintMgmtReportRun::construct(');
+    expect(text).toContain('printMgmtReportRun.parmReportRunController(this);');
+    // xppc on the VM: "does not contain a definition for method 'parmPrintMgmtDocType'"
+    expect(text).not.toContain('parmPrintMgmtDocType');
+    expect(text).toContain('ssrsReportStr(ConsignmentNote, Report)');
+  });
+});
+
+/**
+ * Regression: without a `caption` the scaffold labelled the tmp table and menu item
+ * "<Name> (temp)" / "<Name>" — prose in a slot that must hold a label ID, so every
+ * scaffolded report started life with a BPErrorLabelIsText
+ * (eval/corpus/runs/2026-08-30T05__L3-print-mgmt-doctype-extension).
+ */
+describe('generate_object(scaffold, report) labels', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  const scaffold = (args: Record<string, unknown>) =>
+    handleGenerateSmartReport(
+      {
+        name: 'DemoNoteReport',
+        fieldsHint: 'NoteId, Subject',
+        generateController: true,
+        modelName: 'MyModel',
+        ...args,
+      } as any,
+      createSymbolIndexStub()
+    );
+
+  it('writes no Label at all when no caption is given, and says so', async () => {
+    const text = (await scaffold({})).content[0].text as string;
+
+    expect(text).not.toContain('(temp)');
+    expect(text).not.toContain('<Label>DemoNoteReport');
+    expect(text).not.toContain('@TODO:LabelId');
+    expect(text).toContain('BPErrorLabelIsText');
+    expect(text).toContain('caption="@Model:LabelId"');
+  });
+
+  it('keeps prose out of the Label slot but still titles the RDL with it', async () => {
+    const text = (await scaffold({ caption: 'Inventory by Zones' })).content[0].text as string;
+
+    expect(text).not.toContain('<Label>Inventory by Zones</Label>');
+    // The caption is not lost — it is the RDL page-header title and the doc comments.
+    expect(text).toContain('Inventory by Zones');
+    expect(text).toContain('is prose, not a label ID');
+  });
+
+  it('uses a label reference everywhere when one is given', async () => {
+    const text = (await scaffold({ caption: '@TaxTransactionInquiry:HeaderNote' })).content[0].text as string;
+
+    // Both the tmp table and the menu item — the shape every captured report golden holds.
+    expect(text.match(/<Label>@TaxTransactionInquiry:HeaderNote<\/Label>/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(text).not.toContain('BPErrorLabelIsText');
+  });
+});
+
+/**
+ * Regression: `prePromptModifyContract()` opened with a contract local followed by a
+ * TODO that never read it — a BPLocalVariableNotUsed on all three Phase F report
+ * captures (eval/corpus/runs/2026-08-30T04+).
+ */
+describe('generate_object(scaffold, report) controller hook', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('does not declare an unused contract local when there is nothing to pre-fill', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'DemoNoteReport',
+        fieldsHint: 'NoteId, Subject',
+        contractParams: [{ name: 'subjectFilter', type: 'str' }],
+        generateController: true,
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).toContain('protected void prePromptModifyContract()');
+    // The fetch survives as an example, never as a live declaration.
+    expect(text).not.toContain('        DemoNoteReportContract contract = this.parmReportContract()');
+    expect(text).toContain('//     DemoNoteReportContract contract = this.parmReportContract()');
+    // Pinned wording: the five captured controller goldens carry these exact lines.
+    expect(text).toContain('// TODO: set default parameter values here. Fetch the contract where you read it:');
+    // Emitted X++ stays ASCII — the AOT goldens are ASCII documents.
+    const hookStart = text.indexOf('protected void prePromptModifyContract()');
+    const hook = text.slice(hookStart, hookStart + 400);
+    expect([...hook].filter(c => (c.codePointAt(0) ?? 0) > 127)).toEqual([]);
+  });
+
+  it('still declares and USES the contract when a caller record pre-fills it', async () => {
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'DemoNoteReport',
+        fieldsHint: 'NoteId, Subject',
+        contractParams: [{ name: 'CustAccount', type: 'str' }],
+        callerTableName: 'CustTable',
+        generateController: true,
+        modelName: 'MyModel',
+      } as any,
+      createSymbolIndexStub()
+    );
+    const text = result.content[0].text as string;
+
+    expect(text).toContain('        DemoNoteReportContract contract = this.parmReportContract()');
+    expect(text).toContain('contract.parmCustAccount(custTable.CustAccount);');
+  });
+});
+
+/**
+ * A report temp table has no natural key: it is a bag of rows produced by
+ * processReport(). The scaffold built its UNIQUE index on the table's FIRST
+ * field, which under designStyle="GroupedWithTotals" is by construction the GROUP
+ * key — so the table could hold exactly one row per group, and the second record
+ * in a group failed on a duplicate key. At RUN time; the metadata builds clean
+ * and nothing else notices, which is why an eval run had to find it and repair
+ * the table by hand.
+ */
+describe('report temp table index', () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Same reason as above: the non-Windows path RETURNS the XML instead of
+    // writing it. Without this the test scaffolds a real package into
+    // PackagesLocalDirectory — which is exactly what happened while writing it.
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
+  it('keys the unique index on RecId, not on the first data column', async () => {
+    const symbolIndex = createSymbolIndexStub();
+
+    const result = await handleGenerateSmartReport(
+      {
+        name: 'ConDemoIdxProbe',
+        fieldsHint: 'CustGroup, AccountNum, CreditMax',
+        designStyle: 'GroupedWithTotals',
+        modelName: 'MyModel',
+      } as any,
+      symbolIndex,
+    );
+
+    const text = result.content[0].text as string;
+    const indexBlock = /<Indexes>([\s\S]*?)<\/Indexes>/.exec(text)?.[1] ?? '';
+
+    expect(indexBlock, 'no <Indexes> block was emitted for the temp table').not.toBe('');
+    expect(indexBlock).toContain('RecId');
+    // The group column must not be made unique by accident.
+    expect(indexBlock).not.toContain('CustGroup');
+  });
+});

@@ -16,9 +16,13 @@
 
 import * as fs from 'fs/promises';
 import {
-  resolveMembership, renderMembership, axFolderForObjectType, type Membership,
+  resolveMembership, renderMembership, axFolderForObjectType, hasAxFolder, type Membership,
 } from '../../workspace/projectMembership.js';
 import { getConfigManager } from '../../utils/configManager.js';
+import {
+  findControlElementOrderViolations,
+  formatElementOrderViolations,
+} from '../../validation/formControlElementOrder.js';
 
 /**
  * The model's other .rnrproj, or none — never a throw.
@@ -49,7 +53,15 @@ export function membershipOf(
   objectType: string,
   objectName: string,
   modelName: string | null | undefined,
-): { axFolder: string; objectName: string; siblingProjectPaths: string[] } {
+): { axFolder: string; objectName: string; siblingProjectPaths: string[] } | undefined {
+  // A type with no Ax* folder has no membership question to answer. Gating HERE
+  // rather than at each call site is deliberate: the first fix for this put the
+  // guard in modifyD365File's single-operation path only, and the batch wrapper
+  // in d365foFile.ts asked the same question again and reported the same
+  // invented "no .rnrproj references AxClass\<Model>" on the very next run.
+  // verifyWrittenFile already takes this optional, so returning undefined
+  // silences every caller at once — present and future.
+  if (!hasAxFolder(objectType)) return undefined;
   return {
     axFolder: axFolderForObjectType(objectType),
     objectName,
@@ -141,6 +153,26 @@ export async function runInlineBpCheck(
   }
 }
 
+/**
+ * "Send the rest of the edits together" — the line that turns the dominant waste
+ * pattern into one call.
+ *
+ * 45 of 273 sampled tool calls were consecutive single-op modifies, and 40 of 49
+ * modifies were single-op even though operations[] already existed: the gap is
+ * discovery, not capability, so the hint names the concrete call.
+ *
+ * `objectName` MUST be the name the object actually carries after prefix
+ * normalization. Passing the requested name instead hands back a follow-up call
+ * aimed at an object that does not exist.
+ */
+export function renderBatchEditHint(objectType: string, objectName: string, opts?: { afterCreate?: boolean }): string {
+  if (!objectName) return '';
+  return opts?.afterCreate
+    ? `Further edits to "${objectName}" go in ONE call: d365fo_file(action="modify", ` +
+      `objectType="${objectType}", objectName="${objectName}", operations:[…]) — not one call per edit.\n`
+    : `\nMore edits to "${objectName}"? Send them together: operations:[{operation:"…"}, …] in ONE modify call.`;
+}
+
 /** One-line summary for a write response, or '' when there is nothing worth saying. */
 export function renderWriteVerification(v: WriteVerification): string {
   if (!v.onDisk) {
@@ -155,4 +187,43 @@ export function renderWriteVerification(v: WriteVerification): string {
     ? renderMembership(v.membership, v.axFolder ?? '', v.objectName ?? '')
     : '';
   return note ? verified + note : `${verified}.`;
+}
+
+/**
+ * Post-write element-order check for a form document (#989).
+ *
+ * `create` can only pass through a defect the caller supplied, and it is gated
+ * BEFORE the write. `modify` is different in kind: the direct XML writers insert
+ * elements into an existing document, and an insertion at the wrong offset IS
+ * this defect — the same class as the nesting-scope trap behind #927/#928. So
+ * the interesting failure here is one this server just introduced, and it can
+ * only be seen after the operation has applied (through IMetadataProvider.Update()
+ * or the XML fallback, neither of which can be dry-run).
+ *
+ * Hence a report rather than a gate. The write has happened; the caller needs to
+ * know the file on disk now contains something the compiler will not see, and
+ * which tool undoes it.
+ *
+ * Advisory like everything else in this module: a check that throws must not
+ * turn a successful write into a reported failure.
+ */
+export async function verifyFormElementOrder(
+  filePath: string | undefined,
+  objectType: string,
+): Promise<string> {
+  if (!filePath || (objectType !== 'form' && objectType !== 'form-extension')) return '';
+  try {
+    const xml = await fs.readFile(filePath, 'utf-8');
+    const dropped = findControlElementOrderViolations(xml).filter(v => v.kind === 'order');
+    if (dropped.length === 0) return '';
+    return (
+      `\n\n⛔ **The file on disk now has ${dropped.length} element(s) the metadata deserializer ` +
+      `will DROP silently** — they are in the file and the compiler will not see them:\n` +
+      `${formatElementOrderViolations(dropped)}\n` +
+      `This is a defect in the write, not in your request. Undo it with ` +
+      `\`undo_last_modification\`, and please report the operation that produced it.`
+    );
+  } catch {
+    return '';
+  }
 }

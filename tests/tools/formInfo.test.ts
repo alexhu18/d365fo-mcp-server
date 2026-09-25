@@ -3,7 +3,7 @@
  *
  * 561 lines with no test, on a path the agent depends on before every form
  * extension: it is how the model learns the EXACT control name to pass as
- * `parent=` / `after=` when adding a control. A wrong name there produces a
+ * `parentControl=` / `previousSibling=` when adding a control. A wrong name there produces a
  * form extension that writes successfully and does nothing visible, which is
  * the most expensive failure shape this server has.
  *
@@ -209,9 +209,13 @@ describe('getFormInfoTool — searchControl', () => {
     const out = await search('GeneralGroup');
     expect(out).toContain('MainTab › TabPageGeneral › GeneralGroup');
     expect(out).toContain('Parent: `TabPageGeneral`');
-    // Both add-control placements, spelled as the parameters d365fo_file takes.
-    expect(out).toContain('parent="GeneralGroup"');
-    expect(out).toContain('parent="TabPageGeneral", after="GeneralGroup"');
+    // Both add-control placements, spelled as the parameters d365fo_file's
+    // add-control actually declares. The hint used to say parent=/after=, which
+    // the operation does not read — following the tool's own instruction cost a
+    // guaranteed retry.
+    expect(out).toContain('parentControl="GeneralGroup"');
+    expect(out).toContain('parentControl="TabPageGeneral", previousSibling="GeneralGroup"');
+    expect(out).not.toMatch(/set `parent="/);
   });
 
   it('keeps recursing past a match, so a matching ancestor does not hide descendants', async () => {
@@ -268,5 +272,67 @@ describe('getFormInfoTool — older Design/Controls layout', () => {
     ));
     expect(out).toContain('MainTab');
     expect(out).toContain('TabPageGeneral');
+  });
+});
+
+/**
+ * The defect these cover: `searchControl` is implemented on the XML path only,
+ * and in full mode the BRIDGE answers first — so the filter was silently dropped
+ * and the whole control tree came back. On CustTable (635 controls) that blew the
+ * response cap, and the truncation message then advised passing `searchControl`,
+ * which the caller already had.
+ *
+ * It survived because the existing searchControl tests all go through the
+ * explicit-filePath branch, which returns BEFORE the bridge is consulted — a test
+ * of a branch the real caller does not take. These use the dispatch a real call
+ * reaches.
+ */
+describe('getFormInfoTool — searchControl must not be lost to the bridge', () => {
+  const bridgeForm = {
+    name: 'MyFleetVehicleForm',
+    model: 'MyModel',
+    dataSources: [],
+    controls: [
+      { name: 'TabHeader', type: 'Tab', children: [] },
+      { name: 'TabPageDetails', type: 'TabPage', children: [] },
+    ],
+    methods: [],
+  };
+
+  function bridgeCtx(readForm: () => Promise<unknown>): XppServerContext {
+    return {
+      bridge: { isReady: true, metadataAvailable: true, readForm },
+      symbolIndex: { getReadDb: () => { throw new Error('no index in this test'); } },
+    } as unknown as XppServerContext;
+  }
+
+  it('does not answer a search from the bridge, which cannot filter', async () => {
+    let bridgeCalls = 0;
+    const result = await getFormInfoTool(
+      req({ formName: 'MyFleetVehicleForm', searchControl: 'TabPageDetails' }),
+      bridgeCtx(async () => { bridgeCalls++; return bridgeForm; }),
+    ) as { content: Array<{ text: string }> };
+
+    const out = textOf(result);
+    if (bridgeCalls > 0) {
+      // The bridge may still be used as a LAST resort when the XML is
+      // unreachable — but then it must say the filter was not applied, rather
+      // than present a full tree as if it were the search result.
+      expect(out).toMatch(/was NOT applied/i);
+      expect(out).toMatch(/TabPageDetails/);
+    } else {
+      expect(out).not.toMatch(/Source: C# bridge/);
+    }
+  });
+
+  it('still uses the bridge when no search is requested', async () => {
+    let bridgeCalls = 0;
+    const result = await getFormInfoTool(
+      req({ formName: 'MyFleetVehicleForm' }),
+      bridgeCtx(async () => { bridgeCalls++; return bridgeForm; }),
+    ) as { content: Array<{ text: string }> };
+
+    expect(bridgeCalls).toBe(1);
+    expect(textOf(result)).toMatch(/Source: C# bridge/);
   });
 });

@@ -62,10 +62,10 @@ export function toRepoRelative(repoRoot: string, absolutePath: string): string {
   return toPosix(path.relative(realpathOrSelf(repoRoot), realpathOrSelf(absolutePath)));
 }
 
-// Tool registration (name, description, inputSchema) lives in
-// src/server/toolSchemas/undoLastModification.ts — the single source of truth for tool
-// instructions. It is NOT in mcpServer.ts; that file only spreads the
-// aggregated toolSchemas array into the ListTools response.
+// This handler has no schema of its own — it is reached through
+// d365fo_file(action="undo") (src/server/toolSchemas/d365foFile.ts), and stays
+// routable under its old tool name `undo_last_modification` for agents still
+// holding it from an earlier session.
 
 export const undoLastModificationTool = async (params: any, context: XppServerContext) => {
   const { filePath } = params;
@@ -164,9 +164,14 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
     }
 
     fs.unlinkSync(absolutePath);
+    // The create registered this file in a .rnrproj; deleting it without that
+    // entry leaves a <Content Include> pointing at nothing, which nothing else in
+    // the session removes and only VS reports. A model directory under source
+    // control takes this path, not the ledger one below.
+    const projectNote = await removeFromProjectAndForget(absolutePath);
     await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
     return {
-      content: [{ type: 'text', text: 'Successfully undid file creation (deleted untracked file): ' + absolutePath + '\nStale index entries cleaned up.' }],
+      content: [{ type: 'text', text: 'Successfully undid file creation (deleted untracked file): ' + absolutePath + projectNote + '\nStale index entries cleaned up.' }],
     };
   } catch (error: any) {
     return {
@@ -193,8 +198,7 @@ async function undoViaLedger(
   if (!fs.existsSync(absolutePath)) {
     // Already gone (e.g. removed by hand). Still clean the project + index and
     // forget the ledger entry so the run's state is consistent.
-    await removeFromProjectSafe(entry);
-    forgetCreatedArtifact(absolutePath);
+    await removeFromProjectAndForget(absolutePath);
     await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
     return {
       content: [{ type: 'text', text: 'File already removed; cleaned project + index entries for session-created object: ' + absolutePath }],
@@ -210,16 +214,30 @@ async function undoViaLedger(
   }
 
   fs.unlinkSync(absolutePath);
-  await removeFromProjectSafe(entry);
-  forgetCreatedArtifact(absolutePath);
+  const projectNote = await removeFromProjectAndForget(absolutePath);
   await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
 
-  const projectNote = entry.projectPath
-    ? '\nRemoved its project entry from ' + path.basename(entry.projectPath) + '.'
-    : '';
   return {
     content: [{ type: 'text', text: 'Successfully undid file creation (deleted session-created file outside git): ' + absolutePath + projectNote + '\nStale index entries cleaned up.' }],
   };
+}
+
+/**
+ * Reverse the create's project registration for a deleted path and drop its
+ * ledger entry. Returns the line the undo message appends — '' when the ledger
+ * never saw this path (a file from an earlier session, or one created outside
+ * this server), in which case the .rnrproj is deliberately left alone.
+ *
+ * Both undo paths go through here so neither can forget the project entry.
+ */
+async function removeFromProjectAndForget(absolutePath: string): Promise<string> {
+  const entry = lookupCreatedArtifact(absolutePath);
+  if (!entry) return '';
+  await removeFromProjectSafe(entry);
+  forgetCreatedArtifact(absolutePath);
+  return entry.projectPath
+    ? '\nRemoved its project entry from ' + path.basename(entry.projectPath) + '.'
+    : '';
 }
 
 /**

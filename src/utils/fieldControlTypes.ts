@@ -12,8 +12,9 @@
  */
 
 import fs from 'fs';
+import path from 'path';
 import { lookupSymbolNocase } from './symbolLookup.js';
-import { resolveIndexedFilePath } from './packagesRoot.js';
+import { packagesRoots, resolveIndexedFilePath } from './packagesRoot.js';
 
 export interface ControlTypeInfo {
   /** AxForm control i:type attribute, e.g. 'AxFormComboBoxControl' */
@@ -233,7 +234,7 @@ export function parseTableTitleField(tableXml: string): string | undefined {
  * Resolve a table's `TitleField1` through the symbol index (same file_path hop as
  * {@link getFieldControlMap}). Used by the form scaffold so a DetailsMaster title
  * control binds to the record's identifying field instead of the alphabetically
- * first one (docs/eval-sweep-findings-2026-07-21.md #32).
+ * first one (the 2026-07-21 eval sweep, finding #32).
  */
 export function getTableTitleField(db: any, table: string): string | undefined {
   try {
@@ -258,4 +259,114 @@ export function getTableTitleField(db: any, table: string): string | undefined {
 /** Control type for a single field from a (possibly undefined) map, defaulting to String. */
 export function controlForField(field: string, types?: FieldControlMap): ControlTypeInfo {
   return types?.get(field.toLowerCase()) ?? DEFAULT_CONTROL;
+}
+
+/** Cache of packages-root → (lower-cased table name → AxTable XML path). */
+const tableXmlIndexByRoot = new Map<string, Map<string, string>>();
+
+/**
+ * Locate a table's AOT XML WITHOUT the symbol index.
+ *
+ * {@link getFieldControlMap} needs a SQLite handle, which the shared XML
+ * builders do not have and should not grow — and the index is also the wrong
+ * oracle here: a table created moments ago in the same call is on disk but not
+ * yet indexed, which is exactly the case a form-over-a-new-table hits. Reading
+ * the layout instead (`<root>/<package>/<model>/AxTable/<Name>.xml`) sees it.
+ *
+ * The per-root directory listing is built once and cached; on this VM that is
+ * 214 packages and a few hundred milliseconds, against a form create that
+ * otherwise emits a String control for every column.
+ */
+export function findTableXmlPath(table: string, roots?: readonly string[]): string | undefined {
+  if (!table?.trim()) return undefined;
+  const wanted = table.trim().toLowerCase();
+  for (const root of roots ?? packagesRoots()) {
+    let index = tableXmlIndexByRoot.get(root);
+    if (!index) {
+      index = new Map();
+      try {
+        for (const pkg of fs.readdirSync(root, { withFileTypes: true })) {
+          if (!pkg.isDirectory()) continue;
+          const pkgDir = path.join(root, pkg.name);
+          let models: fs.Dirent[];
+          try {
+            models = fs.readdirSync(pkgDir, { withFileTypes: true });
+          } catch { continue; }
+          for (const model of models) {
+            if (!model.isDirectory()) continue;
+            const tablesDir = path.join(pkgDir, model.name, 'AxTable');
+            let entries: string[];
+            try {
+              entries = fs.readdirSync(tablesDir);
+            } catch { continue; }
+            for (const entry of entries) {
+              if (!entry.toLowerCase().endsWith('.xml')) continue;
+              const name = entry.slice(0, -4).toLowerCase();
+              // First package wins, matching how resolveIndexedFilePath picks a root.
+              if (!index.has(name)) index.set(name, path.join(tablesDir, entry));
+            }
+          }
+        }
+      } catch { /* an unreadable root contributes nothing */ }
+      tableXmlIndexByRoot.set(root, index);
+    }
+    const hit = index.get(wanted);
+    if (hit && fs.existsSync(hit)) return hit;
+  }
+  return undefined;
+}
+
+/** Forget the cached AxTable listings — for tests, and after a model is written. */
+export function resetTableXmlIndexCache(): void {
+  tableXmlIndexByRoot.clear();
+}
+
+/** The `<AxTableFieldGroup>` names a table document declares. */
+export function parseTableFieldGroupNames(tableXml: string): Set<string> {
+  const names = new Set<string>();
+  const re = /<AxTableFieldGroup>[\s\S]*?<Name>([^<]+)<\/Name>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(tableXml)) !== null) names.add(m[1].trim().toLowerCase());
+  return names;
+}
+
+/**
+ * Does this table declare that field group?
+ *
+ * `undefined` means "could not tell" — the table was not found or not readable
+ * — and is deliberately distinct from `false`. A form control's `<DataGroup>`
+ * is a build error when it names a group the table does not have, but dropping
+ * it on a mere failure to read would break every form built without the
+ * packages root in reach. Only a positive `false` may change behaviour.
+ */
+export function tableDeclaresFieldGroup(
+  table: string,
+  group: string,
+  roots?: readonly string[],
+): boolean | undefined {
+  try {
+    const file = findTableXmlPath(table, roots);
+    if (!file) return undefined;
+    return parseTableFieldGroupNames(fs.readFileSync(file, 'utf-8')).has(group.trim().toLowerCase());
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Field→control-type map for a table, read straight off disk. Returns an empty
+ * map when the table cannot be found, so callers fall back to String controls
+ * exactly as before.
+ */
+export function getFieldControlMapFromDisk(
+  table: string,
+  roots?: readonly string[],
+): FieldControlMap {
+  try {
+    const file = findTableXmlPath(table, roots);
+    if (!file) return new Map();
+    return parseTableFieldControls(fs.readFileSync(file, 'utf-8'));
+  } catch {
+    return new Map();
+  }
 }

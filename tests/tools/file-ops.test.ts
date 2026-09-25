@@ -96,19 +96,27 @@ vi.mock('../../src/utils/packageResolver', () => ({
   })),
 }));
 
-vi.mock('../../src/utils/modelClassifier', () => ({
-  registerCustomModel: vi.fn(),
-  resolveObjectPrefix: vi.fn(() => ''),
-  applyObjectPrefix: vi.fn((name: string) => name),
-  getObjectSuffix: vi.fn(() => ''),
-  applyObjectSuffix: vi.fn((name: string) => name),
-  getExtensionNamingStyle: vi.fn(() => 'prefix'),
-  // validate_object_naming derives the extension token from the model's own
-  // convention; the identity form keeps these tests on the plain prefix infix.
-  deriveExtensionInfix: vi.fn((prefix: string) => prefix),
-  isCustomModel: vi.fn(() => true),
-  isStandardModel: vi.fn(() => false),
-}));
+vi.mock('../../src/utils/modelClassifier', () => {
+  const getExtensionNamingStyle = vi.fn(() => 'prefix');
+  return {
+    registerCustomModel: vi.fn(),
+    resolveObjectPrefix: vi.fn(() => ''),
+    applyObjectPrefix: vi.fn((name: string) => name),
+    getObjectSuffix: vi.fn(() => ''),
+    applyObjectSuffix: vi.fn((name: string) => name),
+    getExtensionNamingStyle,
+    // Delegates, exactly as the real one does when EXTENSION_CLASS_NAMING_STYLE is
+    // unset. A fixed 'prefix' here would quietly change what the tests below mean:
+    // several switch getExtensionNamingStyle to 'model-name' and then assert on a
+    // CLASS extension, which now asks this function instead.
+    getExtensionClassNamingStyle: vi.fn(() => getExtensionNamingStyle()),
+    // validate_object_naming derives the extension token from the model's own
+    // convention; the identity form keeps these tests on the plain prefix infix.
+    deriveExtensionInfix: vi.fn((prefix: string) => prefix),
+    isCustomModel: vi.fn(() => true),
+    isStandardModel: vi.fn(() => false),
+  };
+});
 
 // These fixtures create into model "Contoso" while the mocked workspace targets
 // "MyModel" — a cross-model write, which d365fo_file now refuses by default. The
@@ -1801,7 +1809,7 @@ describe('modify_d365fo_file', () => {
     // An AxMenu's <Elements> holds AxMenuElement entries discriminated by i:type.
     // `AxMenuFunctionItem` (what this used to write) is not a type in the metadata
     // model — zero of the 73 shipped AxMenu files use it, so the element
-    // deserialized into nothing: docs/eval-sweep-findings-2026-07-21.md #30.
+    // deserialized into nothing: the 2026-07-21 eval sweep, finding #30.
     expect(writtenContent).toContain('<AxMenuElement xmlns="" i:type="AxMenuElementMenuItem">');
     expect(writtenContent).not.toContain('AxMenuFunctionItem');
     expect(writtenContent).toContain('<MenuItemName>ContosoRentEquipmentTable</MenuItemName>');
@@ -2267,5 +2275,72 @@ describe('EDT base-type resolution cost', () => {
       ctx,
     );
     expect(readEdt).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── validate_object_naming — both element-extension suffix forms (issue #986) ─
+//
+// `Base.{Infix}Extension` and `Base.{ModelToken}` are BOTH shipped AOT. A census
+// of all 214 packages in PackagesLocalDirectory finds 1,453 of 2,563 dotted
+// extension names — 57 % — using the bare model token
+// (CustTable.AdvancedQualityManagement, AppCopilotAgentType.Foundation,
+// ModuleAxapta.ApplicationCommon). Under the prefix style the validator called
+// that an ERROR and offered to rename it, while under the model-name style the
+// same name was correct — and `applyObjectPrefix` has always written a bare
+// model-token suffix through unchanged. The checker was refusing what the writer
+// supports.
+describe('validate_object_naming — element-extension suffix forms', () => {
+  let ctx: XppServerContext;
+
+  beforeEach(() => {
+    ctx = buildContext();
+    (ctx.symbolIndex.db as any).stmt.get.mockReturnValue(undefined);
+    (ctx.symbolIndex.db as any).stmt.all.mockReturnValue([]);
+    // The DEFAULT style — the one that used to error.
+    vi.mocked(getExtensionNamingStyle).mockReturnValue('prefix');
+  });
+
+  const check = (proposedName: string) =>
+    validateObjectNamingTool(
+      req('validate_object_naming', {
+        proposedName,
+        objectType: 'enum-extension',
+        baseObjectName: 'NumberSeqModule',
+        modelName: 'ContosoRobotics',
+        modelPrefix: 'CR',
+      }),
+      ctx,
+    );
+
+  it('accepts the bare model-token suffix under the PREFIX style too', async () => {
+    const result = await check('NumberSeqModule.ContosoRobotics');
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).not.toMatch(/ERRORS \(\d/);
+    expect(result.content[0].text).not.toMatch(/must end with 'Extension'/);
+  });
+
+  it('still accepts the infix form', async () => {
+    const result = await check('NumberSeqModule.CRExtension');
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).not.toMatch(/ERRORS \(\d/);
+    expect(result.content[0].text).not.toMatch(/neither of the two forms/);
+  });
+
+  it('warns — never errors — for a suffix that is neither form, and names both', async () => {
+    const result = await check('NumberSeqModule.ConDemoRent');
+    expect(result.isError).toBeFalsy();
+    // The house convention still shows...
+    expect(result.content[0].text).toMatch(/neither of the two forms/);
+    // Both acceptable forms are named: the model's infix one and the bare token.
+    expect(result.content[0].text).toMatch(/CRExtension/);
+    expect(result.content[0].text).toMatch(/ContosoRobotics \(bare model name\)/);
+    // ...but a legal, buildable AOT name is not an error.
+    expect(result.content[0].text).not.toMatch(/ERRORS \(\d/);
+  });
+
+  it('still errors when the base half does not match the object being extended', async () => {
+    // The rule that IS about correctness, not convention, is untouched.
+    const result = await check('SomeOtherEnum.ContosoRobotics');
+    expect(result.content[0].text).toMatch(/Extension base \(before '\.'\) must exactly match/);
   });
 });

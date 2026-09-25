@@ -3,7 +3,7 @@
  * payload, which is sent to the model on (at least) every new session and is
  * the server's largest fixed token cost.
  *
- * Rationale: the 23 tool schemas are verbose on purpose (the descriptions encode
+ * Rationale: the 20 tool schemas are verbose on purpose (the descriptions encode
  * hard-won D365FO patterns that prevent failed/retried calls), so the goal is
  * NOT to minimise blindly — it is to make the size *visible and bounded* so it
  * cannot creep upward unnoticed. Lower these ceilings whenever the schema is
@@ -76,8 +76,116 @@ const CHARS_PER_TOKEN = 4;
 // does not shrink anything, so those chars buy back thousands per call. Against
 // main alone it needed the ceiling at 53_700; combined with the Phase 1.5 trim
 // it fits far below, so the ceiling is set from the real measured payload.
-const TOTAL_BUDGET = 50_700;
-const LARGEST_TOOL_BUDGET = 5_300;
+//
+// Raised by ~1,000 chars for get_knowledge's new kind="bp-moniker": validate an
+// exact BP-check moniker, search by scenario when there is no moniker yet, or
+// render a _BPSuppressions.xml <Diagnostic> block — all backed by names/text
+// extracted from a real D365FO install (src/knowledge/bpMonikers/), not typed
+// from memory. A moniker guessed wrong and only caught by reading the xppc log
+// by hand is the failure this buys back. Only the four fields a caller cannot
+// work without are published (action, moniker, path, justification); the rest —
+// limit, message, severity, itemSpecific, and the elementType/elementName
+// fallback for deriving a path — stay in the zod handler schema, the same trade
+// already made for `labels`.
+//
+// Raised DELIBERATELY by ~350 chars for the three removal capabilities d365fo_file
+// was missing: the `delete` action (an object's XML plus its .rnrproj entry) and
+// the remove-control / remove-entry-point operations. All three are enum values
+// plus one line of prose for the action — the parameters stay behind
+// get_knowledge(kind="op-spec"), as #825 requires. An operation the model cannot
+// see is an operation it works around by rewriting the whole object with
+// action="create", overwrite=true, which costs orders of magnitude more than the
+// enum value does and loses metadata as well.
+//
+// Raised by ~50 chars for add-query-range / remove-query-range — two XML-only
+// operations for inserting/removing ViewMetadata filter ranges on data entities.
+// Lowered to bank the removal of build_d365fo_project.buildReferencedModels, a
+// parameter whose handler hard-codes `false` and ignores it (buildProject.ts).
+// The ratchet only works in this direction: fit the change to the budget, never
+// the budget to the change.
+// Lowered again after unpublishing parameters no caller passed in 273 sampled
+// tool calls (search: workspacePath/includeWorkspace/globalTypeFilter/deduplicate/
+// crossReference; labels: the list/list-files and limit aliases; trigger_db_sync:
+// tableName) and de-duplicating prose the tool description already carried. Every
+// one of those keys is still accepted by its handler — only the advertisement is
+// gone. Measured payload after the trim: 49_210.
+// Lowered again after de-duplicating prose that two schemas stated twice:
+// undo_last_modification carried the story of how it got its name, and
+// find_references spelled the "Owner.method or it over-reports" rule out in full
+// both in its description and in the parameter that rule applies to. Measured
+// payload after: 48_904.
+// Lowered again by the 2026-08-25 round-trip audit. prepare's `operation` now
+// takes SEVERAL operations comma-separated, so ONE prepare returns every write
+// contract an ordinary table change needs (add-field + add-index +
+// add-field-to-field-group) instead of one — measured over 1,400 real MCP calls,
+// get_knowledge was called 186 times against only 81 prepares, nearly all of them
+// op-spec lookups a prepare could have answered. That clause was paid for inside
+// the two schemas it belongs to, and then some: `prepare.mode` and
+// `get_knowledge.kind` restated the enum bullet lists their own tool descriptions
+// already carry, and `get_knowledge.topic` listed twelve example topics the
+// description had already named. Measured payload after: 48_436.
+// Lowered again by the same audit's post-build tools. verify_d365fo_project and
+// run_bp_check now say WHEN they are worth calling — after a BUILD, not after a
+// write, because d365fo_file already verifies its own write inline and
+// build_d365fo_project(bpCheck:true) already folds the BP check into the build.
+// That is what the 1,400-call sample shows being got wrong: 39 run_bp_check and
+// 35 verify_d365fo_project calls, largely right after writes. Paid for inside
+// those three schemas and then some, by unpublishing parameters that were never
+// worth their bytes: run_bp_check's targetFilter/targetElementType (the
+// single-object spelling of the objects[] the schema itself calls "preferred",
+// passed 0 times in 273 sampled calls), verify's auto-resolved packageName/
+// packagePath, and build's self-described "(Legacy)" projectPath. All five are
+// still accepted by their handlers — only the advertisement is gone. Net across
+// the three schemas, measured in isolation against HEAD: 48,904 -> 48,502.
+// Measured payload for the whole tree after: 48_034.
+// Lowered again by the same audit's Phase C, which folded three tools into the
+// tools that already owned their subject and paid for the folds with trims —
+// 23 published tools -> 20:
+//   • undo_last_modification -> d365fo_file(action="undo"). `filePath` was
+//     already on d365fo_file, the tool is already annotated destructive, and the
+//     "discards ALL uncommitted changes to the file, not just the last edit"
+//     warning moved with it.
+//   • review_workspace_changes -> get_workspace_info(changes=true). Both LOCAL,
+//     both read-only, both about one workspace. Its published description also
+//     promised "BP violations, missing labels, CoC patterns" while the handler
+//     ran `git diff HEAD --unified=3`; the folded knob says what it returns.
+//   • trigger_db_sync -> build_d365fo_project(dbSync), on the `bpCheck`
+//     precedent: a sync always follows a successful build.
+// Paid for inside the schemas that grew, and then some: d365fo_file bought its
+// `undo` enum value back out of its own prose (5,676 -> 5,649, still the largest
+// tool), get_object_info stopped inlining the object-type enum a second time in
+// objects[] (`search` already solved this the same way), four discriminator
+// parameters stopped restating the bullet list their own tool description
+// carries (generate_object.mode, security_info.mode, object_patterns.domain,
+// validate_code.mode), and update_symbol_index dropped the half of its
+// description that was an essay rather than the two facts the inventory test
+// pins. All three retired names stay ROUTABLE, so an agent holding one still
+// gets an answer. Measured payload after: 44_919.
+// Then the three report-extension patterns (report-dataset-extension,
+// report-custom-design, report-menu-redirect) were published, and paid for
+// twice over inside generate_object's own schema, on the same principle: its
+// `pattern` description opened with a roll-call of five values printed verbatim
+// in the enum immediately above it, and its `params` description repeated the
+// op-spec pointer that the tool description already carries. 73 chars of new
+// enum, 138 chars of restatement removed. Measured payload after: 44_936 —
+// below where it stood before the patterns were added.
+//
+// Then `prepare` published the five extension objectTypes (#983 — the handler
+// accepted them while the tool list did not offer them), paid for the same way
+// inside prepare's own schema: `operation` said the parameter contracts come
+// back in this response AND "so no separate op-spec call", and `objectName`
+// carried a cross-reference to d365fo_file that an agent at that point in the
+// flow does not need. ~100 chars of new enum, ~150 of restatement and prose
+// removed. Measured payload after: 44_951.
+//
+// Then d365fo_file published objectType "model-descriptor" and the operations
+// add-/remove-module-reference: +67 serialized chars (5_640 -> 5_707), the cost
+// of giving the model descriptor a write path at all. It was the ONE file under
+// src/Metadata the server could read and not write, so every <ModuleReferences>
+// entry — a mandatory step before code that names a type from another model —
+// was a hand-edited XML carve-out. Parameters stay in the op-spec registry.
+const TOTAL_BUDGET = 45_100;
+const LARGEST_TOOL_BUDGET = 5_780;
 
 async function getTools(): Promise<Array<{ name: string }>> {
   const ctx: any = { symbolIndex: {}, parser: {} };
@@ -97,7 +205,7 @@ describe('tool schema token budget', () => {
       `[tool-budget] ${tools.length} tools · ${chars} chars ≈ ${Math.round(chars / CHARS_PER_TOKEN)} tokens ` +
       `(budget ${TOTAL_BUDGET} chars)`,
     );
-    expect(tools.length).toBe(23);
+    expect(tools.length).toBe(20);
     expect(chars).toBeLessThan(TOTAL_BUDGET);
   });
 
@@ -124,7 +232,14 @@ describe('tool schema token budget', () => {
     const tools = await getTools();
     const byName = new Map(tools.map(t => [t.name, t]));
 
-    for (const [name, cap] of [['d365fo_file', 5_300], ['generate_object', 3_400]] as const) {
+    // d365fo_file's cap moved 5,700 -> 5,780 when objectType "model-descriptor"
+    // and operations add-/remove-module-reference were published (5,640 -> 5,707
+    // serialized chars: 19 for the objectType, 48 for the two operations). That
+    // is ~67 chars on EVERY request, for the write path that closes the last
+    // hand-edited-XML hole under src/Metadata — a model descriptor was the only
+    // file the server could read but not write. The parameters stay out of the
+    // schema, in the op-spec registry, like every other operation's.
+    for (const [name, cap] of [['d365fo_file', 5_780], ['generate_object', 3_400]] as const) {
       const tool: any = byName.get(name);
       expect(tool, `${name} is not published`).toBeDefined();
       const chars = JSON.stringify(tool).length;

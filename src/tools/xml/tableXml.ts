@@ -49,6 +49,124 @@ export function fieldTypeToAxType(fieldType: string, edtName?: string): string {
   return heuristic ? axTableFieldElement(heuristic) : 'AxTableFieldString';
 }
 
+/** Field-group spec as accepted by the tool surface (same shape as the table-extension path). */
+export interface AxTableFieldGroupSpec {
+  name: string;
+  label?: string;
+  fields?: string[];
+}
+
+/**
+ * The five groups every AxTable carries. They are not optional — the metadata
+ * layer expects them by name — so caller groups are APPENDED to these rather
+ * than replacing them.
+ */
+const AUTO_FIELD_GROUPS: ReadonlyArray<{ name: string; autoPopulate?: boolean }> = [
+  { name: 'AutoReport' },
+  { name: 'AutoLookup' },
+  { name: 'AutoIdentification', autoPopulate: true },
+  { name: 'AutoSummary' },
+  { name: 'AutoBrowse' },
+];
+
+/**
+ * Render <FieldGroups>: the five Auto* groups, then whatever the caller asked for.
+ *
+ * This block used to be a hardcoded literal, so `properties.fieldGroups` on a
+ * table create was DROPPED — silently, because a table with no groups of its own
+ * still builds clean. It stops being silent one step later and in the wrong
+ * place: the SimpleList form template emits `<DataGroup>Overview</DataGroup>`
+ * for its grid, and the build then fails with "Field group 'Overview' does not
+ * exist" on the FORM, pointing away from the table that actually lost it.
+ * Found by capturing L3-form-event-handler-class on the VM.
+ */
+export function buildAxTableFieldGroupsXml(groupSpecs: AxTableFieldGroupSpec[]): string {
+  let xml = '\t<FieldGroups>\n';
+  for (const g of AUTO_FIELD_GROUPS) {
+    xml += `\t\t<AxTableFieldGroup>\n\t\t\t<Name>${g.name}</Name>\n`;
+    if (g.autoPopulate) xml += '\t\t\t<AutoPopulate>Yes</AutoPopulate>\n';
+    xml += '\t\t\t<Fields />\n\t\t</AxTableFieldGroup>\n';
+  }
+  for (const g of groupSpecs) {
+    if (!g?.name) continue;
+    // A caller group named like an Auto* one would be a duplicate the metadata
+    // layer rejects; the five above already carry those names.
+    if (AUTO_FIELD_GROUPS.some(a => a.name.toLowerCase() === g.name.toLowerCase())) continue;
+    xml += `\t\t<AxTableFieldGroup>\n\t\t\t<Name>${escapeXml(g.name)}</Name>\n`;
+    if (g.label) xml += `\t\t\t<Label>${escapeXml(g.label)}</Label>\n`;
+    const fields = Array.isArray(g.fields) ? g.fields : [];
+    if (fields.length === 0) {
+      xml += '\t\t\t<Fields />\n';
+    } else {
+      xml += '\t\t\t<Fields>\n';
+      for (const df of fields) {
+        xml += `\t\t\t\t<AxTableFieldGroupField>\n\t\t\t\t\t<DataField>${escapeXml(df)}</DataField>\n\t\t\t\t</AxTableFieldGroupField>\n`;
+      }
+      xml += '\t\t\t</Fields>\n';
+    }
+    xml += '\t\t</AxTableFieldGroup>\n';
+  }
+  return `${xml}\t</FieldGroups>`;
+}
+
+/** Index spec as accepted by the tool surface (same shape as the table-extension path). */
+export interface AxTableIndexSpec {
+  name: string;
+  fields: Array<{ fieldName?: string; name?: string; dataField?: string; direction?: string } | string>;
+  allowDuplicates?: boolean;
+  alternateKey?: boolean;
+}
+
+/**
+ * Render <Indexes> from the caller's index specs.
+ *
+ * Lifted out of the table-EXTENSION builder so the two cannot drift, and
+ * because the plain table builder emitted a hardcoded `<Indexes />`, dropping
+ * every index the caller passed. `createTablePropertyHonesty` caught the loss and
+ * offered `add-index` as the repair — but that operation needs the C# bridge, so
+ * on the template path there was no way to get an index at all.
+ *
+ * `<Relations />` is still a literal, and stays reported by that same check.
+ */
+export function buildAxTableIndexesXml(indexSpecs: AxTableIndexSpec[]): string {
+  if (indexSpecs.length === 0) return '\t<Indexes />';
+
+  let xml = '\t<Indexes>\n';
+  for (const idx of indexSpecs) {
+    if (!idx?.name) continue;
+    xml += `\t\t<AxTableIndex>\n\t\t\t<Name>${escapeXml(idx.name)}</Name>\n`;
+    if (idx.allowDuplicates !== undefined) {
+      xml += `\t\t\t<AllowDuplicates>${idx.allowDuplicates ? 'Yes' : 'No'}</AllowDuplicates>\n`;
+    }
+    if (idx.alternateKey) xml += '\t\t\t<AlternateKey>Yes</AlternateKey>\n';
+    // `fields: ["AccountNum"]` is the documented shape everywhere else — the
+    // bridge normalizer accepts it and so does add-index. Reading only
+    // `fieldName` turned the string form into a literal
+    // <DataField>undefined</DataField>: it deserializes, and the index points
+    // at nothing.
+    const fields = (Array.isArray(idx.fields) ? idx.fields : [])
+      .map((f): { fieldName?: string; direction?: string } => (typeof f === 'string'
+        ? { fieldName: f }
+        : { fieldName: f?.fieldName ?? f?.name ?? f?.dataField, direction: f?.direction }))
+      .filter((f): f is { fieldName: string; direction?: string } =>
+        typeof f.fieldName === 'string' && f.fieldName.length > 0);
+
+    if (fields.length === 0) {
+      xml += '\t\t\t<Fields />\n';
+    } else {
+      xml += '\t\t\t<Fields>\n';
+      for (const f of fields) {
+        xml += `\t\t\t\t<AxTableIndexField>\n\t\t\t\t\t<DataField>${escapeXml(f.fieldName)}</DataField>\n`;
+        if (f.direction) xml += `\t\t\t\t\t<Direction>${escapeXml(f.direction)}</Direction>\n`;
+        xml += '\t\t\t\t</AxTableIndexField>\n';
+      }
+      xml += '\t\t\t</Fields>\n';
+    }
+    xml += '\t\t</AxTableIndex>\n';
+  }
+  return `${xml}\t</Indexes>`;
+}
+
 /** Render the <Fields> block from the caller's field specs. */
 export function buildAxTableFieldsXml(fieldSpecs: AxTableFieldSpec[]): string {
   if (fieldSpecs.length === 0) return '\t<Fields />\n';
@@ -130,6 +248,15 @@ export function buildAxTableXml(
     Array.isArray(properties?.fields) ? properties.fields : [],
   );
 
+  // Caller-defined field groups, appended to the five Auto* ones.
+  const fieldGroupsXml = buildAxTableFieldGroupsXml(
+    Array.isArray(properties?.fieldGroups) ? properties.fieldGroups : [],
+  );
+
+  const indexesXml = buildAxTableIndexesXml(
+    Array.isArray(properties?.indexes) ? properties.indexes : [],
+  );
+
   // X++ passed in `sourceCode` used to be discarded outright: the caller got a ✅
   // and an empty <Methods /> on disk, discoverable only by reading the file back
   // (findings #19). Table source is class-shaped (`public class X extends common`
@@ -159,31 +286,9 @@ ${declarationXpp}
 ${methodsXml}
 \t</SourceCode>
 ${propertiesXml}\t<DeleteActions />
-\t<FieldGroups>
-\t\t<AxTableFieldGroup>
-\t\t\t<Name>AutoReport</Name>
-\t\t\t<Fields />
-\t\t</AxTableFieldGroup>
-\t\t<AxTableFieldGroup>
-\t\t\t<Name>AutoLookup</Name>
-\t\t\t<Fields />
-\t\t</AxTableFieldGroup>
-\t\t<AxTableFieldGroup>
-\t\t\t<Name>AutoIdentification</Name>
-\t\t\t<AutoPopulate>Yes</AutoPopulate>
-\t\t\t<Fields />
-\t\t</AxTableFieldGroup>
-\t\t<AxTableFieldGroup>
-\t\t\t<Name>AutoSummary</Name>
-\t\t\t<Fields />
-\t\t</AxTableFieldGroup>
-\t\t<AxTableFieldGroup>
-\t\t\t<Name>AutoBrowse</Name>
-\t\t\t<Fields />
-\t\t</AxTableFieldGroup>
-\t</FieldGroups>
+${fieldGroupsXml}
 ${fieldsXml}\t<FullTextIndexes />
-\t<Indexes />
+${indexesXml}
 \t<Mappings />
 \t<Relations />
 \t<StateMachines />

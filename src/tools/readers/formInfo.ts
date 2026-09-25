@@ -14,7 +14,13 @@ import type { XppServerContext } from '../../types/context.js';
 import { promises as fs } from 'fs';
 import { parseStringPromise } from '../../utils/xml.js';
 import { tryBridgeForm } from '../../bridge/bridgeAdapter.js';
-import { readIndexedXml } from '../../utils/indexedXmlLookup.js';
+import { readIndexedXml, resolveIndexedObject } from '../../utils/indexedXmlLookup.js';
+import { isCustomModel } from '../../utils/modelClassifier.js';
+import {
+  countFormControls,
+  findControlElementOrderViolations,
+  formatElementOrderViolations,
+} from '../../validation/formControlElementOrder.js';
 import { describeBridgeStartup } from '../../bridge/bridgeReadiness.js';
 import { assertWritePathAllowed } from '../../utils/pathContainment.js';
 import {
@@ -120,8 +126,26 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
       return await parseAndFormatForm(formName, 'Unknown', xmlContent, includeControls, includeDataSources, includeMethods, searchControl, maxControls);
     }
 
-    const bridgeResult = await tryBridgeForm(context.bridge, formName, maxControls);
-    if (bridgeResult) return bridgeResult;
+    // searchControl is implemented on the XML path only, so the bridge — which
+    // answers first in full mode — silently returned the WHOLE tree instead of
+    // the matches. On CustTable (635 controls) that blew the response cap, and
+    // the truncation message then advised using searchControl: the option the
+    // caller had already passed. An eval run lost a cycle dumping the form to a
+    // file and grepping it. So when a search is asked for, prefer the path that
+    // can actually perform it.
+    const wantsSearch = Boolean(searchControl);
+
+    if (!wantsSearch) {
+      const bridgeResult = await tryBridgeForm(context.bridge, formName, maxControls);
+      if (bridgeResult) {
+        // The bridge cannot know it is short — whatever the deserializer dropped
+        // was gone before it looked. Compare against the file (#985).
+        const note = await bridgeCrossCheckWarning(
+          context, formName, bridgeResult.content?.[0]?.text ?? '', args.modelName,
+        );
+        return prefixResult(bridgeResult, note);
+      }
+    }
 
     // Symbol index → form XML. A silent bridge is not proof the form is missing:
     // it also happens when the bridge is down or its provider does not cover that
@@ -136,6 +160,22 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
           includeControls, includeDataSources, includeMethods, searchControl, maxControls,
         );
       } catch { /* not a usable AxForm XML — fall through to the error below */ }
+    }
+
+    // The XML was unreachable and a search was asked for. The bridge can still
+    // describe the form, but it cannot filter — say so rather than returning a
+    // full tree that looks like the search found everything.
+    if (wantsSearch) {
+      const bridgeFallback = await tryBridgeForm(context.bridge, formName, maxControls);
+      if (bridgeFallback) {
+        const note =
+          `⚠️ searchControl="${searchControl}" was NOT applied: the form XML is not in the symbol ` +
+          `index (run update_symbol_index, or pass options={filePath:"<absolute path>"}), and the ` +
+          `bridge reader cannot filter. The full control tree follows.\n\n`;
+        const first = bridgeFallback.content?.[0];
+        if (first && typeof first.text === 'string') first.text = note + first.text;
+        return bridgeFallback;
+      }
     }
 
     // Determine why the bridge returned nothing to give an actionable error message.
@@ -175,6 +215,107 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
       ],
       isError: true,
     };
+  }
+}
+
+// Elements the platform cannot see (issue #985)
+
+/**
+ * The warning block for a form whose XML writes elements out of the order the
+ * metadata deserializer expects, or '' when the document is clean.
+ *
+ * AOT metadata XML is order-sensitive and the deserializer drops a misplaced
+ * element in silence. When the dropped element is a container's `<Controls>`,
+ * every control under it is in the file and invisible to the platform — that is
+ * #979, where a scaffolded form carried 16 controls of which the compiler could
+ * reach 14. The reader is where an agent finds out what a form contains before
+ * writing to it, so it is where the discrepancy has to be said out loud.
+ *
+ * `providerCount` is the number the bridge reported, when a bridge answer is
+ * being cross-checked; omit it on the pure-XML paths, where there is no second
+ * number and inventing one would be worse than saying nothing.
+ */
+function elementOrderWarning(xml: string, providerCount?: number): string {
+  const violations = findControlElementOrderViolations(xml).filter(v => v.kind === 'order');
+  const documentCount = countFormControls(xml);
+  const countsDiffer = providerCount !== undefined && providerCount !== documentCount;
+  if (violations.length === 0 && !countsDiffer) return '';
+
+  const lines: string[] = [];
+  if (countsDiffer) {
+    lines.push(
+      `⚠️ **This form's XML holds ${documentCount} controls; the metadata provider reports ` +
+      `${providerCount}.** The ${documentCount - providerCount} missing one(s) are in the file and ` +
+      `invisible to the platform — the compiler will not see them either.`,
+    );
+  } else {
+    lines.push(
+      `⚠️ **${violations.length} element(s) in this form are written out of order, and the ` +
+      `metadata deserializer drops those silently.** Anything under a dropped \`<Controls>\` is ` +
+      `in the file and invisible to the platform.`,
+    );
+  }
+
+  if (violations.length > 0) {
+    lines.push('', formatElementOrderViolations(violations));
+    lines.push(
+      '',
+      'Fix the ORDER in the AxForm XML — the canonical sequence per control type is mined from ' +
+      'shipped metadata in `src/validation/formControlElementOrder.generated.ts` ' +
+      '(e.g. on a group control `<DataGroup>` and `<DataSource>` come AFTER `</Controls>`).',
+    );
+  } else {
+    lines.push(
+      '',
+      'No element-order violation was found, so the cause is something else the provider ' +
+      'rejected — compare the file against a shipped form of the same shape.',
+    );
+  }
+  return `${lines.join('\n')}\n\n---\n\n`;
+}
+
+/** Prefix a tool result's first text block with `note`, if there is anything to say. */
+function prefixResult<T extends { content?: Array<{ text?: string }> }>(result: T, note: string): T {
+  if (!note) return result;
+  const first = result.content?.[0];
+  if (first && typeof first.text === 'string') first.text = note + first.text;
+  return result;
+}
+
+/**
+ * Cross-check a bridge answer against the form's XML on disk.
+ *
+ * The bridge reads through `IMetadataProvider` — the same reader the compiler
+ * uses — so anything dropped for being out of order is ALREADY gone by the time
+ * it answers, and it cannot know it is short. The only way to notice from that
+ * path is to compare against the raw file.
+ *
+ * Restricted to CUSTOM models on purpose. Microsoft's own forms were written by
+ * Microsoft's tooling and are not the ones this server or its user can have
+ * broken; reading SalesTable.xml off disk on every `get_object_info(form)` call
+ * would be a real cost for a warning that will never fire. The index row is
+ * consulted first (cheap) precisely so the file read can be skipped.
+ */
+async function bridgeCrossCheckWarning(
+  context: XppServerContext,
+  formName: string,
+  bridgeText: string,
+  modelName?: string,
+): Promise<string> {
+  try {
+    const ref = await resolveIndexedObject(context.symbolIndex.getReadDb(), formName, ['form'], modelName);
+    if (!ref?.localPath || !isCustomModel(ref.model)) return '';
+
+    // The rendered tree is capped by maxControls, but the Summary line is not —
+    // it reports the true total the bridge saw.
+    const reported = /Controls:\s*(\d+)/.exec(bridgeText.slice(bridgeText.indexOf('📈 Summary')));
+    if (!reported) return '';
+
+    const xml = await fs.readFile(ref.localPath, 'utf-8');
+    return elementOrderWarning(xml, Number(reported[1]));
+  } catch {
+    // A cross-check that cannot run is not a finding — the bridge answer stands.
+    return '';
   }
 }
 
@@ -219,14 +360,24 @@ async function parseAndFormatForm(
     formInfo.methods = extractMethods(axForm.SourceCode[0].Methods[0]);
   }
 
+  // This path reads the RAW document, so it sees every control — including the
+  // ones the metadata provider has already dropped for being out of order, which
+  // is exactly why the two disagree (#979, #985). Say so before reporting a tree
+  // the platform cannot fully see. The search branch gets it too: a control name
+  // looked up here is about to be written against.
+  const orderNote = elementOrderWarning(xmlContent);
+
   if (searchControl) {
     const matches = searchControlsInHierarchy(formInfo.design, searchControl);
-    return {
+    return prefixResult({
       content: [{ type: 'text', text: formatControlSearchResults(formInfo.name, formInfo.model, matches, searchControl) }],
-    };
+    }, orderNote);
   }
 
-  return formatFormOutput(formInfo, includeControls, includeDataSources, includeMethods, maxControls);
+  return prefixResult(
+    formatFormOutput(formInfo, includeControls, includeDataSources, includeMethods, maxControls),
+    orderNote,
+  );
 }
 
 // Control search helpers
@@ -316,10 +467,16 @@ function formatControlSearchResults(
       }
     }
 
+    // The parameter names here MUST be the ones add-control actually declares
+    // (src/tools/specs/d365foFileOpSpecs.ts): this hint said parent=/after=,
+    // which the operation does not read, so an agent following the tool's own
+    // instruction wrote nothing and paid a full round trip to be told the real
+    // spelling. `parent`/`after` are registered as aliases too, so the older
+    // spelling keeps working — but the hint names the contract.
     out += `\n💡 **Form extension usage:**\n`;
-    out += `  • Add a control **inside** \`${r.control.name}\`: set \`parent="${r.control.name}"\`\n`;
+    out += `  • Add a control **inside** \`${r.control.name}\`: set \`parentControl="${r.control.name}"\`\n`;
     if (r.parentName) {
-      out += `  • Add a control **after** \`${r.control.name}\`: set \`parent="${r.parentName}", after="${r.control.name}"\`\n`;
+      out += `  • Add a control **after** \`${r.control.name}\`: set \`parentControl="${r.parentName}", previousSibling="${r.control.name}"\`\n`;
     }
     out += `\n`;
   }

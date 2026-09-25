@@ -1,0 +1,409 @@
+/**
+ * prepare(mode="test") — everything needed to write a SysTest for a class,
+ * before writing it.
+ *
+ * The other two modes answer "how do I change this" and "how do I create this".
+ * This one answers "how do I TEST this", and it exists because the answer was
+ * the part of the loop the server could not give: the method list to write tests
+ * for lives in the index, the tests that already cover the target live in the
+ * index too, and the one thing that reliably breaks a first test run — the model
+ * not referencing TestEssentials — is visible in the descriptor and nowhere else
+ * until the build fails.
+ *
+ * It deliberately states the RED-first order. A test written after the code, that
+ * passes on its first run, has proven nothing about the assertion inside it.
+ */
+import { ATL_PACKAGES, ATL_ROOT_MODULES } from '../../knowledge/atlNodes.generated.js';
+import { z } from 'zod';
+import * as fs from 'fs';
+import * as path from 'path';
+
+import type { XppServerContext } from '../../types/context.js';
+import { createProvenanceToken } from '../../utils/provenanceStore.js';
+import { resolveTestTarget } from './testFirst.js';
+import { getConfigManager } from '../../utils/configManager.js';
+import { lookupSymbolsNocase } from '../../utils/symbolLookup.js';
+
+const prepareTestArgsSchema = z.object({
+  goal: z.string().optional(),
+  objectName: z.string().min(1, 'objectName (the class or table under test) is required'),
+  methodName: z.string().optional(),
+  modelName: z.string().optional(),
+}).passthrough();
+
+interface ClassMember {
+  name: string;
+  signature?: string;
+  visibility?: string;
+}
+
+/**
+ * Is the target a class or a table?
+ *
+ * It decides the whole answer: a table's rules run on a BUFFER and report through
+ * the infolog, so `new X()` and "expect an exception" are the wrong shape for
+ * them. The distinction used to be unaskable here — this mode resolved classes
+ * only — which left the most-requested X++ task in real sessions (a validateWrite
+ * CoC) with no red-first path through the server at all.
+ */
+function targetKind(context: XppServerContext, name: string): 'class' | 'table' | 'unknown' {
+  try {
+    const db = context.symbolIndex.getReadDb();
+    const hit = lookupSymbolsNocase(db, name, { types: ['class', 'table'], limit: 1 })[0];
+    if (hit?.type === 'table' || hit?.type === 'class') return hit.type;
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * The SHAPE the test must take, beyond "class or table".
+ *
+ * The five scaffolds observe the behaviour in five different places, and picking
+ * the wrong one produces a test that compiles, runs, passes and proves nothing —
+ * most sharply for a Chain of Command wrapper, where a test that names the
+ * `_Extension` class exercises the wrapper in isolation and passes with `next`
+ * never reached.
+ *
+ * Every signal here is read from the index, never guessed from the goal text:
+ * the caller says what they are testing, not how, and inferring the shape from
+ * prose is how a service test ends up constructing a controller.
+ */
+function testShape(
+  context: XppServerContext,
+  target: string,
+  kind: 'class' | 'table' | 'unknown',
+  askedForExtension: boolean,
+): 'class' | 'table' | 'coc' | 'event-handler' | 'service' | 'report-dp' {
+  if (kind === 'table') return 'table';
+  if (kind !== 'class') return 'class';
+
+  // A SysOperation service is reached with a hand-built contract, never through
+  // its controller — so the shape is decided by what the class extends.
+  try {
+    const db = context.symbolIndex.getReadDb();
+    const row = db.prepare(
+      "SELECT signature FROM symbols WHERE type = 'class' AND name = ? LIMIT 1",
+    ).get(target) as { signature?: string } | undefined;
+    if (row?.signature && /SysOperationServiceBase/i.test(row.signature)) return 'service';
+    // A report data provider is tested through processReport() and its dataset
+    // getter, never through a controller — a different shape from any other class.
+    if (row?.signature && /SRS?ReportDataProvider/i.test(row.signature)) return 'report-dp';
+  } catch {
+    // Index unavailable — fall through to the name-based signals below.
+  }
+  if (/Service$/.test(target)) return 'service';
+  if (/DP$/.test(target)) return 'report-dp';
+
+  // The caller named an extension: they are testing a WRAPPER, and the base
+  // class is what the test must construct.
+  if (askedForExtension) return 'coc';
+  return 'class';
+}
+
+/** Public/protected instance and static methods of the target, from the index. */
+function targetMethods(context: XppServerContext, className: string): ClassMember[] {
+  try {
+    const db = context.symbolIndex.getReadDb();
+    // One `symbols` table holds every kind; a method row carries its owner in
+    // parent_name. There is no is_static column — the modifier is in `signature`.
+    //
+    // No COLLATE NOCASE on parent_name. The index is on the column's BINARY
+    // collation, so a NOCASE comparison cannot use it and the query degrades to a
+    // full scan of a 2.5 GB table: measured 74 s cold and 2.4–6.9 s warm, versus
+    // ~1 ms with the plain equality below. The case-insensitive half is delegated
+    // to lookupSymbolsNocase, which resolves the class's canonical spelling first.
+    const read = db.prepare(
+      `SELECT name, signature, visibility
+         FROM symbols
+        WHERE type = 'method' AND parent_name = ?
+        ORDER BY name
+        LIMIT 60`,
+    );
+    let rows = read.all(className) as Array<{ name: string; signature?: string; visibility?: string }>;
+    if (rows.length === 0) {
+      // Both kinds: a table's methods hang off parent_name exactly like a class's,
+      // and resolving only classes here is what hid table targets from this mode.
+      const canonical = lookupSymbolsNocase(db, className, { types: ['class', 'table'], limit: 1 })[0]?.name;
+      if (canonical && canonical !== className) {
+        rows = read.all(canonical) as Array<{ name: string; signature?: string; visibility?: string }>;
+      }
+    }
+    // `signature` holds the return type and parameters, NOT the modifiers
+    // ("void assertExpectedInfoLogMessage(str _infoMessage, …)"), so static vs
+    // instance cannot be read here and is not claimed. get_object_info answers it
+    // when the distinction matters.
+    return rows.map(r => ({ name: r.name, signature: r.signature, visibility: r.visibility }));
+  } catch {
+    return [];
+  }
+}
+
+/** Classes that look like tests and mention the target — the coverage that exists. */
+function existingTests(context: XppServerContext, className: string): string[] {
+  try {
+    const db = context.symbolIndex.getReadDb();
+    const rows = db.prepare(
+      `SELECT DISTINCT name
+         FROM symbols
+        WHERE type = 'class'
+          AND (name LIKE ? OR name LIKE ?)
+        ORDER BY name
+        LIMIT 10`,
+    ).all(`${className}Test%`, `%Test${className}%`) as Array<{ name: string }>;
+    return rows.map(r => r.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Package references declared in a model's descriptor, or null when the
+ * descriptor cannot be read at all.
+ *
+ * Null and empty are different answers and the caller must keep them apart: an
+ * unreadable descriptor is "unknown", not "references nothing", and reporting
+ * the second for the first sends the caller to add a reference that is there.
+ */
+function referencedPackages(modelName: string | undefined): Set<string> | null {
+  if (!modelName) return null;
+  try {
+    const packages = getConfigManager().getPackagePath();
+    if (!packages) return null;
+    const descriptorDir = path.join(packages, modelName, 'Descriptor');
+    if (!fs.existsSync(descriptorDir)) return null;
+    const found = new Set<string>();
+    for (const file of fs.readdirSync(descriptorDir).filter(f => f.endsWith('.xml'))) {
+      const xml = fs.readFileSync(path.join(descriptorDir, file), 'utf8');
+      for (const m of xml.matchAll(/<d2p1:string>([^<]+)<\/d2p1:string>/gi)) found.add(m[1]);
+    }
+    return found;
+  } catch {
+    return null;
+  }
+}
+
+/** Does the model that will hold the test reference TestEssentials? */
+function testEssentialsReferenced(modelName: string | undefined): boolean | null {
+  const refs = referencedPackages(modelName);
+  if (!refs) return null;
+  return [...refs].some(r => r.toLowerCase() === 'testessentials');
+}
+
+/**
+ * Which ATL packages the model is missing, or null when the descriptor is
+ * unreadable. ATL is the platform's own "arrange", and the failure mode it
+ * produces without a reference is the confusing one: `AtlDataRootNode` resolves
+ * because AtlFoundation is often already there, and `data.invent()` does not,
+ * because every module accessor lives on an extension class in another package.
+ */
+function missingAtlPackages(modelName: string | undefined): string[] | null {
+  const refs = referencedPackages(modelName);
+  if (!refs) return null;
+  const have = new Set([...refs].map(r => r.toLowerCase()));
+  return ATL_PACKAGES.filter(pkgName => !have.has(pkgName.toLowerCase()));
+}
+
+export async function prepareTestTool(request: unknown, context: XppServerContext): Promise<unknown> {
+  const raw = (request as { params?: { arguments?: unknown } })?.params?.arguments ?? request;
+  const parsed = prepareTestArgsSchema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      isError: true,
+      content: [{
+        type: 'text',
+        text:
+          '❌ prepare(mode="test") needs the class or TABLE under test:\n' +
+          '  prepare(mode="test", objectName="ConSalesCalculator", goal="cover the discount rules")\n' +
+          '  prepare(mode="test", objectName="CustTable.validateWrite")  — a table method, dotted form\n' +
+          '  Optional: methodName (focus on one method), modelName (the model that will hold the test).',
+      }],
+    };
+  }
+
+  const { goal, objectName, methodName, modelName } = parsed.data;
+  // "CustTable.validateWrite" is how a developer names the thing under test, and
+  // how real sessions asked for it. Split it rather than failing to resolve it.
+  const dotted = /^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/.exec(objectName.trim());
+  const rawTarget = (dotted ? dotted[1] : objectName).trim();
+
+  // An extension name is reduced to the object it extends: a CoC wrapper is
+  // transparent to a test, so `CustTableConExtension_Extension` is tested by
+  // exercising `CustTable`. The reduction is index-verified — the infix between
+  // base and `_Extension` is a per-model convention, so stripping the suffix
+  // alone leaves a name that is not an object.
+  const askedForExtension = /_Extension$/i.test(rawTarget) || Boolean(dotted && /extension/i.test(dotted[2]));
+  const target = (askedForExtension ? resolveTestTarget(context, rawTarget) : undefined) ?? rawTarget;
+
+  const kind = targetKind(context, target);
+  const shape = testShape(context, target, kind, askedForExtension);
+  const testClass = shape === 'coc' ? `${target}CocTest`
+    : shape === 'event-handler' ? `${target}EventTest`
+    : `${target}Test`;
+  const methods = targetMethods(context, target);
+  const focus = (methodName ?? dotted?.[2])?.trim();
+  // Lifecycle and serialisation members are not what a unit test pins down.
+  const skip = new Set(['new', 'finalize', 'typenew', 'pack', 'unpack', 'classdeclaration']);
+  const testable = methods.filter(m => !skip.has(m.name.toLowerCase()));
+  const suggested = (focus ? methods.filter(m => m.name.toLowerCase() === focus.toLowerCase()) : testable)
+    .filter(m => (m.visibility ?? 'public').toLowerCase() !== 'private')
+    .slice(0, 8);
+
+  const tests = existingTests(context, target);
+  const model = modelName ?? getConfigManager().getModelName() ?? undefined;
+  const hasTestEssentials = testEssentialsReferenced(model);
+  const atlMissing = missingAtlPackages(model);
+
+  const token = createProvenanceToken({
+    goal: goal ?? `unit tests for ${target}`,
+    objectName: target,
+    objectType: kind === 'table' ? 'table' : 'class',
+    proposedName: testClass,
+  });
+
+  const lines: string[] = [];
+  lines.push(`# prepare(test) — ${target}`);
+  lines.push('');
+  lines.push(`**Test class:** \`${testClass} extends SysTestCase\` (the platform's own convention: <Target>Test).`);
+  lines.push('');
+
+  if (methods.length === 0) {
+    lines.push(`⚠️ \`${target}\` is not in the symbol index as a class or a table. Check the name, or ` +
+      'run `update_symbol_index` if it was written outside this server. The rest of this answer is generic.');
+  } else {
+    lines.push(`**Methods worth a test** (${methods.length} found on the ${kind === 'unknown' ? 'target' : kind}` +
+      `${focus ? `, focused on \`${focus}\`` : ''}):`);
+    for (const m of suggested) {
+      lines.push(`  • \`${m.name}\`${m.signature ? ` — ${m.signature}` : ''}`);
+    }
+    if (suggested.length === 0) lines.push('  • (nothing testable found — check the target name)');
+    lines.push('');
+    lines.push('Scaffold them in one call:');
+    lines.push('```');
+    lines.push(`generate_object(mode="pattern", pattern="systest", name="${target}",`);
+    lines.push(`  params: { testMethods: [${suggested.map(m => `"${m.name}"`).join(', ')}]` +
+      `${shape !== 'class' ? `, testTargetType: "${shape}"` : ''}` +
+      `${shape === 'service' ? ', baseName: "<the DataContract class>"' : ''}` +
+      `${shape === 'report-dp' ? ', baseName: "<the DataContract class>", datasetAccessor: "<the [SRSReportDataSetAttribute] getter>"' : ''} })`);
+    lines.push('```');
+  }
+
+  if (shape === 'coc') {
+    lines.push('');
+    lines.push(`**\`${rawTarget}\` is an extension, so the test targets \`${target}\`** — and ` +
+      '`testTargetType: "coc"` above is what selects that shape:');
+    lines.push('  • The test constructs the BASE class and calls the wrapped method. It must NOT name the ' +
+      'extension class: Chain of Command is transparent at the call site, so a test that references the ' +
+      'wrapper exercises it in isolation and passes with `next` never reached.');
+    lines.push('  • Two inputs, not one. A wrapper that ignores `next` and returns a constant passes a ' +
+      'single assertion; the second input is what proves the base value is carried through.');
+    lines.push('  • The honest check: remove the wrapper and the test must fail. If it still passes, it is ' +
+      'testing the base method.');
+  }
+
+  if (shape === 'service') {
+    lines.push('');
+    lines.push('**This is a SysOperation service** — `testTargetType: "service"` above selects the shape:');
+    lines.push('  • Build the contract by hand and call the service method directly. No controller, no ' +
+      'dialog, no batch queue — that plumbing is the framework\'s business and it is neither fast nor ' +
+      'deterministic to drag into a unit test.');
+    lines.push('  • Name the contract class in `baseName`. It is not derived: the scaffold emits ' +
+      '`{N}DataContract` while hand-written services commonly use `{N}Contract`, and a guess names a ' +
+      'class that does not exist.');
+  }
+
+  if (shape === 'report-dp') {
+    lines.push('');
+    lines.push('**This is a report DATA PROVIDER** — `testTargetType: "report-dp"` above selects the shape:');
+    lines.push('  • The test builds a contract by hand, calls `processReport()` and reads the staged rows ' +
+      'back through the dataset getter. No controller, no dialog, no render request — compiler-verified ' +
+      'that `processReport()` is callable from outside.');
+    lines.push('  • Name the dataset getter in `datasetAccessor`. It is NOT derivable: ' +
+      '`SrsReportDataProviderBase` has eleven members and none of them is a `getTmp*`, so the getter is ' +
+      'yours and carries `[SRSReportDataSetAttribute]`. The platform itself ships a mis-typed one ' +
+      '(`geAssetBarCodeTmp`), which is why guessing loses.');
+    lines.push('  • Write the EMPTY case too. A provider that stages rows unconditionally passes the ' +
+      'positive test on its own.');
+    lines.push('  • What this cannot cover: the design. Whether the RDL binds a field is a Report Designer ' +
+      'question, and no SysTest reaches it.');
+  }
+
+  if (shape === 'table' || shape === 'event-handler') {
+    lines.push('');
+    lines.push('**This is a TABLE, so the test has a different shape** — and `testTargetType: "table"` ' +
+      'above is what selects it:');
+    lines.push('  • Arrange a BUFFER and call `initValue()`. Table validation runs on an unsaved row, ' +
+      'so most of these tests never touch the database.');
+    lines.push('  • `validateWrite` / `validateField` / `validateDelete` answer with a **boolean** and ' +
+      'explain themselves through the **infolog** — they do not throw. Assert both: ' +
+      '`this.assertFalse(buffer.validateWrite())` and then ' +
+      '`this.assertExpectedInfoLogMessage(<the text>)`.');
+    lines.push('  • Pass the **resolved label text** to that assertion, not the `"@Label:Id"` the rule ' +
+      'hands to `checkFailed` — it scans the infolog, which holds the resolved string.');
+    lines.push('  • Write the ACCEPTING case too. A rule that refuses every row passes the rejecting ' +
+      'test on its own.');
+    lines.push('  • The logic under test usually lives in a CoC class, not on the table: ' +
+      `\`extension_info(mode="coc", target="${target}")\` shows the wrappers, and ` +
+      '`get_knowledge(topic="coc-authoring")` the `next` placement rules. The test still calls the ' +
+      'TABLE method — that is the point, it proves the wrapper is in the chain.');
+  }
+  lines.push('');
+
+  if (tests.length > 0) {
+    lines.push(`**Tests that already exist for this target:** ${tests.map(t => `\`${t}\``).join(', ')} — ` +
+      'extend one of those rather than starting a second class for the same target.');
+  } else {
+    lines.push('**No existing test class** found for this target.');
+  }
+  lines.push('');
+
+  if (hasTestEssentials === false) {
+    lines.push(`🚨 **Model \`${model}\` does not reference TestEssentials.** [SysTestMethod] and ` +
+      '[SysTestCheckInTest] come from ApplicationFoundation and will compile, but [SysTestCategory], ' +
+      '[SysTestOwner], [SysTestPriority] and [SysTestAreaPath] are in TestEssentials and will not. ' +
+      'Add the reference to the model descriptor BEFORE the first build if you plan to use them.');
+  } else if (hasTestEssentials === true) {
+    lines.push(`✅ Model \`${model}\` references TestEssentials — the filtering attributes are available.`);
+  }
+
+  // ATL is reported whether or not it is present, because its absence is invisible
+  // until the build: the ROOT class resolves and the module accessor does not.
+  if (atlMissing !== null && atlMissing.length > 0) {
+    // Name what each missing package COSTS. "ATL is incomplete" reads as blocking
+    // when the packages that carry invent/sales/cust are usually already there,
+    // and the ones missing carry two modules nobody asked for.
+    const cost = atlMissing.map(pkgName => {
+      const mods = ATL_ROOT_MODULES.filter(m => m.package === pkgName).map(m => m.accessor);
+      return `\`${pkgName}\`${mods.length > 0 ? ` (${mods.map(m => `data.${m}()`).join(', ')})` : ''}`;
+    }).join(', ');
+    lines.push(`ℹ️ ATL: \`${model}\` is missing ${cost}. Every module accessor lives on an extension class in ` +
+      'its own package, so a missing one fails on the ACCESSOR while `AtlDataRootNode::construct()` still ' +
+      'compiles — the confusing half. Add the package to the descriptor if you need those modules; ' +
+      '`generate_object(pattern="systest", arrange="atl")` works today for every module the model already has.');
+  } else if (atlMissing !== null) {
+    lines.push(`✅ Model \`${model}\` references every ATL package — ` +
+      '`generate_object(pattern="systest", arrange="atl")` will compile.');
+  }
+  lines.push('');
+
+  lines.push('**The cycle — red first.** A test that passes on its first run has proven nothing:');
+  lines.push('  1. `d365fo_file(action="create", objectType="class")` — write the test class.');
+  lines.push('  2. `build_d365fo_project` — it must COMPILE. Red means a failing assertion, not a broken file.');
+  lines.push(`  3. \`run_systest_class(className="${testClass}")\` — expect failures. If it passes here, the ` +
+    'assertion is empty and the test is worthless.');
+  lines.push('  4. Implement the behaviour.');
+  lines.push('  5. Build, then run again — expect green.');
+  lines.push('  6. `run_bp_check` on the class you changed.');
+  lines.push('');
+  lines.push('**API the framework really has** (`get_knowledge(topic="unit-testing")` for the rest): asserts ' +
+    'come from SysTestAssert — assertEquals, assertNotEqual, assertTrue, assertFalse, assertNull, ' +
+    'assertNotNull, assertSame, assertNotSame, assertRealEquals, assertUTCDateTimeEquals, fail. There is ' +
+    'no assertExpectedException: declare it with `this.parmExceptionExpected(true)` before the call that ' +
+    'must throw. Every test runs in its own transaction and is rolled back, so created records need no ' +
+    'cleanup and there is no SysTestCaseAutoRollback attribute to add.');
+  lines.push('');
+  lines.push(`**Grounding token:** \`${token}\``);
+
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
+}

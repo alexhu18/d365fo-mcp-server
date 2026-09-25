@@ -13,6 +13,7 @@
  */
 
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
+import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import type { XppSymbolIndex } from '../../metadata/symbolIndex.js';
@@ -24,8 +25,13 @@ import { PackageResolver } from '../../utils/packageResolver.js';
 import { crossModelWriteRefusal, standDownNotice } from '../../utils/crossModelWriteGuard.js';
 import { resolveAnchorModel } from './writeAnchorGuard.js';
 import { detectEol } from '../../utils/eolUtils.js';
+import {
+  deriveLabelIdFromText, formatLabelReference, isValidLabelFileId, labelIdSpellings,
+  parseLabelReference, suggestLabelFileId,
+} from '../../utils/labelReference.js';
 import { isExtensionLabelFile } from '../../metadata/labelParser.js';
 import { ProjectFileManager, ProjectFileFinder } from '../../workspace/projectFile.js';
+import { recordWriteSideEffect } from '../../utils/writeSideEffects.js';
 
 const UTF8_BOM = '\uFEFF';
 
@@ -37,7 +43,12 @@ const TranslationSchema = z.object({
   comment: z.string().optional().describe('Optional developer comment for this language'),
 });
 
-const CreateLabelArgsSchema = z.object({
+/**
+ * Exported so argument validation can be tested WITHOUT calling the tool: the
+ * create branch writes real .label.txt files into a live model, so a test that
+ * exercises it through createLabelTool leaves labels behind in the environment.
+ */
+export const CreateLabelArgsSchema = z.object({
   labelId: z
     .string()
     .regex(/^[A-Za-z][A-Za-z0-9_]*$/, 'Label ID must be alphanumeric (no spaces)')
@@ -50,11 +61,22 @@ const CreateLabelArgsSchema = z.object({
     ),
   labelFileId: z
     .string()
+    .regex(
+      /^[A-Za-z][A-Za-z0-9_]*$/,
+      'Label file ID must start with a letter and contain only letters, digits and underscores — ' +
+      'it is the first half of an @LabelFileId:LabelId reference, so a hyphen or dot ends the ' +
+      'identifier and makes every label in the file unreferenceable (BPErrorLabelIsText). ' +
+      'If you passed the MODEL name and the model name itself contains a hyphen ("fm-mcp"), that is ' +
+      'expected and there is nothing to fix in the model: pass a valid identifier instead ("fmmcp"), ' +
+      'and the label file still lives in the model directory.',
+    )
     .describe(
       'Label file ID to add the label to (e.g. ContosoExt). Must exist in the model, or be creatable ' +
       '(createLabelFileIfMissing=true, default). ⛔ For a NEW label file this ID is the MODEL name — ' +
       'never the bare EXTENSION_PREFIX (e.g. use "ContosoExt", not "Con"). The file lives inside the ' +
-      'model directory regardless of prefix, so an ID that is not the model name will not resolve.',
+      'model directory regardless of prefix, so an ID that is not the model name will not resolve. ' +
+      'When the model name itself is not a valid identifier (e.g. "fm-mcp"), the label file ID CANNOT ' +
+      'equal it — pass a valid one ("fmmcp"); the file still lives in the model directory.',
     ),
   model: z
     .string()
@@ -233,7 +255,7 @@ function serializeLabelMap(
 async function writeFileWithBom(filePath: string, content: string): Promise<void> {
   // Ensure content starts with BOM
   const contentWithBom = content.startsWith(UTF8_BOM) ? content : UTF8_BOM + content;
-  await fs.writeFile(filePath, contentWithBom, 'utf-8');
+  await writeFileAtomic(filePath, contentWithBom);
 }
 
 /** XML descriptor content for a new AxLabelFile locale */
@@ -370,6 +392,307 @@ export async function createLabelsBulk(
   };
 }
 
+// Auto-resolution: raw label text → a label reference, without a round trip
+
+/**
+ * Where an auto-resolved label is allowed to land, and the path plumbing the
+ * caller has already resolved (passing it saves createLabelTool re-deriving it).
+ */
+export interface AutoLabelTarget {
+  model: string;
+  /** Overrides the label file pick; normally left out so the model's ORIGINAL file wins. */
+  labelFileId?: string;
+  packagePath?: string;
+  projectPath?: string;
+  solutionPath?: string;
+  addToProject?: boolean;
+}
+
+export interface AutoLabelRequest {
+  /** The raw text as the caller wrote it. */
+  text: string;
+  /** What is being labelled, for the reported note — e.g. `field "Status"`. */
+  what: string;
+  /**
+   * The enum an enum-typed field points at. Its own Label must NOT be reused:
+   * xppbp reports BPErrorFieldLabelIsCopyOfEnumLabel, and the agent cannot see
+   * that until a build runs.
+   */
+  enumType?: string;
+}
+
+export interface AutoLabelResult {
+  /** The reference to write. Absent when nothing could be resolved — keep the raw text. */
+  ref?: string;
+  /** One line, in the shape the other auto-corrections report in. */
+  note: string;
+}
+
+/** How many id spellings a resolve tries before giving up and leaving the text alone. */
+const MAX_LABEL_ID_CANDIDATES = 5;
+
+/**
+ * The model's ORIGINAL label file — never an `…_Extension…` one.
+ *
+ * New labels belong in the model's own file; an extension label file extends
+ * one owned by ANOTHER model, and labels added there end up wrongly prefixed
+ * (the same rule createLabelTool enforces with a hard error below).
+ * The file named after the model is the convention, so it wins; otherwise the
+ * one original file the model already has; otherwise the model name, which
+ * createLabelFileIfMissing then creates.
+ *
+ * A file whose id cannot appear in an `@FileId:LabelId` reference is skipped
+ * rather than preferred: a model named `fm-mcp` ships a label file `fm-mcp`,
+ * and picking it hands the caller a reference xppbp rejects. When only such
+ * files exist the model name is returned unchanged, and the callers below
+ * refuse on {@link isValidLabelFileId} instead of writing an unusable label.
+ */
+export function pickOriginalLabelFileId(model: string, symbolIndex?: XppSymbolIndex): string {
+  try {
+    const originals = (symbolIndex?.getLabelFileIds(model) ?? [])
+      .filter(f => !isExtensionLabelFile(f.labelFileId));
+    const named = originals.find(f => f.labelFileId.toLowerCase() === model.toLowerCase());
+    if (named && isValidLabelFileId(named.labelFileId)) return named.labelFileId;
+    const usable = originals.find(f => isValidLabelFileId(f.labelFileId));
+    if (usable) return usable.labelFileId;
+    if (named) return named.labelFileId;
+    if (originals.length > 0) return originals[0].labelFileId;
+  } catch {
+    // Index unavailable or mid-rebuild — the model name is the right guess.
+  }
+  return model;
+}
+
+/**
+ * An existing label whose text is EXACTLY this text, in this model.
+ *
+ * The FTS index is queried through the same searchLabels the `search` action
+ * uses, then filtered to an exact (case-insensitive) text match: the index
+ * matches wording, not meaning, so anything less than identical text is a
+ * candidate for a human, not for an automatic rewrite of the caller's XML.
+ */
+function findLabelByExactText(
+  text: string,
+  model: string,
+  preferredFileId: string,
+  excluded: Set<string>,
+  symbolIndex: XppSymbolIndex,
+): { labelFileId: string; labelId: string } | null {
+  const wanted = text.trim().toLowerCase();
+  let rows: Array<{ labelId: string; labelFileId: string; text: string }>;
+  try {
+    rows = symbolIndex.searchLabels(text, { language: 'en-US', model, limit: 200 });
+  } catch {
+    return null;
+  }
+  const hits = rows.filter(r =>
+    String(r.text ?? '').trim().toLowerCase() === wanted &&
+    !isExtensionLabelFile(r.labelFileId) &&
+    !excluded.has(String(r.labelId).replace(/^@/, '').toLowerCase()));
+  const preferred = hits.find(h => h.labelFileId.toLowerCase() === preferredFileId.toLowerCase());
+  const chosen = preferred ?? hits[0];
+  return chosen ? { labelFileId: chosen.labelFileId, labelId: chosen.labelId } : null;
+}
+
+/**
+ * Is this id free for `text`, already carrying it, or taken by something else?
+ *
+ * The third case is the one that matters: createIfMissing reuses an id it finds,
+ * so writing `@Model:Status` when `Status` already means "Statut" would point
+ * the object at a different sentence than the caller wrote. That is the one
+ * failure mode worse than the advisory this replaces, so a taken id is skipped
+ * rather than reused.
+ */
+function labelIdState(
+  labelId: string,
+  labelFileId: string,
+  model: string,
+  text: string,
+  symbolIndex?: XppSymbolIndex,
+): 'free' | 'same-text' | 'taken' {
+  if (!symbolIndex) return 'free';
+  let rows: Array<{ text: string; language: string }>;
+  try {
+    rows = symbolIndex.getLabelById(labelId, labelFileId, model);
+  } catch {
+    return 'free';
+  }
+  if (rows.length === 0) return 'free';
+  const wanted = text.trim().toLowerCase();
+  const enUs = rows.find(r => (r.language ?? '').toLowerCase() === 'en-us') ?? rows[0];
+  return String(enUs.text ?? '').trim().toLowerCase() === wanted ? 'same-text' : 'taken';
+}
+
+/**
+ * The label id an enum uses for its OWN Label, so a field pointing at that enum
+ * can be given a different one (BPErrorFieldLabelIsCopyOfEnumLabel).
+ *
+ * Read from the enum's XML rather than the index: the index stores no Label for
+ * enums, and one small file read is cheaper than the build that would otherwise
+ * report the error. `known: false` means the enum could not be read at all —
+ * the caller then declines to REUSE any existing label for the field, because
+ * an unverifiable reuse is exactly how the enum's own id gets picked up.
+ */
+async function enumOwnLabelId(
+  enumType: string,
+  symbolIndex?: XppSymbolIndex,
+): Promise<{ known: boolean; labelId?: string }> {
+  try {
+    const sym = symbolIndex?.getSymbolByName(enumType, 'enum');
+    const filePath = sym?.filePath;
+    if (!filePath || !/\.xml$/i.test(filePath)) return { known: false };
+    const xml = await fs.readFile(filePath, 'utf-8');
+    // The AxEnum's own <Label> precedes <EnumValues>, so the first match is it.
+    const m = /<Label>([^<]+)<\/Label>/i.exec(xml);
+    if (!m) return { known: true };            // read fine, the enum simply has no label
+    return { known: true, labelId: parseLabelReference(m[1].trim()).labelId };
+  } catch {
+    return { known: false };
+  }
+}
+
+/**
+ * Raw label text → a `@File:Id` reference, reusing an existing label when one
+ * already carries that exact text and creating one when none does.
+ *
+ * Why this exists: `labels` was the second most-called tool in a 1,515-call
+ * corpus — 268 calls against 171 writes — and `labels → labels` was the single
+ * most frequent consecutive pair (177 times). The shape was always the same:
+ * search for a label, read it back, create it, then write the object, once per
+ * label. Every one of those is a round trip that re-bills the whole cached
+ * context, and all of it is derivable from the text the write already carries.
+ *
+ * Nothing is invented silently: the returned note names the id that was reused
+ * or created, because a label reference the caller never chose and cannot see
+ * would be worse than the BP advisory this replaces.
+ */
+export async function resolveOrCreateLabelRef(
+  req: AutoLabelRequest,
+  target: AutoLabelTarget,
+  symbolIndex?: XppSymbolIndex,
+): Promise<AutoLabelResult | null> {
+  const text = (req.text ?? '').trim();
+  if (!text || text.startsWith('@') || !target.model) return null;
+
+  const base = deriveLabelIdFromText(text);
+  if (!base) return null;
+
+  const labelFileId = target.labelFileId ?? pickOriginalLabelFileId(target.model, symbolIndex);
+
+  // No label file whose id can be referenced: auto-labelling here would hand
+  // back `@fm-mcp:Something`, which reads as a working reference and is not one.
+  // Falling through to null leaves the caller its raw text and the BP advisory
+  // — worse copy, but honest, and the caller can still create a valid file.
+  if (!isValidLabelFileId(labelFileId)) return null;
+
+  // An enum field must not carry its enum's own label id.
+  const excluded = new Set<string>();
+  let enumCaveat = '';
+  if (req.enumType) {
+    const own = await enumOwnLabelId(req.enumType, symbolIndex);
+    if (own.labelId) excluded.add(own.labelId.toLowerCase());
+    if (!own.known) {
+      enumCaveat =
+        ` Could not read ${req.enumType}'s own Label to compare, so no existing label was reused` +
+        ` — check the two ids differ (BPErrorFieldLabelIsCopyOfEnumLabel).`;
+    }
+  }
+
+  // Reuse before create. Skipped entirely when an enum's own label could not be
+  // read: an unverifiable reuse is the one that lands on the enum's id.
+  if (symbolIndex && !enumCaveat) {
+    const existing = findLabelByExactText(text, target.model, labelFileId, excluded, symbolIndex);
+    if (existing) {
+      return {
+        ref: formatLabelReference(existing.labelFileId, existing.labelId),
+        note:
+          `${req.what}: "${text}" is raw text, not a label ID — reused the existing ` +
+          `${formatLabelReference(existing.labelFileId, existing.labelId)}, which already carries ` +
+          `exactly that text.`,
+      };
+    }
+  }
+
+  // Nothing carries the text: pick an id that is free (or already means the same
+  // thing) and let createIfMissing do the rest.
+  const candidates = [base, `${base}Field`, `${base}2`, `${base}3`, `${base}4`]
+    .slice(0, MAX_LABEL_ID_CANDIDATES);
+  let chosen: string | undefined;
+  let alreadyThere = false;
+  for (const candidate of candidates) {
+    if (excluded.has(candidate.toLowerCase())) continue;
+    const state = labelIdState(candidate, labelFileId, target.model, text, symbolIndex);
+    if (state === 'taken') continue;
+    chosen = candidate;
+    alreadyThere = state === 'same-text';
+    break;
+  }
+  if (!chosen) return null;
+
+  const disambiguated = chosen !== base
+    ? ` (id "${base}" was not free${excluded.size > 0 ? ` — it is ${req.enumType}'s own label` : ''})`
+    : '';
+
+  // createIfMissing, not a bare create: it is the existing "create when absent,
+  // reuse when present, never overwrite" path, and re-implementing the
+  // multi-language .label.txt write here would fork it.
+  const result = await createLabelTool(
+    {
+      method: 'tools/call',
+      params: {
+        name: 'create_label',
+        arguments: {
+          labelId: chosen,
+          labelFileId,
+          model: target.model,
+          translations: [{ language: 'en-US', text }],
+          createIfMissing: true,
+          ...(target.packagePath ? { packagePath: target.packagePath } : {}),
+          ...(target.projectPath ? { projectPath: target.projectPath } : {}),
+          ...(target.solutionPath ? { solutionPath: target.solutionPath } : {}),
+          ...(target.addToProject !== undefined ? { addToProject: target.addToProject } : {}),
+        },
+      },
+    },
+    // The real index, not an empty stand-in: createLabelTool writes the new rows
+    // into it (bulkAddLabels) so the very next lookup — including the reuse check
+    // of the next label in this same write — sees the label that was just created.
+    { symbolIndex } as unknown as XppServerContext,
+  );
+
+  if (result?.isError) {
+    const why = String(result.content?.[0]?.text ?? '').split('\n')[0];
+    return {
+      note:
+        `${req.what}: "${text}" is raw text, not a label ID, and creating ` +
+        `@${labelFileId}:${chosen} failed — ${why} The raw text was written as passed; ` +
+        `xppbp will report BPErrorLabelIsText until a label reference replaces it.`,
+    };
+  }
+
+  // Whether it was created or reused comes from the create's OWN answer, not from
+  // the index probe above: the index can be a moment behind the .label.txt (a
+  // rolled-back run, a model rebuilt outside the server), and reporting "created"
+  // for a label that was reused is exactly the kind of quiet inaccuracy that makes
+  // an auto-correction untrustworthy.
+  const reused = alreadyThere ||
+    String(result?.content?.[0]?.text ?? '').includes('already exists — reusing it');
+
+  const ref = `@${labelFileId}:${chosen}`;
+  // A CREATED label is on disk from here on, whatever the operation that asked
+  // for it does next. If that operation then fails, its "nothing was written"
+  // is about itself; toolHandler appends this so the statement is not read as
+  // covering the whole call. A REUSED label committed nothing.
+  if (!reused) recordWriteSideEffect('label created', ref);
+  return {
+    ref,
+    note:
+      `${req.what}: "${text}" is raw text, not a label ID — ` +
+      `${reused ? 'reused' : 'created'} ${ref}${disambiguated} and wrote that reference.` +
+      enumCaveat,
+  };
+}
+
 // Tool implementation
 
 export async function createLabelTool(request: CallToolRequest, context: XppServerContext) {
@@ -389,6 +712,14 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       // Detect the common mistake of passing the label-file shape
       // (labelFileId + top-level `language`) instead of labelId + translations[].
       const raw = (request.params.arguments ?? {}) as Record<string, unknown>;
+      // A rejected labelFileId is usually the model name copied verbatim, so
+      // name the id that WOULD work rather than restating the rule.
+      const badFileId =
+        typeof raw.labelFileId === 'string' && !isValidLabelFileId(raw.labelFileId)
+          ? `\n\n💡 "${raw.labelFileId}" cannot be referenced as \`@${raw.labelFileId}:YourLabel\`. ` +
+            `Use labelFileId="${suggestLabelFileId(raw.labelFileId)}" (model stays "${raw.model ?? raw.labelFileId}") — ` +
+            `the label file lives in the model directory either way.`
+          : '';
       const wrongShape =
         (raw.language !== undefined || raw.labelFileId !== undefined) &&
         raw.labelId === undefined &&
@@ -407,6 +738,7 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
             `Required: labelId, labelFileId, model, translations:[{language, text}]. Example:\n` +
             `  labels(action="create", labelId="EquipmentName", labelFileId="ContosoExt", model="ContosoExt", ` +
             `translations=[{language:"en-US", text:"Equipment name"}])` +
+            badFileId +
             shapeHint,
         }],
         isError: true,
@@ -480,13 +812,18 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
     ]);
     let collisionWarning = '';
     try {
+      // Both spellings (#888): the 27 legacy files store their keys with the
+      // sigil, so a verbatim `label_id = ?` could never collide with SYS/GLS/
+      // RET/… — the very files this Microsoft-collision guard is about.
+      const spellings = labelIdSpellings(labelId);
       const existing = symbolIndex.labelsDb
         .prepare(
           `SELECT label_id, label_file_id, model, text FROM labels
-           WHERE label_id = ? AND language = 'en-US' AND label_file_id != ?
+           WHERE label_id IN (${spellings.map(() => '?').join(', ')})
+             AND language = 'en-US' AND label_file_id != ?
            LIMIT 10`,
         )
-        .all(labelId, labelFileId) as Array<{ label_id: string; label_file_id: string; model: string; text: string }>;
+        .all(...spellings, labelFileId) as Array<{ label_id: string; label_file_id: string; model: string; text: string }>;
 
       if (existing.length > 0) {
         const msCollisions = existing.filter(r => MICROSOFT_LABEL_FILES.has(r.label_file_id.toUpperCase()));
@@ -495,7 +832,11 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
         ];
         for (const r of existing) {
           const flag = MICROSOFT_LABEL_FILES.has(r.label_file_id.toUpperCase()) ? ' ← Microsoft standard' : '';
-          lines.push(`  @${r.label_file_id}:${labelId}  [${r.model}]  "${r.text}"${flag}`);
+          // formatLabelReference, not `@file:id` — a legacy row's id already
+          // carries its file id and the doubled form is what xppbp rejects.
+          lines.push(
+            `  ${formatLabelReference(r.label_file_id, r.label_id)}  [${r.model}]  "${r.text}"${flag}`,
+          );
         }
         if (msCollisions.length > 0) {
           lines.push('');

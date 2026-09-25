@@ -203,16 +203,34 @@ describe('run_bp_check — path resolution', () => {
       expect(metaArg).toContain(UDE_CUSTOM);
     });
 
-    it('passes -compilerMetadata= / -packagesRoot= pointing to microsoftPackagesPath', async () => {
+    // The build writes `<modelStore>\<Model>\XppMetadata` (build_d365fo_project passes
+    // -compilermetadata=<model store>), so that is the only root on a UDE box where the
+    // module's compiler metadata exists. Aiming -compilerMetadata at the framework
+    // directory instead makes xppbp report the checked element as never compiled and skip
+    // every rule that reads compiled X++.
+    it('passes -compilerMetadata= pointing to customPackagesPath (where the build writes it)', async () => {
       allowPaths([UDE_CUSTOM, UDE_MS, UDE_XPPBP]);
 
       await runBpCheckTool({ modelName: 'MyModel' }, {});
 
       const args    = capturedArgs(0);
-      const compArg = args.find(a => a.includes('compilerMetadata') || a.includes('packagesRoot'));
-      expect(compArg).toContain(UDE_MS);
-      // Must NOT point to the custom metadata dir
-      expect(compArg).not.toContain(UDE_CUSTOM);
+      const compArg = args.find(a => a.includes('compilerMetadata'));
+      expect(compArg).toContain(UDE_CUSTOM);
+      expect(compArg).not.toContain(UDE_MS);
+    });
+
+    // Separate flag, separate root: referenced Microsoft modules resolve from their
+    // binaries in the framework directory, which is what lets -compilerMetadata stay on
+    // the model store.
+    it('passes -packagesRoot= pointing to microsoftPackagesPath alongside it', async () => {
+      allowPaths([UDE_CUSTOM, UDE_MS, UDE_XPPBP]);
+
+      await runBpCheckTool({ modelName: 'MyModel' }, {});
+
+      const args    = capturedArgs(0);
+      const pkgArg  = args.find(a => a.includes('packagesRoot'));
+      expect(pkgArg).toContain(UDE_MS);
+      expect(pkgArg).not.toContain(UDE_CUSTOM);
     });
 
     it('does NOT consult configManager.getCustomPackagesPath when xppConfig is present', async () => {
@@ -845,6 +863,106 @@ describe('run_bp_check — build freshness reflects THESE objects', () => {
 
     expect(result.content[0].text as string).toContain('✅ Compiled');
   });
+
+  // Run 7b8de4ba read "✅ BP Check passed — 3 objects checked, 0 with findings"
+  // sitting directly above "⚠️ Not compiled", 54 s before its first build, and
+  // met two build failures after it. The caveat was already on the next line; the
+  // tick above it is what got believed. So the tick has to go.
+  it('withholds the tick when nothing has ever compiled the model', async () => {
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+    // No recordBuild at all — the state run 7b8de4ba was in.
+
+    const result = await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    );
+
+    const text = result.content[0].text as string;
+    expect(text).toContain('⚠️ BP clean, NOT compiled');
+    expect(text).not.toContain('✅ BP Check passed');
+    // The check still ran and still reports — this changes the claim, not the
+    // check. Scope and xppbp's own output survive untouched.
+    expect(text).toContain('Filter: table:ConDemoTicket');
+    expect(text).toContain('Not compiled');
+    expect(result.isError).toBeFalsy();
+  });
+
+  it('withholds it for a stale build too — same thing to the caller', async () => {
+    recordBuild(dataDir, 'MyModel', {
+      builtAt: new Date(Date.now() - 60_000).toISOString(),
+      fullBuild: true,
+      succeeded: true,
+    });
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+
+    const text = (await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    )).content[0].text as string;
+
+    expect(text).toContain('⚠️ BP clean, build is STALE');
+    expect(text).not.toContain('✅ BP Check passed');
+  });
+
+  it('gives the tick back once a full build covers the write', async () => {
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+    recordBuild(dataDir, 'MyModel', {
+      builtAt: new Date(Date.now() + 60_000).toISOString(),
+      fullBuild: true,
+      succeeded: true,
+    });
+
+    const text = (await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    )).content[0].text as string;
+
+    expect(text).toContain('✅ BP Check passed');
+  });
+
+  it('leaves a findings verdict alone — it was never the misleading one', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: 'BPError: LocalVariableNotUsed\nErrors: 1', stderr: '' });
+    });
+    realFs.writeFileSync(objectPath, '<AxTable/>');
+
+    const text = (await runBpCheckTool(
+      { modelName: 'MyModel', objects: [{ objectType: 'table', objectName: 'ConDemoTicket' }] },
+      contextWithPath(),
+    )).content[0].text as string;
+
+    expect(text).toContain('⚠️ BP Check completed with issues');
+    expect(text).not.toContain('BP clean');
+  });
+});
+
+// Unknown freshness must not manufacture a warning: with no dataDir there is no
+// marker to read, so the tool has learned nothing that would justify one. A
+// caveat printed on no evidence is the kind that gets tuned out.
+describe('run_bp_check — no build marker to read', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    detectedRoots.splice(0, detectedRoots.length, CHE_PKG);
+    cfgEnsureLoaded.mockResolvedValue(undefined);
+    cfgGetModelName.mockReturnValue('MyModel');
+    cfgGetProjectPath.mockResolvedValue(null);
+    cfgGetPackagePath.mockReturnValue(null);
+    cfgGetCustomPackagesPath.mockResolvedValue(null);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(null);
+    cfgGetActiveXppConfig.mockResolvedValue(null);
+    allowPaths([CHE_PKG, CHE_XPPBP]);
+  });
+
+  it('keeps the plain pass when freshness is unknown', async () => {
+    execFileMock.mockImplementation((_f: string, _a: string[], _o: any, cb: Function) => {
+      cb(null, { stdout: 'Errors: 0\nWarnings: 0', stderr: '' });
+    });
+
+    const text = (await runBpCheckTool({ modelName: 'MyModel' }, {})).content[0].text as string;
+
+    expect(text).toContain('✅ BP Check passed');
+    expect(text).not.toContain('BP clean');
+  });
 });
 
 describe('run_bp_check — omitted element type never defaults to class (#828)', () => {
@@ -993,6 +1111,19 @@ describe('normalizeElementType', () => {
 });
 
 describe('describeNonRun', () => {
+  it('explains that xppbp cannot check an enum or EDT extension instead of listing "translatable" types', async () => {
+    // Phase F (L3-print-mgmt-doctype-extension): xppbp's own rejection lists every element
+    // type it knows and neither EnumExtension nor an EDT extension is among them.
+    const { describeNonRun, normalizeElementType } = await import('../../src/tools/sdlc/runBpCheck');
+    const out = "The element type 'enumextension' is invalid. Supported types are Class, Table, Form, View, Enum, ExtendedDataType, TableExtension, FormExtension, MenuExtension.";
+    expect(describeNonRun(out)).toMatch(/has no element type for enum extensions/);
+    expect(describeNonRun(out)).toMatch(/BASE enum/);
+    expect(describeNonRun(out)).not.toMatch(/Translatable objectTypes/);
+    expect(describeNonRun("The element type 'edtextension' is invalid.")).toMatch(/has no element type for EDT extensions/);
+    // The kebab-case token still squashes the same way — the table no longer claims it.
+    expect(normalizeElementType('enum-extension')).toBe('enumextension');
+  });
+
   it('recognises a rejected element type', async () => {
     const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
     const out = "The element type 'table-extension' is invalid. Supported types are Class, Table.";
@@ -1007,6 +1138,50 @@ describe('describeNonRun', () => {
   it('stays quiet on a real run', async () => {
     const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
     expect(describeNonRun('1 elements processed\nWarnings: 0\nErrors: 0')).toBe('');
+  });
+
+  // Verbatim shape of the xppbp 7.0.7996.33 warning, emitted when -compilerMetadata points
+  // at a root that has no XppMetadata for the module. The rules that read compiled X++ then
+  // never run, and their silence used to be reported as findings-free.
+  const UNCOMPILED = (name: string) =>
+    `BestPractices Warning: Class dynamics://Class/${name}: The element '${name}' in module ` +
+    `'MyModel' appears not to have been compiled. Ensure the element has been compiled before ` +
+    `invoking xppbp.exe, and provide the -compilerMetadata argument if necessary.`;
+
+  it('recognises the requested element being reported as never compiled', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    const out = `1 elements processed.\n${UNCOMPILED('MyClass')}\nCompilerMetadataMissing: 1`;
+    expect(describeNonRun(out, 'MyClass')).toMatch(/no compiled metadata for "MyClass"/);
+  });
+
+  it('ignores the warning when it names a different element', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    // A module-wide run routinely carries this for extensions of classes the environment
+    // does not have installed — that says nothing about the object under check.
+    const out = `1 elements processed.\n${UNCOMPILED('SomeOther_Extension')}\nCompilerMetadataMissing: 1`;
+    expect(describeNonRun(out, 'MyClass')).toBe('');
+  });
+
+  it('does not judge an unfiltered whole-model run by it', async () => {
+    const { describeNonRun } = await import('../../src/tools/sdlc/runBpCheck');
+    const out = `283 elements processed.\n${UNCOMPILED('SomeOther_Extension')}\nCompilerMetadataMissing: 1`;
+    expect(describeNonRun(out)).toBe('');
+  });
+});
+
+describe('uncompiledElements', () => {
+  it('collects every element xppbp reported as uncompiled, once each', async () => {
+    const { uncompiledElements } = await import('../../src/tools/sdlc/runBpCheck');
+    const line = (n: string) =>
+      `BestPractices Warning: Class dynamics://Class/${n}: The element '${n}' in module 'MyModel' ` +
+      `appears not to have been compiled.`;
+    const out = [line('A'), line('B'), line('A')].join('\n');
+    expect(uncompiledElements(out)).toEqual(['A', 'B']);
+  });
+
+  it('returns nothing for a clean run', async () => {
+    const { uncompiledElements } = await import('../../src/tools/sdlc/runBpCheck');
+    expect(uncompiledElements('1 elements processed\nWarnings: 0\nErrors: 0')).toEqual([]);
   });
 });
 

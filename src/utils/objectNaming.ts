@@ -17,9 +17,12 @@ import {
   resolveObjectPrefix,
   applyObjectPrefix,
   applyObjectSuffix,
+  deriveExtensionInfix,
   getObjectSuffix,
   getExtensionNamingStyle,
+  getExtensionClassNamingStyle,
 } from './modelClassifier.js';
+import { normalizeModelToken } from './modelToken.js';
 
 /**
  * Extension types whose AOT name is `Base.{Token}Extension`. A bare base name
@@ -38,6 +41,31 @@ export function isExtensionObjectType(objectType: string): boolean {
 }
 
 /**
+ * Strip an element-style "Extension" word — and the infix or model token in front
+ * of it — off a class-extension name, leaving the base class.
+ *
+ * `Base.CtsoExtension` is how the dot-notation types spell it, so a caller writes
+ * a CoC class the same way: `Base_CtsoExtension`. Only the `_Extension` form was
+ * recognised, so that name read as a brand-new base class and grew a SECOND
+ * suffix — `Base_CtsoExtensionCtso_Extension`. Returns `name` unchanged when
+ * there is no "Extension" word, or when stripping would leave nothing.
+ */
+function stripElementStyleExtensionWord(name: string, tokens: readonly string[]): string {
+  if (!/extension$/i.test(name)) return name;
+  let base = name.slice(0, -'Extension'.length);
+  // Infix first: the token that would be re-applied is the one to take off, and
+  // for most models these are all the same string anyway.
+  for (const token of tokens) {
+    if (token && base.toLowerCase().endsWith(token.toLowerCase())) {
+      base = base.slice(0, -token.length);
+      break;
+    }
+  }
+  base = base.replace(/_+$/, '');
+  return base || name;
+}
+
+/**
  * Normalise `objectName` for `objectType` under the active naming style.
  *
  * Idempotent: an already-normalised name comes back unchanged, so callers may
@@ -52,17 +80,25 @@ export function normalizeObjectName(
   onNote?: (note: string) => void,
 ): string {
   const objectPrefix = resolveObjectPrefix(modelName ?? '');
-  const namingStyle = getExtensionNamingStyle();
+  // Elements and classes carry their own style: a convention may spell one with the
+  // model name and the other with the prefix. Case A is an element, Case B a class.
+  const elementNamingStyle = getExtensionNamingStyle();
+  const classNamingStyle = getExtensionClassNamingStyle();
   let effective = objectName;
 
+  // Cases A and B below strip a model-name token off a name that already carries
+  // one, so they have to compare against the spelling a NAME can hold — the token,
+  // not the raw model name. They are the same string for any model whose name is
+  // already an identifier; for "Contoso Robotics" the raw form matches nothing (#892).
+  const modelToken = modelName ? normalizeModelToken(modelName) : '';
   const modelDiffersFromPrefix =
-    !!modelName && objectPrefix.toLowerCase() !== modelName.toLowerCase();
+    !!modelToken && objectPrefix.toLowerCase() !== modelToken.toLowerCase();
 
   // Case A: dot-notation extension carrying the model name as its token —
   // "CustTable.MyModelExtension" → "CustTable.Extension", so applyObjectPrefix
   // can put the right token back.
   if (
-    namingStyle !== 'model-name' &&
+    elementNamingStyle !== 'model-name' &&
     effective.includes('.') &&
     effective.toLowerCase().endsWith('extension') &&
     modelDiffersFromPrefix
@@ -70,22 +106,26 @@ export function normalizeObjectName(
     const dotIdx = effective.lastIndexOf('.');
     const basePart = effective.slice(0, dotIdx);
     const suffixPart = effective.slice(dotIdx + 1);
-    if (suffixPart.toLowerCase().startsWith(modelName!.toLowerCase())) {
-      effective = `${basePart}.${suffixPart.slice(modelName!.length)}`;
+    if (suffixPart.toLowerCase().startsWith(modelToken.toLowerCase())) {
+      effective = `${basePart}.${suffixPart.slice(modelToken.length)}`;
       onNote?.(`Stripped model name from dot-notation extension: ${objectName} → ${effective}`);
     }
   }
 
   // Case B: the same, for extension classes ending in "_Extension".
   if (
-    namingStyle !== 'model-name' &&
+    classNamingStyle !== 'model-name' &&
     effective.endsWith('_Extension') &&
     modelDiffersFromPrefix
   ) {
     const baseName = effective.slice(0, -'_Extension'.length);
-    if (baseName.toLowerCase().endsWith(modelName!.toLowerCase())) {
-      effective = baseName.slice(0, -modelName!.length) + '_Extension';
-      onNote?.(`Stripped model name infix "${modelName}" from extension class: ${objectName} → ${effective}`);
+    if (baseName.toLowerCase().endsWith(modelToken.toLowerCase())) {
+      // Trim the separator the token was sitting behind. Without it the stripped stem
+      // keeps the separator and the infix lands one character late:
+      // CustTable_ContosoRobotics_Extension → CustTable_ → CustTable_Ctso_Extension,
+      // where the shape this converts TO is spelled CustTableCtso_Extension.
+      effective = baseName.slice(0, -modelToken.length).replace(/_+$/, '') + '_Extension';
+      onNote?.(`Stripped model name infix "${modelToken}" from extension class: ${objectName} → ${effective}`);
     }
   }
 
@@ -95,10 +135,18 @@ export function normalizeObjectName(
     onNote?.(`Bare extension name auto-converted to dot-notation: ${objectName} → ${effective}`);
   }
 
-  // Case D: a class extension given a bare base class name.
+  // Case D: a class extension given a base class name — bare, or already carrying
+  // an element-style "Extension" word.
   if (objectType === 'class-extension' && !effective.endsWith('_Extension')) {
-    effective = `${effective}_Extension`;
-    onNote?.(`Bare class-extension name auto-converted to _Extension form: ${objectName} → ${effective}`);
+    const base = stripElementStyleExtensionWord(
+      effective,
+      [deriveExtensionInfix(objectPrefix, modelName), objectPrefix, modelToken],
+    );
+    const hadExtensionWord = base !== effective;
+    effective = `${base}_Extension`;
+    onNote?.(hadExtensionWord
+      ? `Element-style extension name rewritten to the class form: ${objectName} → ${effective}`
+      : `Bare class-extension name auto-converted to _Extension form: ${objectName} → ${effective}`);
   }
 
   let finalName = applyObjectPrefix(effective, objectPrefix, modelName);

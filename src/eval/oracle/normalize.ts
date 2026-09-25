@@ -60,7 +60,7 @@ export const GOLDEN_CAPTURE_PREFIX = 'Contoso';
  *
  * Canonicalising against the whole set (longest-first, so `Contoso` is consumed
  * before `Con` can bite into it) makes prefix resolution tolerant instead of
- * requiring the goldens to be renamed — see docs/eval-sweep-findings-2026-07-21.md #2.
+ * requiring the goldens to be renamed — see the 2026-07-21 eval sweep, finding #2.
  */
 export const GOLDEN_CAPTURE_PREFIXES: readonly string[] = ['Contoso', 'Con'];
 
@@ -120,7 +120,7 @@ function isXppSourcePath(pathPrefix: string): boolean {
  * canonicalisation — it never rewrites a stored artifact.
  */
 function canonicalizeXppSourceText(s: string): string {
-  return canonicalizeXppDocComments(reindentXppSource(s, 0));
+  return canonicalizeXppBlankLines(canonicalizeXppDocComments(reindentXppSource(s, 0)));
 }
 
 /**
@@ -128,7 +128,57 @@ function canonicalizeXppSourceText(s: string): string {
  * Deliberately still a `///` line: PRESENCE of a doc comment survives the
  * canonicalisation, only its PROSE is discarded (see below).
  */
-const XMLDOC_PLACEHOLDER = '/// <xmldoc/>';
+export const XMLDOC_PLACEHOLDER = '/// <xmldoc/>';
+
+/** Is this line the collapsed XmlDoc placeholder (at any indent)? */
+function isXmlDocPlaceholderLine(line: string): boolean {
+  return line.trim() === XMLDOC_PLACEHOLDER;
+}
+
+/**
+ * Drop blank lines that sit immediately before a closing `}`.
+ *
+ * `reindentXppSource` re-derives indentation but deliberately PRESERVES blank
+ * lines ("preserve blank lines in the middle"), so a purely cosmetic blank line
+ * survives canonicalisation and reaches the diff. The writer emits exactly one
+ * such line: `ensureBlankLineBeforeClosingBrace` (src/utils/xppDocGen.ts) puts a
+ * blank line between the last member-variable declaration and the class body's
+ * `}`, matching the shipped-Microsoft convention. Goldens captured before that
+ * convention was applied do not have it, so
+ *
+ *     class PFXDemoBatchContract     class PFXDemoBatchContract
+ *     {                              {
+ *         int batchSize;                 int batchSize;
+ *         int priorityFactor;            int priorityFactor;
+ *     }                                              ← writer's blank line
+ *                                    }
+ *
+ * false-mismatched on a Declaration whose tokens are identical. Measured on
+ * `L3-batch-basic`'s `DemoBatchContract`
+ * (eval/corpus/runs/2026-08-31T23__L3-batch-basic__278eee3.json).
+ *
+ * Unlike the doc-comment rule below this one is SYMMETRIC: blank lines are not
+ * scored by anything — no best-practice rule fires on their presence or absence
+ * — so there is no direction in which losing them hides a real defect. It is
+ * kept narrow (only before a `}`) rather than "strip every blank line", so a
+ * golden that deliberately asserts paragraph structure inside a method body
+ * still asserts it.
+ */
+function canonicalizeXppBlankLines(s: string): string {
+  const lines = s.split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() !== '') { out.push(lines[i]); continue; }
+    let end = i;
+    while (end < lines.length && lines[end].trim() === '') end++;
+    // Keep the run unless a closing brace follows it.
+    if (!(end < lines.length && lines[end].trim().startsWith('}'))) {
+      for (let k = i; k < end; k++) out.push(lines[k]);
+    }
+    i = end - 1;
+  }
+  return out.join('\n');
+}
 
 /**
  * Collapse every contiguous run of `///` XmlDoc lines to a single placeholder
@@ -138,7 +188,7 @@ const XMLDOC_PLACEHOLDER = '/// <xmldoc/>';
  * `d365fo_file` auto-injects a class-level doc comment whose text is generated
  * from the object name. A faithful rerun by an agent that writes different
  * prose therefore scored `golden_match: 0` for a purely cosmetic reason —
- * corpus-wide oracle fragility, docs/eval-sweep-findings-2026-07-21.md #24.
+ * corpus-wide oracle fragility (2026-07-21 eval sweep, finding #24).
  *
  * Why COLLAPSE rather than STRIP (the direction the finding suggested):
  * deleting `///` lines outright would also make a golden that HAS a doc comment
@@ -170,14 +220,95 @@ function canonicalizeXppDocComments(s: string): string {
 }
 
 /**
+ * Are two normalised values equal, treating a doc comment that exists ONLY on
+ * the ACTUAL side as equal? DIRECTIONAL — see the two halves below.
+ *
+ * ── Why the actual side may carry MORE documentation ────────────────────────
+ * `ensureXppDocComment` (src/utils/xppDocGen.ts) injects a class-level `///`
+ * block unconditionally, and commit 0a95198 (2026-08-09) extended that to the
+ * bridge create path — FIVE WEEKS after the affected goldens were captured
+ * (2026-07-07 / 2026-07-23). The writer changed underneath the goldens, so no
+ * faithful rerun of those cases can ever reproduce them: 34 of the 159
+ * committed goldens carrying a class/interface `<Declaration>` have no `///`
+ * block at all, and the writer now puts one on 32 of them.
+ *
+ * An actual that carries MORE documentation than its golden is strictly
+ * BP-BETTER: `BPXmlDocNoDocumentationComments` fires on ABSENCE, and
+ * `bp_clean` already scores that separately. `canonicalizeXppDocComments` above
+ * has always collapsed doc-comment CONTENT to a placeholder, so PRESENCE was
+ * the only thing a golden ever asserted here — and the writer now guarantees
+ * it. Failing `golden_match` on it measures the writer's release date, not the
+ * agent's work.
+ *
+ * ── Why the reverse still fails ─────────────────────────────────────────────
+ * A doc comment present in the GOLDEN and MISSING from the actual is a real
+ * regression — documentation the corpus proved reachable that a run stopped
+ * producing — and the oracle keeps catching it. That direction is pinned by an
+ * explicit test; it is the whole reason this is not simply "ignore doc
+ * comments".
+ *
+ * ── Policy: the goldens are NOT being re-captured in a batch ────────────────
+ * DO NOT "clean up" this softened rule, and DO NOT mass-regenerate
+ * `eval/goldens/` to make it unnecessary. Each affected case re-captures its
+ * own golden naturally the next time it runs on the VM; the moment it does, its
+ * golden carries the doc comment and full strictness returns for that case, on
+ * its own, one case at a time. Removing the rule before the corpus has caught
+ * up re-breaks every case that has not run yet; batch-regenerating the goldens
+ * would rewrite evidence wholesale to match the current writer, which is
+ * exactly the overfitting the golden corpus exists to prevent.
+ */
+export function valuesEquivalent(expected: string, actual: string): boolean {
+  if (expected === actual) return true;
+
+  const exp = expected.split('\n');
+  const act = actual.split('\n');
+  let i = 0;
+  let j = 0;
+  while (i < exp.length && j < act.length) {
+    if (exp[i] === act[j]) { i++; j++; continue; }
+    // The ONLY tolerated asymmetry: an extra doc-comment line on the actual
+    // side. A placeholder on the EXPECTED side that the actual does not have
+    // falls through to `return false`.
+    if (isXmlDocPlaceholderLine(act[j]) && !isXmlDocPlaceholderLine(exp[i])) { j++; continue; }
+    return false;
+  }
+  while (j < act.length && isXmlDocPlaceholderLine(act[j])) j++;
+  return i === exp.length && j === act.length;
+}
+
+/**
  * Normalize text content: CRLF -> LF (the C# bridge writes CRLF into <Source>
  * CDATA; a golden authored or diffed on a different platform may use LF — that
  * is a whitespace-style difference, not a semantic one) then trim. X++ source
  * elements (`Source`/`Declaration`) additionally get indentation canonicalised
  * (see `canonicalizeXppSourceText`) since X++ doesn't care about indent depth.
  */
+/**
+ * Identifiers a report generator mints fresh on every run.
+ *
+ * An AxReport carries its RDL inside CDATA, and the RDL carries
+ * `rd:DataSourceID`, `rd:DataSetID` and `rd:ReportID` — GUIDs regenerated each
+ * time the design is produced. They say nothing about whether the report is
+ * correct, and they make every report golden unreproducible: re-running the case
+ * yields a diff on identifiers that were always going to differ.
+ *
+ * `ignore` globs cannot reach them, because they are not XML nodes in the
+ * document being compared — they live inside a text payload. So they are masked
+ * here, in the same comparison-time canonicalisation that already re-indents X++
+ * source: the stored artifact is never rewritten.
+ *
+ * Six committed goldens carry them today (ssrs-report-advanced, -design-rdl,
+ * -multidataset, -preprocess, -uibuilder and print-mgmt-doctype-extension), so
+ * this is what makes a re-capture of any of them meaningful.
+ */
+const GENERATED_RDL_IDS = /(<rd:(?:DataSourceID|DataSetID|ReportID)>)\s*\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?\s*(<\/rd:(?:DataSourceID|DataSetID|ReportID)>)/g;
+
+function maskGeneratedIds(s: string): string {
+  return s.replace(GENERATED_RDL_IDS, '$1<generated-guid>$2');
+}
+
 function normalizeText(s: string, pathPrefix?: string): string {
-  const crlfNormalized = s.replace(/\r\n/g, '\n').trim();
+  const crlfNormalized = maskGeneratedIds(s.replace(/\r\n/g, '\n').trim());
   return pathPrefix && isXppSourcePath(pathPrefix)
     ? canonicalizeXppSourceText(crlfNormalized)
     : crlfNormalized;
@@ -384,7 +515,13 @@ export async function normalizeMultiArtifact(
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   const names = Object.keys(artifacts).sort();
-  const keys = artifactKeyMap(names, prefix);
+  // Content is passed so a COLLIDING key (two artifacts of the same object name —
+  // e.g. a form and the display menu item that opens it, the shape a table's
+  // `FormRef` forces) is broken by AOT type rather than by raw filename: the raw
+  // filename differs between the golden and the files reproducing it, so
+  // raw-filename degradation reported every path of both artifacts as
+  // missing + extra. See artifactKeyMap.
+  const keys = artifactKeyMap(names, prefix, n => artifacts[n]);
   for (const name of names) {
     const single = await normalizeAotXml(artifacts[name], ignore, prefix);
     const canonName = keys.get(name) ?? canonicalizePrefix(name, prefix);

@@ -1,0 +1,674 @@
+/**
+ * D365FO object-naming rules, as data.
+ *
+ * These rules used to live inside the validate_object_naming MCP tool and nowhere
+ * else, because the module exported only the tool wrapper. So prepare could not
+ * reuse them and grew TWO hand-rolled validators of its own
+ * (prepareCreate.validateNaming, and the block in prepareChange), each weaker and
+ * neither agreeing with this one. Live, on the same input, prepare(mode="create")
+ * answered "Naming looks valid" for a name this checker warns is missing the model
+ * prefix, and prepare(mode="change") answered a malformed table-extension name with
+ * "Confirm naming follows your convention" — no check at all.
+ *
+ * Everything below is MOVED, not rewritten: the tool renders this result and its
+ * ~35 existing tests are the proof that the rules did not change in the move.
+ */
+
+import {
+  getObjectSuffix,
+  getExtensionNamingStyle,
+  getExtensionClassNamingStyle,
+  deriveExtensionInfix,
+} from './modelClassifier.js';
+import { normalizeObjectName } from './objectNaming.js';
+import {
+  matchPrefixCandidate,
+  modelWritesLandIn,
+  prefixCandidates,
+  prefixConflictWarning,
+  resolveEffectivePrefix,
+  type PrefixCandidate,
+} from './effectivePrefix.js';
+import { getConfigManager } from './configManager.js';
+import { normalizeModelToken } from './modelToken.js';
+import { lookupSymbolNocase, lookupSymbolsNocase } from './symbolLookup.js';
+
+// Extension types that require base object name
+const EXTENSION_TYPES = new Set([
+  'table-extension',
+  'class-extension',
+  'form-extension',
+  'enum-extension',
+  'edt-extension',
+]);
+
+/** Non-extension type → the extension type that extends it. */
+const EXTENSION_COUNTERPART: Record<string, string> = {
+  table: 'table-extension',
+  class: 'class-extension',
+  form: 'form-extension',
+  enum: 'enum-extension',
+  edt: 'edt-extension',
+};
+
+/**
+ * A name that can only be an extension: `Base.Suffix` (element extensions) or
+ * `BasePrefix_Extension` (class CoC).
+ *
+ * The suffix does NOT have to spell "Extension". This pattern used to require it
+ * (`\w*Extension$`), which made `NumberSeqModule.ConDemoRent` — a perfectly
+ * ordinary enum-extension name — unreadable as an extension, so it was validated
+ * as a plain enum, refused for containing a dot, and "corrected" to
+ * `ConNumberSeqModule.ConDemoRent`: a prefix on the BASE, naming an object that
+ * does not exist (#983). Shipped metadata settles it — `AppCopilotAgentType.Foundation`
+ * and `ModuleAxapta.ApplicationCommon` are Microsoft's own AxEnumExtensions.
+ *
+ * A dot is unambiguous: no non-extension AOT element name may contain one.
+ */
+const DOTTED_EXTENSION = /^[A-Za-z]\w*\.[A-Za-z]\w*$/;
+const UNDERSCORE_EXTENSION = /^[A-Za-z]\w*_Extension$/;
+
+/**
+ * Reinterpret `objectType` when the proposed name is unmistakably an extension.
+ *
+ * Callers reach for the base type — "is this a valid *form* name?" — while proposing
+ * `ConCore_TaxTransReportChangeLog.ConSKExtension`. Validated as a plain form
+ * that trips the "non-extension objects must not contain underscores" rule and comes
+ * back as a hard ERROR, which is both wrong and a wasted round trip: run f2e7b71a
+ * asked with `form`, was refused, and asked again with `form-extension` (T56 → T59).
+ *
+ * Only the shapes above qualify, so a genuinely bad non-extension name — the case the
+ * underscore rule exists for — still fails.
+ */
+function reinterpretExtensionType(
+  objectType: string,
+  proposedName: string,
+): { objectType: string; note: string } | undefined {
+  const counterpart = EXTENSION_COUNTERPART[objectType];
+  if (!counterpart) return undefined;
+  const dotted = DOTTED_EXTENSION.test(proposedName);
+  const underscored = objectType === 'class' && UNDERSCORE_EXTENSION.test(proposedName);
+  if (!dotted && !underscored) return undefined;
+  return {
+    objectType: counterpart,
+    note:
+      `Read as **${counterpart}**, not "${objectType}" — "${proposedName}" is an extension name. ` +
+      `Pass objectType="${counterpart}" directly next time.`,
+  };
+}
+
+/** What the caller asks about. Mirrors the tool's arguments. */
+export interface ObjectNamingInput {
+  proposedName: string;
+  objectType: string;
+  baseObjectName?: string;
+  modelPrefix?: string;
+  modelName?: string;
+  /**
+   * Whether the object an extension EXTENDS exists, already answered by a caller
+   * that has a better source than this one.
+   *
+   * These rules can only probe the SYMBOL INDEX, while `search`, `get_object_info`
+   * and the write path all prefer the C# bridge. On an instance indexed with
+   * `extractMode: "custom"` the index deliberately holds only custom models, so
+   * the index answer for a Microsoft base enum is "not found in symbol index —
+   * ensure it's indexed": false, and advice that re-indexing can never satisfy.
+   * `undefined` keeps the index probe, which is the only option without a bridge.
+   */
+  baseObjectExists?: boolean;
+}
+
+/** Every verdict the rules reach, before anything decides how to print it. */
+export interface ObjectNamingCheck {
+  /** Possibly reinterpreted from the requested type — see reinterpretExtensionType. */
+  objectType: string;
+  reinterpretedNote?: string;
+  baseObjectName?: string;
+  isExtension: boolean;
+  prefix: string;
+  prefixOrigin: string;
+  modelName: string;
+  modelTokenPhrase: string;
+  extensionInfix: string;
+  useModelName: boolean;
+  namingStyle: string;
+  useModelNameForClass: boolean;
+  classNamingStyle: string;
+  errors: string[];
+  warnings: string[];
+  suggestions: string[];
+  exactConflict: Array<{ name: string; type: string; model: string }>;
+  similarSymbols: Array<{ name: string; type: string; model: string }>;
+}
+
+/**
+ * Run every naming rule against one proposed name.
+ *
+ * Async because the effective prefix must wait for a model detection still in
+ * flight; reading it early resolves from EXTENSION_PREFIX alone and validates
+ * against a token the server itself would not apply (#833).
+ */
+export async function checkObjectNaming(
+  db: any,
+  input: ObjectNamingInput,
+): Promise<ObjectNamingCheck> {
+  const args = { ...input };
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const suggestions: string[] = [];
+
+    const name = args.proposedName;
+
+    // Before any rule runs: an extension name asked about under its base type is a
+    // question about the extension. Answer that question instead of refusing.
+    const reinterpreted = reinterpretExtensionType(args.objectType, name);
+    if (reinterpreted) {
+      args.objectType = reinterpreted.objectType as typeof args.objectType;
+    }
+
+    // The base is the part before the dot. Deriving it only after a
+    // reinterpretation punished the caller who named the type CORRECTLY:
+    // `objectType="enum-extension", proposedName="NumberSeqModule.ConDemoRent"`
+    // answered "baseObjectName is required … and it could not be derived", while
+    // the same name under `objectType="enum"` was understood. A dotted name
+    // states its base whichever way the type arrived (#983).
+    if (!args.baseObjectName && DOTTED_EXTENSION.test(name)) {
+      args.baseObjectName = name.slice(0, name.indexOf('.'));
+    }
+
+    // The same courtesy for the UNDERSCORE form. `MyThing_Extension` states its
+    // base just as plainly as `MyThing.ConExtension` does, and without this the
+    // check demanded a parameter the caller had no way to send: `prepare` does
+    // not publish baseObjectName at all, so its answer was
+    // "baseObjectName is required" with no route to supplying one.
+    let baseDerivedFromExtensionWord = false;
+    if (!args.baseObjectName && /_Extension$/i.test(name)) {
+      args.baseObjectName = name.slice(0, name.length - '_Extension'.length);
+      baseDerivedFromExtensionWord = true;
+    }
+
+    const isExtension = EXTENSION_TYPES.has(args.objectType);
+
+    // D365FO has a hard 81-character limit on AOT names; exceeding it is a build error.
+    const MAX_NAME_LENGTH = 81;
+    if (name.length > MAX_NAME_LENGTH) {
+      errors.push(
+        `Name "${name}" is ${name.length} characters — exceeds the D365FO AOT maximum of ${MAX_NAME_LENGTH} characters. This will cause a build error.`,
+      );
+      suggestions.push(`Shortened name (${MAX_NAME_LENGTH} chars max): ${name.slice(0, MAX_NAME_LENGTH)}`);
+    } else if (name.length > 70) {
+      warnings.push(
+        `Name is ${name.length} characters — approaching the ${MAX_NAME_LENGTH}-char AOT limit. Consider a shorter name to leave room for extensions.`,
+      );
+    }
+
+    // The model whose convention is being validated against: explicit arg, else the
+    // model WRITES land in — the same model get_workspace_info reports the prefix for
+    // (see prefixDiagnostics). Reading the active model here instead made the two
+    // tools disagree after a project switch. The await lets a detection still in
+    // flight finish: reading null resolves the prefix from EXTENSION_PREFIX alone and
+    // validates against a token the server itself would not apply (#833).
+    const configManager = getConfigManager();
+    await configManager.getAutoDetectedModelName();
+    const activeModel = configManager.getModelName();
+    const namingStyle = getExtensionNamingStyle();
+    const modelName =
+      args.modelName?.trim() ||
+      modelWritesLandIn(configManager.getWriteAnchorModel() ?? activeModel, activeModel) ||
+      '';
+    const useModelName = namingStyle === 'model-name' && !!modelName;
+    // Extension CLASSES may follow a different style from element extensions; the
+    // class-extension branch below asks this one, the element branch asks the above.
+    const classNamingStyle = getExtensionClassNamingStyle();
+    const useModelNameForClass = classNamingStyle === 'model-name' && !!modelName;
+    // The spelling of the model name that may appear INSIDE an object name — what the
+    // write path embeds (applyObjectPrefix → normalizeModelToken, #892). Comparing the
+    // raw name instead flagged the very name d365fo_file(create) writes and recommended
+    // one carrying a space, which no build accepts (#901).
+    const modelToken = modelName ? normalizeModelToken(modelName) : '';
+    // Prose has to carry BOTH halves when the token is not the model name itself,
+    // otherwise "should be the model name X" is followed by "Recommended: Y". Collapses
+    // to the plain form for every model whose name is already an identifier.
+    const modelTokenPhrase =
+      modelToken === modelName
+        ? `model name "${modelName}"`
+        : `model-name token "${modelToken}" (from model "${modelName}")`;
+
+    // Resolve model prefix: explicit arg → the effective prefix for that model
+    // (resolveEffectivePrefix: learned from the model's own objects, else
+    // EXTENSION_PREFIX, else the model name) → DB auto-detect for an unconfigured
+    // workspace.
+    // NOT upper-cased: "ContosoFin" is a PascalCase prefix, and "CONTOSOFIN" would make every
+    // suggested name and every startsWith() check below wrong.
+    const resolution = resolveEffectivePrefix(modelName);
+    const explicitPrefix = args.modelPrefix?.trim() || '';
+    const prefix = explicitPrefix || resolution.prefix || detectModelPrefix(db, name);
+
+    // An explicitly passed prefix is the caller's decision and the only candidate;
+    // otherwise every token that could rightfully prefix a name in this workspace
+    // counts, so a disagreement between model and configuration produces a warning
+    // naming both rather than an error against whichever one the server picked.
+    const resolvedCandidates = prefixCandidates(resolution);
+    const candidates: PrefixCandidate[] = explicitPrefix
+      ? [{ token: explicitPrefix.replace(/_+$/, ''), label: 'the prefix you passed', effective: true }]
+      : resolvedCandidates.length > 0
+        ? resolvedCandidates
+        : prefix
+          ? [{ token: prefix, label: 'the prefix detected from the symbol index', effective: true }]
+          : [];
+    // Stated once, wherever the name lands: the reader cannot otherwise tell which
+    // of the two tokens the validation above used.
+    const conflictWarning = explicitPrefix ? null : prefixConflictWarning(resolution);
+    // Token embedded in extension element/class names — the model's own infix when its
+    // existing extensions state one (ContosoFinanceSK → "ContosoSK"), else derived.
+    const extensionInfix = prefix ? deriveExtensionInfix(prefix, modelName) : '';
+
+    // A base derived from the name still carries the token the name embeds, and that
+    // token is exactly what the rules below look for BETWEEN the base and "_Extension".
+    // Left in place it makes the check vacuous: the canonical `CustTableBku_Extension`
+    // derives base `CustTableBku`, leaving an empty middle, and warns that the name
+    // "does not include the infix Bku" — about a name that plainly does, and that the
+    // write path returns untouched. prepare(mode="create") never sends baseObjectName
+    // (prepareCreate.ts), and validate_object_naming's parameter is optional, so that
+    // warning fired on every correctly named extension class asked about either way.
+    //
+    // Stripping the token beats special-casing the comparison, because the base is
+    // published — validate_object_naming renders "Base Object:" from it and the
+    // suggestions build on it, and the un-stripped form recommended the nonsense
+    // `CustTableBku.BkuExtension`. Matches applyObjectPrefix, which likewise reads a
+    // trailing token as "already prefixed".
+    if (baseDerivedFromExtensionWord && args.baseObjectName) {
+      // Both tokens are tried, the active style's first: a name reaching the check was
+      // written under whichever style was configured THEN, so a model-name name asked
+      // about under the prefix style must still yield the base the writer derives from
+      // it (objectNaming.ts case B), or check and writer name different targets. A name
+      // ending in "_Extension" is a class, so the class style decides which goes first.
+      const candidates = useModelNameForClass ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
+      const derived = args.baseObjectName;
+      for (const token of candidates) {
+        if (!token || !derived.toLowerCase().endsWith(token.toLowerCase())) continue;
+        const stripped = derived.slice(0, derived.length - token.length).replace(/_+$/, '');
+        if (stripped) args.baseObjectName = stripped;
+        break;
+      }
+    }
+
+    // Rule set 1: extension naming rules
+    if (isExtension) {
+      const baseObjectName = args.baseObjectName;
+
+      if (!baseObjectName) {
+        // Say what the caller can DO. Not every caller publishes this parameter —
+        // prepare does not — so a bare "it is required" is unactionable there.
+        errors.push(
+          `baseObjectName is required for extension types (${args.objectType}), and it could not be ` +
+          `derived from "${name}". Name the extension after its base — "MyBase_Extension" or ` +
+          `"MyBase.${'${'}ModelToken}Extension" — or ask the check directly, which does accept it: ` +
+          `validate_object_naming(objectType="${args.objectType}", proposedName="${name}", baseObjectName="<base>").`,
+        );
+      } else {
+        if (args.objectType === 'class-extension') {
+          // prefix style → {Base}{Prefix}_Extension; model-name style → {Base}_{ModelToken}_Extension
+          const expectedPattern = useModelNameForClass
+            ? `${baseObjectName}_${modelToken}_Extension`
+            : `${baseObjectName}${extensionInfix}_Extension`;
+          const expectedToken = useModelNameForClass ? modelToken : extensionInfix;
+
+          if (!name.startsWith(baseObjectName)) {
+            errors.push(
+              `Class extension names must start with the base class name.\n  Expected format: ${expectedPattern}`,
+            );
+            if (expectedToken) suggestions.push(`Correct name: ${expectedPattern}`);
+          } else if (!name.endsWith('_Extension')) {
+            errors.push(`Class extension names must end with '_Extension'.\n  Expected format: ${expectedPattern}`);
+            if (expectedToken) suggestions.push(`Correct name: ${expectedPattern}`);
+          } else {
+            // Structure is correct — check the expected token is included. Strip a leading
+            // separator so "_ContosoRobotics" compares cleanly to the model token.
+            const middle = name.slice(baseObjectName.length, -'_Extension'.length).replace(/^_+/, '');
+            if (
+              expectedToken &&
+              middle.toLowerCase() !== expectedToken.toLowerCase() &&
+              !middle.toLowerCase().includes(expectedToken.toLowerCase())
+            ) {
+              warnings.push(
+                useModelNameForClass
+                  ? `Extension name does not embed the ${modelTokenPhrase} (${classNamingStyle === namingStyle ? 'EXTENSION_NAMING_STYLE' : 'EXTENSION_CLASS_NAMING_STYLE'}=model-name).\n  Current: ${name}\n  Recommended: ${expectedPattern}`
+                  : `Extension name does not include model "${modelName || '(unknown)'}"'s extension infix "${extensionInfix}".\n  Current: ${name}\n  Recommended: ${expectedPattern}`,
+              );
+            }
+          }
+
+          suggestions.push(
+            useModelName
+              ? `AOT name for an element extension instead: ${baseObjectName}.${modelToken}`
+              : `AOT label for extension file: ${baseObjectName}.${extensionInfix}Extension (if creating table-extension AOT object instead)`,
+          );
+
+          // Say what the write path will actually call this. The rules above judge
+          // a name; normalizeObjectName WRITES one, and for an assembled name the
+          // two part company silently — `CustTable_Bku_Table_Extension` passes every
+          // check here and lands on disk as `CustTable_Bku_TableBku_Extension`,
+          // because the trailing "_Extension" makes the whole string read as a base
+          // class and the infix is applied a second time. The caller then looks for
+          // a file under the name it asked for. Same shape as #986/#987, where the
+          // checker and the writer disagreed in the other direction.
+          //
+          // Only when the token both sides use is the same one: an explicitly passed
+          // modelPrefix is not what the writer reads, and a prefix that came from
+          // detectModelPrefix is a guess off the symbol index that resolveObjectPrefix
+          // would not make. Skipped once an error stands, so a rejected name is not
+          // also told what it would have been written as.
+          if (!explicitPrefix && resolution.prefix && errors.length === 0) {
+            const wouldWrite = normalizeObjectName(name, 'class-extension', modelName || undefined);
+            if (wouldWrite !== name) {
+              warnings.push(
+                `The write path will not use this name as given.
+` +
+                `  Asked for: ${name}
+` +
+                `  d365fo_file(action="create") writes: ${wouldWrite}
+` +
+                `  Pass the element you are extending instead — "${baseObjectName}" — and the ` +
+                `prefix is applied once: ${expectedPattern}`,
+              );
+              suggestions.push(`Name the class after its target: ${expectedPattern}`);
+            }
+          }
+        } else if (useModelName) {
+          // AOT extensions (table/form/enum/edt), model-name style: {Base}.{ModelToken} — bare
+          // model token, no "Extension" word.
+          const expectedPattern = `${baseObjectName}.${modelToken}`;
+
+          if (!name.includes('.')) {
+            errors.push(
+              `${args.objectType} names must use dot notation: {Base}.{ModelName}.\n  Expected: ${expectedPattern}`,
+            );
+            suggestions.push(`Correct name: ${expectedPattern}`);
+          } else {
+            const [basePart, extPart] = name.split('.', 2);
+
+            if (basePart !== baseObjectName) {
+              errors.push(
+                `Extension base (before '.') must exactly match baseObjectName.\n  Expected: ${baseObjectName}.xxx\n  Got: ${basePart}.xxx`,
+              );
+            }
+            if (extPart.toLowerCase() !== modelToken.toLowerCase()) {
+              warnings.push(
+                `Extension token (after '.') should be the ${modelTokenPhrase} (EXTENSION_NAMING_STYLE=model-name).\n  Current: ${extPart}\n  Recommended: ${modelToken}`,
+              );
+            }
+          }
+        } else {
+          // AOT extensions (table/form/enum/edt), prefix style: {Base}.{Infix}Extension.
+          const expectedPattern = `${baseObjectName}.${extensionInfix}Extension`;
+
+          if (!name.includes('.')) {
+            errors.push(
+              `${args.objectType} names must use dot notation: {Base}.{Prefix}Extension.\n  Expected: ${expectedPattern}`,
+            );
+            if (prefix) suggestions.push(`Correct name: ${expectedPattern}`);
+          } else {
+            const [basePart, extPart] = name.split('.', 2);
+
+            if (basePart !== baseObjectName) {
+              errors.push(
+                `Extension base (before '.') must exactly match baseObjectName.\n  Expected: ${baseObjectName}.xxx\n  Got: ${basePart}.xxx`,
+              );
+            }
+            // Both suffix forms are legal AOT, and the platform's own metadata is
+            // the evidence: a census of all 214 packages in PackagesLocalDirectory
+            // finds 1,453 of 2,563 dotted extension names — 57 % — NOT ending in
+            // "Extension" (CustTable.AdvancedQualityManagement,
+            // AppCopilotAgentType.Foundation, ModuleAxapta.ApplicationCommon).
+            // They use the bare model token, which is what
+            // EXTENSION_NAMING_STYLE=model-name produces and what the branch above
+            // treats as correct. The same fact was a warning under one style and a
+            // hard ERROR under the other (#986), and `prepare` printed that ❌ for a
+            // name d365fo_file writes and xppc builds — applyObjectPrefix has always
+            // returned a bare model-token suffix unchanged ("Bare model-name suffix
+            // — return as-is"), so the checker was refusing what the writer supports.
+            //
+            // The house convention still shows: a suffix that is NEITHER form gets a
+            // warning naming both. What is gone is calling a shipped, buildable name
+            // an error and offering to rename it.
+            const isInfixForm = extPart.endsWith('Extension');
+            const isModelTokenForm =
+              !!modelToken && extPart.toLowerCase() === modelToken.toLowerCase();
+            if (!isInfixForm && !isModelTokenForm) {
+              warnings.push(
+                `Extension suffix (after '.') is neither of the two forms the platform uses.\n` +
+                `  Expected: ${extensionInfix}Extension` +
+                (modelToken ? ` (this model's style) or ${modelToken} (bare model name)` : '') +
+                `\n  Got: ${extPart}`,
+              );
+            } else if (isInfixForm && extensionInfix && !extPart.toLowerCase().startsWith(extensionInfix.toLowerCase())) {
+              warnings.push(
+                `Extension suffix should start with model "${modelName || '(unknown)'}"'s infix "${extensionInfix}".\n  Current: ${extPart}\n  Recommended: ${extensionInfix}Extension`,
+              );
+            }
+          }
+        }
+
+        const dbTypes = args.objectType.includes('class')
+          ? ['class']
+          : args.objectType.includes('table')
+            ? ['table']
+            : args.objectType.includes('form')
+              ? ['form']
+              : args.objectType.includes('enum')
+                ? ['enum']
+                : ['edt'];
+
+        // A caller with a metadata provider has already answered this better than
+        // the index can — see ObjectNamingInput.baseObjectExists.
+        if (args.baseObjectExists === false) {
+          warnings.push(
+            `Base object "${baseObjectName}" does not exist as a ${dbTypes.join('/')} ` +
+            `(checked against the metadata provider). An extension of a missing object cannot build.`,
+          );
+        } else if (args.baseObjectExists === undefined) {
+          // Case-insensitive: the base object may be spelled with different casing
+          // than the canonical AOT name (#686).
+          const baseExists = lookupSymbolNocase(db, baseObjectName, dbTypes);
+          if (!baseExists) {
+            warnings.push(
+              `Base object "${baseObjectName}" not found in the symbol index for types: ${dbTypes.join(', ')}. ` +
+              `If the base is a standard Microsoft object this may just mean the index is scoped to custom ` +
+              `models (extractMode "custom") — confirm with get_object_info before treating it as missing.`,
+            );
+          }
+        }
+      }
+    }
+
+    // Rule set 2: new object naming rules
+    if (!isExtension) {
+      /** The candidate prefix the name turned out to carry, once one is found. */
+      let separator: PrefixCandidate | null = null;
+
+      // Underscores are allowed only as a prefix separator: {Prefix}_{Rest}
+      // (e.g. valid "MY_VendPaymTermsMaintain", invalid "MYVendPaymTerms_Helper").
+      if (name.includes('_')) {
+        const underscoreIdx = name.indexOf('_');
+        const beforeUnderscore = name.slice(0, underscoreIdx);
+        // Matched against every candidate prefix, not just the winning one: while
+        // the model's own naming and EXTENSION_PREFIX disagree, "Other_MyObject"
+        // IS prefix-separator form — under the token the server did not pick. The
+        // conflict is reported as a warning below; declaring the name invalid
+        // contradicts the prefix the server itself reports as effective (#833).
+        separator = matchPrefixCandidate(beforeUnderscore, candidates);
+        if (!separator) {
+          errors.push(
+            `Non-extension objects must not contain underscores. ` +
+              `The only allowed underscore is as a prefix separator: ` +
+              `${prefix ? prefix + '_MyObject' : 'Prefix_MyObject'}. ` +
+              `For extension classes use: VendTable${prefix || 'Prefix'}_Extension.`,
+          );
+        }
+      }
+
+      if (prefix) {
+        const leading = separator ?? candidates.find(c => name.toLowerCase().startsWith(c.token.toLowerCase()));
+        if (!leading) {
+          warnings.push(
+            `Proposed name does not start with model prefix "${prefix}". All custom objects should be prefixed to avoid conflicts.`,
+          );
+          suggestions.push(`Prefixed name: ${prefix}${name}`);
+        } else if (!leading.effective) {
+          warnings.push(
+            `"${name}" carries "${leading.token}" (${leading.label}), not the prefix this server ` +
+              `applies, "${prefix}" (${resolution.source}).`,
+          );
+        }
+      }
+
+      const configuredSuffix = getObjectSuffix();
+      if (configuredSuffix) {
+        if (!name.toLowerCase().endsWith(configuredSuffix.toLowerCase())) {
+          warnings.push(
+            `EXTENSION_SUFFIX="${configuredSuffix}" is configured but the proposed name does not end with it. Expected: ${name}${configuredSuffix}`,
+          );
+          suggestions.push(`Suffixed name: ${name}${configuredSuffix}`);
+        }
+      }
+
+      if (args.objectType === 'security-privilege') {
+        if (!/(View|Maintain|Delete|Admin|Invoke|Approve|FullControl)$/.test(name)) {
+          warnings.push(
+            `Security privileges typically end with an action suffix: View, Maintain, Delete, Admin, Invoke, Approve, or FullControl.\n  Examples: ${name}View, ${name}Maintain`,
+          );
+        }
+      }
+
+      if (args.objectType === 'security-duty') {
+        if (
+          !/(Maintain|View|Inquire|Admin|Approve|Process)$/.test(name) &&
+          !(name.toLowerCase().includes('maintain') || name.toLowerCase().includes('view'))
+        ) {
+          warnings.push(`Security duties typically end with: Maintain, View, Inquire, Admin, Approve, or Process.`);
+        }
+      }
+
+      if (args.objectType === 'data-entity') {
+        if (!name.endsWith('Entity')) {
+          warnings.push(`Data entity names typically end with 'Entity'. Recommendation: ${name}Entity`);
+          suggestions.push(`Data entity name: ${name}Entity`);
+        }
+      }
+
+      if (args.objectType === 'report') {
+        // The AxReport name itself carries no suffix; what matters is that the
+        // companion classes follow the role-suffix convention, so hand the full
+        // roster to the caller in one place.
+        if (/(DP|Contract|Controller|UIBuilder|Tmp)$/.test(name)) {
+          warnings.push(
+            `"${name}" ends with a report COMPANION-class suffix — the AxReport itself is normally the bare document name ` +
+            `(the suffixed names belong to its classes/table).`,
+          );
+        }
+        suggestions.push(
+          `SSRS companion objects for "${name}": ${name}Tmp (TempDB table), ${name}Contract, ${name}DP, ` +
+          `${name}Controller, ${name}UIBuilder (optional), plus an AxMenuItemOutput named ${name}. ` +
+          `generate_object(mode="scaffold", objectType="report") emits the full roster.`,
+        );
+      }
+    }
+
+    // The model's own naming and EXTENSION_PREFIX disagree. Reported wherever the
+    // name landed, because every rule above ran against ONE of the two tokens and
+    // the reader cannot otherwise tell which — the state that produced a false
+    // ERROR on a name that was correct under the effective prefix (#833).
+    if (conflictWarning) warnings.push(conflictWarning);
+
+    // Rule set 3: conflict detection
+    const dbType =
+      args.objectType === 'class-extension'
+        ? 'class-extension'
+        : args.objectType === 'table-extension'
+          ? 'table-extension'
+          : args.objectType === 'form-extension'
+            ? 'form-extension'
+            : args.objectType === 'enum-extension'
+              ? 'enum-extension'
+              : args.objectType === 'edt-extension'
+                ? 'edt-extension'
+                : args.objectType === 'data-entity'
+                  ? 'view'
+                  : args.objectType;
+
+    // AOT names are case-insensitive, so an existing object differing only in
+    // casing IS a conflict — a case-sensitive probe here reported a false
+    // "no existing objects" (#686). Scoped to top-level objects: a method or
+    // field sharing the name is not an AOT naming conflict.
+    const exactConflict = lookupSymbolsNocase(db, name, { limit: 5 });
+
+    const similarSymbols = db
+      .prepare(`SELECT name, type, model FROM symbols WHERE name LIKE ? AND type = ? ORDER BY name LIMIT 5`)
+      .all(`${name.slice(0, Math.max(4, name.length - 3))}%`, dbType) as any[];
+
+
+  return {
+    objectType: args.objectType,
+    reinterpretedNote: reinterpreted?.note,
+    baseObjectName: args.baseObjectName,
+    isExtension,
+    prefix,
+    prefixOrigin: explicitPrefix ? 'passed in' : resolution.source,
+    modelName,
+    modelTokenPhrase,
+    extensionInfix,
+    useModelName,
+    namingStyle,
+    useModelNameForClass,
+    classNamingStyle,
+    errors,
+    warnings,
+    suggestions,
+    exactConflict: exactConflict as any,
+    similarSymbols: similarSymbols as any,
+  };
+}
+
+/**
+ * Detect common model prefix from existing custom symbols.
+ * Looks for 2-4 char prefix shared by many objects in the index.
+ */
+function detectModelPrefix(db: any, proposedName: string): string {
+  const stdPrefixes = [
+    'Cust',
+    'Vend',
+    'Sales',
+    'Purch',
+    'Ledger',
+    'Invent',
+    'Proj',
+    'WHS',
+    'Sma',
+    'MCR',
+    'Retail',
+    'Ax',
+    'Sys',
+    'Global',
+    'Common',
+    'Tax',
+    'Bank',
+  ];
+  for (const p of stdPrefixes) {
+    if (proposedName.startsWith(p)) return '';
+  }
+
+  try {
+    const prefix3 = proposedName.slice(0, 3).toUpperCase();
+    const sample = db
+      .prepare(`SELECT name FROM symbols WHERE type = 'class' AND name LIKE ? LIMIT 20`)
+      .all(`${prefix3}%`) as any[];
+
+    if (sample.length >= 3) return prefix3;
+
+    const prefix2 = proposedName.slice(0, 2).toUpperCase();
+    return prefix2.length >= 2 ? prefix2 : '';
+  } catch {
+    return '';
+  }
+}

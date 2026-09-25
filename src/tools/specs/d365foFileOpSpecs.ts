@@ -60,6 +60,17 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string (None | Restricted | Cascade | CascadeRestricted)',
     description: 'Delete action to take on the related table. Defaults to Restricted.',
   },
+  deleteActionRelation: {
+    type: 'string',
+    description:
+      'The RELATION linking the two tables, by name. Do not assume which side declares it: in ' +
+      'shipped metadata it is usually the relation on the RELATED table pointing back at this one ' +
+      '(DMFDataSource\u2019s delete action on DMFPublishedEntity names the relation declared on ' +
+      'DMFPublishedEntity), but the reverse ships too (AxKPITable names a relation on itself). ' +
+      'Read the related table with get_object_info(options:{relations:true}) and use the name you ' +
+      'find. Optional \u2014 without it xppbp reports BPUpgradeMetadataDeleteAction ("has no ' +
+      'explicit relation set").',
+  },
   // table fields
   fieldName: { type: 'string', description: 'Field name.' },
   fieldNewName: {
@@ -72,7 +83,7 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'EDT name for the field (e.g. "InventQty", "WHSZoneId", "TransDate"). For modify-field: new EDT to set.',
   },
   fieldBaseType: {
-    type: 'string (String | Integer | Real | Date | DateTime | Int64 | GUID | Enum)',
+    type: 'string (String | Integer | Real | Date | DateTime | Int64 | GUID | Enum | Container)',
     description:
       'Base type selecting the XML element for add-field (e.g. edt "InventQty" + "Real" → AxTableFieldReal). ' +
       'Auto-resolved from the symbol index when omitted — pass explicitly when the EDT is not indexed yet.',
@@ -139,7 +150,9 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
   controlName: {
     type: 'string',
     description:
-      'Name of the new form control — MUST match the field name in the table extension so the binding works.',
+      'add-control: name of the new form control — MUST match the field name in the table extension so ' +
+      'the binding works. remove-control: <Name> of the existing control to delete, at any depth in the ' +
+      'design.',
   },
   parentControl: {
     type: 'string',
@@ -165,11 +178,14 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
   controlLabel: { type: 'string', description: 'Optional label for the new control.' },
   positionType: {
     type: 'string',
-    description: 'AfterItem | BeforeItem. Omit to append at the end of the parent.',
+    description:
+      'AfterItem (needs previousSibling) | Begin | End. Omit to append at the end of the parent. ' +
+      'These are the values D365FO form-extension metadata actually carries; anything else is refused.',
   },
   previousSibling: {
     type: 'string',
-    description: 'Name of the sibling control to position after (used with positionType=AfterItem).',
+    description:
+      'Name of the sibling control to position after. Implies positionType=AfterItem when that is omitted.',
   },
   baseFormName: {
     type: 'string',
@@ -201,6 +217,13 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
   indexAllowDuplicates: { type: 'boolean', description: 'Allow duplicates (default: false = unique).' },
   indexAlternateKey: { type: 'boolean', description: 'Mark the index as an alternate key.' },
   indexEnabled: { type: 'boolean', description: 'Whether the index is enabled (default: true).' },
+  indexValidTimeStateKey: {
+    type: 'boolean',
+    description:
+      'Date-effective tables only: mark this index as the ValidTimeStateKey (ValidTimeStateFieldType = Date/UtcDateTime ' +
+      'requires a unique AlternateKey index over the business key + ValidFrom + ValidTo carrying this flag — xppc rejects the table without it).',
+  },
+  indexValidTimeStateMode: { type: 'string', description: '"Gap" or "NoGap" — the valid-time-state mode of that key index.' },
   // relations
   relationName: { type: 'string', description: 'Relation name.' },
   relatedTable: { type: 'string', description: 'Related (foreign key) table name.' },
@@ -257,6 +280,66 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'Optional join/link type when joinSource is set: InnerJoin | OuterJoin | ExistJoin | NotExistJoin | ' +
       'Delayed | Active | Passive.',
   },
+  // add-query-range
+  rangeField: {
+    type: 'string',
+    description: 'Field name to filter on (e.g. "IsActive"). Becomes <Field> in the range object.',
+  },
+  rangeName: {
+    type: 'string',
+    description:
+      'Name for the range object (<Name>). Defaults to rangeField when omitted. ' +
+      'Only ever matched against other ranges of the SAME data source.',
+  },
+  reportAction: {
+    type: '"refresh-dataset" | "add-parameter"',
+    description:
+      'report-design: which half to do. "refresh-dataset" copies the temp table fields into the dataset; ' +
+      '"add-parameter" declares a report parameter and binds it to the dataset. There is deliberately no ' +
+      '"add-column" — placing a column edits the RDL, whose failures surface only in the SSRS renderer.',
+  },
+  tableName: {
+    type: 'string',
+    description:
+      'report-design(refresh-dataset): the temp table whose fields the dataset should carry. It is read ' +
+      'off disk, so it must exist; only MISSING fields are added, never rewritten or removed.',
+  },
+  datasetName: {
+    type: 'string',
+    description:
+      'report-design: which dataset to act on. Optional when the report has exactly one; REQUIRED when it ' +
+      'has several, because guessing puts the field on the wrong dataset.',
+  },
+  parameterName: {
+    type: 'string',
+    description: 'report-design(add-parameter): the parameter to declare and bind.',
+  },
+  parameterDataType: {
+    type: 'string',
+    description:
+      'report-design(add-parameter): .NET type name, default System.String. Shipped reports use ' +
+      'System.String / System.Boolean / System.DateTime / System.Int32 / System.Int64.',
+  },
+  parameterHidden: {
+    type: 'boolean',
+    description:
+      'report-design(add-parameter): true writes <UserVisibility>Hidden</UserVisibility>. Leave it off for ' +
+      'a VISIBLE parameter — across 1,057 shipped reports there is no "Visible" value, a visible parameter ' +
+      'omits the element, and an unknown one is dropped silently.',
+  },
+  promptString: {
+    type: 'string',
+    description:
+      'report-design(add-parameter): the dialog caption. Pass a LABEL id ("@MyModel:FromDate") — it is ' +
+      'user-visible text living in metadata, which no BP rule checks.',
+  },
+  rangeValue: {
+    type: 'string',
+    description:
+      'Filter value the range applies (e.g. "1" for a NoYes field, "Sales" for an enum, ' +
+      '"1..99" for an interval). Required: a range with no value filters nothing. ' +
+      'For the empty-string filter pass the two characters "" — that is how D365FO stores it.',
+  },
   // enum values
   enumValueName: { type: 'string', description: 'Enum value name (e.g. "Approved").' },
   enumValueNewName: {
@@ -276,6 +359,116 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string',
     description: 'ISO country/region codes, comma-separated (e.g. "CZ,SK").',
   },
+  removeSeparator: {
+    type: 'boolean (default false)',
+    description:
+      'remove-control: also delete the adjacent AxFormButtonSeparatorControl — the sibling after the ' +
+      'control, else the one before it. Removing a toolbar button usually orphans its separator, which ' +
+      'then shows as a stray divider. Opt-in: a separator between two REMAINING buttons is load-bearing.',
+  },
+  // security privileges
+  entryPointName: {
+    type: 'string',
+    description:
+      '<Name> of the AxSecurityEntryPointReference to remove — conventionally the menu item name. ' +
+      'This is the entry point ON the privilege, not the privilege itself (that is objectName).',
+  },
+  entryPointObjectName: {
+    type: 'string',
+    description:
+      '<ObjectName> of the entry point — the menu item or service operation it grants access to. Use ' +
+      'instead of entryPointName when the entry point carries a different <Name> than its target.',
+  },
+  entryPointObjectType: {
+    type: 'string (MenuItemDisplay | MenuItemAction | MenuItemOutput | ServiceOperation | None)',
+    description:
+      '<ObjectType> (EntryPointType) of the entry point. REQUIRED on add-entry-point; on ' +
+      'remove-entry-point only needed to disambiguate one ObjectName referenced through two ' +
+      'entry-point types — two matches are refused, never guessed. A value outside the enum ' +
+      'deserializes to nothing, so it is rejected rather than written.',
+  },
+  accessLevel: {
+    type: 'string (view | read | maintain)',
+    description:
+      'add-entry-point: permissions the <Grant> carries. "view"/"read" grant Read; "maintain" grants ' +
+      'Correct+Create+Delete+Read+Update (plus Invoke on a ServiceOperation). DEFAULTS to "view", so a maintain privilege must say so explicitly. ' +
+      'Nothing else is accepted — "full"/"edit" used to be taken and silently degraded to Read-only.',
+  },
+  // BP-check suppressions
+  diagnosticPath: {
+    type: 'string',
+    description:
+      'remove-diagnostic-suppression: REQUIRED — exact <Path> of the <Diagnostic> to remove (e.g. ' +
+      '"dynamics://Form/MyForm"), copied verbatim from the suppression entry. ' +
+      'add-diagnostic-suppression: the dynamics:// path a BP-check finding was raised against — copy it ' +
+      'verbatim from the finding when you have it (the only way to address a sub-element: a control, a ' +
+      'field, a method, an enum value). Preferred over diagnosticElementType + diagnosticElementName, which ' +
+      'can only derive a path to a whole top-level object. This is the same value ' +
+      'get_knowledge(kind="bp-moniker", action="suppress") renders it from.',
+  },
+  diagnosticMoniker: {
+    type: 'string',
+    description:
+      'remove-diagnostic-suppression: <Moniker> of the suppression to remove. Only needed when the same ' +
+      'diagnosticPath carries more than one <Diagnostic> (two different rules ignored on the same target) ' +
+      '— two matches on path alone are refused, never guessed. ' +
+      'add-diagnostic-suppression: REQUIRED — the BP moniker being suppressed, validated against the known ' +
+      'catalog (e.g. "BPErrorPrivilegeNotCoveredByDuty").',
+  },
+  diagnosticElementType: {
+    type: 'string (AxClass | AxTable | AxForm | AxView | AxMap | AxEnum | AxQuerySimple | ' +
+      'AxDataEntityView | AxSecurityPrivilege | AxSecurityDuty | AxSecurityRole | AxTableExtension | ' +
+      'AxFormExtension | AxMenuExtension | AxMenu | AxMenuItemDisplay | AxMenuItemAction | ' +
+      'AxMenuItemOutput | AxEdtString | AxEdtInt | … | AxConfigurationKey | AxLicenseCode)',
+    description:
+      'add-diagnostic-suppression: top-level AOT element type of the object the finding was raised against ' +
+      '— used with diagnosticElementName to DERIVE diagnosticPath when it is not given directly. Only ' +
+      'addresses a whole object; a sub-element needs diagnosticPath verbatim from the finding instead.',
+  },
+  diagnosticElementName: {
+    type: 'string',
+    description:
+      'add-diagnostic-suppression: name of the object the finding was raised against, paired with ' +
+      'diagnosticElementType to derive diagnosticPath.',
+  },
+  diagnosticJustification: {
+    type: 'string',
+    description:
+      'add-diagnostic-suppression: why this warning is being ignored. Omitting it writes an obvious TODO ' +
+      'placeholder plus a warning — a suppression with no stated reason is what a reviewer rejects.',
+  },
+  diagnosticMessage: {
+    type: 'string',
+    description:
+      'add-diagnostic-suppression: the real message text from the BP-check finding, if known. Never ' +
+      'invented when omitted — <Message> is simply left off, which is normal (absent from most real entries).',
+  },
+  diagnosticSeverity: {
+    type: 'string (Error | Warning)',
+    description: 'add-diagnostic-suppression: <Severity> of the diagnostic being suppressed. Default: Warning.',
+  },
+  diagnosticItemSpecific: {
+    type: 'boolean (default false)',
+    description:
+      'add-diagnostic-suppression: emit the <ItemSpecific> block — rare, only for element-specific rules ' +
+      '(BPErrorUnknownLabel, BPXmlDoc*, BPErrorPrivilegeNotCoveredByDuty, …). Requires diagnosticElementName.',
+  },
+  // Model descriptor module references
+  moduleReference: {
+    type: 'string',
+    description:
+      'add-module-reference / remove-module-reference: REQUIRED — the module to add to or remove from the ' +
+      'descriptor\'s <ModuleReferences>, spelled exactly as the PACKAGE FOLDER is (e.g. "ApplicationSuite", ' +
+      '"Ledger", "ApplicationFoundation", or an ISV package name). Matched case-insensitively against what ' +
+      'is already there, so a re-run is a reported duplicate rather than a second entry.',
+  },
+  // Alias spellings (see OP_PARAM_ALIASES). They never appear as their own line
+  // in a rendered spec - renderOpSpec walks required/optional only - but every
+  // alias must be describable, so the registry guard can prove none is a typo.
+  parent: { type: 'string', description: 'Alias of parentControl (as printed by get_object_info form control search).' },
+  after: { type: 'string', description: 'Alias of previousSibling (as printed by get_object_info form control search).' },
+  edt: { type: 'string', description: 'Alias of fieldType - the element-level spelling used by fields[{ name, edt, type }].' },
+  type: { type: 'string', description: 'Alias of fieldBaseType - the element-level spelling used by fields[{ name, edt, type }].' },
   // menus
   menuItemToAdd: { type: 'string', description: 'Name of the menu item to add (e.g. "MyCustomForm").' },
   menuItemToAddType: {
@@ -304,10 +497,52 @@ export interface D365FileOpSpec {
 /**
  * A required param may be satisfied by an alias instead
  * (e.g. add-method accepts methodCode in place of sourceCode).
+ *
+ * The alias is also RENAMED to its canonical spelling before the modify args are
+ * validated (see normalizeModifyArgs in write/modifyD365File.ts), so an alias is
+ * a working parameter and not merely a name that suppresses a warning. That
+ * rename fires only when the canonical param is declared by the operation and
+ * was not supplied itself, which is why an alias may safely stand for an
+ * OPTIONAL param too — `opParamNames` below only expands aliases of REQUIRED
+ * ones, since that is all the required-satisfaction check needs.
+ *
+ * Why these four, all measured:
+ *   • parent / after — get_object_info(form, options.searchControl) renders a
+ *     usage hint saying `parent="…"` / `after="…"`, which add-control did not
+ *     accept (it wants parentControl / previousSibling). Following the tool's
+ *     own hint cost a guaranteed retry, so the hint was fixed AND the older
+ *     spelling kept working.
+ *   • edt / type — the element-level spelling of a field's parts, as used by
+ *     `fields:[{ name, edt, type }]` here and by create's `properties.fields`.
+ *     A caller that flattens one such element into `params` sends {name, edt,
+ *     type}: live probe, add-field {name:"Note2", edt:"Notes"} wrote nothing and
+ *     returned the full 3,000-char spec. (`name` is not listed here — the
+ *     did-you-mean the server already computes resolves it to fieldName.)
  */
 export const OP_PARAM_ALIASES: Record<string, string[]> = {
   sourceCode: ['methodCode'],
+  parentControl: ['parent'],
+  previousSibling: ['after'],
+  fieldType: ['edt'],
+  fieldBaseType: ['type'],
 };
+
+/**
+ * The canonical param an alias key stands for on THIS operation, or undefined.
+ *
+ * Deliberately checks the operation's own declared params (required AND
+ * optional) rather than opParamNames(): an alias is only meaningful where the
+ * canonical parameter is something the operation actually reads.
+ */
+export function canonicalParamForAlias(operation: string, key: string): string | undefined {
+  const spec = D365FO_FILE_OP_SPECS[operation];
+  if (!spec) return undefined;
+  for (const [canonical, aliases] of Object.entries(OP_PARAM_ALIASES)) {
+    if (!aliases.includes(key)) continue;
+    if (spec.required.includes(canonical) || spec.optional.includes(canonical)) return canonical;
+  }
+  return undefined;
+}
 
 /** Per-operation parameter specs for ALL d365fo_file [modify] operations. */
 export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
@@ -329,13 +564,13 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   'add-field': {
     required: ['fieldName'],
     optional: ['fieldType', 'fieldBaseType', 'fieldEnumType', 'fieldMandatory', 'fieldLabel', 'dataField', 'dataSource', 'fieldGroupName', 'autoCorrect'],
-    mutationOneOf: ['fieldType', 'fieldEnumType', 'dataField'],
+    mutationOneOf: ['fieldType', 'fieldEnumType', 'dataField', 'fieldBaseType'],
     note:
       'Enum field: pass fieldEnumType="<enum name>" and NO fieldType — an enum-typed table field ' +
       'is an AxTableFieldEnum with an EnumType and needs no EDT. (fieldType is the EDT name here, ' +
       'never an XML element name like "AxTableFieldEnum" — that one is read as fieldEnumType when the ' +
       'enum is unambiguous, unless autoCorrect=false.) ' +
-      'Table/table-extension: otherwise fieldType (EDT) is REQUIRED. data-entity-extension: pass dataField AND ' +
+      'Container field: prefer a container EDT — fieldType="Bitmap" for an image, "Blobdata" for a binary payload; the base type resolves itself. Pass fieldBaseType="Container" and NO fieldType only for a bare container (52 of 332 shipped container fields), which draws BPErrorTableFieldNotDefinedUsingType. "Container" is never an EDT name. Table/table-extension: otherwise fieldType (EDT) is REQUIRED. data-entity-extension: pass dataField AND ' +
       'dataSource instead — BOTH, or nothing is written; a mapped field has no EDT of its own, it points ' +
       'at dataField on the entity data source dataSource. fieldGroupName is optional and only applies to ' +
       'a data-entity-extension: it appends the field to that BASE-entity field group (shipped extensions ' +
@@ -373,7 +608,7 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   },
   'add-index': {
     required: ['indexName', 'indexFields'],
-    optional: ['indexAllowDuplicates', 'indexAlternateKey', 'indexEnabled'],
+    optional: ['indexAllowDuplicates', 'indexAlternateKey', 'indexEnabled', 'indexValidTimeStateKey', 'indexValidTimeStateMode'],
   },
   'remove-index': { required: ['indexName'], optional: [] },
   'add-full-text-index': {
@@ -395,8 +630,11 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   'remove-relation': { required: ['relationName'], optional: [] },
   'add-delete-action': {
     required: ['deleteActionName'],
-    optional: ['deleteActionTable', 'deleteActionType'],
-    note: 'objectType="table" only. deleteActionTable defaults to deleteActionName; deleteActionType defaults to Restricted.',
+    optional: ['deleteActionTable', 'deleteActionType', 'deleteActionRelation'],
+    note:
+      'objectType="table" only. deleteActionTable defaults to deleteActionName; deleteActionType ' +
+      'defaults to Restricted. Re-sending the same deleteActionName with a DIFFERENT deleteActionType ' +
+      'rewrites the entry in place — it is a repair path, not a no-op.',
   },
   'remove-delete-action': { required: ['deleteActionName'], optional: [] },
   'add-field-group': {
@@ -425,6 +663,47 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
     optional: ['joinSource', 'linkType'],
     note: 'form-extension only.',
   },
+  'report-design': {
+    required: ['reportAction'],
+    optional: ['tableName', 'datasetName', 'parameterName', 'parameterDataType', 'parameterHidden', 'promptString'],
+    note:
+      'objectType="report" only — the FIRST write path an AxReport has. Two actions, both metadata-only: ' +
+      'reportAction="refresh-dataset" (+ tableName, optional datasetName) copies the temp table\'s fields ' +
+      'into the dataset, adding only what is missing; reportAction="add-parameter" (+ parameterName, ' +
+      'optional parameterDataType [default System.String], parameterHidden, promptString, datasetName) ' +
+      'declares a parameter AND binds it to the dataset, which are two elements in two collections that ' +
+      'must agree. ' +
+      'It NEVER touches the RDL in the <![CDATA[…]]> block and never removes anything: a dataset field the ' +
+      'design does not bind is inert, while removing one it does bind breaks the render — and a malformed ' +
+      'RDL fails in the SSRS renderer at run time, where no build and no test can see it. ' +
+      'For the same reason there is no "add-column": placing a column IS layout, and layout stays with the ' +
+      'Report Designer. Both actions are idempotent. ' +
+      'parameterHidden=true writes <UserVisibility>Hidden</UserVisibility>; leave it off for a VISIBLE ' +
+      'parameter — across 1,057 shipped reports and 13,833 parameters there is no "Visible" value, a ' +
+      'visible parameter simply omits the element, and an unknown one is dropped silently ' +
+      '(get_knowledge(topic="axreport-anatomy")).',
+  },
+  'add-query-range': {
+    required: ['dataSourceName', 'rangeField', 'rangeValue'],
+    optional: ['rangeName'],
+    note:
+      'objectType="data-entity" only. Adds an <AxQuerySimpleDataSourceRange> to the <Ranges> that the ' +
+      'named data source OWNS inside <ViewMetadata>. dataSourceName is the <Name> of either the root ' +
+      'data source (<AxQuerySimpleRootDataSource>, usually the primary table) or a joined one ' +
+      '(<AxQuerySimpleEmbeddedDataSource>) — a joined data source keeps its own <Ranges>, and filtering ' +
+      'the joined table is not the same query as filtering the root. ' +
+      'rangeName defaults to rangeField when omitted. ' +
+      'rangeValue is required (e.g. "1" to restrict to active rows); pass "" (two characters) for the ' +
+      'empty-string filter. Idempotent per data source.',
+  },
+  'remove-query-range': {
+    required: ['dataSourceName', 'rangeName'],
+    optional: [],
+    note:
+      'objectType="data-entity" only. Removes the <AxQuerySimpleDataSourceRange> whose <Name> equals ' +
+      'rangeName from the <Ranges> the named data source OWNS — a same-named range on a joined data ' +
+      'source is left alone. Collapses <Ranges> to <Ranges /> when empty. Idempotent.',
+  },
   'add-control': {
     required: ['controlName', 'parentControl'],
     optional: [
@@ -433,7 +712,126 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
     ],
     note: 'objectType="form": parentControl="Design" adds the control at the TOP LEVEL of the '
       + 'form design — use it for the first control on a form whose design is still empty. '
-      + 'Otherwise pass the exact name of an existing container (Tab, TabPage, Group, Grid).',
+      + 'Otherwise pass the exact name of an existing container (Tab, TabPage, Group, Grid). '
+      + 'objectType="form-extension": parentControl may name a base-form container OR a container '
+      + 'the extension itself defines — the writer picks the right XML shape from which it is, so '
+      + 'just pass the name. A BASE-FORM parent bound to a table field group via <DataGroup> is '
+      + 'REFUSED: the compiler generates that group\'s members, so an explicit control collides — add '
+      + 'the field to the field group instead (add-field-to-field-group) and refresh the group in the '
+      + 'designer. On an EXTENSION-OWNED <DataGroup> parent the control IS written, with a warning: '
+      + 'nothing tops that group up, so the explicit control is what puts the field on the form, and '
+      + 'the field group entry is needed as well so a later designer Refresh does not discard it. '
+      + 'previousSibling works under either parent — under an extension-defined parent it orders the '
+      + 'control in the XML, under a base-form parent it is written as '
+      + '<PositionType>AfterItem</PositionType> + <PreviousSibling>.',
+  },
+  'remove-control': {
+    required: ['controlName'],
+    optional: ['removeSeparator'],
+    note:
+      'objectType="form" or "form-extension". Removes the control WHEREVER it sits in the design — '
+      + 'controls nest (ActionPane → ButtonGroup → Button), so no parentControl is needed. '
+      + 'On a form-extension the whole <AxFormExtensionControl> envelope goes, not just its '
+      + '<FormControl>: an envelope without its control is a <Parent> reference to nothing. '
+      + 'A control the form SHOWS but does not DEFINE belongs to the base form and is reported as '
+      + 'not found — a form extension cannot delete a base control, only hide it '
+      + '(modify-property Visible=No on a control extension). Emptying a <Controls> collection '
+      + 'collapses it to <Controls />, the spelling the serializer uses.',
+  },
+  'add-entry-point': {
+    required: ['entryPointObjectName', 'entryPointObjectType'],
+    optional: ['entryPointName', 'accessLevel'],
+    note:
+      'objectType="security-privilege". Adds one <AxSecurityEntryPointReference> — the block that ' +
+      'grants a menu item or service operation through this privilege. create takes only ONE entry ' +
+      'point (properties.targetObject), so this is how a privilege gets a second: without it the only ' +
+      'route was create(overwrite=true, xmlContent=...), i.e. hand-authored XML. ' +
+      'entryPointObjectType is a CLOSED enum (MenuItemDisplay | MenuItemAction | MenuItemOutput | ' +
+      'ServiceOperation | None) — an unknown value deserializes to nothing, so the privilege would ' +
+      'build clean, pass BP and grant access to no object at all. ' +
+      'entryPointName defaults to entryPointObjectName (they are equal in 910 of the 1036 shipped ' +
+      'entry points). accessLevel is "view"/"read" (Read) or "maintain" (Correct+Create+Delete+Read+Update, plus Invoke on a ServiceOperation); ' +
+      'it defaults to "view", so pass "maintain" explicitly for a maintain privilege. ' +
+      'Idempotent on the entry point <Name>.',
+  },
+  'remove-entry-point': {
+    required: [],
+    optional: ['entryPointName', 'entryPointObjectName', 'entryPointObjectType'],
+    mutationOneOf: ['entryPointName', 'entryPointObjectName'],
+    note:
+      'objectType="security-privilege". Removes one <AxSecurityEntryPointReference> — the block that '
+      + 'grants a menu item through this privilege. Identify it by entryPointName, or by '
+      + 'entryPointObjectName (+ entryPointObjectType when the same object is referenced through two '
+      + 'entry-point types). Two matches are REFUSED rather than resolved: removing the wrong entry '
+      + 'point revokes access to a different object, builds clean, and only surfaces as a user losing '
+      + 'a form. Removing the last one collapses <EntryPoints> to <EntryPoints />. '
+      + 'A privilege left with no entry points and no data-entity permissions grants nothing — delete '
+      + 'it with d365fo_file(action="delete") and drop its BP suppression entry.',
+  },
+  'remove-diagnostic-suppression': {
+    required: ['diagnosticPath'],
+    optional: ['diagnosticMoniker'],
+    note:
+      'objectType="ignore-diagnostic-list". Removes one <Diagnostic> from a {Model}_BPSuppressions.xml ' +
+      '— objectName is the file\'s own base name, "{Model}_BPSuppressions" (or pass filePath). Identify ' +
+      'the entry by diagnosticPath, the exact <Path> a BP-check finding was suppressed against; add ' +
+      'diagnosticMoniker when the same path carries more than one suppressed rule. Two matches on path ' +
+      'alone are REFUSED rather than resolved: removing the wrong one leaves a live finding silenced. ' +
+      'Removing the last entry collapses <Items> to <Items />. ' +
+      'd365fo_file(action="delete") already strips suppressions whose <Path> targets the deleted object ' +
+      '— use this operation for suppressions left stale by other means (a moniker fixed in code, a ' +
+      'renamed sub-element).',
+  },
+  'add-diagnostic-suppression': {
+    required: ['diagnosticMoniker'],
+    optional: [
+      'diagnosticPath', 'diagnosticElementType', 'diagnosticElementName',
+      'diagnosticJustification', 'diagnosticMessage', 'diagnosticSeverity', 'diagnosticItemSpecific',
+    ],
+    note:
+      'objectType="ignore-diagnostic-list". Adds one <Diagnostic> to a {Model}_BPSuppressions.xml — ' +
+      'objectName is the file\'s own base name, "{Model}_BPSuppressions" (or pass filePath). Needs ' +
+      'diagnosticMoniker PLUS either diagnosticPath (verbatim from the finding — the only way to address ' +
+      'a control/field/method/enum value) or diagnosticElementType + diagnosticElementName (derives a path ' +
+      'to a whole top-level object only). Builds the <Diagnostic> the same way ' +
+      'get_knowledge(kind="bp-moniker", action="suppress") does, so the two cannot describe two different ' +
+      'shapes — that helper is now redundant for anyone with write access to the metadata; call this ' +
+      'directly instead of rendering text to paste by hand. Refuses a duplicate (same diagnosticPath AND ' +
+      'diagnosticMoniker already present) rather than writing a second copy. When the model has never ' +
+      'suppressed anything before, {Model}_BPSuppressions.xml does not exist yet — this creates it and its ' +
+      'AxIgnoreDiagnosticList folder, in the shape real shipped suppression lists have, and says so in the ' +
+      'reply so you can add it to the model\'s .rnrproj if Visual Studio does not pick it up.',
+  },
+  'add-module-reference': {
+    required: ['moduleReference'],
+    optional: [],
+    note:
+      'objectType="model-descriptor". Adds one <d2p1:string> to the model descriptor\'s ' +
+      '<ModuleReferences> — the ONLY statement of what your model may see, since xppc resolves types ' +
+      'against the referenced packages and not against everything installed. Do this BEFORE writing code ' +
+      'that names a type from another model: a missing entry is a classStr/delegateStr/"type not found" ' +
+      'error at COMPILE time, not a code bug, and the code itself will look correct. ' +
+      'objectName is not needed — a descriptor is named for its model, so modelName alone identifies it ' +
+      '(or pass filePath). NOTHING is created implicitly: a model with no descriptor, or a descriptor with ' +
+      'no <ModuleReferences> element, is REPORTED rather than invented, because a <d2p1:string> entry needs ' +
+      'the arrays-namespace prefix bound by an xmlns:d2p1 attribute and guessing where that declaration ' +
+      'belongs writes a file Visual Studio rewrites on the next save. Refuses a duplicate (case-insensitive) ' +
+      'rather than writing a second entry. The module is probed as a package folder under every configured ' +
+      'root and a miss is WARNED about, not refused — a package can be absent on a dev box and present on ' +
+      'the build agent — but a typo produces exactly that warning. ' +
+      'A descriptor change needs a FULL build of the model to take effect. ' +
+      'Read the current list with get_workspace_info.',
+  },
+  'remove-module-reference': {
+    required: ['moduleReference'],
+    optional: [],
+    note:
+      'objectType="model-descriptor". Removes one <d2p1:string> from the descriptor\'s <ModuleReferences>. ' +
+      'This is the one direction that BREAKS a build that currently passes — every type the model resolved ' +
+      'through that module goes invisible to xppc at once — so run a full build of the model afterwards. ' +
+      'A module that is not referenced comes back as not-found WITH the list that is there, rather than as ' +
+      'a silent success. Removing the last entry collapses the element to the self-closing ' +
+      '<ModuleReferences /> a model that references nothing ships with.',
   },
   'add-enum-value': {
     required: ['enumValueName'],
@@ -449,7 +847,18 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
     required: ['menuItemToAdd'],
     optional: ['menuItemToAddType'],
   },
-  'modify-property': { required: ['propertyPath', 'propertyValue'], optional: [] },
+  'modify-property': {
+    required: ['propertyPath', 'propertyValue'],
+    optional: ['controlName'],
+    note:
+      'controlName is for objectType="form-extension" ONLY, and it is what customises a control of ' +
+      'the BASE form: the property goes to <ControlModifications>, the collection shipped extensions ' +
+      'use for exactly this (83 of 416, Visible/Enabled/Caption/HelpText/Label/CountryRegionCodes). ' +
+      'A dotted propertyPath ("MyGrid.Visible") is read the same way. WITHOUT a control the property ' +
+      'is the EXTENSION\'s own — on a form extension that changes the WHOLE FORM, so hiding one ' +
+      'control by omitting controlName hides the form instead. One envelope per control: a second ' +
+      'property joins the existing one. Idempotent.',
+  },
 };
 
 /**
@@ -468,13 +877,17 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
     'label, tableGroup, tableType, titleField1/2, cacheLookup?, primaryIndex?, ' +
     'allowRowVersionChangeTracking? (dual-write), created/modifiedBy/DateTime?, ' +
     'fields[{name,type?|edt?|fieldType?,enumType?,label?,mandatory?}] — enum fields need enumType ' +
-    '(+ optionally fieldType:"AxTableFieldEnum")',
+    '(+ optionally fieldType:"AxTableFieldEnum"), validTimeStateFieldType? (Date|UtcDateTime — then ADD the ValidFrom/ValidTo ' +
+    'fields yourself and give the key index validTimeStateKey:true), ' +
+    'indexes?[{name,fields[],allowDuplicates?,alternateKey?,validTimeStateKey?,validTimeStateMode?("Gap"|"NoGap")}]',
   enum:
     'label, useEnumValue, configurationKey, isExtensible, enumValues[{name,value?,label?,helpText?}] — ' +
-    'an explicit value: sets UseEnumValue=Yes for you; an OFF-POSITIONAL one (a number differing from the ' +
-    "entry's index) is refused when combined with isExtensible rather than dropped, since xppc requires " +
-    'UseEnumValue=No and no <Value> on an extensible enum. Plain 0,1,2 numbering states nothing the order ' +
-    'does not, so it is accepted and the numbers are dropped. ' +
+    'every member keeps its number: the value you pass (or its position when you pass none) is written as ' +
+    'an explicit <Value>, except 0, which the serialiser omits. A member WITHOUT <Value> is 0, not the ' +
+    'next ordinal, so an enum written without them has every member equal to 0 — it builds clean and ' +
+    'enum2int() returns 0 for all of them. isExtensible forces UseEnumValue=No and is refused only in ' +
+    'combination with useEnumValue:true (xppc: "UseEnumValue property must be set to \'No\' when the ' +
+    'IsExtensible property is \'True\'"); the numbers are kept either way. ' +
     'CHOOSE isExtensible DELIBERATELY: it also bars `<`/`>`/`<=`/`>=` on the enum ("Cannot use extensible ' +
     'enumerated type in non-equality comparison"), so any enum whose values get RANKED in X++ — a tier, a ' +
     'severity, a no-downgrade check — must be isExtensible:false',
@@ -488,7 +901,7 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
   form: 'caption, formTemplate, dataSource',
   'security-privilege':
     'label, targetObject, objectType (MenuItemDisplay|MenuItemAction|MenuItemOutput|ServiceOperation), ' +
-    'accessLevel (view|read = Read only, maintain = full CRUD — nothing else is accepted; "full"/"edit" ' +
+    'accessLevel (view|read = Read only, maintain = Correct+Create+Delete+Read+Update, plus Invoke on a ServiceOperation — nothing else is accepted; "full"/"edit" ' +
     'used to degrade silently to Read-only), dataEntity (grants perms)',
   'security-duty': 'label, privileges[]',
   'security-role': 'label, duties[], privileges[]',
@@ -558,6 +971,11 @@ export const D365FO_FILE_CORE_PARAMS: ReadonlySet<string> = new Set([
   // "peerOperations: IGNORED (not a recognised d365fo_file parameter)" — the
   // exact false warning the batch flow exists to stop producing.
   'peerOperations',
+  // Internal, injected by runModifyBatch — decisions only the BATCH can make:
+  // which single entry prints the shared best-practice advisory and which fields
+  // it covers. A 3-field batch printed the identical 350-char field-group
+  // paragraph three times because each entry could only see itself.
+  'batchAdvice',
 ]);
 
 /**
@@ -617,18 +1035,40 @@ function opParamNames(operation: string): string[] {
 }
 
 /**
+ * Every param of this operation that `key` could plausibly be a misspelling of,
+ * best tier first: exact (case-insensitive), then `param` ends with `key`
+ * (`mandatory` → `fieldMandatory`), then `key` ends with `param`. Only
+ * suffix/prefix containment is used — no fuzzy distance guessing.
+ *
+ * Returns only the BEST non-empty tier: a weaker match is not a rival candidate,
+ * it is a worse one. Within that tier the order is required-params first, then
+ * shortest name — which is what makes `name` on add-field resolve to `fieldName`
+ * (required) rather than to `fieldGroupName`, so the correction the server prints
+ * is also one it can safely apply.
+ */
+export function paramCorrectionCandidates(operation: string, key: string): string[] {
+  const k = key.toLowerCase();
+  const spec = D365FO_FILE_OP_SPECS[operation];
+  const candidates = [...new Set(opParamNames(operation))];
+  const tiers = [
+    candidates.filter(p => p.toLowerCase() === k),
+    candidates.filter(p => p.toLowerCase().endsWith(k)),
+    candidates.filter(p => k.endsWith(p.toLowerCase())),
+  ];
+  const best = tiers.find(t => t.length > 0) ?? [];
+  return [...best].sort((a, b) => {
+    const ra = spec?.required.includes(a) ? 0 : 1;
+    const rb = spec?.required.includes(b) ? 0 : 1;
+    return ra !== rb ? ra - rb : a.length - b.length;
+  });
+}
+
+/**
  * Near-miss suggestion for an unrecognised key: `mandatory` → `fieldMandatory`,
  * `allowDuplicates` → `indexAllowDuplicates`, `alternateKey` → `indexAlternateKey`.
- * Only suffix/prefix containment is used — no fuzzy distance guessing.
  */
 function suggestParam(operation: string, key: string): string | undefined {
-  const k = key.toLowerCase();
-  const candidates = opParamNames(operation);
-  return (
-    candidates.find(p => p.toLowerCase() === k) ??
-    candidates.find(p => p.toLowerCase().endsWith(k)) ??
-    candidates.find(p => k.endsWith(p.toLowerCase()))
-  );
+  return paramCorrectionCandidates(operation, key)[0];
 }
 
 /**
@@ -719,14 +1159,14 @@ export function renderOpSpec(operation: string): string {
   const op = D365FO_FILE_OP_SPECS[operation];
   if (!op) return `Unknown operation '${operation}'. Valid operations: ${Object.keys(D365FO_FILE_OP_SPECS).join(', ')}.`;
   const lines = [
-    // The published schema no longer carries op params (issue #825), so every
-    // spec names the lookup that returns it — otherwise the only way to see the
-    // contract is to fail a call first.
-    `(Fetch this spec any time with get_knowledge(kind="op-spec", topic="${operation}").)`,
-    `Parameter spec for operation '${operation}' — pass these NESTED inside \`params\`. ` +
-    `(Flat top-level keys still work for a few legacy names, but do not rely on it: strict MCP clients ` +
-    `validate against the base wire schema and drop anything undeclared before it reaches this server, ` +
-    `which then surfaces as a "required parameters missing" error that names the wrong cause.)`,
+    // The published schema no longer carries op params (issue #825), so the spec
+    // names the lookup that returns it — otherwise the only way to see the
+    // contract is to fail a call first. Kept to one line: the rationale for why
+    // flat keys fail was ~340 chars in front of every spec and changed nothing
+    // the caller does about it.
+    `Parameter spec for operation '${operation}' — pass these NESTED inside \`params\` ` +
+    `(strict MCP clients drop undeclared top-level keys). ` +
+    `Re-fetch: get_knowledge(kind="op-spec", topic="${operation}").`,
     ...op.required.map(p => renderParamLine(p, 'REQUIRED')),
     ...op.optional.map(p => renderParamLine(p, 'optional')),
   ];

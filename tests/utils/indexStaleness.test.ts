@@ -2,12 +2,13 @@
  * Index staleness detection tests.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  findNewestMetadataMtime, checkIndexStaleness, resetMetadataMtimeCache,
+  findNewestMetadataMtime, findNewestMetadataMtimeCached, checkIndexStaleness,
+  resetMetadataMtimeCache,
 } from '../../src/utils/indexStaleness';
 import { XppSymbolIndex } from '../../src/metadata/symbolIndex';
 
@@ -114,6 +115,108 @@ describe('findNewestMetadataMtime scan cache', () => {
 
     resetMetadataMtimeCache();
     expect(findNewestMetadataMtime(root)!.scannedFiles).toBe(2);
+  });
+});
+
+describe('non-blocking freshness scan (audit 2026-08-25)', () => {
+  // get_workspace_info averaged 31.5 s over 31 real calls and is neither
+  // bridge-gated nor DB-gated: the cost was inside the tool, and this walk —
+  // up to 5,000 synchronous statSync calls — was part of it. It cannot be made
+  // cheap, so it stops being the thing the first call of a session waits for.
+  const root = () => path.join(tmpDir, 'MyModel');
+
+  it('answers "pending" on a cold cache instead of walking the tree', () => {
+    resetMetadataMtimeCache();
+    expect(findNewestMetadataMtimeCached(root(), { blocking: false })).toEqual({ status: 'pending' });
+  });
+
+  it('has the real answer once the background scan has run', async () => {
+    resetMetadataMtimeCache();
+    findNewestMetadataMtimeCached(root(), { blocking: false });
+
+    // Poll to a deadline rather than sleeping a fixed 20 ms. The scan is a real
+    // filesystem walk on a background tick; 20 ms is comfortable on an idle dev
+    // box and not on a loaded CI runner, which is a flake that looks like a
+    // broken cache. Polling finishes as fast as the scan does.
+    let state = findNewestMetadataMtimeCached(root(), { blocking: false });
+    const deadline = Date.now() + 5000;
+    while (state.status !== 'ready' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      state = findNewestMetadataMtimeCached(root(), { blocking: false });
+    }
+
+    expect(state.status).toBe('ready');
+    expect(state.status === 'ready' && state.result!.newestFile).toContain('ContosoHelper.xml');
+  });
+
+  it('blocking:true is the old behaviour — scan now, answer now', () => {
+    resetMetadataMtimeCache();
+    const state = findNewestMetadataMtimeCached(root(), { blocking: true });
+    expect(state.status).toBe('ready');
+  });
+
+  it('checkIndexStaleness says the verdict is pending rather than hiding it', () => {
+    resetMetadataMtimeCache();
+    const report = checkIndexStaleness(new Date().toISOString(), root(), { blocking: false });
+
+    expect(report.status).toBe('pending');
+    // Named, not absent — and both ways to the real answer are on the line.
+    expect(report.compactLines.join('\n')).toContain('background');
+    expect(report.compactLines.join('\n')).toContain('diagnostics=true');
+    expect(report.compactLines).toHaveLength(1);
+  });
+
+  it('checkIndexStaleness still blocks by default, so existing callers are unchanged', () => {
+    resetMetadataMtimeCache();
+    const report = checkIndexStaleness(new Date(Date.now() - 24 * 3_600_000).toISOString(), root());
+    expect(report.status).toBe('stale');
+  });
+
+  /**
+   * "Call again for the verdict" has to be an instruction the caller can carry out.
+   * The entry lives 30 s and expiring it dropped the state back to 'pending', so an
+   * agent re-asking any later than that got the identical "still running" line —
+   * seen live on 2026-09-07 as three get_workspace_info calls 105 s apart with
+   * byte-identical output. After the first scan there is always an answer.
+   */
+  const scanned = async () => {
+    resetMetadataMtimeCache();
+    let state = findNewestMetadataMtimeCached(root(), { blocking: false });
+    const deadline = Date.now() + 5000;
+    while (state.status !== 'ready' && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      state = findNewestMetadataMtimeCached(root(), { blocking: false });
+    }
+    expect(state.status).toBe('ready');
+  };
+
+  /** Run `fn` as if `ms` had passed, without touching timers the scan itself uses. */
+  const laterBy = <T>(ms: number, fn: () => T): T => {
+    const realNow = Date.now.bind(Date);
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + ms);
+    try { return fn(); } finally { spy.mockRestore(); }
+  };
+
+  it('serves the last completed scan after the cache expires, rather than "pending" again', async () => {
+    await scanned();
+
+    const state = laterBy(10 * 60_000, () => findNewestMetadataMtimeCached(root(), { blocking: false }));
+
+    expect(state.status).toBe('ready');
+    expect(state.status === 'ready' && state.result!.newestFile).toContain('ContosoHelper.xml');
+  });
+
+  it('says how old the scan behind a "fresh" verdict is when it is served from an expired entry', async () => {
+    await scanned();
+
+    const report = laterBy(10 * 60_000, () =>
+      checkIndexStaleness(new Date().toISOString(), root(), { blocking: false }));
+
+    expect(report.status).toBe('fresh');
+    // A stale verdict from an old scan would still be true — files only get newer —
+    // so only this one has to admit what it did not look at.
+    expect(report.compactLines.join('\n')).toContain('10 min ago');
+    expect(report.compactLines.join('\n')).toContain('rescan running');
   });
 });
 

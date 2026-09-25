@@ -6,13 +6,13 @@
 
 export const findReferencesTool = {
     name: 'find_references',
-    description: 'Find all references (where-used) to a class, method, field, table, enum, or LABEL. Essential for impact analysis before refactoring. For a method, SCOPE it to its declaring type — pass "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable"), set ownerName alongside a bare method name, or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name (no owner) matches that name on every type and over-reports. For a label, pass the label id as targetName (e.g. "@WAX2194" or "@MyLabelFile:MyLabel"); results span every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), not just code, and require the xref database (DYNAMICSXREFDB, full server mode).',
+    description: 'Find all references (where-used) to a class, method, field, table, enum, EDT, or LABEL. Essential for impact analysis before refactoring. For a method, SCOPE it to its declaring type — pass "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable"), set ownerName alongside a bare method name, or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name (no owner) matches that name on every type and over-reports. For a label, pass the label id as targetName (e.g. "@WAX2194" or "@MyLabelFile:MyLabel"); results span every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), not just code, and require the xref database (DYNAMICSXREFDB, full server mode).',
     inputSchema: {
       type: 'object',
       properties: {
         targetName: {
           type: 'string',
-          description: 'Target name. Method where-used: qualify as "Owner.method" or pass an AOT path "/Tables/<Table>/Methods/<method>" for a result scoped to one declaring type (matches Visual Studio xref). A bare method name is name-only and over-reports. Label where-used: pass the label id exactly as written — old format "@WAX2194" or new format "@LabelFile:LabelId" (e.g. "@ApplicationPlatform:AbortButtonText").'
+          description: 'Target name. Methods: see the scoping rule in the description above. Labels: the id exactly as written — "@WAX2194" or "@LabelFile:LabelId".'
         },
         targetType: {
           type: 'string',

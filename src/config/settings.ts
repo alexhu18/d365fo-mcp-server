@@ -11,8 +11,9 @@
  * Everything else — the wizard, the config loader, the doctor and the docs
  * table — is generated from this list, so a new setting only has to be added
  * here. Purely operational variables the user should never have to set
- * (NODE_ENV, WEBSITES_PORT, CI/TERM detection, ENV_FILE, MCP_STDIO_MODE) are
- * deliberately absent: they are runtime/platform inputs, not configuration.
+ * (NODE_ENV, WEBSITES_PORT, CI/TERM detection, ENV_FILE, MCP_STDIO_MODE,
+ * ALLOW_UNAUTHENTICATED) are deliberately absent: they are runtime/platform
+ * inputs, not configuration.
  */
 
 export type SettingType = 'string' | 'path' | 'boolean' | 'int' | 'list' | 'enum';
@@ -43,13 +44,21 @@ export interface Setting {
   /**
    * Dotted path inside the JSON config, e.g. "environment.packagePath".
    *
-   * Absent for `env-only` settings: consent-style switches whose whole point is
-   * that they are re-read from the environment (or the .env file) between tool
-   * calls, so writing them into the wizard-managed JSON would misrepresent when
-   * a change takes effect. They are still registered here — without an entry
-   * the docs generator silently drops them, which is how three cross-model
-   * variables disappeared from docs/CONFIGURATION.md the last time it was
-   * regenerated.
+   * Absent for `env-only` settings: values whose reader is somewhere the
+   * wizard-managed JSON cannot honestly describe — the cross-model consent
+   * switches, re-read from the .env before every guard decision so a grant
+   * applies without a restart (loadEnv.reloadWritePolicy), and the lock
+   * heartbeat, read at acquire time in a process the wizard never configures.
+   * A JSON key would misrepresent when a change takes effect.
+   *
+   * "The runtime reads it straight from process.env" is NOT that reason — every
+   * setting here does, via toEnvRecord. EXTENSION_PREFIX_SOURCE sat in this
+   * group on that basis alone until #893, which cost a multi-instance install a
+   * whole second configuration file for one static naming preference.
+   *
+   * env-only settings are still registered — without an entry the docs
+   * generator silently drops them, which is how three cross-model variables
+   * disappeared from docs/CONFIGURATION.md the last time it was regenerated.
    */
   path?: string;
   /** Environment variable the server/scripts read at runtime. */
@@ -151,6 +160,20 @@ export const SETTINGS: Setting[] = [
     placeholder: 'C:\\AOSService\\PackagesLocalDirectory',
   },
   {
+    path: 'environment.scanDrives',
+    env: 'D365FO_SCAN_DRIVES',
+    section: 'environment',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Drive letters probed for AosService',
+    description:
+      'Comma-separated letters the packages-root scan probes when no packagePath is configured, e.g. "C,K". ' +
+      'Empty probes C: to Z: — the letters that have ever held AosService first, the rest inside a 2 s budget. ' +
+      'Set it on a machine with a disconnected mapped network drive: one stat on such a drive stalls for the ' +
+      'SMB timeout, and the scan runs on the first tool call of a session.',
+    placeholder: 'C,K',
+  },
+  {
     path: 'environment.customModels',
     env: 'CUSTOM_MODELS',
     section: 'environment',
@@ -227,7 +250,11 @@ export const SETTINGS: Setting[] = [
     label: 'Folder scanned for .rnrproj projects',
     description:
       'Scanned once at startup so the server can switch model automatically when you open another solution or ' +
-      'git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring.',
+      'git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring. ' +
+      'The scan resolves the MODEL; it does not pick a project when several .rnrproj under it build that model — ' +
+      'get_workspace_info then reports `Project : (not selected)` and names them, and anything that registers a ' +
+      'file needs an explicit projectName/projectPath. Picking one meant every write landed in whichever project ' +
+      'the scan saw first.',
     placeholder: 'K:\\repos\\MySolution\\projects',
   },
   {
@@ -289,14 +316,22 @@ export const SETTINGS: Setting[] = [
     required: true,
   },
   {
+    path: 'naming.prefixSource',
     env: 'EXTENSION_PREFIX_SOURCE',
     section: 'naming',
-    tier: 'env-only',
-    type: 'string',
-    label: 'Pin the configured prefix',
+    tier: 'advanced',
+    type: 'enum',
+    label: 'Where the prefix comes from',
     description:
-      'Set to `config` to make `EXTENSION_PREFIX` authoritative again instead of learning each model\'s prefix from ' +
-      'its own objects.',
+      'Whether the effective prefix is learned from the active model\'s own objects or pinned to the configured ' +
+      '`naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns ' +
+      'the shared stem, while the objects you write need the full one. See ' +
+      '[Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from).',
+    default: 'model',
+    choices: [
+      { value: 'model', hint: 'the model\'s own objects decide, falling back to naming.prefix' },
+      { value: 'config', hint: 'always naming.prefix, inference off (pre-1.8.2 behaviour)' },
+    ],
   },
   {
     path: 'naming.suffix',
@@ -323,6 +358,25 @@ export const SETTINGS: Setting[] = [
     choices: [
       { value: 'prefix', hint: 'CustTable.CrExtension — embeds the extension prefix' },
       { value: 'model-name', hint: 'CustTable.ContosoRobotics — embeds the model name (VS default)' },
+    ],
+  },
+  {
+    path: 'naming.extensionClassStyle',
+    env: 'EXTENSION_CLASS_NAMING_STYLE',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'enum',
+    label: 'How extension CLASSES are named',
+    description:
+      'Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. ' +
+      'Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with ' +
+      'prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one ' +
+      'or the other. Leave on inherit unless your convention names classes differently from elements.',
+    default: 'inherit',
+    choices: [
+      { value: 'inherit', hint: 'follow naming.extensionStyle — the default, behaviour unchanged' },
+      { value: 'prefix', hint: 'CustTableCtso_Extension — embeds the extension prefix' },
+      { value: 'model-name', hint: 'CustTable_ContosoRobotics_Extension — embeds the model name' },
     ],
   },
 
@@ -406,6 +460,26 @@ export const SETTINGS: Setting[] = [
     default: './extracted-metadata',
   },
   {
+    path: 'index.bpCatalogPath',
+    env: 'BP_CATALOG_PATH',
+    section: 'index',
+    tier: 'advanced',
+    type: 'path',
+    label: 'BP moniker catalog file',
+    description:
+      'Per-instance JSON catalog of real BP-check monikers, extracted from this instance\'s own D365FO version ' +
+      '(scripts/extract-bp-catalog.ps1). Falls back to the compiled-in snapshot when absent — this setting is only ' +
+      'written once an instance has regenerated its own catalog.',
+    // Deliberately no `default`. defaultPathEnv() projects every path setting
+    // that has a string default onto process.env, which would make
+    // BP_CATALOG_PATH permanently set — the "unset → compiled-in catalog"
+    // branch in bpMonikers/loadCatalog() would be unreachable and every
+    // install that has never regenerated a catalog (all existing ones, every
+    // Linux deployment, every checkout) would warn about a missing file on
+    // each start. ensureBpCatalogFresh writes the value after a successful
+    // extraction instead, which is what the description above promises.
+  },
+  {
     path: 'index.labelSortOrder',
     env: 'LABEL_SORT_ORDER',
     section: 'index',
@@ -458,15 +532,15 @@ export const SETTINGS: Setting[] = [
     type: 'enum',
     label: 'Tool profile',
     description:
-      'How many tools this server advertises. "full" publishes all 23. "core" publishes only the plan → discover → ' +
-      'write → build → verify loop (18 tools) and leaves out the specialist ones (extension_info, analyze_code, ' +
+      'How many tools this server advertises. "full" publishes all 20. "core" publishes only the plan → discover → ' +
+      'write → build → verify loop (15 tools) and leaves out the specialist ones (extension_info, analyze_code, ' +
       'validate_code, security_info, run_systest_class). Worth switching ' +
       'when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a ' +
       'limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool.',
     default: 'full',
     choices: [
-      { value: 'full', hint: 'all 23 tools' },
-      { value: 'core', hint: '18-tool create-and-build loop' },
+      { value: 'full', hint: 'all 20 tools' },
+      { value: 'core', hint: '15-tool create-and-build loop' },
     ],
   },
   {
@@ -501,8 +575,10 @@ export const SETTINGS: Setting[] = [
     type: 'string',
     label: 'HTTP bind address',
     description:
-      'Interface the HTTP transport binds to. The default accepts connections from anywhere, which is what a ' +
-      'container or App Service needs; set 127.0.0.1 to make a local server unreachable from the network.',
+      'Interface the HTTP transport binds to. Left unset it follows the API key: 0.0.0.0 once a key (or ' +
+      'ALLOW_UNAUTHENTICATED) is configured, which is what a container or App Service needs, and 127.0.0.1 when ' +
+      'neither is, so an unauthenticated server stays off the network. Setting it to a public interface without a ' +
+      'key is refused at startup.',
     default: '0.0.0.0',
   },
   {
@@ -646,6 +722,49 @@ export const SETTINGS: Setting[] = [
       'Writes one line per tool call that exceeds this, with the tool name and a short argument digest. ' +
       'Aggregate metrics cannot say which specific call cost five minutes; this can. Set LOG_FILE to keep the lines.',
     default: 10000,
+  },
+  {
+    path: 'server.slowCallHeartbeatMs',
+    env: 'SLOW_CALL_HEARTBEAT_MS',
+    section: 'server',
+    tier: 'advanced',
+    type: 'int',
+    label: 'Say what a running call is doing every (ms)',
+    description:
+      'While a tool call is still running, print the phase it is in to stderr at this interval. ' +
+      'The phase block in the reply is only ever read afterwards; a create that took 341 s and ' +
+      'reported all of it as unmeasured left nothing to look at either way. 0 turns it off.',
+    default: 30000,
+  },
+  {
+    path: 'index.warmup',
+    env: 'INDEX_WARMUP',
+    section: 'index',
+    tier: 'advanced',
+    type: 'enum',
+    label: 'Warm the hot indexes at startup',
+    description:
+      'Reads the indexes the request paths use into the OS file cache, on a worker thread, before ' +
+      'the first question needs them. Measured on the reference environment: the first covering scan ' +
+      'of the symbol-name index costs 83 s cold and 0.11 s warm, and the label join behind every ' +
+      'label search 31 s cold. Turn it off where a second reader of the same file is not free.',
+    default: 'on',
+    choices: [
+      { value: 'on', hint: 'warm in the background at startup (default)' },
+      { value: 'off', hint: 'first query pays for the cold cache, as before' },
+    ],
+  },
+  {
+    path: 'index.warmupBudgetMs',
+    env: 'INDEX_WARMUP_BUDGET_MS',
+    section: 'index',
+    tier: 'advanced',
+    type: 'int',
+    label: 'Stop starting warm-up steps after (ms)',
+    description:
+      'The warm-up stops beginning new steps once it has run this long; steps are ordered by what ' +
+      'the request paths wait on longest, so the budget cuts the least useful ones first.',
+    default: 600000,
   },
 
   // ── bridge ───────────────────────────────────────────────────────────────
@@ -812,8 +931,11 @@ export const SETTINGS: Setting[] = [
     type: 'string',
     label: 'API key required from HTTP clients',
     description:
-      'When set, every HTTP request must present this key. Leave empty for a localhost-only server; set it whenever ' +
-      'the port is reachable from another machine.',
+      'Every HTTP request must present this key as X-Api-Key (or Authorization: Bearer). Required for any server ' +
+      'reachable from the network — without it the listener serves your indexed X++ source to anyone who can reach ' +
+      'the port, so with no key set the server binds 127.0.0.1 instead, and refuses to start if HOST asks for a ' +
+      'public interface anyway. May be left empty only for a localhost-only development server. Generate with ' +
+      '`openssl rand -hex 32`.',
   },
   {
     path: 'behavior.groundingSecret',

@@ -188,16 +188,16 @@ describe('d365fo_file(action="modify") with operations[]', () => {
   it('unwraps a per-entry `params` the way the single-operation form does', async () => {
     await d365foFileTool(call({
       objectType: 'table-extension',
-      objectName: 'AslFinCore_TaxTransReportChangeLog.AslFinSKExtension',
+      objectName: 'ConCore_TaxTransReportChangeLog.ConSKExtension',
       operations: [
-        { operation: 'modify-field', params: { fieldName: 'AslFinSK_QualityTier', fieldLabel: '@AslFinSK:QualityTierField' } },
-        { operation: 'add-field-to-field-group', params: { fieldName: 'AslFinSK_QualityTier', fieldGroupName: 'Identification', extendBaseFieldGroup: true } },
+        { operation: 'modify-field', params: { fieldName: 'ConSK_QualityTier', fieldLabel: '@ConSK:QualityTierField' } },
+        { operation: 'add-field-to-field-group', params: { fieldName: 'ConSK_QualityTier', fieldGroupName: 'Identification', extendBaseFieldGroup: true } },
       ],
     }), ctx);
 
     const [first, second] = forwarded();
-    expect(first.fieldName).toBe('AslFinSK_QualityTier');
-    expect(first.fieldLabel).toBe('@AslFinSK:QualityTierField');
+    expect(first.fieldName).toBe('ConSK_QualityTier');
+    expect(first.fieldLabel).toBe('@ConSK:QualityTierField');
     expect(first.params).toBeUndefined();
     expect(second.fieldGroupName).toBe('Identification');
     expect(second.extendBaseFieldGroup).toBe(true);
@@ -210,5 +210,80 @@ describe('d365fo_file(action="modify") with operations[]', () => {
     }), ctx);
 
     expect(forwarded()[0].fieldName).toBe('Nested');
+  });
+
+  /**
+   * A bridge skip is an ok result that wrote nothing. Counting it as applied is
+   * what produced "✅ 3/3 operation(s) applied" over a file whose mtime had not
+   * moved — the header that made a silent no-op look like delivered work.
+   */
+  describe('operations the bridge skipped', () => {
+    /** Marks the nth (0-based) forwarded operation as skipped by the bridge. */
+    const skipAt = (...indexes: number[]) => {
+      let n = -1;
+      mockModify.mockImplementation(async (_req: any, _ctx: any, outcome: any) => {
+        n += 1;
+        if (indexes.includes(n)) {
+          outcome.skipped = true;
+          outcome.filePath = 'C:\\M\\AxFormExtension\\F.Ext.xml';
+          return ok('⏭️ NOT written — DataSource \'KSFoo\' was skipped by the bridge: already exists');
+        }
+        outcome.filePath = 'C:\\M\\AxFormExtension\\F.Ext.xml';
+        return ok('✅ applied');
+      });
+    };
+
+    it('does not count a skipped operation as applied', async () => {
+      skipAt(0, 1, 2);
+      const result = await d365foFileTool(call({
+        objectType: 'form-extension', objectName: 'PurchLineBackOrder.Ext',
+        operations: [
+          { operation: 'add-data-source', dataSourceName: 'A', dataSourceTable: 'PurchTable' },
+          { operation: 'add-data-source', dataSourceName: 'B', dataSourceTable: 'DirPartyTable' },
+          { operation: 'add-data-source', dataSourceName: 'C', dataSourceTable: 'VendTable' },
+        ],
+      }), ctx);
+
+      const out = text(result);
+      // The exact string the original bug reported.
+      expect(out).not.toContain('3/3 operation(s) applied');
+      expect(out).toContain('0/3 operation(s) applied');
+      expect(out).toContain('3 skipped');
+      // Nothing was written, so the reply must not open with a green check.
+      expect(out.startsWith('✅')).toBe(false);
+    });
+
+    it('separates what applied from what skipped in a mixed batch', async () => {
+      skipAt(1);
+      const result = await d365foFileTool(call({
+        objectType: 'form-extension', objectName: 'F.Ext',
+        operations: [
+          { operation: 'add-data-source', dataSourceName: 'A', dataSourceTable: 'T1' },
+          { operation: 'add-data-source', dataSourceName: 'B', dataSourceTable: 'T2' },
+          { operation: 'add-data-source', dataSourceName: 'C', dataSourceTable: 'T3' },
+        ],
+      }), ctx);
+
+      const out = text(result);
+      expect(out).toContain('2/3 operation(s) applied');
+      expect(out).toContain('1 skipped');
+      // Per-operation headings distinguish the three outcomes at a glance.
+      expect(out).toContain('⏭️ #2 add-data-source');
+      expect(out).toContain('✅ #1 add-data-source');
+    });
+
+    it('still reports a clean batch exactly as before', async () => {
+      const result = await d365foFileTool(call({
+        objectType: 'table', objectName: 'T',
+        operations: [
+          { operation: 'add-field', fieldName: 'A' },
+          { operation: 'add-field', fieldName: 'B' },
+        ],
+      }), ctx);
+
+      const out = text(result);
+      expect(out).toContain('✅ d365fo_file(action="modify") — 2/2 operation(s) applied');
+      expect(out).not.toContain('skipped');
+    });
   });
 });

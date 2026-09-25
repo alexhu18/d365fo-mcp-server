@@ -21,6 +21,10 @@ export function registerCodeReviewPrompt(server: Server, context: XppServerConte
   const { symbolIndex, parser } = context;
 
   server.setRequestHandler(ListPromptsRequestSchema, async () => {
+    // Same reason as the resource handlers (src/resources/index.ts): stdio logs
+    // nothing per request, so without this line a client that reads our prompts
+    // and one that ignores them look identical.
+    process.stderr.write('[prompts] 💬 prompts/list — client enumerated the MCP prompts\n');
     return {
       prompts: [
         getSystemInstructionsPromptDefinition(),
@@ -96,6 +100,7 @@ export function registerCodeReviewPrompt(server: Server, context: XppServerConte
   // Handle prompt requests
   server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const promptName = request.params.name;
+    process.stderr.write(`[prompts] 💬 prompts/get ${promptName}\n`);
 
     // Handle system instructions prompt
     if (promptName === 'xpp_system_instructions') {
@@ -236,7 +241,7 @@ ${classSource}
 Use CoC when you need to wrap or augment an existing method's logic.
 
 ### Prerequisites
-1. Call \`get_method(include="signature")\` to get exact parameter types and return type
+1. Call \`get_object_info(objectType="class", name, options:{"method":"<name>","include":"signature"})\` to get exact parameter types and return type
 2. Call \`extension_info(mode="coc")\` to check if the method is already wrapped
 3. Call \`extension_info(mode="points")\` to verify the method is CoC-eligible (not \`final\` / \`[Hookable(false)]\`)
 

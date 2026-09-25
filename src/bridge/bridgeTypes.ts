@@ -154,9 +154,17 @@ export interface BridgeEdtInfo {
   name: string;
   baseType?: string;
   extends?: string;
+  /** Root of the Extends chain, for orientation in a multi-level hierarchy. */
+  rootEdt?: string;
   label?: string;
   helpText?: string;
   stringSize?: number;
+  /**
+   * Ancestor the reported `stringSize` came from. Absent when the number is what this EDT's
+   * own XML declares. Present both when the EDT declares nothing (the common case) and when
+   * an ancestor's value overrode one the EDT did declare.
+   */
+  stringSizeInheritedFrom?: string;
   enumType?: string;
   referenceTable?: string;
   model?: string;
@@ -447,6 +455,20 @@ export interface BridgeWriteResult {
    * create ops and on add-control; the write itself still succeeded.
    */
   unsupportedProperties?: string[];
+  /**
+   * The bridge declined the operation and changed NOTHING — an element with that
+   * name is already there. `success` stays true because nothing failed, so a
+   * caller that reads only `success` reports a write that did not happen. Render
+   * it with skippedMessage() (bridgeAdapter.ts) rather than the success branch.
+   *
+   * Returned today by add-field (data-entity-extension), add-field-to-field-group,
+   * add-menu-item-to-menu and add-data-source. It was absent from this interface
+   * for as long as the bridge has been sending it, which is precisely why four
+   * wrappers could ignore it without so much as a type error.
+   */
+  skipped?: boolean;
+  /** Why the bridge skipped, in its own words. Only set alongside `skipped`. */
+  reason?: string;
   api?: string;
 }
 
@@ -579,6 +601,12 @@ export interface BridgeSecurityPrivilegeResult {
   model?: string;
   entryPoints: BridgeSecurityEntryPoint[];
   parentDuties: Array<{ name: string }>;
+  /**
+   * False when the duty scan could not finish. An empty `parentDuties` then
+   * means "unknown", not "none" — and "none" is the claim
+   * BPErrorPrivilegeNotCoveredByDuty is about, so the two must not render alike.
+   */
+  parentDutiesComplete?: boolean;
   _source: string;
 }
 
@@ -677,6 +705,13 @@ export interface BridgeExtensionClassEntry {
   className: string;
   path?: string;
   module?: string;
+  /**
+   * AOT path this class actually extends, read from its [ExtensionOf] declaration —
+   * "/Tables/SalesTable", "/Forms/SalesTable/DataSources/SalesLine", etc. Needed because a
+   * name can belong to several objects at once: "SalesTable" is both a table and a form,
+   * and the form's data sources, controls and data fields are extended separately again.
+   */
+  extendedElement?: string;
   /** Methods that the extension class wraps via CoC */
   wrappedMethods?: string[];
 }

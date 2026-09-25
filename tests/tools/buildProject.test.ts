@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // --- hoisted mocks -----------------------------------------------------------
 const {
-  accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, statMock, spawnMock, execFileMock,
+  accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, rmMock, statMock, spawnMock, execFileMock,
   cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
   cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
   cfgGetActiveXppConfig, cfgGetModelName, detectedRoots,
@@ -15,6 +15,7 @@ const {
   const unlinkMock = vi.fn().mockResolvedValue(undefined);
   const readFileMock = vi.fn();
   const readdirMock = vi.fn().mockRejectedValue(new Error('not found'));
+  const rmMock = vi.fn().mockResolvedValue(undefined);
   // Source-staleness scan (hasSourceChangesSince). mtimeMs 0 = "older than any
   // build", so a mocked tree never looks modified unless a test says so.
   const statMock = vi.fn().mockResolvedValue({ mtimeMs: 0 });
@@ -32,7 +33,7 @@ const {
   const cfgGetActiveXppConfig = vi.fn().mockResolvedValue(null);
   const cfgGetModelName = vi.fn().mockReturnValue(null);
   return {
-    accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, statMock, spawnMock, execFileMock,
+    accessMock, writeFileMock, appendFileMock, unlinkMock, readFileMock, readdirMock, rmMock, statMock, spawnMock, execFileMock,
     cfgEnsureLoaded, cfgGetProjectPath, cfgGetPackagePath, cfgGetContext,
     cfgGetCustomPackagesPath, cfgGetMicrosoftPackagesPath,
     cfgGetActiveXppConfig, cfgGetModelName, detectedRoots,
@@ -51,6 +52,7 @@ vi.mock('fs/promises', () => ({
   readFile: readFileMock,
   appendFile: appendFileMock,
   readdir: readdirMock,
+  rm: rmMock,
   stat: statMock,
 }));
 vi.mock('../../src/utils/configManager.js', () => ({
@@ -83,8 +85,69 @@ vi.mock('../../src/utils/packagesRoot.js', async () => {
   };
 });
 
+const { pruneMock } = vi.hoisted(() => ({ pruneMock: vi.fn() }));
+vi.mock('../../src/tools/sdlc/compilerMetadataPrune.js', () => ({ pruneStaleCompilerMetadata: pruneMock }));
+
 import path from 'path';
-import { buildProjectTool } from '../../src/tools/sdlc/buildProject';
+import { buildProjectTool, readFullLog, renderFailureLog, trimSucceededLog } from '../../src/tools/sdlc/buildProject';
+
+describe('trimSucceededLog', () => {
+  const SUMMARY = ['Compilation completed', 'Errors: 0', 'Warnings: 2'];
+  const timing = (n: number) =>
+    Array.from({ length: n }, (_, i) => 'Phase timing row ' + i);
+
+  it('drops the phase-timing table a green build has no use for', () => {
+    const out = trimSucceededLog([...timing(45), ...SUMMARY].join('\n'));
+
+    expect(out).toContain('phase-timing line(s) omitted');
+    expect(out).not.toContain('Phase timing row 0');
+    // The trailing summary is the part a green build is actually read for.
+    expect(out).toContain('Errors: 0');
+    expect(out).toContain('Warnings: 2');
+  });
+
+  it('keeps every warning, wherever it sits in the tail', () => {
+    const warning = 'Metadata Warning: dynamics://MyModel/MyTable: [(1,1)]: label is missing.';
+    const out = trimSucceededLog([...timing(20), warning, ...timing(20), ...SUMMARY].join('\n'));
+
+    expect(out).toContain(warning);
+    expect(out).not.toContain('Phase timing row 3');
+  });
+
+  it('is a no-op on a log with nothing to strip', () => {
+    const short = ['Compilation completed', 'Errors: 0'].join('\n');
+    expect(trimSucceededLog(short)).toBe(short);
+
+    // Long, but every line is a diagnostic — none of it is timing noise.
+    const allDiags = Array.from({ length: 40 },
+      (_, i) => 'Metadata Warning: dynamics://M/T' + i + ': [(1,1)]: x.').join('\n');
+    expect(trimSucceededLog(allDiags)).toBe(allDiags);
+  });
+
+  it('shrinks a real-shaped tail by roughly the phase table', () => {
+    const raw = [...timing(57), ...SUMMARY].join('\n');
+    expect(trimSucceededLog(raw).length).toBeLessThan(raw.length / 2);
+  });
+
+  it('keeps a warning whatever shape it arrives in', () => {
+    // DIAG_LINE_TEST is anchored and case-sensitive — it wants xppc's exact shape
+    // and nothing else. On the FAILURE path a non-matching line still arrives via
+    // the head/tail fallback; here it would be dropped outright, and hasWarnings
+    // uses the same test, so such a warning would not even set the ⚠️ icon.
+    // Verified dropped before this widening: the lowercase and MSBuild shapes.
+    const shapes = [
+      'Metadata Warning: dynamics://M/T: [(1,1)]: label missing.',
+      'warning: lowercase generic',
+      'MyTable.xpp(12,3): warning CS1234: unused variable',
+    ];
+    const out = trimSucceededLog([...timing(20), ...shapes, ...timing(20), ...SUMMARY].join('\n'));
+
+    for (const line of shapes) expect(out, line).toContain(line);
+    // Still a trim, not a passthrough.
+    expect(out).toContain('phase-timing line(s) omitted');
+    expect(out).not.toContain('Phase timing row 3');
+  });
+});
 
 const PROJECT_PATH = 'C:\\MyProject\\MyProject.rnrproj';
 const MODEL_NAME = 'MyModel';
@@ -117,10 +180,12 @@ describe('build_d365fo_project', () => {
     appendFileMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
     readdirMock.mockRejectedValue(new Error('not found'));
+    rmMock.mockResolvedValue(undefined);
     // resetAllMocks() above wipes the hoisted implementation, and an unarmed
     // stat resolves undefined — which the staleness scan reads as "unreadable,
     // assume changed", so every finished result would be refused and rebuilt.
     statMock.mockResolvedValue({ mtimeMs: 0 });
+    pruneMock.mockResolvedValue({ stale: [], phantoms: [], skippedModels: [], errors: [], scanned: 0 });
     cfgGetProjectPath.mockResolvedValue(PROJECT_PATH);
     cfgGetPackagePath.mockReturnValue(null);
     cfgGetContext.mockReturnValue({});
@@ -341,8 +406,189 @@ describe('build_d365fo_project', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
     const [, args] = spawnMock.mock.calls[0];
     expect(args).toContain(`-metadata=${CUSTOM}`);
-    expect(args).toContain(`-compilermetadata=${MSFT}`);
     expect(args).toContain(`-modelmodule=${MODEL_NAME}`);
+    // The framework directory stays reachable as a reference folder, so Microsoft's
+    // compiler metadata still resolves.
+    expect(args).toContain(`-referenceFolder=${MSFT}`);
+  });
+
+  it('points -compilermetadata at the model store, never the framework directory', async () => {
+    // xppc writes its compiler metadata BACK to the -compilermetadata root. Aimed at
+    // the framework directory it deposits <FrameworkDirectory>\<CustomModel>\XppMetadata,
+    // putting customer model names in a directory shared by every environment on the box
+    // and splitting the -incremental baseline from the one VS maintains.
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT = 'C:\\AOSService\\PackagesLocalDirectory';
+    const xppc = path.join(MSFT, 'bin', 'xppc.exe');
+
+    cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+
+    const child = makeFakeChild(56);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, xppc]);
+
+    await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+    const [, args] = spawnMock.mock.calls[0];
+    expect(args).toContain(`-compilermetadata=${CUSTOM}`);
+    expect(args).not.toContain(`-compilermetadata=${MSFT}`);
+  });
+
+  it('records the xppc invocation in the build log', async () => {
+    // Validating this patch on a real instance could only confirm it by its
+    // effects, because the build log recorded no command line — buildLog() sends
+    // that to stderr and to bridgeLogFile, and bridgeLogFile is optional. The
+    // arguments belong in the log that is actually read after the fact.
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT = 'C:\\AOSService\\PackagesLocalDirectory';
+    const xppc = path.join(MSFT, 'bin', 'xppc.exe');
+
+    cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+    cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+
+    const child = makeFakeChild(57);
+    spawnMock.mockReturnValue(child);
+    allowPaths([PROJECT_PATH, xppc]);
+
+    await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+    const logWrite = writeFileMock.mock.calls.find(
+      (c: any[]) => typeof c[0] === 'string' && c[0].includes('d365build_log'),
+    );
+    expect(logWrite).toBeDefined();
+    const written = String(logWrite![1]);
+    expect(written).toContain('=== xppc invocation ===');
+    expect(written).toContain(`-compilermetadata=${CUSTOM}`);
+    expect(written).toContain(`-metadata=${CUSTOM}`);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Stale compiler-metadata stubs in the framework directory
+  // ---------------------------------------------------------------------------
+  describe('stale framework compiler-metadata stubs', () => {
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT   = 'C:\\AOSService\\PackagesLocalDirectory';
+    const XPPC_UDE = path.join(MSFT, 'bin', 'xppc.exe');
+    const STUB   = path.join(MSFT, MODEL_NAME);
+
+    /** readdir answers for the stub folder only; every other path stays "not found". */
+    function stubContains(entries: string[]) {
+      readdirMock.mockImplementation(async (p: string) => {
+        if (p === STUB) return entries;
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+      });
+    }
+
+    beforeEach(() => {
+      cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+      cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+      spawnMock.mockReturnValue(makeFakeChild(58));
+    });
+
+    // Every build made before -compilermetadata moved deposited one of these. Nothing
+    // refreshes them now, yet the framework directory is still a -referenceFolder, so
+    // xppc keeps reading metadata frozen at the last pre-move build.
+    it('deletes a write-back stub left in the framework directory', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, path.join(CUSTOM, MODEL_NAME)]);
+      stubContains(['XppMetadata']);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(rmMock).toHaveBeenCalledWith(STUB, { recursive: true, force: true });
+    });
+
+    it('leaves a package genuinely installed in the framework directory alone', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, path.join(CUSTOM, MODEL_NAME)]);
+      stubContains(['bin', 'Descriptor', 'XppMetadata']);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+
+    it('leaves it alone when the model is not in the model store', async () => {
+      // No <modelStore>\<Model> — nothing establishes that the framework copy is the stale one.
+      allowPaths([PROJECT_PATH, XPPC_UDE]);
+      stubContains(['XppMetadata']);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+
+    it('never touches the framework directory on CHE, where it holds the live metadata', async () => {
+      cfgGetCustomPackagesPath.mockResolvedValue(PKG);
+      cfgGetMicrosoftPackagesPath.mockResolvedValue(PKG);
+      allowPaths([PROJECT_PATH, XPPC, path.join(PKG, MODEL_NAME)]);
+      readdirMock.mockImplementation(async (p: string) => {
+        if (p === path.join(PKG, MODEL_NAME)) return ['XppMetadata'];
+        throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+      });
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(rmMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // The model's own compiler metadata (xppc's write-back leaves removals stale)
+  // ---------------------------------------------------------------------------
+  describe('stale compiler metadata of the model being built', () => {
+    const CUSTOM = 'C:\\Repos\\MyCode\\Metadata';
+    const MSFT   = 'C:\\AOSService\\PackagesLocalDirectory';
+    const XPPC_UDE = path.join(MSFT, 'bin', 'xppc.exe');
+    const TREE   = path.join(CUSTOM, MODEL_NAME, 'XppMetadata');
+
+    beforeEach(() => {
+      cfgGetCustomPackagesPath.mockResolvedValue(CUSTOM);
+      cfgGetMicrosoftPackagesPath.mockResolvedValue(MSFT);
+      spawnMock.mockReturnValue(makeFakeChild(59));
+    });
+
+    it('clears the whole tree before a full build, and does not prune', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false, fullBuild: true }, {});
+
+      expect(rmMock).toHaveBeenCalledWith(TREE, { recursive: true, force: true });
+      expect(pruneMock).not.toHaveBeenCalled();
+      const [, args] = spawnMock.mock.calls[0];
+      expect(args).not.toContain('-incremental');
+    });
+
+    it('builds anyway when the tree cannot be cleared', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+      rmMock.mockRejectedValue(Object.assign(new Error('EBUSY: locked'), { code: 'EBUSY' }));
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false, fullBuild: true }, {});
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('prunes file by file — never clears the tree — before an incremental build', async () => {
+      // An incremental build writes back only what it recompiles: a cleared tree would
+      // lose every unchanged element.
+      allowPaths([PROJECT_PATH, XPPC_UDE, TREE]);
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(pruneMock).toHaveBeenCalledWith(CUSTOM, CUSTOM, MODEL_NAME);
+      expect(rmMock).not.toHaveBeenCalledWith(TREE, expect.anything());
+      const [, args] = spawnMock.mock.calls[0];
+      expect(args).toContain('-incremental');
+      expect(pruneMock.mock.invocationCallOrder[0]).toBeLessThan(spawnMock.mock.invocationCallOrder[0]);
+    });
+
+    it('builds anyway when the prune throws', async () => {
+      allowPaths([PROJECT_PATH, XPPC_UDE]);
+      pruneMock.mockRejectedValue(new Error('boom'));
+
+      await buildProjectTool({ projectPath: PROJECT_PATH, wait: false }, {});
+
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('force=true kills orphaned build and restarts', async () => {
@@ -458,6 +704,7 @@ describe('build_d365fo_project', () => {
     writeFileMock.mockResolvedValue(undefined);
     unlinkMock.mockResolvedValue(undefined);
     readdirMock.mockRejectedValue(new Error('not found'));
+    rmMock.mockResolvedValue(undefined);
     cfgGetActiveXppConfig.mockResolvedValue(null);
     cfgGetModelName.mockReturnValue(null);
     cfgGetCustomPackagesPath.mockResolvedValue(null);
@@ -657,5 +904,127 @@ describe('build_d365fo_project', () => {
     expect(args).toContain('-modelmodule=ExplicitModel');
     expect(result.content[0].text).toContain('build started');
     expect(result.isError).toBeFalsy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readFullLog — the excerpt returned for a FAILED build
+// ---------------------------------------------------------------------------
+describe('readFullLog', () => {
+  const HEADER = [
+    '=== xppc invocation ===',
+    'C:\\AOSService\\PackagesLocalDirectory\\bin\\xppc.exe',
+    '  -metadata=C:\\Repos\\MyCode\\Metadata',
+    '  -compilermetadata=C:\\Repos\\MyCode\\Metadata',
+    '  -modelmodule=MyModel',
+    '=======================',
+    '',
+  ];
+
+  /** A log too long to be returned whole, with one diagnostic buried in the middle. */
+  function longLog(header: string[] = HEADER) {
+    return [
+      ...header,
+      ...Array.from({ length: 400 }, (_, i) => `Phase timing row ${i}`),
+      "Compile Error: Class dynamics://MyModel/MyClass: [(1,1),(1,2)]: ';' expected.",
+      ...Array.from({ length: 400 }, (_, i) => `More phase timing ${i}`),
+      'Errors: 1',
+    ].join('\n');
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  // The header is written so that a failed build can be traced back to its arguments —
+  // and a failed build is precisely when this excerpt path runs. It used to return only
+  // diagnostic windows plus a tail, so the header never reached the response.
+  it('keeps the invocation header when the log is trimmed to diagnostic windows', async () => {
+    readFileMock.mockResolvedValue(longLog());
+
+    const out = await readFullLog('C:\\Temp\\d365build_log.log');
+
+    // The diagnostic-window path, not the head+tail fallback — which would include the
+    // top of the log anyway and make this assertion vacuous.
+    expect(out).toContain('Phase table omitted');
+    expect(out).toContain('=== xppc invocation ===');
+    expect(out).toContain('-compilermetadata=C:\\Repos\\MyCode\\Metadata');
+    expect(out).toContain('Compile Error:');
+  });
+
+  it('is unaffected by a log that has no invocation header', async () => {
+    readFileMock.mockResolvedValue(longLog([]));
+
+    const out = await readFullLog('C:\\Temp\\d365build_log.log');
+
+    expect(out).not.toContain('=== xppc invocation ===');
+    expect(out).toContain('Compile Error:');
+  });
+
+  it('returns a short log whole', async () => {
+    readFileMock.mockResolvedValue([...HEADER, 'Errors: 0'].join('\n'));
+
+    const out = await readFullLog('C:\\Temp\\d365build_log.log');
+
+    expect(out).toContain('=== xppc invocation ===');
+    expect(out).toContain('Errors: 0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderFailureLog — how much raw log a FAILED build is worth carrying
+// ---------------------------------------------------------------------------
+//
+// build_d365fo_project is deliberately 'uncapped' in the response capper, and a
+// failure used to return the structured diagnostics AND up to 300 raw log lines.
+// Measured over 1,400 real MCP calls, all 43 build results sat at the host's
+// logging cap, and every byte of that is re-billed on every later request in the
+// session. The raw log is evidence only when the parser produced nothing — that
+// is the case renderUnexplainedFailure points at ("read the raw log at the end
+// of this response"), and it must keep working.
+describe('renderFailureLog', () => {
+  const HEADER = [
+    '=== xppc invocation ===',
+    'C:\\AOSService\\PackagesLocalDirectory\\bin\\xppc.exe',
+    '  -modelmodule=MyModel',
+    '=======================',
+    '',
+  ];
+
+  /** A captured-shape xppc log: long phase table, one diagnostic, a tally. */
+  const CAPTURED = [
+    ...HEADER,
+    ...Array.from({ length: 400 }, (_, i) => `Phase timing row ${i}`),
+    "Compile Error: Class dynamics://MyModel/MyClass: [(1,1),(1,2)]: ';' expected.",
+    ...Array.from({ length: 400 }, (_, i) => `More phase timing ${i}`),
+    'Errors: 1',
+  ].join('\n');
+
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  it('returns the whole excerpt when NO diagnostic could be parsed — the raw log is the only evidence', async () => {
+    readFileMock.mockResolvedValue(CAPTURED);
+
+    const out = await renderFailureLog('C:\\Temp\\d365build_log.log', false);
+
+    expect(out).toBe(await readFullLog('C:\\Temp\\d365build_log.log'));
+    expect(out).toContain('=== xppc invocation ===');
+    expect(out).toContain('Compile Error:');
+  });
+
+  it('returns a short tail plus the log path once diagnostics were parsed', async () => {
+    readFileMock.mockResolvedValue(CAPTURED);
+
+    const trimmed = await renderFailureLog('C:\\Temp\\d365build_log.log', true);
+    const full = await readFullLog('C:\\Temp\\d365build_log.log');
+
+    // The tail still carries xppc's own tally, which is what the diagnostics get
+    // cross-checked against (see renderUnexplainedFailure).
+    expect(trimmed).toContain('Errors: 1');
+    // …and it names where the rest is, so nothing is lost, only deferred.
+    expect(trimmed).toContain('C:\\Temp\\d365build_log.log');
+    // 41 lines of tail + one header line, whatever the log's length.
+    expect(trimmed.split('\n').length).toBeLessThanOrEqual(42);
+    expect(trimmed.length).toBeLessThan(full.length);
   });
 });

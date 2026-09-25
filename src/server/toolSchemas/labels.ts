@@ -7,10 +7,10 @@
 export const labelsTool = {
     name: 'labels',
     description:
-      'Unified label operations — read and write. Choose an `action`:\n' +
-      '• search → full-text query across indexed label files.\n' +
+      'Unified label operations — read and write. Writing an object? d365fo_file create/modify already turn a raw-text label/fieldLabel into a real @Ref by themselves; no call here is needed. Choose an `action`:\n' +
+      '• search → full-text query across indexed label files. Never needed before a create.\n' +
       '• info → all translations for a labelId; without labelId lists label files (with labelFileId: physical .label.txt path per language).\n' +
-      '• create → add a new label to an AxLabelFile across every language .label.txt (write). Label IDs describe MEANING — never add a model prefix; target the model\'s ORIGINAL label file, never an …_Extension… file. Pass createIfMissing=true to reuse an existing label instead of reporting it — one call, no search first. Bulk: pass labels:[{labelId, translations}, …] with shared labelFileId/model at top level.\n' +
+      '• create → add a label to an AxLabelFile across every language .label.txt (write). ALWAYS pass createIfMissing=true: it creates when absent and reuses when present, so this ONE call replaces search-then-create. Bulk: labels:[{labelId, translations}, …] with shared labelFileId/model at top level does a whole object in one call. Label IDs describe MEANING — never a model prefix; target the model\'s ORIGINAL label file, never an …_Extension… one.\n' +
       '• update → overwrite the text of an EXISTING label; same args as create with corrected translations[] (write).\n' +
       '• rename → rename a label ID across .label.txt + X++ + XML + index. Use dryRun=true first (write).\n' +
       'Write plumbing (paths, languages, sortLabels, allowExtensionLabelFile…) is auto-resolved; ' +
@@ -21,12 +21,13 @@ export const labelsTool = {
         params: {
           type: 'object',
           additionalProperties: true,
-          description: 'Optional write plumbing (packagePath, projectPath, languages, sortLabels, allowExtensionLabelFile, …) — all auto-resolved when omitted. Contract: get_knowledge(kind="op-spec", topic="labels").',
+          description: 'Optional write plumbing — the auto-resolved overrides named at the end of the description above.',
         },
+        // No description: the five bullets above already say what each value does,
+        // and restating it here was ~45 chars of the payload per session.
         action: {
           type: 'string',
-          enum: ['search', 'info', 'create', 'update', 'rename', 'list', 'list-files'],
-          description: 'Label operation to perform. "list"/"list-files" are aliases of "info" (lists label files).',
+          enum: ['search', 'info', 'create', 'update', 'rename'],
         },
         // shared filters
         model: {
@@ -35,7 +36,7 @@ export const labelsTool = {
         },
         labelFileId: {
           type: 'string',
-          description: '[search|info|create|update|rename] AxLabelFile ID (e.g. ContosoExt, SYS). For action=info with no labelId, returns the physical .label.txt path per language. For create/update/rename use the model\'s ORIGINAL label file, not an extension (…_Extension…). For a NEW label file this ID is the MODEL name, never the bare EXTENSION_PREFIX.',
+          description: '[search|info|create|update|rename] AxLabelFile ID (e.g. ContosoExt, SYS). For a NEW label file this ID is the MODEL name, never the bare EXTENSION_PREFIX.',
         },
         language: {
           type: 'string',
@@ -43,9 +44,8 @@ export const labelsTool = {
         },
         maxResults: {
           type: 'number',
-          description: '[search] Max labels listed (default 10, alias `limit`); a truncated set reports how many more matched.',
+          description: '[search] Max labels listed (default 10); a truncated set reports how many more matched.',
         },
-        limit: { type: 'number', description: '[search] Alias of maxResults.' },
         verbose: {
           type: 'boolean',
           description: '[search] Default one line per label; true = full multi-line block.',
@@ -59,29 +59,20 @@ export const labelsTool = {
         // action=info
         labelId: {
           type: 'string',
-          description: '[info] Exact label ID. Omit for action=info to list available label files for the model.',
+          description:
+            '[info] Label ID, any spelling: SYS67433, @SYS67433, @ContosoExt:MyLabel ' +
+            '(paste search output). labelFileId/model optional. Omit to list label files.',
         },
         // action=create
         labels: {
           type: 'array',
           description:
-            '[create] OPTIONAL bulk mode — create several labels in one call; shared fields (labelFileId, model, languages, paths…) stay at the top level and top-level labelId/translations are ignored. A failed entry does not abort the batch.',
+            '[create] Bulk mode — shared fields stay at the top level (top-level labelId/translations are then ignored); a failed entry does not abort the batch.',
           items: {
             type: 'object',
             properties: {
-              labelId: { type: 'string', description: 'Label ID for this entry — alphanumeric, no model prefix.' },
-              translations: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  properties: {
-                    language: { type: 'string', description: 'Locale code, e.g. en-US, cs, de, sk' },
-                    text: { type: 'string', description: 'Label text' },
-                    comment: { type: 'string', description: 'Developer comment (optional)' },
-                  },
-                  required: ['language', 'text'],
-                },
-              },
+              labelId: { type: 'string' },
+              translations: { type: 'array', items: { type: 'object' } },
             },
             required: ['labelId', 'translations'],
           },
@@ -93,8 +84,8 @@ export const labelsTool = {
             type: 'object',
             properties: {
               language: { type: 'string', description: 'Locale code, e.g. en-US, cs, de, sk' },
-              text: { type: 'string', description: 'Label text' },
-              comment: { type: 'string', description: 'Developer comment (optional)' },
+              text: { type: 'string' },
+              comment: { type: 'string' },
             },
             required: ['language', 'text'],
           },
@@ -105,11 +96,11 @@ export const labelsTool = {
         },
         newLabelId: {
           type: 'string',
-          description: '[rename] REQUIRED. New label ID — must be alphanumeric, no spaces.',
+          description: '[rename] REQUIRED. New label ID.',
         },
         dryRun: {
           type: 'boolean',
-          description: '[rename] Preview changes without writing anything (default: false). Use this first!',
+          description: '[rename] Preview changes without writing anything.',
         },
       },
       required: ['action'],

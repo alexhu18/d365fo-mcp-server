@@ -9,8 +9,13 @@ import type { XppServerContext } from '../../types/context.js';
 import { validateWorkspacePath } from '../../workspace/workspaceUtils.js';
 import { buildObjectTypeMismatchMessage } from '../../utils/metadataResolver.js';
 import { tryBridgeClass } from '../../bridge/bridgeAdapter.js';
+import { COMPACT_METHODS_HINT, SOURCE_UNAVAILABLE_HINT, INDEXED_BODIES_HINT, fullBodyHint } from '../../utils/methodBodyHint.js';
+import { readIndexedMethodSources } from '../../utils/indexedMethodSource.js';
 
 const METHOD_PAGE_SIZE = 15;
+
+/** Ceiling on one method body inside a class LISTING (both render paths). */
+const BODY_PREVIEW_CHARS = 200;
 
 const ClassInfoArgsSchema = z.object({
   className: z.string().describe('Name of the X++ class'),
@@ -73,7 +78,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 
     // compact=true (default): serve entirely from DB — no filesystem access, instant response
     if (args.compact !== false) {
-      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0);
+      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0, 'compact');
     }
 
     // compact=false: parse XML for source bodies, with timeout guard to avoid hanging
@@ -91,7 +96,7 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 
     if (!classInfo.success || !classInfo.data) {
       // Fallback to DB when XML not available (build agent, no D365FO install, timeout)
-      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0);
+      return buildDbOnlyResponse(args.className, classSymbol, symbolIndex, args.methodOffset ?? 0, 'source-unavailable');
     }
 
     const cls = classInfo.data;
@@ -107,6 +112,11 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
     }
     
     output += `**Model:** ${cls.model}\n`;
+    // Beside the model, because the two are only useful together: `internal` is
+    // package-scoped, so whether it blocks the reader depends on which model the
+    // reader is writing in. Stated as a fact, with no verdict attached (#902).
+    // The declaration was read here, so an absent modifier really is public.
+    output += `**Access:** ${cls.visibility ?? 'public'}\n`;
     output += `**Abstract:** ${cls.isAbstract ? 'Yes' : 'No'}\n`;
     output += `**Final:** ${cls.isFinal ? 'Yes' : 'No'}\n\n`;
 
@@ -139,7 +149,9 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
           output += `**Documentation:**\n${method.documentation}\n\n`;
         }
         
-        output += `\`\`\`xpp\n${method.source.substring(0, 200)}${method.source.length > 200 ? '\n// ... (use get_method(include="signature") for full body)' : ''}\n\`\`\`\n\n`;
+        // include="signature" returns the signature INSTEAD of the body, so the
+        // old text here named the one value that cannot answer "full body".
+        output += `\`\`\`xpp\n${method.source.substring(0, BODY_PREVIEW_CHARS)}${method.source.length > BODY_PREVIEW_CHARS ? `\n// ... (${fullBodyHint(method.name)})` : ''}\n\`\`\`\n\n`;
       }
     }
 
@@ -169,6 +181,28 @@ export async function classInfoTool(request: CallToolRequest, context: XppServer
 }
 
 /**
+ * Indexed bodies for the methods on THIS page, or an empty map when the DB
+ * cannot be opened.
+ *
+ * Scoped to `methodNames` because the owner's whole body set is far larger than
+ * one page of previews: measured on the production index, `Tax` is 510 methods /
+ * 1.39 MB and `SalesLine` 808 / 836 KB, against the ~3 KB this renderer actually
+ * prints — and `node:sqlite` is synchronous, so every byte of that is time the
+ * event loop is not running.
+ *
+ * `getReadDb()` throws on its own (the helper's internal guard only covers the
+ * query), and this renderer is the LAST fallback — throwing here would turn a
+ * degraded-but-useful listing into an error.
+ */
+function readIndexedBodies(symbolIndex: any, className: string, methodNames: string[]) {
+  try {
+    return readIndexedMethodSources(symbolIndex.getReadDb(), className, methodNames);
+  } catch {
+    return new Map();
+  }
+}
+
+/**
  * Build a response from DB data only — no filesystem access, instant.
  * Used for compact=true (default) and as fallback when XML is unavailable.
  */
@@ -177,6 +211,14 @@ async function buildDbOnlyResponse(
   classSymbol: any,
   symbolIndex: any,
   methodOffset: number,
+  /**
+   * Why this response carries signatures only. 'compact' means the caller never
+   * asked for bodies and `compact:false` will get them; 'source-unavailable'
+   * means they DID ask and the XML could not be read (no D365FO install, or the
+   * parse timed out), where repeating "pass compact:false" would send them
+   * round the same loop.
+   */
+  reason: 'compact' | 'source-unavailable',
 ): Promise<any> {
   const methods = symbolIndex.getClassMethods(className) as Array<{ name: string; signature?: string; isStatic?: boolean }>;
 
@@ -184,6 +226,10 @@ async function buildDbOnlyResponse(
   let output = `# Class: ${className}`;
   if (classSymbol.extendsClass) output += ` extends ${classSymbol.extendsClass}`;
   output += `\n**Model:** ${classSymbol.model}`;
+  // Only when the column holds something. Unlike the XML path this one has not
+  // read the source, and a database built before the column existed answers NULL
+  // for every class — which is "not indexed yet", not "public" (#902).
+  if (classSymbol.visibility) output += `  **Access:** ${classSymbol.visibility}`;
   if (classSymbol.implementsInterfaces) output += `  **Implements:** ${classSymbol.implementsInterfaces}`;
   output += '\n\n';
 
@@ -191,15 +237,51 @@ async function buildDbOnlyResponse(
   const paged = methods.slice(methodOffset, methodOffset + METHOD_PAGE_SIZE);
   const hasMore = methodOffset + METHOD_PAGE_SIZE < totalMethods;
 
+  // Bodies only when they were asked for and the file could not supply them.
+  // 'compact' means the caller never wanted bodies, so the index is not
+  // consulted at all and the response stays the cheap one-line-per-method view.
+  const bodies = reason === 'source-unavailable' && paged.length > 0
+    ? readIndexedBodies(symbolIndex, className, paged.map(m => m.name))
+    : new Map();
+
   output += `## Methods (${totalMethods} total, showing ${methodOffset + 1}–${Math.min(methodOffset + METHOD_PAGE_SIZE, totalMethods)})\n\n`;
   for (const m of paged) {
     const sig = m.signature || m.name;
-    output += `- \`${sig}\`\n`;
+    const body = bodies.get(m.name.toLowerCase());
+    if (!body) {
+      output += `- \`${sig}\`\n`;
+      continue;
+    }
+    // Truncated to the same BODY_PREVIEW_CHARS as the on-disk path above, for
+    // the same reason: a listing of 15 method bodies is a payload, not a read.
+    // The largest single body in a production index is 175k characters.
+    const preview = body.source.length > BODY_PREVIEW_CHARS
+      ? `${body.source.slice(0, BODY_PREVIEW_CHARS)}\n// ... (${fullBodyHint(body.name)})`
+      : body.source;
+    // The signature stays, above the body. An AOT method's `source` opens with
+    // its `/// <summary>` doc comment, so the declaration is regularly past the
+    // 200-char ceiling — measured on the production index, 44% of CustTable's
+    // methods, 55% of SalesLine's and 75% of Tax's. Printing the body INSTEAD of
+    // the signature would have handed Azure (where this path is the only one)
+    // less than the signatures-only listing it replaced. The on-disk path above
+    // keeps its **Signature:** bullet for the same reason.
+    output += `### ${body.name}\n\n\`${sig}\`\n\n\`\`\`xpp\n${preview}\n\`\`\`\n\n`;
   }
   if (hasMore) {
     output += `\n> ⚠️ ${totalMethods - methodOffset - METHOD_PAGE_SIZE} more — call with \`methodOffset: ${methodOffset + METHOD_PAGE_SIZE}\`\n`;
   }
-  output += `\n> 💡 Use \`get_method(include="signature")\` for a full method body.\n`;
+  // Was: `Use get_method(include="signature") for a full method body` — which
+  // named the one `include` value that returns a signature INSTEAD of a body
+  // (getMethod.ts METHOD_INCLUDES is signature|source|both), on a tool that is
+  // no longer published in ListTools. An agent following it either got no body
+  // or called a name it could not see. Same wording as the bridge path now, so
+  // the two never disagree about the escape hatch.
+  // Three outcomes, not two: bodies were never asked for, they were asked for
+  // and the index supplied them, or they were asked for and nothing could.
+  const hint = reason === 'compact'
+    ? COMPACT_METHODS_HINT
+    : bodies.size > 0 ? INDEXED_BODIES_HINT : SOURCE_UNAVAILABLE_HINT;
+  output += totalMethods > 0 ? `\n${hint}\n` : '';
 
   return { content: [{ type: 'text', text: output }] };
 }

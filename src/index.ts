@@ -15,6 +15,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createXppMcpServer } from './server/mcpServer.js';
 import { createStreamableHttpTransport } from './server/transport.js';
 import { XppSymbolIndex } from './metadata/symbolIndex.js';
+import { shouldWarmIndexes, warmIndexes, renderWarmupReport } from './metadata/indexWarmup.js';
+import { canIndexOffThread, indexMetadataOffThread } from './metadata/startupIndexing.js';
 import { XppMetadataParser } from './metadata/xmlParser.js';
 import { WorkspaceScanner } from './workspace/workspaceScanner.js';
 import { HybridSearch } from './workspace/hybridSearch.js';
@@ -22,11 +24,16 @@ import { initializeDatabase } from './database/download.js';
 import { initializeConfig, getConfigManager } from './utils/configManager.js';
 import { SERVER_MODE, LOCAL_TOOLS, TOOL_PROFILE, EXTRA_TOOLS, isToolEnabled } from './server/serverMode.js';
 import { TOOL_ANNOTATIONS } from './server/toolAnnotations.js';
-import { apiKeyAuth } from './middleware/apiKeyAuth.js';
+import { apiKeyAuth, authStartupError, resolveBindHost } from './middleware/apiKeyAuth.js';
 import { VERSION } from './version.js';
 import { setInitializeParams } from './utils/stdioSessionInfo.js';
 import { setModelObjectNameSource } from './utils/modelPrefixInference.js';
 import { trackBridgeStartup } from './bridge/bridgeReadiness.js';
+import { startLoopLagMonitor } from './utils/loopLag.js';
+import { warmPackagesRoots } from './utils/packagesRoot.js';
+import {
+  startupIndexBegan, setStartupIndexProgress, clearStartupIndexProgress,
+} from './utils/startupProgress.js';
 import { createShutdownCoordinator } from './utils/gracefulShutdown.js';
 import { box, kv, sectionTitle, statusLine, spread, c, glyph, sanitize, supportsUnicode, log, shortPath, startupWarnings } from './utils/terminalUi.js';
 import * as fs from 'fs/promises';
@@ -102,8 +109,36 @@ console.error = (...args: any[]) => {
   const isModuleDebugMessage = /^\[[\w\- ]+\]/.test(firstArg) && !hasErrorIndicator;
   if (!isModuleDebugMessage) {
     originalConsoleError(...args);
+    return;
   }
+  logFileOnly(args);
 };
+
+/**
+ * Write a line the client never sees to LOG_FILE anyway.
+ *
+ * Both filters below the tee — this one and the stdio console.log redirect — exist
+ * so the MCP client's stderr pane is not a scroll of operational chatter. They were
+ * dropping the line entirely, and since the tee sits on process.stderr, a dropped
+ * line never reached the log file either. So a session that hung for five and a
+ * half minutes on its first call left a log holding a start banner and nothing
+ * else: "Loading symbols…", "Database opened in Xs" and "Database loaded in N ms"
+ * are all log.step/log.ok, all suppressed, all the answer to what it was doing.
+ * Setting DEBUG_LOGGING=true was the only way to see them, and it turns the client
+ * pane into that same scroll. The file is the right place for both.
+ */
+function logFileOnly(args: any[]): void {
+  if (!_logStream) return;
+  try {
+    // Timestamped, unlike the tee'd lines: these are the progress lines, and the
+    // question they answer ("which phase took the five minutes?") is unanswerable
+    // without the clock. Time only — the banner above carries the date.
+    const at = new Date().toISOString().slice(11, 23);
+    _logStream.write(`[${at}] ` + args.map(a => (typeof a === 'string' ? a : String(a))).join(' ') + '\n');
+  } catch {
+    // Mirroring is best-effort; it must never take down the caller.
+  }
+}
 
 // ─── Global safety net ────────────────────────────────────────────────────────
 // An unhandled promise rejection terminates the Node process by default
@@ -184,10 +219,14 @@ const shutdownCoordinator = createShutdownCoordinator({
 const onShutdown = shutdownCoordinator.onShutdown;
 
 async function initializeServices() {
+  // Attribution for "the first call took seconds" — off unless DEBUG_LOGGING is
+  // set. See src/utils/loopLag.ts for what was measured and what could not be.
+  startLoopLagMonitor();
+
   // -----------------------------------------------------------------------
   // write-only mode: skip all database/symbol work — the LOCAL_TOOLS set
   // (src/server/serverMode.ts; d365fo_file, build_d365fo_project,
-  //  verify_d365fo_project, undo_last_modification, get_workspace_info, …)
+  //  verify_d365fo_project, run_bp_check, get_workspace_info, …)
   //  only needs the config manager for path resolution, not the 1.5 GB symbol
   //  database. Read the set from serverMode.ts rather than trusting this list.
   // -----------------------------------------------------------------------
@@ -321,8 +360,14 @@ async function initializeServices() {
       log.detail('or set METADATA_PATH and the server will index on startup');
 
       // If metadata path exists, index it
+      let metadataAccessible = false;
       try {
         await fs.access(METADATA_PATH);
+        metadataAccessible = true;
+      } catch {
+        log.warn('Metadata path not accessible — starting with empty index');
+      }
+      if (metadataAccessible) {
         log.step(`Indexing metadata from ${METADATA_PATH}` + glyph.ellipsis);
         serverState.statusMessage = 'Indexing metadata...';
         const modelNamesStr = process.env.CUSTOM_MODELS || 'CustomModel';
@@ -332,11 +377,39 @@ async function initializeServices() {
         // Single pass over all requested models — the FTS index is rebuilt once at the
         // end of the call, so looping per model would repeat a full-table rebuild.
         log.detail(`indexing ${modelNames.join(', ')}` + glyph.ellipsis);
-        await symbolIndex.indexMetadataDirectory(METADATA_PATH, modelNames);
-
-        log.ok(`Indexed ${symbolIndex.getSymbolCount().toLocaleString('en-US')} symbols from ${modelNames.length} model(s)`);
-      } catch {
-        log.warn('Metadata path not accessible — starting with empty index');
+        // Published so the "still loading" answer every symbol-backed tool gets
+        // meanwhile can say which model the build is on — see startupProgress.
+        startupIndexBegan();
+        try {
+          if (canIndexOffThread(DB_PATH, LABELS_DB_PATH)) {
+            // On a worker thread: the build is synchronous end to end, and inline
+            // it blocked the event loop for its whole duration — every tool call,
+            // get_workspace_info included, hung until it finished. dbReady is still
+            // held until it completes, so symbol-backed tools keep answering "still
+            // loading" rather than returning empty results; the loop stays free.
+            const { elapsedMs } = await indexMetadataOffThread({
+              dbPath: DB_PATH,
+              labelsDbPath: LABELS_DB_PATH,
+              metadataPath: METADATA_PATH,
+              modelNames,
+              output: process.stderr,
+              onProgress: setStartupIndexProgress,
+            });
+            log.detail(`indexed in ${(elapsedMs / 1000).toFixed(1)}s on a worker thread`);
+          } else {
+            await symbolIndex.indexMetadataDirectory(METADATA_PATH, modelNames, {
+              onProgress: setStartupIndexProgress,
+            });
+          }
+          log.ok(`Indexed ${symbolIndex.getSymbolCount().toLocaleString('en-US')} symbols from ${modelNames.length} model(s)`);
+        } catch (error) {
+          log.warn(`Metadata indexing failed — starting with empty index: ${error}`);
+          log.detail('run `npm run index-metadata` to build the database');
+        } finally {
+          // On the failure path too: a phase left behind would have the next
+          // "still loading" answer citing a model whose build died minutes ago.
+          clearStartupIndexProgress();
+        }
       }
     } else {
       log.ok(`Database opened in ${((Date.now() - dbLoadStart) / 1000).toFixed(1)}s ${glyph.dot} counting symbols in background`);
@@ -349,6 +422,20 @@ async function initializeServices() {
       }).catch(err => {
         console.error(statusLine('warn', 'Symbol count failed:'), err);
       });
+
+      // Read the indexes the request paths use, on a thread of their own, before
+      // anyone asks a question that needs them. Measured on the reference VM:
+      // the first covering scan of idx_symbols_name costs 83 s cold and 0.11 s
+      // warm, and the labels join behind every label search costs 31 s cold —
+      // which is most of what the benchmark's tool time has ever been. The OS
+      // page cache is process-wide, so a worker warms it for the main thread's
+      // own connections. Never awaited: an unfinished warm-up just leaves the
+      // first query paying for the part not yet read, exactly as it does today.
+      if (shouldWarmIndexes(DB_PATH, LABELS_DB_PATH)) {
+        void warmIndexes({ dbPath: DB_PATH, labelsDbPath: LABELS_DB_PATH })
+          .then(report => { log.detail(renderWarmupReport(report)); })
+          .catch(err => { log.detail(`Index warm-up skipped: ${err}`); });
+      }
     }
 
     serverState.symbolIndex = symbolIndex;
@@ -493,6 +580,14 @@ async function main() {
   onShutdown('symbol index', () => serverState.symbolIndex?.close?.());
   shutdownCoordinator.registerSignalHandlers({ stdio: isStdioMode });
 
+  // Start the AosService drive scan now, off the event loop, in both transports.
+  // Every path that needs a packages path reads a cache, and whoever fills it
+  // pays for the probes — on a machine with a disconnected mapped network drive
+  // that bill is an SMB timeout. Paid here it lands on the libuv threadpool
+  // before the first request; left to the first synchronous caller it is paid on
+  // the event loop, and the server answers nothing at all until it clears.
+  void warmPackagesRoots();
+
   // ─────────────────────────────────────────────────────────────────────────────
   // Stdin sniffer: capture the `initialize` request params for get_workspace_info.
   // ─────────────────────────────────────────────────────────────────────────────
@@ -540,7 +635,12 @@ async function main() {
           msg.includes('Error') || msg.includes('error') ||
           msg.includes('Failed') || msg.includes('failed')) {
         process.stderr.write(msg + '\n');
+        return;
       }
+      // Suppressed from the client's pane, kept in LOG_FILE — see logFileOnly.
+      // This is where every startup progress line goes: log.step/ok/detail are
+      // console.log, and console.log is this function in stdio mode.
+      logFileOnly([msg]);
     };
     console.log = stderrWrite;
     console.info = stderrWrite;
@@ -693,7 +793,19 @@ async function main() {
     // Branded banner first — connection details are known immediately, before
     // the (potentially long) database load. Symbol counts are intentionally NOT
     // shown here; they appear once during the load (`✓ Loaded … symbols`).
-    const host = process.env.HOST || '0.0.0.0';
+    // Fail closed before anything binds: a network-reachable listener with no
+    // API_KEY would serve the whole read surface to anonymous callers.
+    const authError = authStartupError();
+    if (authError) {
+      console.error('');
+      console.error(authError);
+      console.error('');
+      process.exit(1);
+    }
+
+    // Not `process.env.HOST || '0.0.0.0'` — with no key configured the default
+    // is loopback, so forgetting the key costs reachability, not secrecy.
+    const host = resolveBindHost();
     const W = 50;
     console.log('');
     for (const line of box([
@@ -704,6 +816,13 @@ async function main() {
     }
     console.log('');
     console.log(kv('Mode', `HTTP ${c.dim(glyph.dot)} ${SERVER_MODE}`));
+    // Three states, and the guard above has already ruled out the fourth
+    // (no key on a public interface), so "none" here always means loopback.
+    console.log(kv('Auth', process.env.API_KEY?.trim()
+      ? `API key ${c.dim(glyph.dot)} X-Api-Key`
+      : process.env.ALLOW_UNAUTHENTICATED === 'true'
+        ? c.yellow(`delegated upstream ${c.dim(glyph.dot)} nothing is checked here`)
+        : `none ${c.dim(glyph.dot)} ${c.dim('loopback only, not reachable from the network')}`));
     console.log(kv('Endpoint', c.cyan(`http://${host}:${PORT}/mcp`)));
     console.log(kv('Health', c.cyan(`http://localhost:${PORT}/health`)));
     console.log(kv('Runtime', `Node ${process.version} ${c.dim(glyph.dot)} pid ${process.pid}`));
@@ -818,7 +937,7 @@ async function main() {
           { name: 'generate_object',                     desc: 'mode=pattern (named X++ skeleton) | scaffold (whole table/form/report)' },
         ]},
         { icon: '📝', category: 'File & Metadata Operations', tools: [
-          { name: 'd365fo_file',                  desc: 'action=create|modify|generate — write/edit AOT objects or emit XML (cloud)' },
+          { name: 'd365fo_file',                  desc: 'action=create|modify|delete|undo|generate — write/edit/roll back AOT objects or emit XML (cloud)' },
         ]},
         { icon: '📈', category: 'Pattern Analysis', tools: [
           { name: 'object_patterns',                     desc: 'domain=table|form — table field/index patterns, or form-pattern toolkit (analyze/spec/validate)' },
@@ -827,19 +946,14 @@ async function main() {
           { name: 'security_info',                desc: 'mode=artifact|coverage — Privilege/Duty/Role chain, or who can access an object' },
           { name: 'extension_info',                desc: 'mode=coc|events|table-merge|points|strategy — CoC/event-handler/extension analysis + strategy advice' },
           { name: 'validate_object_naming',       desc: 'Validate proposed extensions and object names against D365FO conventions' },
-          { name: 'get_workspace_info',           desc: 'Detected workspace paths, model name, project file, and server mode' },
+          { name: 'get_workspace_info',           desc: 'Detected workspace paths, model name, project file, and server mode; changes=true returns the uncommitted git diff' },
           { name: 'verify_d365fo_project',        desc: 'Verify objects exist on disk and are referenced in the .rnrproj project file' },
         ]},
         { icon: '🏗️ ', category: 'SDLC & Build Tools', tools: [
           { name: 'update_symbol_index',          desc: 'Re-index a file changed outside this server (create/modify refresh it themselves)' },
-          { name: 'build_d365fo_project',         desc: 'Run MSBuild compilation locally to capture errors' },
-          { name: 'trigger_db_sync',              desc: 'Run a database sync for the current model' },
+          { name: 'build_d365fo_project',         desc: 'Compile the model locally; bpCheck/dbSync fold the BP check and the database sync into the same call' },
           { name: 'run_bp_check',                 desc: 'Run Microsoft Best Practices (xppbp.exe) analysis' },
           { name: 'run_systest_class',            desc: 'Execute unit tests using SysTestConsole.exe' },
-        ]},
-        { icon: '🔄', category: 'Code Review & Source Control', tools: [
-          { name: 'review_workspace_changes',     desc: 'AI-based D365FO code review on uncommitted X++ changes (git diff)' },
-          { name: 'undo_last_modification',       desc: 'Safely revert last file change: checkout HEAD or delete untracked file' },
         ]},
         { icon: '🧪', category: 'Code Quality & Grounding', tools: [
           { name: 'validate_code',                     desc: 'mode=syntax (offline BP validator, SEL/COC/BP/TTS/XML) | references (semantic symbol resolver vs index)' },

@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { XppMetadataParser } from '../../metadata/xmlParser.js';
+import { XppMetadataParser, buildClassExtensionRecord } from '../../metadata/xmlParser.js';
 import { parseLabelFile } from '../../metadata/labelParser.js';
 import type { XppServerContext } from '../../types/context.js';
 import type { XppSymbol } from '../../metadata/types.js';
@@ -64,6 +64,18 @@ const AOT_FOLDER_TYPE_MAP: Record<string, XppSymbol['type']> = {
  */
 /** Any AOT element folder, mapped or not (AxMenu, AxWorkflowType, …). */
 const AOT_FOLDER_PATTERN = /^ax[a-z]/i;
+
+/**
+ * The types that own an extension_metadata row, taken from the map above so a
+ * new Ax*Extension folder cannot be added without one.
+ *
+ * class-extension is deliberately absent: the AOT has no AxClassExtension
+ * artifact, so a class extension arrives as an AxClass file and is recognised by
+ * its [ExtensionOf] attribute in the class branch instead.
+ */
+const EXTENSION_OBJECT_TYPES = new Set<string>(
+  Object.values(AOT_FOLDER_TYPE_MAP).filter(t => t.endsWith('-extension')),
+);
 
 /** True for an AOT element folder segment — mapped types plus everything else Ax*. */
 export function isAotFolder(segment: string): boolean {
@@ -303,12 +315,44 @@ async function refreshOnly(context: XppServerContext) {
  * update_symbol_index — which was the last legitimate mid-task reason to call
  * that tool at all.
  */
+/**
+ * Refresh the extension_metadata row for one Ax*Extension file.
+ *
+ * Returns the identity the caller needs for the symbol row, or null when the
+ * file does not parse as an extension — in which case the caller falls back to
+ * the bare object row, which is what every extension used to get.
+ */
+async function reindexExtensionMetadata(
+  filePath: string,
+  objectType: string,
+  model: string,
+  symbolIndex: XppServerContext['symbolIndex'],
+  parser: XppMetadataParser,
+): Promise<{ name: string; baseObjectName: string } | null> {
+  const parsed = await parser.parseExtensionFile(filePath, objectType);
+  if (!parsed.success || !parsed.data?.name) return null;
+  const data = parsed.data;
+  symbolIndex.upsertExtensionMetadata?.({
+    extensionName: data.name,
+    extensionType: objectType,
+    baseObjectName: data.baseObjectName,
+    addedFields: data.addedFields,
+    addedMethods: data.addedMethods,
+    addedIndexes: data.addedIndexes,
+    cocMethods: data.cocMethods,
+    eventSubscriptions: data.eventSubscriptions,
+    model,
+  });
+  return { name: data.name, baseObjectName: data.baseObjectName };
+}
+
 export async function indexOneFile(
   filePath: string,
   context: XppServerContext,
-): Promise<{ text: string; isError: boolean }> {
+): Promise<{ text: string; isError: boolean; skipped?: boolean }> {
   const ok = (text: string) => ({ text, isError: false });
   const err = (text: string) => ({ text, isError: true });
+  const skip = (text: string) => ({ text, isError: false, skipped: true });
   try {
     const { symbolIndex } = context;
     const pathParts = filePath.split(/[\\/]/);
@@ -328,6 +372,17 @@ export async function indexOneFile(
       // 2. Remove labels from labels DB (label files live alongside XML)
       const labelCount = symbolIndex.removeLabelsByFile(filePath);
 
+      // 2b. extension_metadata is keyed by name + type + model, not by path, so
+      // removeSymbolsByFile above cannot reach it. Both spellings are tried
+      // because a class extension is an AxClass file; each is a no-op when the
+      // row is not there.
+      const deletedModel = extractModelFromPath(filePath) ?? 'Unknown';
+      const metaCount =
+        (symbolIndex.removeExtensionMetadata?.(objectName, objectType, deletedModel) ?? 0) +
+        (objectType === 'class'
+          ? (symbolIndex.removeExtensionMetadata?.(objectName, 'class-extension', deletedModel) ?? 0)
+          : 0);
+
       // The bridge refresh that stops it seeing the deleted file is the caller's
       // per-batch one.
       symbolIndex.touchLastIndexed?.();
@@ -335,6 +390,7 @@ export async function indexOneFile(
       const parts_cleaned: string[] = [];
       if (deletedCount > 0) parts_cleaned.push(`${deletedCount} symbol(s)`);
       if (labelCount > 0) parts_cleaned.push(`${labelCount} label(s)`);
+      if (metaCount > 0) parts_cleaned.push(`${metaCount} extension record(s)`);
       const summary = parts_cleaned.length > 0 ? parts_cleaned.join(' + ') : 'no stale entries found';
 
       return ok(`🗑️ File deleted — cleaned up ${summary} for **${objectName}** (${objectType}).`);
@@ -342,6 +398,35 @@ export async function indexOneFile(
 
     // File exists: re-index
     const model = extractModelFromPath(filePath) ?? 'Unknown';
+
+    // A file in NO Ax* folder is not an AOT object and must not be indexed as
+    // one. classifyAotFolder falls back to 'class' for an unrecognised folder,
+    // which is a sane default for an unknown Ax* type and a lie for a file that
+    // has no AOT folder at all: a model descriptor
+    // (<Package>/Descriptor/<Model>.xml) was indexed as a CLASS named after the
+    // model, in model "Unknown" — a phantom that `search` then returned as an
+    // exact match, and that resolve_references would accept as a real type.
+    //
+    // Stale rows are still removed before returning, so this also CLEANS UP
+    // whatever an earlier run of the old behaviour inserted for this path:
+    // pointing update_symbol_index at such a file is what undoes the damage.
+    // Label files are exempt — they legitimately live outside Ax* folders and
+    // are handled by the branch below.
+    if (!aotFolder && !isLabelTextFile(filePath)) {
+      const { deletedCount } = symbolIndex.removeSymbolsByFile(filePath);
+      if (deletedCount > 0) symbolIndex.touchLastIndexed?.();
+      console.error(
+        `[update_symbol_index] Not an AOT object file (no Ax* folder): ${filePath}` +
+        (deletedCount > 0 ? ` — removed ${deletedCount} stale symbol(s)` : ''),
+      );
+      return skip(
+        `ℹ️ **${path.basename(filePath)}** is not an AOT object file — it is in no Ax* folder, so it ` +
+        `holds no symbol to index (a model descriptor, for example, is the package's manifest).` +
+        (deletedCount > 0
+          ? `\n\n🧹 Removed ${deletedCount} stale symbol(s) a previous run had indexed for it.`
+          : ''),
+      );
+    }
 
     // Label files are indexed in labels DB (not symbols DB).
     if (isLabelTextFile(filePath)) {
@@ -400,6 +485,18 @@ export async function indexOneFile(
 
     // 2. Re-parse the XML and insert fresh symbols
     let insertedCount = 0;
+    /**
+     * Did the Ax*Extension branch below write the extension_metadata row, or did
+     * it fall through to the bare object row? `null` for a file that is not an
+     * extension.
+     *
+     * The two outcomes were indistinguishable in the response — both insert
+     * exactly one symbol, so both printed "Inserted: 1 symbol" — and the second
+     * is the state in which every field and method the extension contributes is
+     * invisible to resolve_references, which reports them as hallucinated. An
+     * agent that read "✅ Symbol index updated" had no way to tell.
+     */
+    let extensionMetadataWritten: boolean | null = null;
     const tx = symbolIndex.db.transaction(() => {
       // Minimal fallback for types not handled individually below
       symbolIndex.addSymbol({
@@ -427,6 +524,7 @@ export async function indexOneFile(
             tags: classData.tags?.join(', '),
             extendsClass: classData.extends,
             implementsInterfaces: classData.implements?.join(', '),
+            visibility: classData.visibility,
             usedTypes: classData.usedTypes?.join(', '),
           });
           insertedCount++;
@@ -451,6 +549,23 @@ export async function indexOneFile(
           }
         });
         insert();
+        // A class carrying [ExtensionOf(...)] is also an extension — the AOT has
+        // no separate artifact for one — and resolveReferences resolves an
+        // extension-added or CoC-wrapped method through extension_metadata.
+        const extension = buildClassExtensionRecord(classData, model);
+        if (extension) {
+          symbolIndex.upsertExtensionMetadata?.({
+            extensionName: extension.name,
+            extensionType: 'class-extension',
+            baseObjectName: extension.baseObjectName,
+            addedFields: extension.addedFields,
+            addedMethods: extension.addedMethods,
+            addedIndexes: extension.addedIndexes,
+            cocMethods: extension.cocMethods,
+            eventSubscriptions: extension.eventSubscriptions,
+            model,
+          });
+        }
       } else {
         // Fallback: just index the object name
         tx();
@@ -604,7 +719,28 @@ export async function indexOneFile(
       } else {
         tx();
       }
-    } else if (objectType === 'form' || objectType === 'form-extension') {
+    } else if (EXTENSION_OBJECT_TYPES.has(objectType)) {
+      // One branch for every Ax*Extension kind, form extensions included: they
+      // differ only in which tag holds the added members, which
+      // parseExtensionFile already knows. The symbol row carries the base object
+      // the way the full build writes it, so the two paths agree.
+      const extension = await reindexExtensionMetadata(filePath, objectType, model, symbolIndex, parser);
+      extensionMetadataWritten = extension !== null;
+      if (extension) {
+        symbolIndex.addSymbol({
+          name: extension.name,
+          type: objectType,
+          parentName: extension.baseObjectName || undefined,
+          extendsClass: extension.baseObjectName || undefined,
+          signature: extension.baseObjectName || undefined,
+          filePath,
+          model,
+        });
+        insertedCount++;
+      } else {
+        tx();
+      }
+    } else if (objectType === 'form') {
       const result = await parser.parseFormFile(filePath, model);
       if (result.success && result.data) {
         const formData = result.data as any;
@@ -747,10 +883,20 @@ export async function indexOneFile(
 
     symbolIndex.touchLastIndexed?.();
 
+    const extensionNote =
+      extensionMetadataWritten === true
+        ? `\nExtension record: written — the members it adds resolve now.`
+        : extensionMetadataWritten === false
+          ? `\n⚠️ Extension record: NOT written — ${path.basename(filePath)} did not parse as a ` +
+            `${objectType}, so only a bare object row was indexed. Every field and method this ` +
+            `extension adds will still read as unknown; check the file's root element and <Name>.`
+          : '';
+
     return ok(
       `✅ Symbol index updated for **${objectName}** (${objectType}, model: ${model}).\n\n` +
       `Removed: ${deletedCount} stale entr${deletedCount === 1 ? 'y' : 'ies'}\n` +
-      `Inserted: ${insertedCount} symbol${insertedCount !== 1 ? 's' : ''}`
+      `Inserted: ${insertedCount} symbol${insertedCount !== 1 ? 's' : ''}` +
+      extensionNote
     );
   } catch (error: any) {
     console.error('Error updating symbol index:', error);

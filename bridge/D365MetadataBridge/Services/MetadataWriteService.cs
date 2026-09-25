@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -44,11 +44,32 @@ namespace D365MetadataBridge.Services
         /// later refresh, so the refresh that finally made the manifest able to answer
         /// correctly changed nothing and every subsequent create into that model kept NREing.
         /// </summary>
+        /// <summary>
+        /// (collection type, object name) -> the model that owns it.
+        ///
+        /// GetModelSaveInfoForObject below is called by every write operation, and
+        /// its third strategy walks every package x 21 AOT folders on disk. The
+        /// answer is a property of the provider generation, so it is cached for
+        /// exactly as long as the other two caches: cleared in UpdateProvider when
+        /// the provider is replaced.
+        ///
+        /// MEASURED, so the comment does not overclaim: on a model the runtime
+        /// manifest already knows (an ordinary create-then-modify against fm-mcp),
+        /// this cache changes nothing — strategy 1 answers immediately and the
+        /// expensive fallbacks never run. A/B over create+3 operations and three
+        /// modifies was inside the noise. It pays only where strategy 1 and 2 miss
+        /// and the disk walk is reached: a model absent from the manifest, i.e. one
+        /// not yet built or registered — which is exactly the sandbox case, and the
+        /// case a write is most likely to be repeated in.
+        /// </summary>
+        private readonly Dictionary<string, ModelSaveInfo> _objectModelCache = new(StringComparer.OrdinalIgnoreCase);
+
         public void UpdateProvider(IMetadataProvider newProvider)
         {
             _provider = newProvider;
             _modelCache.Clear();
             _microsoftModelCache.Clear();
+            _objectModelCache.Clear();
         }
 
         // ========================
@@ -3462,14 +3483,11 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"Form extension '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.FormExtensions, objectName);
 
-                    // Same idempotency rule as the form branch below: skip on a name match,
-                    // and on a different-named data source already bound to the same table.
+                    // Same idempotency rule as the form branch below: skip on a NAME match only.
                     foreach (AxFormDataSourceRoot existing in axExt.DataSources)
                     {
                         if (string.Equals(existing.Name, dsName, StringComparison.OrdinalIgnoreCase))
                             return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{dsName}' already exists", api = "IMetaFormExtensionProvider.Update" };
-                        if (string.Equals(existing.Table, table, StringComparison.OrdinalIgnoreCase))
-                            return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{existing.Name}' already binds table '{table}'", api = "IMetaFormExtensionProvider.Update" };
                     }
 
                     axExt.DataSources.Add((AxFormDataSourceRoot)CreateFormDataSourceRoot(dsName, table, joinSource, linkType));
@@ -3485,18 +3503,23 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"Form '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.Forms, objectName);
 
-                    // Idempotency: don't append a duplicate. If a data source with the same
-                    // NAME already exists, skip (it may be a template stub already bound to the
-                    // right table). If a DIFFERENT-named data source already binds the same
-                    // TABLE, skip too — adding a second binding to the same table is almost
-                    // always an accident (a stub the caller meant to replace, not duplicate).
+                    // Idempotency: don't append a duplicate. A data source with the same NAME
+                    // already there is a real conflict (it may be a template stub already bound
+                    // to the right table), so skip that one.
+                    //
+                    // A different-named data source already bound to the same TABLE is NOT a
+                    // conflict and must still be written. This used to skip too, on the theory
+                    // that "adding a second binding to the same table is almost always an
+                    // accident" — which is simply untrue: a form routinely joins one table into
+                    // several branches of its query. Microsoft's own PurchLineBackOrder carries
+                    // PurchTable and PurchTable1, both over PurchTable, with different link
+                    // types. The rule silently dropped three legitimate data sources and, because
+                    // `skipped` never reached the caller, reported all three as added.
                     foreach (var existing in axForm.DataSources)
                     {
                         dynamic dyn = existing;
                         if (string.Equals((string)dyn.Name, dsName, StringComparison.OrdinalIgnoreCase))
                             return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{dsName}' already exists", api = "IMetaFormProvider.Update" };
-                        if (string.Equals((string)dyn.Table, table, StringComparison.OrdinalIgnoreCase))
-                            return new { success = true, operation = "add-data-source", objectType, objectName, dsName, table, skipped = true, reason = $"data source '{(string)dyn.Name}' already binds table '{table}'", api = "IMetaFormProvider.Update" };
                     }
 
                     axForm.AddDataSource(CreateFormDataSourceRoot(dsName, table, joinSource, linkType));
@@ -4826,6 +4849,21 @@ namespace D365MetadataBridge.Services
         /// and finally try to infer from the on-disk file path.
         /// </summary>
         private ModelSaveInfo GetModelSaveInfoForObject<T>(IReadOnlySingleKeyedMetadataProvider<T> collection, string objectName)
+            where T : class
+        {
+            // Keyed by collection type as well as name: two AOT kinds may carry the
+            // same name (a table and a form both called CustTable), and they need
+            // not live in the same model.
+            var cacheKey = typeof(T).Name + "|" + objectName;
+            if (_objectModelCache.TryGetValue(cacheKey, out var cachedForObject))
+                return cachedForObject;
+
+            var resolved = ResolveModelSaveInfoForObjectUncached(collection, objectName);
+            if (resolved != null) _objectModelCache[cacheKey] = resolved;
+            return resolved!;
+        }
+
+        private ModelSaveInfo ResolveModelSaveInfoForObjectUncached<T>(IReadOnlySingleKeyedMetadataProvider<T> collection, string objectName)
             where T : class
         {
             // Strategy 1: dynamic dispatch on the collection object (works if runtime type exposes GetModelInfo)

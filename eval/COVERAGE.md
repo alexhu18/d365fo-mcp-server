@@ -8,8 +8,8 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 
 | Tier | Covered | Leaves | % |
 | --- | ---: | ---: | ---: |
-| core | 44 | 44 | **100%** |
-| total | 78 | 78 | 100% |
+| core | 74 | 74 | **100%** |
+| total | 124 | 124 | 100% |
 
 ## Data model (12/12)
 
@@ -19,8 +19,8 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Table extension | core | ✅ | ✅ | ✅ | L2-table-extension |
 | Extended data type | core | ✅ | ✅ | ✅ | L0-edt-basic |
 | EDT extension | total | ✅ | ✅ | ✅ | L2-edt-extension-basic |
-| Base enum | core | ✅ | ✅ | ✅ | L0-enum-basic |
-| Enum extension | core | ✅ | ✅ | ✅ | L2-enum-extension-empty-values |
+| Base enum | core | ✅ | ✅ | ✅ | L0-enum-basic, L3-enum-field-form-downgrade-guard |
+| Enum extension | core | ✅ | ✅ | ✅ | L2-enum-extension-empty-values, L2-enum-modify-values |
 | View | core | ✅ | ✅ | ✅ | L1-query-view-basic, L2-form-over-view |
 | AOT query | core | ✅ | ✅ | ✅ | L1-query-view-basic |
 | Map | total | ✅ | ✅ | ✅ | L1-map-basic |
@@ -28,7 +28,7 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Relations, indexes, field groups | core | ✅ | ✅ | ✅ | L2-table-modify-lifecycle, L3-form-detailstransaction |
 | Table inheritance (SupportInheritance/Extends) | total | ✅ | ✅ | ✅ | L2-table-inheritance-basic |
 
-## Code (22/22)
+## Code (37/37)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
@@ -39,23 +39,38 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Event handler subscription | core | ✅ | ✅ | ✅ | L2-event-handler-basic |
 | Delegate | core | ✅ | ✅ | ✅ | L2-delegate-basic |
 | Macro | total | ✅ | ✅ | ✅ | L1-macro-library-flight |
-| Transactions (ttsbegin/ttscommit) | core | ✅ | ✅ | ✅ | L2-class-method-ops, L2-form-modify-controls, L2-table-modify-lifecycle +2 |
-| X++ select grammar | core | ✅ | ✅ | ✅ | L4-ssrs-report-advanced, L4-ssrs-report-basic |
-| Set-based operations | core | ✅ | ✅ | ✅ | L4-ssrs-report-basic |
+| Transactions (ttsbegin/ttscommit) | core | ✅ | ✅ | ✅ | L2-exception-tts-retry, L2-occ-retry-basic |
+| X++ select grammar | core | ✅ | ✅ | ✅ | L2-date-effective-table, L2-multi-company-changecompany, L2-sysda-fluent-query +2 |
+| Set-based operations | core | ✅ | ✅ | ✅ | L2-performance-set-based, L4-ssrs-report-basic |
 | SysDa fluent query API | total | ✅ | ✅ | ✅ | L2-sysda-fluent-query |
 | Error handling & infolog | core | ✅ | ✅ | ✅ | L2-error-handling-infolog |
 | SysExtension plug-in pattern | total | ✅ | ✅ | ✅ | L2-sysextension-plugin |
 | Performance patterns | core | ✅ | ✅ | ✅ | L2-performance-set-based |
-| Best-practice (BP) compliance | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +36 |
-| Deprecated APIs & migration | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +36 |
+| Best-practice (BP) compliance | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +63 |
+| Deprecated APIs & migration | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +62 |
 | Optimistic concurrency & UnitOfWork | core | ✅ | ✅ | ✅ | L2-occ-retry-basic |
 | Caching (CacheLookup, SysGlobalObjectCache, RecordViewCache) | total | ✅ | ✅ | ✅ | L2-table-caching-basic |
 | X++ collections & containers (List/Map/Set/Struct) | total | ✅ | ✅ | ✅ | L2-collections-map-list-container |
 | Date/time & time zones (utcdatetime, DateTimeUtil) | total | ✅ | ✅ | ✅ | L2-datetime-timezone-range |
 | .NET interop (CLRInterop, using alias, CLRError) | total | ✅ | ✅ | ✅ | L2-dotnet-interop-clrerror |
 | Reflection / Dict* metadata API | total | ✅ | ✅ | ✅ | L2-reflection-dict-fieldwalk |
+| Data types, literals & conversions | core | ✅ | ✅ | ✅ | L2-data-types-conversions |
+| Declarations & scope (var/const/readonly/using) | core | ✅ | ✅ | ✅ | L2-declarations-scope |
+| Operators & precedence (&&/|| trap, like, is/as) | core | ✅ | ✅ | ✅ | L2-operators-precedence |
+| Statements & flow (switch fallthrough, loops) | core | ✅ | ✅ | ✅ | L2-statements-switch-loops |
+| Exceptions inside transactions (catchability, retry) | core | ✅ | ✅ | ✅ | L2-exception-tts-retry |
+| Attribute authoring & reflection | total | ✅ | ✅ | ✅ | L2-attribute-authoring-reflection |
+| Compile-time (intrinsic) functions | core | ✅ | ✅ | ✅ | L2-intrinsic-functions |
+| Table buffer API (xRecord/Common members) | core | ✅ | ✅ | ✅ | L2-table-modify-lifecycle |
+| Date-effective tables (validTimeState) | total | ✅ | ✅ | ✅ | L2-date-effective-table |
+| Run-time (predefined) functions | core | ✅ | ✅ | ✅ | L2-runtime-functions-arity |
+| Implicit conversions & explicit converters | core | ✅ | ✅ | ✅ | L2-implicit-conversions |
+| select find options, join kinds and clause order | core | ✅ | ✅ | ✅ | L2-select-find-options-joins |
+| Global:: statics (query values, access checks) | core | ✅ | ✅ | ✅ | L2-global-statics-access-checks |
+| System objects (infolog, Box, Debug, session) | core | ✅ | ✅ | ✅ | L2-system-objects-infolog-box |
+| Query filters, range expressions, custom range functions | total | ✅ | ✅ | ✅ | L2-query-range-expression-sysqueryrangeutil |
 
-## UI (7/7)
+## UI (11/11)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
@@ -63,27 +78,41 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Form patterns (ListPage, DetailsMaster, …) | core | ✅ | ✅ | ✅ | L1-form-detailsmaster, L1-form-dialog, L1-form-listpage +5 |
 | Form extension | core | ✅ | ✅ | ✅ | L2-form-extension-basic |
 | FormRun lifecycle & data sources | core | ✅ | ✅ | ✅ | L2-form-modify-controls, L3-form-add-datasource-lines |
-| Menu items (display/action/output) | core | ✅ | ✅ | ✅ | L4-ssrs-report-advanced, L4-ssrs-report-multidataset |
+| Menu items (display/action/output) | core | ✅ | ✅ | ✅ | L2-config-key-gated-table, L3-batch-basic, L4-ssrs-report-advanced +3 |
 | Menus & submenu nesting | core | ✅ | ✅ | ✅ | L4-master-security-slice |
 | Tiles & KPIs | total | ✅ | ✅ | ✅ | L2-tile-cue-over-query |
+| Args — record, caller and parameters | core | ✅ | ✅ | ✅ | L2-args-record-caller |
+| display / edit methods | core | ✅ | ✅ | ✅ | L2-display-edit-methods |
+| Form event handlers | core | ✅ | ✅ | ✅ | L3-form-event-handler-class |
+| Lookups (table, reference, multi-select, override) | core | ✅ | ✅ | ✅ | L2-lookup-reference-multiselect |
 
-## Reporting (4/4)
+## Reporting (14/14)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
 | SSRS report (DP + contract + controller) | core | ✅ | ✅ | ✅ | L4-ssrs-report-advanced, L4-ssrs-report-basic |
 | Multi-dataset SSRS report | total | ✅ | ✅ | ✅ | L4-ssrs-report-multidataset |
-| Print management | total | ✅ | ✅ | ✅ | L3-print-management-report |
+| Print management | total | ✅ | ✅ | ✅ | L3-print-management-report, L3-print-mgmt-doctype-extension |
+| Report contracts (RDP/RDL/print/composite) | core | ✅ | ✅ | ✅ | L4-ssrs-report-advanced |
+| Pre-processed RDP (long-running reports) | total | ✅ | ✅ | ✅ | L4-ssrs-report-preprocess |
+| Report dialog UI builders | total | ✅ | ✅ | ✅ | L4-ssrs-report-uibuilder |
 | Electronic Reporting (ER) | total | ✅ | ✅ | ✅ | L3-electronic-reporting-integration |
+| Extending a standard report | core | ✅ | ✅ | ✅ | L3-report-dataset-extension |
+| Report design & RDL expressions | core | ✅ | ✅ | ✅ | L4-ssrs-report-design-rdl |
+| Report parameters and dataset upkeep (after the scaffold) | core | ✅ | ✅ | ✅ | L4-ssrs-report-parameters |
+| Testing a report data provider (red-first) | core | ✅ | ✅ | ✅ | L4-tdd-report-dp |
+| Report print destinations (file, e-mail, archive, batch) | core | ✅ | ✅ | ✅ | L4-ssrs-report-print-destinations |
+| Publishing a report as a print-management format | core | ✅ | ✅ | ✅ | L3-print-mgmt-publish-format |
+| Logo and barcode on a report (container + encoded string) | total | ✅ | ✅ | ✅ | L4-ssrs-report-logo-barcode |
 
-## Frameworks (16/16)
+## Frameworks (21/21)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
 | SysOperation / batch | core | ✅ | ✅ | ✅ | L3-batch-basic |
 | Parallel batch processing | total | ✅ | ✅ | ✅ | L3-parallel-batch-tasks |
 | Async & retryable batch (BatchRetryable/runAsync) | total | ✅ | ✅ | ✅ | L3-batch-retryable-basic |
-| Number sequences | core | ✅ | ✅ | ✅ | L2-numberseq-basic |
+| Number sequences | core | ✅ | ✅ | ✅ | L2-numberseq-basic, L3-numberseq-module-slice |
 | Financial dimensions | core | ✅ | ✅ | ✅ | L2-dimension-basic |
 | Posting engine (LedgerVoucher) | total | ✅ | ✅ | ✅ | L4-posting-ledgervoucher-slice |
 | Workflow | core | ✅ | ✅ | ✅ | L3-workflow-document-submit |
@@ -95,13 +124,18 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Currency & exchange rates | total | ✅ | ✅ | ✅ | L3-currency-exchange-conversion |
 | Inventory (InventTrans / InventDim) | total | ✅ | ✅ | ✅ | L3-inventory-inventdim-onhand |
 | Warehouse management (WHS) | total | ✅ | ✅ | ✅ | L3-warehouse-work-slice |
+| Warehouse app / barcode scanning | total | ✅ | ✅ | ✅ | L3-warehouse-scan-resolve-slice |
+| Warehouse-app screens (ProcessGuide / legacy) | total | ✅ | ✅ | ✅ | L2-processguide-page-control, L3-legacy-workexecutedisplay-extend, L3-processguide-flow-slice |
 | Trade agreements & pricing | total | ✅ | ✅ | ✅ | L3-trade-agreement-price-lookup |
+| SysOperation dialog from contract attributes | total | ✅ | ✅ | ✅ | L3-sysoperation-dialog-attributes |
+| SysOperation query parameter (batch with a filter) | core | ✅ | ✅ | ✅ | L3-sysoperation-query-parameter-batch |
+| RunBase lifecycle & packed state | total | ✅ | ✅ | ✅ | L3-runbase-coc-pack-unpack |
 
-## Integration (9/9)
+## Integration (14/14)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
-| Data entity (OData) | core | ✅ | ✅ | ✅ | L4-entity-security |
+| Data entity (OData) | core | ✅ | ✅ | ✅ | L4-bridge-drops-data-entity-primarytable-fields-on-create, L4-entity-security |
 | Data entity extension | total | ✅ | ✅ | ✅ | L3-data-entity-extension-field |
 | Custom services / OData actions | core | ✅ | ✅ | ✅ | L3-custom-service-basic |
 | Data management framework (DMF/DIXF) | total | ✅ | ✅ | ✅ | L3-dmf-entity-import-slice |
@@ -110,6 +144,11 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Reading Excel / CSV files | total | ✅ | ✅ | ✅ | L3-file-csv-import |
 | Direct SQL execution | total | ✅ | ✅ | ✅ | L2-direct-sql-connection |
 | Aggregate measurements / analytics | total | ✅ | ✅ | ✅ | L3-aggregate-measurement-basic |
+| Sending e-mail (SysMailerMessageBuilder) | total | ✅ | ✅ | ✅ | L3-attachment-docuref-pdf |
+| Writing files (CSV, XLSX, SendFileToUser) | total | ✅ | ✅ | ✅ | L3-file-csv-import |
+| HTTP, JSON and regex from X++ | total | ✅ | ✅ | ✅ | L2-entity-query-range-roundtrip |
+| Data entity lifecycle methods | core | ✅ | ✅ | ✅ | L2-entity-query-range-roundtrip, L3-data-entity-extension-field |
+| Attachments (DocuRef / DocumentManagement) | total | ✅ | ✅ | ✅ | L3-attachment-docuref-pdf |
 
 ## Security (6/6)
 
@@ -122,12 +161,34 @@ A taxonomy leaf counts as covered only when all three hold: **K** a knowledge en
 | Extensible data security (XDS) | total | ✅ | ✅ | ✅ | L3-xds-policy-constrained-table |
 | License codes | total | ✅ | ✅ | ✅ | L2-license-code-configkey |
 
-## Quality (2/2)
+## Quality (3/3)
 
 | Leaf | Tier | K | E | T | Evidence / gap |
 | --- | --- | :-: | :-: | :-: | --- |
-| SysTest unit testing | core | ✅ | ✅ | ✅ | L2-coc-extension, L2-event-handler-basic, L3-batch-basic |
-| Labels & localisation | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +36 |
+| SysTest unit testing | core | ✅ | ✅ | ✅ | L2-anytype-retyping-runtime, L2-coc-extension, L2-event-handler-basic +6 |
+| Labels & localisation | core | ✅ | ✅ | ✅ | L0-edt-basic, L0-enum-basic, L1-class-basic +62 |
+| TDD loop (red-first SysTest authoring) | core | ✅ | ✅ | ✅ | L2-systest-authoring-basic |
+
+## Language (1/1)
+
+| Leaf | Tier | K | E | T | Evidence / gap |
+| --- | --- | :-: | :-: | :-: | --- |
+| anytype at run time | total | ✅ | ✅ | ✅ | L2-anytype-retyping-runtime |
+
+## Testing (4/4)
+
+| Leaf | Tier | K | E | T | Evidence / gap |
+| --- | --- | :-: | :-: | :-: | --- |
+| The red-green cycle, both runs recorded | core | ✅ | ✅ | ✅ | L2-tdd-red-green-cycle |
+| Validator rules for test authoring (TST001-003) | core | ✅ | ✅ | ✅ | L2-systest-attributes-isolation |
+| SysTest attributes: filtering, isolation, dependencies | core | ✅ | ✅ | ✅ | L2-systest-attributes-isolation |
+| Test data through ATL | total | ✅ | ✅ | ✅ | L3-test-data-atl |
+
+## Forms (1/1)
+
+| Leaf | Tier | K | E | T | Evidence / gap |
+| --- | --- | :-: | :-: | :-: | --- |
+| Form runtime API (element, data source, controls) | core | ✅ | ✅ | ✅ | L2-form-control-removal-lifecycle, L2-form-extension-basic |
 
 ## Closure queue (uncovered, by frequency weight)
 
@@ -135,7 +196,7 @@ Nothing uncovered.
 
 ## Orphans
 
-- Knowledge entries no leaf claims (**unproven knowledge**): extensible-enums
-- Eval cases no leaf claims (**unmapped proof**): L0-create-readback-no-reindex, L2-batched-object-reads, L2-oracle-discriminator-random-wrapper-name, L3-enum-field-form-downgrade-guard, L4-headerlines-document-slice
+- Knowledge entries no leaf claims (**unproven knowledge**): form-adaptor-tests
+- Eval cases no leaf claims (**unmapped proof**): L0-create-readback-no-reindex, L2-batched-object-reads, L2-object-delete-and-entry-point-cleanup, L2-oracle-discriminator-random-wrapper-name, L4-headerlines-document-slice
 
-_Generated 2026-08-08._
+_Generated 2026-09-03._

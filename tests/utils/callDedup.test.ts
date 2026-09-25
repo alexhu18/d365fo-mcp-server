@@ -7,8 +7,9 @@ import {
   dedupKey, getDedupedResult, storeDedupResult, clearDedupCache,
   appendNote, DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
   getInFlight, registerInFlight, clearInFlight, clearAllInFlight,
+  MUTATING_TOOLS, currentWriteEpoch, bumpWriteEpoch,
 } from '../../src/utils/callDedup';
-import { recordCallSequence, resetCallSequence, getMetricsSnapshot } from '../../src/utils/toolMetrics';
+import { recordCallSequence, resetCallSequence, getMetricsSnapshot, occurrencesInEpoch } from '../../src/utils/toolMetrics';
 
 beforeEach(() => {
   clearDedupCache();
@@ -21,6 +22,35 @@ afterEach(() => {
 });
 
 describe('dedup cache', () => {
+  it('ignores argument order — the same call spelled two ways hits one entry', () => {
+    // JSON.stringify preserved insertion order, so {objectType,name} and
+    // {name,objectType} were two cache entries for one call and the second
+    // spelling always missed and re-ran the query.
+    const a = dedupKey('get_object_info', { objectType: 'table', name: 'CustTable' });
+    const b = dedupKey('get_object_info', { name: 'CustTable', objectType: 'table' });
+    expect(a).toBe(b);
+
+    storeDedupResult(a, { content: [{ type: 'text', text: 'CustTable' }] });
+    expect(getDedupedResult(b)).toBeDefined();
+  });
+
+  it('sorts keys at every depth, not just the top level', () => {
+    expect(dedupKey('prepare', { o: { z: 1, a: 2 }, t: 'x' }))
+      .toBe(dedupKey('prepare', { t: 'x', o: { a: 2, z: 1 } }));
+  });
+
+  it('keeps ARRAY order significant — operations[] order is meaningful', () => {
+    // Two ops applied in the opposite order are a different write, not a repeat.
+    expect(dedupKey('d365fo_file', { operations: [{ op: 'a' }, { op: 'b' }] }))
+      .not.toBe(dedupKey('d365fo_file', { operations: [{ op: 'b' }, { op: 'a' }] }));
+  });
+
+  it('falls back to a stable marker for a circular argument', () => {
+    const circular: any = { name: 'X' };
+    circular.self = circular;
+    expect(dedupKey('search', circular)).toBe('search|<unserializable>');
+  });
+
   it('returns the stored result for an identical key within the TTL', () => {
     const key = dedupKey('search', { query: 'CustTable' });
     const result = { content: [{ type: 'text', text: 'hit' }] };
@@ -145,10 +175,107 @@ describe('recordCallSequence (loop detection)', () => {
     expect(recordCallSequence('search', 'k1')).toBe(1);
   });
 
+  /**
+   * The loop advisory fires on repeats WITHIN one write epoch, not on raw repeats.
+   *
+   * Re-reading after a write is correct behaviour — it is how an agent sees its own
+   * edit. Counting raw repeats attached "the answer does not change between calls"
+   * to content this server's own writes had just changed twice (observed live, eval
+   * case L2-entity-query-range-roundtrip, 2026-08-24, occurrence #3). That is the
+   * same hazard the cache invalidation was for: talking an agent out of trusting a
+   * re-read it was right to make.
+   */
+  it('counts three repeats as a loop only while the epoch holds', () => {
+    for (let i = 0; i < 3; i++) recordCallSequence('get_object_info', 'ep', 7);
+    expect(occurrencesInEpoch('get_object_info', 'ep', 7)).toBe(3);
+  });
+
+  it('does not count a re-read that follows a write as a repeat', () => {
+    // Two reads, then a write bumps the epoch, then the same read twice more.
+    recordCallSequence('get_object_info', 'ep2', 1);
+    recordCallSequence('get_object_info', 'ep2', 1);
+    recordCallSequence('get_object_info', 'ep2', 2);
+    recordCallSequence('get_object_info', 'ep2', 2);
+    // Four identical calls in the window — but never three under one epoch, so no
+    // loop advisory in either.
+    expect(occurrencesInEpoch('get_object_info', 'ep2', 1)).toBe(2);
+    expect(occurrencesInEpoch('get_object_info', 'ep2', 2)).toBe(2);
+  });
+
   it('tracks duplicates in the metrics snapshot', () => {
     recordCallSequence('search', 'dup');
     recordCallSequence('search', 'dup');
     const snap = getMetricsSnapshot().find(s => s.tool === 'search');
     expect(snap?.duplicateCalls).toBeGreaterThanOrEqual(1);
+  });
+});
+
+/**
+ * Write-awareness. The cache used to key purely on (tool, args), so a read
+ * repeated after a write was answered from before the write — and the note it
+ * carried told the agent to trust it ("the result above is identical. Use the
+ * data you already have instead of re-querying").
+ *
+ * Observed in 2 of the 4 eval runs on 2026-08-23: a get_object_info(include:"xml")
+ * on a data entity, three d365fo_file(action="modify") writes, then the same read
+ * again — served the 2399-byte pre-write body while disk held 2738 bytes with both
+ * ranges. An agent verifying its own write is told the write did not happen.
+ */
+describe('dedup cache — invalidation on write', () => {
+  const key = () => dedupKey('get_object_info', { objectType: 'data-entity', name: 'MyEntity' });
+
+  it('serves the cached read when nothing has been written', () => {
+    storeDedupResult(key(), { content: [{ type: 'text', text: 'before' }] }, currentWriteEpoch());
+    expect(getDedupedResult(key())?.content[0].text).toBe('before');
+  });
+
+  it('drops the cached read once a write bumps the epoch', () => {
+    storeDedupResult(key(), { content: [{ type: 'text', text: 'before' }] }, currentWriteEpoch());
+    bumpWriteEpoch(); // d365fo_file(action="modify")
+    expect(getDedupedResult(key())).toBeUndefined();
+  });
+
+  it('stays dropped after several writes, and re-caches under the new epoch', () => {
+    storeDedupResult(key(), { content: [{ type: 'text', text: 'before' }] }, currentWriteEpoch());
+    bumpWriteEpoch(); bumpWriteEpoch(); bumpWriteEpoch();
+    expect(getDedupedResult(key())).toBeUndefined();
+
+    storeDedupResult(key(), { content: [{ type: 'text', text: 'after' }] }, currentWriteEpoch());
+    expect(getDedupedResult(key())?.content[0].text).toBe('after');
+  });
+
+  it('refuses to cache a read that RACED a write', () => {
+    // The read starts, a write lands while it is in flight, the read finishes:
+    // its answer describes the pre-write disk and must not become the cached one.
+    const epochAtStart = currentWriteEpoch();
+    bumpWriteEpoch();
+    storeDedupResult(key(), { content: [{ type: 'text', text: 'raced' }] }, epochAtStart);
+    expect(getDedupedResult(key())).toBeUndefined();
+  });
+
+  it('leaves unrelated cached reads alone only until the next write', () => {
+    const other = dedupKey('search', { query: 'CustTable' });
+    storeDedupResult(other, { content: [{ type: 'text', text: 'hit' }] }, currentWriteEpoch());
+    expect(getDedupedResult(other)).toBeDefined();
+    // Epoch-wide on purpose: a write to one object changes reads of others
+    // (extensions, references, search hits, the index), so scoping the blast
+    // radius would be a guess.
+    bumpWriteEpoch();
+    expect(getDedupedResult(other)).toBeUndefined();
+  });
+
+  it('every mutating tool is also excluded from being cached itself', () => {
+    for (const tool of MUTATING_TOOLS) {
+      expect(DEDUP_EXCLUDED_TOOLS.has(tool), `${tool} must never be served from cache`).toBe(true);
+    }
+  });
+
+  it('names the write tools that can change a later read', () => {
+    // A new write surface that is not here reopens the defect, so the set is
+    // asserted rather than merely spot-checked.
+    expect([...MUTATING_TOOLS].sort()).toEqual([
+      'd365fo_file', 'generate_object', 'labels',
+      'trigger_db_sync', 'undo_last_modification', 'update_symbol_index',
+    ]);
   });
 });

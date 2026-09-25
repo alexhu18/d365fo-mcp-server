@@ -9,15 +9,15 @@ export const validateCodeTool = {
     description:
       'Static validator for generated X++/XML (paste the text). Choose a `mode`:\n' +
       '• syntax → offline best-practice/BP validator (no xppbp.exe). Structured violations {rule, severity, line, excerpt, fix}. Covers select, CoC, BP and table-XML rules mined from standard models.\n' +
-      '• references → semantic reference resolver (index-only): verifies every type, field, method (incl. arity), enum, label and intrinsic (tableStr/fieldStr/…) EXISTS in the indexed codebase — catches hallucinated symbols before the compiler. codeType="xml-table" checks XML refs instead: EDT/enum/relation/extends/label.\n' +
-      'Call both AFTER generating, BEFORE writes; fix errors in the same turn. Write tools run references internally when GROUNDING_ENFORCE=true.',
+      '• references → semantic reference resolver (index-only): verifies every type, field, method (incl. arity), enum, label and intrinsic (tableStr/fieldStr/…) EXISTS in the indexed codebase. codeType="xml-table" checks XML refs instead: EDT/enum/relation/extends/label.\n' +
+      'Call mode="both" AFTER generating, BEFORE writes; fix errors in the same turn. Write tools run references internally when GROUNDING_ENFORCE=true.',
     inputSchema: {
       type: 'object',
       properties: {
         mode: {
           type: 'string',
-          enum: ['syntax', 'references'],
-          description: 'syntax = BP/best-practice rules; references = symbol resolution against the index. Defaults to syntax.',
+          enum: ['both', 'syntax', 'references'],
+          description: 'both = run the two checks in ONE call (preferred).',
         },
         code: {
           type: 'string',
@@ -25,9 +25,9 @@ export const validateCodeTool = {
         },
         codeType: {
           type: 'string',
-          enum: ['xpp', 'xml-table', 'xml-any'],
+          enum: ['xpp', 'xml-table', 'xml-form', 'xml-any', 'xml-report'],
           default: 'xpp',
-          description: '[syntax] "xpp" for X++ source (default), "xml-table" for AxTable XML, "xml-any" for other XML.',
+          description: '[syntax] "xpp" X++ (default), "xml-table" AxTable, "xml-form" AxForm(+Extension), "xml-report" AxReport, "xml-any" other.',
         },
         context: {
           type: 'string',

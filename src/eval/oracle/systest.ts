@@ -108,3 +108,9 @@ export function parseSysTestResult(output: string | null | undefined): SysTestRe
 
   return { ran: true, passed, failures };
 }
+
+// The XML reader itself ships with the server (sysTestRunner.ts loads it at
+// runtime), so it lives under src/tools/ — src/eval/** is excluded from the
+// published package. Re-exported here so the oracle keeps one import surface.
+export type { SysTestCaseOutcome } from '../../tools/sdlc/sysTestXml.js';
+export { parseSysTestXml } from '../../tools/sdlc/sysTestXml.js';

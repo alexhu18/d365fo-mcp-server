@@ -14,6 +14,7 @@ import {
   type ResolverDeps,
 } from '../../src/tools/write/resolveReferences';
 import { validateCodeTool } from '../../src/tools/analysis/validateCode';
+import { labelIdSpellings, parseLabelReference } from '../../src/utils/labelReference';
 
 const ORIGINAL_ENFORCE = process.env.GROUNDING_ENFORCE;
 
@@ -22,18 +23,30 @@ let db: ResolverDeps['db'];
 let deps: ResolverDeps;
 
 const LABELS: Record<string, string[]> = {
-  // labelFileId → known label ids
-  SYS: ['SYS12345'],
+  // labelFileId → known label ids, stored the way labelParser writes them: the
+  // `Key=` token verbatim. The 27 legacy AX-era files keep their sigil
+  // (`@SYS12345=…`), modern ones do not. This mock used to hold a bare
+  // 'SYS12345' — the opposite of the real index — and that is the only reason
+  // the legacy-label test passed while every `@SYSnnnnn` in real X++ drew an
+  // unknown-label warning (#888).
+  SYS: ['@SYS12345'],
   Contoso: ['MyLabel'],
 };
 
 function makeDeps(database: ResolverDeps['db']): ResolverDeps {
   return {
     db: database,
+    // Mirrors symbolIndex.getLabelById: the caller's spelling is normalised, the
+    // STORED id comes back.
     getLabelById: (labelId: string, labelFileId?: string) => {
+      const parsed = parseLabelReference(labelId);
+      const spellings = labelIdSpellings(parsed.labelId);
+      const file = labelFileId ?? parsed.labelFileId;
       const hit = (fileId: string) =>
-        (LABELS[fileId] ?? []).includes(labelId) ? [{ labelId, labelFileId: fileId }] : [];
-      if (labelFileId) return hit(labelFileId);
+        (LABELS[fileId] ?? [])
+          .filter(stored => spellings.includes(stored))
+          .map(stored => ({ labelId: stored, labelFileId: fileId }));
+      if (file) return hit(file);
       return Object.keys(LABELS).flatMap(hit);
     },
     getLabelFileIds: () => Object.keys(LABELS).map(labelFileId => ({ labelFileId })),
@@ -62,6 +75,10 @@ beforeAll(() => {
   sym('find', 'method', 'CustTable',
     'public static CustTable find(CustAccount _custAccount, boolean _forUpdate = false)');
   sym('SalesTable', 'table');
+  // A table the index knows with ZERO indexed columns — the "created this
+  // session, fields not indexed yet" shape the data-entity field check must
+  // stay silent about rather than report every column as missing.
+  sym('FieldlessTable', 'table');
   sym('SalesId', 'field', 'SalesTable', 'SalesIdBase');
   // Classes with inheritance
   sym('SalesFormLetter', 'class', undefined, undefined, 'RunBaseBatch');
@@ -632,20 +649,41 @@ describe('validateCodeTool references mode — xml-table EDT checking', () => {
       { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
       context,
     );
-    expect(result.isError).toBe(true);
+    // Reported, but no longer fatal. This check is index-only, and on a real
+    // installation 44 enum names that shipped Microsoft metadata references cannot be
+    // resolved by it. A check that cannot tell "absent from the index" from "does
+    // not exist" must not fail the call: the agent obeys, swaps in a real-but-
+    // different enum out of search results, and the edit compiles clean meaning
+    // something else.
     expect(result.content[0].text).toContain('NoSuchEnum');
+    expect(result.content[0].text).toContain('warning');
+    expect(result.isError).toBeFalsy();
   });
 
-  it('accepts a known enum (NoYes) in <EnumType>', async () => {
+  // The shared fixture seeds sym('NoYes', 'enum'), so this passed for the wrong
+  // reason for the whole life of the check: the mock index was more generous than
+  // any real one, where NoYes has no AxEnum element and returns 0 rows. The X++
+  // side had already spotted the same trap and tested against emptyDeps (see
+  // "accepts NoYes:: even when the index does not prove NoYes"); the XML side had
+  // not, which is how <EnumType>NoYes</EnumType> shipped as a hard error.
+  it('accepts NoYes even when the index does NOT contain it', async () => {
     const xml = `<?xml version="1.0"?><AxTable><Name>MyTable</Name><Fields>
       <AxTableField i:type="AxTableFieldEnum"><Name>Active</Name>
         <EnumType>NoYes</EnumType></AxTableField>
     </Fields></AxTable>`;
+    // An index that proves nothing — exactly what a real one offers for NoYes.
+    const blindContext = {
+      symbolIndex: {
+        getReadDb: () => ({ prepare: () => ({ all: () => [], get: () => undefined }) }),
+        getLabelById: () => [],
+      },
+    } as any;
     const result = await validateCodeTool(
       { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
-      context,
+      blindContext,
     );
     expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).not.toContain('NoYes" is not in the symbol index');
   });
 });
 
@@ -665,9 +703,9 @@ describe('label placeholders vs strFmt arguments', () => {
     db: { prepare: () => ({ get: () => undefined, all: () => [] }) },
     getLabelById: (labelId: string) =>
       TEXTS[labelId]
-        ? [{ labelId, labelFileId: 'AslFinSK', language: 'en-US', text: TEXTS[labelId] }]
+        ? [{ labelId, labelFileId: 'ConSK', language: 'en-US', text: TEXTS[labelId] }]
         : [],
-    getLabelFileIds: () => [{ labelFileId: 'AslFinSK' }],
+    getLabelFileIds: () => [{ labelFileId: 'ConSK' }],
   };
 
   const check = (code: string) =>
@@ -676,42 +714,304 @@ describe('label placeholders vs strFmt arguments', () => {
     );
 
   it('flags a placeholder label used without strFmt', () => {
-    const found = check('ret = checkFailed(literalStr("@AslFinSK:Downgrade"));');
+    const found = check('ret = checkFailed(literalStr("@ConSK:Downgrade"));');
     expect(found).toHaveLength(1);
     expect(found[0].severity).toBe('error');
     expect(found[0].detail).toContain('must be wrapped');
   });
 
   it('flags arguments passed to a label that has no placeholders', () => {
-    const found = check('ret = checkFailed(strFmt("@AslFinSK:Plain", enum2str(a), enum2str(b)));');
+    const found = check('ret = checkFailed(strFmt("@ConSK:Plain", enum2str(a), enum2str(b)));');
     expect(found).toHaveLength(1);
     expect(found[0].detail).toContain('discarded');
   });
 
   it('flags an argument-count mismatch', () => {
-    const found = check('ret = checkFailed(strFmt("@AslFinSK:Downgrade", enum2str(a)));');
+    const found = check('ret = checkFailed(strFmt("@ConSK:Downgrade", enum2str(a)));');
     expect(found[0].detail).toContain('takes 2 argument(s), strFmt supplies 1');
   });
 
   it('accepts the matching call, wrapped and across lines', () => {
-    expect(check(`ret = checkFailed(strFmt("@AslFinSK:Downgrade",
+    expect(check(`ret = checkFailed(strFmt("@ConSK:Downgrade",
         enum2str(this.orig().Tier),
         enum2str(this.Tier)));`)).toHaveLength(0);
   });
 
   it('accepts a plain label used bare, and sees through literalStr', () => {
-    expect(check('ret = checkFailed("@AslFinSK:Plain");')).toHaveLength(0);
-    expect(check('ret = checkFailed(strFmt(literalStr("@AslFinSK:Downgrade"), a, b));')).toHaveLength(0);
+    expect(check('ret = checkFailed("@ConSK:Plain");')).toHaveLength(0);
+    expect(check('ret = checkFailed(strFmt(literalStr("@ConSK:Downgrade"), a, b));')).toHaveLength(0);
   });
 
   it('says nothing when the index has no text for the label', () => {
     const noText: ResolverDeps = {
       ...textDeps,
-      getLabelById: (labelId: string) => [{ labelId, labelFileId: 'AslFinSK' }],
+      getLabelById: (labelId: string) => [{ labelId, labelFileId: 'ConSK' }],
     };
     expect(
-      resolveXppReferences('ret = checkFailed("@AslFinSK:Downgrade");', noText)
+      resolveXppReferences('ret = checkFailed("@ConSK:Downgrade");', noText)
         .violations.filter(v => v.kind === 'label-placeholder-mismatch'),
     ).toHaveLength(0);
+  });
+});
+
+/**
+ * A data entity keeps its references under element names NONE of the generic
+ * scans use: the source table is <Table>, a mapped column is <DataField> paired
+ * with a <DataSource>, and a query column is <Field>. So references mode on an
+ * AxDataEntityView reported "all 0 reference(s) verified" — it had checked
+ * nothing, and a hallucinated field name passed the static gate in silence.
+ * Eval case L2-entity-query-range-roundtrip, 2026-08-23.
+ */
+describe('validateCodeTool references mode — AxDataEntityView', () => {
+  const context = {
+    symbolIndex: {
+      getReadDb: () => db,
+      getLabelById: (id: string, f?: string) => makeDeps(db).getLabelById(id, f),
+      getLabelFileIds: () => Object.keys(LABELS).map(labelFileId => ({ labelFileId })),
+    },
+  } as any;
+
+  const entity = (opts: {
+    table?: string; queryField?: string; mappedField?: string; dataSource?: string;
+  } = {}) => {
+    const table = opts.table ?? 'CustTable';
+    const ds = opts.dataSource ?? table;
+    return `<?xml version="1.0"?><AxDataEntityView><Name>MyEntity</Name>
+      <Fields>
+        <AxDataEntityViewField i:type="AxDataEntityViewMappedField">
+          <Name>Acct</Name>
+          <DataField>${opts.mappedField ?? 'AccountNum'}</DataField>
+          <DataSource>${ds}</DataSource>
+        </AxDataEntityViewField>
+      </Fields>
+      <ViewMetadata><Name>Metadata</Name><DataSources>
+        <AxQuerySimpleRootDataSource>
+          <Name>${ds}</Name>
+          <Table>${table}</Table>
+          <DataSources />
+          <Fields>
+            <AxQuerySimpleDataSourceField>
+              <Name>F</Name><Field>${opts.queryField ?? 'AccountNum'}</Field>
+            </AxQuerySimpleDataSourceField>
+          </Fields>
+        </AxQuerySimpleRootDataSource>
+      </DataSources></ViewMetadata>
+    </AxDataEntityView>`;
+  };
+
+  const run = (xml: string) => validateCodeTool(
+    { params: { arguments: { mode: 'references', codeType: 'xml-table', code: xml } } } as any,
+    context,
+  );
+
+  it('actually verifies something — it used to report 0 references checked', async () => {
+    const r: any = await run(entity());
+    const text = r.content[0].text as string;
+    expect(text, 'the entity pass must verify at least the source table').not.toContain('all 0 reference(s) verified');
+  });
+
+  it('flags a source table that does not exist', async () => {
+    const r: any = await run(entity({ table: 'NoSuchTable' }));
+    expect(r.content[0].text).toContain('NoSuchTable');
+  });
+
+  it('flags a query <Field> that is not a column of the data source table', async () => {
+    const r: any = await run(entity({ queryField: 'NotAColumn' }));
+    expect(r.content[0].text).toContain('NotAColumn');
+  });
+
+  it('flags a mapped <DataField> that is not a column of its <DataSource>', async () => {
+    const r: any = await run(entity({ mappedField: 'AlsoNotAColumn' }));
+    expect(r.content[0].text).toContain('AlsoNotAColumn');
+  });
+
+  it('accepts real columns without complaint', async () => {
+    const r: any = await run(entity({ queryField: 'CustGroup', mappedField: 'Blocked' }));
+    const text = r.content[0].text as string;
+    expect(text).not.toContain('CustGroup"');
+    expect(text).not.toContain('Blocked"');
+  });
+
+  it('stays silent about the fields of a table the index knows no columns for', async () => {
+    // A table created earlier in the SAME session may be indexed while its
+    // columns are not. Reporting every field as missing there would be a
+    // confident lie about output that is fine — the failure class this repo
+    // cares about most.
+    const r: any = await run(entity({
+      table: 'FieldlessTable', dataSource: 'FieldlessTable',
+      queryField: 'Whatever', mappedField: 'Whatever2',
+    }));
+    const text = r.content[0].text as string;
+    expect(text).not.toContain('Whatever');
+    expect(text).not.toContain('Whatever2');
+  });
+
+  it('but DOES judge the fields of a table whose columns are indexed', () => {
+    // The other half of the same rule — silence must be about missing evidence,
+    // not a blanket exemption.
+    return run(entity({ table: 'SalesTable', dataSource: 'SalesTable', queryField: 'NotOnSales' }))
+      .then((r: any) => expect(r.content[0].text).toContain('NotOnSales'));
+  });
+
+  it('resolves a JOINED data source to its own table, not the nearest one', async () => {
+    // Embedded data sources nest. A flat tag scan pairs <Field> with whichever
+    // <Table> is nearest in document order, which is how a check reports the
+    // wrong table with full confidence.
+    const xml = `<?xml version="1.0"?><AxDataEntityView><Name>MyEntity</Name>
+      <Fields />
+      <ViewMetadata><Name>Metadata</Name><DataSources>
+        <AxQuerySimpleRootDataSource>
+          <Name>CustTable</Name><Table>CustTable</Table>
+          <Fields>
+            <AxQuerySimpleDataSourceField><Name>A</Name><Field>AccountNum</Field></AxQuerySimpleDataSourceField>
+          </Fields>
+          <DataSources>
+            <AxQuerySimpleEmbeddedDataSource>
+              <Name>SalesTable</Name><Table>SalesTable</Table>
+              <Fields>
+                <AxQuerySimpleDataSourceField><Name>B</Name><Field>SalesId</Field></AxQuerySimpleDataSourceField>
+              </Fields>
+            </AxQuerySimpleEmbeddedDataSource>
+          </DataSources>
+        </AxQuerySimpleRootDataSource>
+      </DataSources></ViewMetadata>
+    </AxDataEntityView>`;
+    const r: any = await run(xml);
+    const text = r.content[0].text as string;
+    // SalesId is a column of SalesTable, not of CustTable — pairing it with the
+    // root table would flag it.
+    expect(text).not.toContain('SalesId');
+  });
+});
+
+/**
+ * A class calling its own static is spelled `MyClass::helper()` — X++ accepts
+ * nothing else, because a bare name resolves only against predefined functions,
+ * Global statics and local functions. So the reference is to a type the index
+ * cannot contain yet: the class is being written. Reporting it as unknown-type
+ * blocked writes of correct code under GROUNDING_ENFORCE, and every non-trivial
+ * new class hits it. Found by an eval implementer, not by a test.
+ *
+ * The exemption is derived from the source itself, so it works for
+ * validate_code(mode="references") too, with no extra parameter to thread.
+ */
+describe('resolveXppReferences — a class may call its own statics', () => {
+  const NEW_CLASS = `
+public class ConDemoNotIndexedYet
+{
+    public static boolean isElevated()
+    {
+        return isSystemAdministrator();
+    }
+
+    public static void assertElevated()
+    {
+        if (!ConDemoNotIndexedYet::isElevated())
+        {
+            throw error("@SYS1");
+        }
+    }
+}`;
+
+  it('does not report the class being written as an unknown type', () => {
+    const errors = errorsOf(NEW_CLASS);
+    expect(
+      errors.filter(e => e.identifier?.startsWith('ConDemoNotIndexedYet')),
+      JSON.stringify(errors, null, 2),
+    ).toEqual([]);
+  });
+
+  it('exempts an interface it declares as well', () => {
+    const code = `
+public interface ConDemoStrategy
+{
+    public static str kind()
+    {
+        return ConDemoStrategy::kind();
+    }
+}`;
+    expect(errorsOf(code).filter(e => e.identifier?.startsWith('ConDemoStrategy'))).toEqual([]);
+  });
+
+  it('still reports a DIFFERENT unknown type in the same source', () => {
+    // The guard must be the declared name, not "anything that looks new" — a
+    // typo has to keep failing, or the exemption would swallow the rule.
+    const code = `${NEW_CLASS}
+public class ConDemoOther
+{
+    public static void go()
+    {
+        ConDemoTypoedNameThatDoesNotExist::run();
+    }
+}`;
+    const identifiers = errorsOf(code).map(e => e.identifier);
+    expect(identifiers).toContain('ConDemoTypoedNameThatDoesNotExist::run');
+  });
+
+  it('is actually wired up — the declaration regex matches real X++', () => {
+    // The first version of this exemption shipped with a literal backspace
+    // instead of \b (a shell heredoc ate the escape), so the pattern matched
+    // nothing and the guard silently did not exist. A test that only asserts
+    // "no error" passes in that state too, which is why this one asserts the
+    // extraction directly.
+    const errorsWithout = errorsOf(`
+public class ConDemoStandalone
+{
+    public static void go()
+    {
+        ConDemoStandalone::go();
+    }
+}`);
+    const errorsForUndeclared = errorsOf(`
+public class ConDemoStandalone
+{
+    public static void go()
+    {
+        ConDemoUndeclaredElsewhere::go();
+    }
+}`);
+    expect(errorsWithout.map(e => e.identifier)).not.toContain('ConDemoStandalone::go');
+    expect(errorsForUndeclared.map(e => e.identifier)).toContain('ConDemoUndeclaredElsewhere::go');
+  });
+});
+
+/**
+ * The intrinsic-target rule and the declared-type rule disagreed about the same
+ * fact: a kernel class has no metadata, so the declared-type path warns and says
+ * "if it is a kernel class this is a false positive" — while `methodStr(<same
+ * class>, m)` was a hard error. An eval run hit it on the ONE spelling X++
+ * accepts for a control override, where the class must be FormStringControl.
+ */
+describe('resolveXppReferences — intrinsics targeting kernel types', () => {
+  it('does not error on methodStr() against a kernel control class', () => {
+    const code = `
+public class ConDemoLookupBinder
+{
+    public void bind(FormStringControl _control)
+    {
+        _control.registerOverrideMethod(
+            methodStr(FormStringControl, lookup),
+            methodStr(ConDemoLookupBinder, onLookup),
+            this);
+    }
+}`;
+    const errors = errorsOf(code);
+    expect(
+      errors.filter(e => e.kind === 'unknown-intrinsic-target'),
+      JSON.stringify(errors, null, 2),
+    ).toEqual([]);
+  });
+
+  it('still errors on an intrinsic target that is neither kernel nor declared here', () => {
+    const code = `
+public class ConDemoLookupBinder
+{
+    public void bind()
+    {
+        info(methodStr(ConDemoNoSuchClassAnywhere, onLookup));
+    }
+}`;
+    expect(errorsOf(code).map(e => e.identifier))
+      .toContain('methodStr(ConDemoNoSuchClassAnywhere, onLookup)');
   });
 });

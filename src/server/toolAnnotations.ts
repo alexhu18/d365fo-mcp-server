@@ -28,6 +28,28 @@ export interface ToolAnnotations {
   openWorldHint?: boolean;
 }
 
+/**
+ * A HINT IS ONLY WORTH SENDING WHEN IT DISAGREES WITH THE SPEC DEFAULT.
+ *
+ * The MCP defaults are `readOnlyHint: false`, `destructiveHint: true`,
+ * `idempotentHint: false`, `openWorldHint: true`. A field repeating its own
+ * default tells a compliant client exactly what its absence would have told it,
+ * and this payload is rationed — the ListTools response is re-sent on every
+ * request and sits against a 45,000-char ratchet.
+ *
+ * Measured: omitting `readOnlyHint: false` (6 tools) and `idempotentHint: false`
+ * (4 tools) recovers 218 chars, which is what paid for the `report-design`
+ * operation's enum value.
+ *
+ * ONE DEFAULT IS KEPT ON PURPOSE. `destructiveHint: true` is also the spec
+ * default, and it stays explicit on the two tools that carry it. Absence is only
+ * equivalent to the default for a client that implements defaults; a client that
+ * reads absence as "unknown" would become MORE cautious about a missing
+ * `readOnlyHint` and LESS cautious about a missing `destructiveHint`. The first
+ * direction is safe to take, the second is not, and 46 chars is not a reason to
+ * gamble on a confirmation dialog for a destructive write.
+ */
+
 /** Read/analysis tool — no filesystem or DB writes. */
 function read(title: string): ToolAnnotations {
   return { title, readOnlyHint: true, openWorldHint: false };
@@ -40,9 +62,10 @@ function write(
 ): ToolAnnotations {
   return {
     title,
-    readOnlyHint: false,
+    // readOnlyHint omitted: false is the spec default for every tool here.
+    // destructiveHint always sent, with its REAL value — see the note above.
     destructiveHint: opts.destructive ?? false,
-    idempotentHint: opts.idempotent ?? false,
+    ...(opts.idempotent ? { idempotentHint: true } : {}),
     openWorldHint: false,
   };
 }
@@ -68,20 +91,17 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
   // Diagnostics
   get_workspace_info:               read('Read workspace configuration'),
   verify_d365fo_project:            read('Verify D365FO project'),
-  review_workspace_changes:         read('Review workspace changes'),
   run_bp_check:                     read('Run Best Practices check'),
 
   // File & label writes. Marked destructive/write so clients prompt for
   // confirmation even though some actions (generate, search/info) are read-only —
   // annotations are hints, not gates.
-  d365fo_file:                      write('D365FO file (create/modify/generate)', { destructive: true }),
+  d365fo_file:                      write('D365FO file (create/modify/delete/undo/generate)', { destructive: true }),
   labels:                           write('Label operations', { destructive: true }),
-  undo_last_modification:           write('Undo last modification', { destructive: true }),
   generate_object:                         write('Generate code (pattern/scaffold)'),
 
   // SDLC operations
   update_symbol_index:              write('Update symbol index', { idempotent: true }),
   build_d365fo_project:             write('Build D365FO project', { idempotent: true }),
-  trigger_db_sync:                  write('Trigger database sync', { idempotent: true }),
   run_systest_class:                write('Run SysTest unit tests'),
 };

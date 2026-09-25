@@ -8,10 +8,10 @@ import { existsSync, realpathSync } from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { autoDetectD365Project, detectD365Project, scanAllD365Projects, extractModelNameFromProject, detectGitBranch, isMicrosoftDemoModel, type D365ProjectInfo } from './workspaceDetector.js';
+import { autoDetectD365Project, detectD365Project, scanAllD365Projects, extractModelNameFromProject, detectGitBranch, isMicrosoftDemoModel, distinctCustomModels, type D365ProjectInfo } from './workspaceDetector.js';
 import { registerCustomModel, getCustomModels } from './modelClassifier.js';
 import { XppConfigProvider, type XppEnvironmentConfig } from './xppConfigProvider.js';
-import { FALLBACK_PACKAGES_ROOT, findPackagesRoot } from './packagesRoot.js';
+import { FALLBACK_PACKAGES_ROOT, findPackagesRoot, warmPackagesRoots } from './packagesRoot.js';
 import { debugLog } from './logger.js';
 import {
   recordDetectionSuccess, reportUnresolvedDetection, resetWorkspaceDetectionStatus,
@@ -101,6 +101,9 @@ class ConfigManager {
   // a change in them buys has been spent — see ensureProjectDetection().
   private lastDetectionFingerprint: string | null = null;
   private detectionRetried = false;
+  // Model conflicts already printed, keyed by (configured, detected, project) —
+  // re-detections of the same workspace must not repeat the same warning.
+  private reportedModelConflicts = new Set<string>();
 
   constructor(configPath?: string) {
     // Default to .mcp.json in current directory or parent directories
@@ -169,12 +172,12 @@ class ConfigManager {
     if (this.autoDetectionCache.has(cacheKey)) {
       this.autoDetectedProject = this.autoDetectionCache.get(cacheKey) || null;
       if (this.autoDetectedProject) {
-        console.error(`[ConfigManager] ⚡ Using cached auto-detection for: ${cacheKey}`);
+        debugLog(`[ConfigManager] ⚡ Using cached auto-detection for: ${cacheKey}`);
       }
       return;
     }
 
-    console.error('[ConfigManager] Auto-detecting D365FO project from workspace...');
+    debugLog('[ConfigManager] Auto-detecting D365FO project from workspace...');
 
     // Try to detect from provided workspace path or current directory
     let detectedProject = await autoDetectD365Project(workspacePath);
@@ -189,7 +192,7 @@ class ConfigManager {
         this.config?.servers?.context?.packagePath;
 
       if (packagePathHint) {
-        console.error(`[ConfigManager] No .rnrproj in workspace — scanning packagePath: ${packagePathHint}`);
+        debugLog(`[ConfigManager] No .rnrproj in workspace — scanning packagePath: ${packagePathHint}`);
         const pkgScan = await detectD365Project(packagePathHint, 4);
         if (pkgScan?.projectPath) {
           detectedProject = {
@@ -199,9 +202,9 @@ class ConfigManager {
             packagePath: packagePathHint,
             detectionSource: 'the configured packagePath',
           };
-          console.error(`[ConfigManager] ✅ Found .rnrproj via packagePath scan: ${pkgScan.projectPath}`);
+          debugLog(`[ConfigManager] ✅ Found .rnrproj via packagePath scan: ${pkgScan.projectPath}`);
         } else {
-          console.error(`[ConfigManager] No .rnrproj found in packagePath either`);
+          debugLog(`[ConfigManager] No .rnrproj found in packagePath either`);
         }
       }
     }
@@ -240,17 +243,7 @@ class ConfigManager {
       // that allDetectedProjects is populated for future matchProjectForWorkspace calls.
     } else if (detectedProject) {
       this.autoDetectedProject = detectedProject;
-      console.error('[ConfigManager] ✅ Auto-detection successful:');
-      console.error(
-        detectedProject.ambiguousProjects
-          ? `   ProjectPath: (not auto-selected — ${detectedProject.ambiguousProjects.length} candidates share this model; pass projectPath explicitly)`
-          : `   ProjectPath: ${detectedProject.projectPath}`
-      );
-      console.error(`   ModelName: ${detectedProject.modelName}`);
-      console.error(`   SolutionPath: ${detectedProject.solutionPath}`);
-      if (detectedProject.detectionSource) {
-        console.error(`   Source: ${detectedProject.detectionSource}`);
-      }
+      this.announceDetectedProject(detectedProject, 'workspace auto-detection');
       // Recorded here rather than at each route's own return: this is the point
       // the result survives the staleness guard and becomes the answer.
       recordDetectionSuccess(
@@ -280,7 +273,7 @@ class ConfigManager {
           this.allDetectedProjects = all;
           const byModel = new Map<string, number>();
           for (const p of all) byModel.set(p.modelName, (byModel.get(p.modelName) ?? 0) + 1);
-          console.error(
+          debugLog(
             `[ConfigManager] Found ${all.length} project(s) across ${byModel.size} model(s) under D365FO_SOLUTIONS_PATH`
           );
         }
@@ -301,10 +294,62 @@ class ConfigManager {
             `This usually means the VS project wizard default model was not changed.`,
           );
         }
-        this.autoDetectedProject = primary;
+        // The scan root can hold several custom models — a solution folder with
+        // dozens of .rnrproj is the ordinary shape, not the exception. Which one
+        // `primary` lands on is disk order, so say out loud that the model was a
+        // PICK and name what else was there. Deliberately not a refusal: for the
+        // many workspaces whose only model source IS this scan, withholding the
+        // model would break detection outright, and get_workspace_info already
+        // lists every project with the projectName to switch by.
+        const scannedModels = distinctCustomModels(all.map(p => p.modelName));
+        if (scannedModels.length > 1) {
+          const shown = scannedModels.slice(0, 6).join(', ');
+          console.error(
+            `[ConfigManager] ⚠️ D365FO_SOLUTIONS_PATH holds ${scannedModels.length} custom models ` +
+            `(${shown}${scannedModels.length > 6 ? ', …' : ''}) — "${primary.modelName}" was picked by scan ` +
+            `order, not by intent. Set modelName in .mcp.json, or pass projectName/projectPath, to target another.`
+          );
+        }
+        // Several .rnrproj files can share one model (a multi-project D365FO solution).
+        // Silently pinning projectPath to whichever one happened to scan first meant
+        // writes landed in an arbitrary project the caller never asked for. Mirror the
+        // ambiguousProjects pattern above (line ~242): the model is still known, but
+        // projectPath is left unset so a project-registering call must name one explicitly.
+        const sameModelProjects = all.filter(p => p.modelName === primary.modelName);
+        if (sameModelProjects.length > 1) {
+          // Keep every field the scan actually resolved and drop only what is now a
+          // guess. solutionPath survives when all candidates agree on one folder —
+          // it is a real fact about the model then, and getSolutionPath() consumers
+          // (createLabel, createD365File) lose nothing they were entitled to. When
+          // they disagree it is as much a guess as projectPath, so it goes too.
+          const solutionPaths = new Set(
+            sameModelProjects.map(p => p.solutionPath).filter((p): p is string => !!p)
+          );
+          this.autoDetectedProject = {
+            ...primary,
+            projectPath: undefined,
+            solutionPath: solutionPaths.size === 1 ? [...solutionPaths][0] : undefined,
+            ambiguousProjects: sameModelProjects
+              .map(p => p.projectPath)
+              .filter((p): p is string => !!p),
+          };
+          console.error(
+            `[ConfigManager] ⚠️ ${sameModelProjects.length} projects share model "${primary.modelName}" under D365FO_SOLUTIONS_PATH — ` +
+            `model resolved, but no project auto-selected. Pass projectName/projectPath explicitly to target one.`
+          );
+        } else {
+          this.autoDetectedProject = primary;
+          this.announceDetectedProject(primary, 'the D365FO_SOLUTIONS_PATH scan');
+        }
         registerCustomModel(primary.modelName);
-        recordDetectionSuccess('the D365FO_SOLUTIONS_PATH scan', primary.modelName, primary.projectPath ?? null);
-        console.error(`[ConfigManager] ✅ Using first found project as primary: ${primary.modelName}`);
+        // The project that was deliberately NOT selected is not the one detection
+        // resolved: reporting it here made `doctor` print a projectPath alongside a
+        // get_workspace_info that says "(not selected)". Report what actually won.
+        recordDetectionSuccess(
+          'the D365FO_SOLUTIONS_PATH scan',
+          primary.modelName,
+          this.autoDetectedProject.projectPath ?? null,
+        );
       }
     }
   }
@@ -356,7 +401,7 @@ class ConfigManager {
       this.detectionRetried = true;
       this.autoDetectionAttempted = false;
       this.autoDetectionCache.delete(workspacePath || 'default');
-      console.error('[ConfigManager] Re-running workspace detection — sources have come up since the first pass');
+      debugLog('[ConfigManager] Re-running workspace detection — sources have come up since the first pass');
       await this.autoDetectProject(workspacePath);
     }
 
@@ -371,6 +416,66 @@ class ConfigManager {
         reportUnresolvedDetection();
       }
     }
+  }
+
+  /**
+   * A project was resolved. The routine outcome goes to the debug log; only a
+   * CONFLICT is printed unconditionally.
+   *
+   * VS Code shows every stderr line as [warning], so the four-line
+   * "Auto-detection successful" block read as four warnings on every start —
+   * on every machine, working or not — while the one line that mattered, the
+   * configured model disagreeing with the project the scan picked, was never
+   * printed at all. `get_workspace_info` and `d365fo-mcp doctor` still report
+   * the full resolution with its source; DEBUG_LOGGING=true restores the lines.
+   */
+  private announceDetectedProject(detected: D365ProjectInfo, via: string): void {
+    debugLog(`[ConfigManager] ✅ Project resolved via ${via}:`);
+    debugLog(
+      detected.ambiguousProjects
+        ? `   ProjectPath: (not auto-selected — ${detected.ambiguousProjects.length} candidates share this model; pass projectPath explicitly)`
+        : `   ProjectPath: ${detected.projectPath}`
+    );
+    debugLog(`   ModelName: ${detected.modelName}`);
+    debugLog(`   SolutionPath: ${detected.solutionPath}`);
+    if (detected.detectionSource) debugLog(`   Source: ${detected.detectionSource}`);
+    this.warnOnModelConflict(detected);
+  }
+
+  /**
+   * The one detection outcome worth a warning: the model named in static
+   * configuration (D365FO_MODEL_NAME / .mcp.json) is not the model of the
+   * project the workspace scan resolved.
+   *
+   * The two are consumed by different priority chains — getModelName() takes
+   * the configured name, getProjectPath() falls through to the detected project
+   * when none is configured — so this is exactly the state where writes target
+   * one model and new files are registered into a project of another. Silent
+   * when a projectPath is configured too: the detected project is then unused
+   * and the disagreement has no effect. Printed once per distinct conflict.
+   */
+  private warnOnModelConflict(detected: D365ProjectInfo): void {
+    const fileContext = this.config?.context || this.config?.servers?.context || null;
+    const envModel = process.env.D365FO_MODEL_NAME?.trim();
+    const configured = envModel || fileContext?.modelName?.trim();
+    if (!configured || configured.toLowerCase() === detected.modelName.toLowerCase()) return;
+    if (process.env.D365FO_PROJECT_PATH || fileContext?.projectPath) return;
+
+    const key = [configured, detected.modelName, detected.projectPath ?? ''].join('|').toLowerCase();
+    if (this.reportedModelConflicts.has(key)) return;
+    this.reportedModelConflicts.add(key);
+
+    const configSource = envModel ? 'D365FO_MODEL_NAME' : '.mcp.json modelName';
+    const found = detected.projectPath
+      ? `the workspace project ${path.basename(detected.projectPath)}`
+      : `the workspace scan (${detected.detectionSource ?? 'auto-detection'})`;
+    const effect = detected.projectPath
+      ? `Writes target "${configured}" while new files are registered into ${detected.projectPath}.`
+      : `Writes target "${configured}"; the scanned project is ignored for the model but still supplies paths.`;
+    console.error(
+      `[ConfigManager] ⚠️ Model conflict: ${configSource} names "${configured}", but ${found} declares model "${detected.modelName}". ` +
+      `${effect} Set projectPath to a project of "${configured}", or change modelName, so the two agree.`
+    );
   }
 
   /**
@@ -417,14 +522,12 @@ class ConfigManager {
             this.autoDetectionAttempted = true;
             this.autoDetectionCache.set(cacheKey, matched);
             recordDetectionSuccess('a known project matching the workspace path', matched.modelName, matched.projectPath ?? null);
-            console.error(`[ConfigManager] ⚡ Workspace matched known project: ${matched.modelName} (gen ${this.detectionGeneration})`);
+            this.announceDetectedProject(matched, `a known project matching the workspace path (gen ${this.detectionGeneration})`);
             return;
           }
         }
 
-        console.error(
-          `[ConfigManager] New workspace — eager auto-detect starting: ${cacheKey}`
-        );
+        debugLog(`[ConfigManager] New workspace — eager auto-detect starting: ${cacheKey}`);
         // Increment generation so any previous background scan that finishes later
         // will recognise its result as stale and discard it.
         const gen = ++this.detectionGeneration;
@@ -439,7 +542,7 @@ class ConfigManager {
         this.autoDetectedProject = this.autoDetectionCache.get(cacheKey) || null;
         this.autoDetectionAttempted = true;
         if (this.autoDetectedProject) {
-          console.error(`[ConfigManager] ⚡ Cache hit — recycled detection for: ${cacheKey}`);
+          debugLog(`[ConfigManager] ⚡ Cache hit — recycled detection for: ${cacheKey}`);
         }
       }
     }
@@ -483,7 +586,7 @@ class ConfigManager {
         recordDetectionSuccess('the workspace root path', match.modelName, match.projectPath ?? null);
         // The workspace itself resolved a project — the user moved, not the agent.
         this.toolForcedProject = null;
-        console.error(`[ConfigManager] ⚡ Root matched project: ${match.modelName} (gen ${gen}, ${match.projectPath})`);
+        this.announceDetectedProject(match, `the workspace root path (gen ${gen})`);
         return;
       }
     }
@@ -505,10 +608,10 @@ class ConfigManager {
             registerCustomModel(gitMatch.modelName);
             recordDetectionSuccess(`the git branch name "${branch}"`, gitMatch.modelName, gitMatch.projectPath ?? null);
             this.toolForcedProject = null;   // genuine workspace move — see above
-            console.error(`[ConfigManager] 🌿 Git branch "${branch}" → project: ${gitMatch.modelName} (gen ${gen})`);
+            this.announceDetectedProject(gitMatch, `the git branch name "${branch}" (gen ${gen})`);
             return;
           }
-          console.error(`[ConfigManager] 🌿 Git branch "${branch}" — no project name match (gen ${gen})`);
+          debugLog(`[ConfigManager] 🌿 Git branch "${branch}" — no project name match (gen ${gen})`);
           break; // only try git on the first root that has a branch
         }
       }
@@ -530,12 +633,12 @@ class ConfigManager {
         this.autoDetectedProject = cached ?? null;
         this.autoDetectionAttempted = true;
         if (cached) {
-          console.error(`[ConfigManager] ⚡ BFS skipped — cache hit for workspace: ${cached.modelName} (gen ${gen})`);
+          debugLog(`[ConfigManager] ⚡ BFS skipped — cache hit for workspace: ${cached.modelName} (gen ${gen})`);
           registerCustomModel(cached.modelName);
         }
         return;
       }
-      console.error(`[ConfigManager] Roots ambiguous (gen ${gen}) — BFS fallback on: ${firstPath}`);
+      debugLog(`[ConfigManager] Roots ambiguous (gen ${gen}) — BFS fallback on: ${firstPath}`);
       // Nothing cached for this root: it is a workspace this server has not resolved
       // before, and BFS is about to resolve it from scratch. Same reasoning as the
       // new-workspace branch of setRuntimeContext — an anchor from the previous
@@ -576,7 +679,7 @@ class ConfigManager {
     }
 
     if (bestMatch) {
-      console.error(`[ConfigManager] 🌿 Branch "${branchName}" → longest model match: "${bestMatch.modelName}" (${bestMatchLength} chars)`);
+      debugLog(`[ConfigManager] 🌿 Branch "${branchName}" → longest model match: "${bestMatch.modelName}" (${bestMatchLength} chars)`);
     }
     return bestMatch;
   }
@@ -615,7 +718,7 @@ class ConfigManager {
     });
 
     if (children.length === 1) {
-      console.error(`[ConfigManager] Single project under workspace — using: ${children[0].modelName}`);
+      debugLog(`[ConfigManager] Single project under workspace — using: ${children[0].modelName}`);
       return children[0];
     }
 
@@ -631,7 +734,7 @@ class ConfigManager {
         return projectFolderName === wpBase;
       });
       if (nameMatch) {
-        console.error(`[ConfigManager] ⚡ Solution-name match (${children.length} candidates): ${nameMatch.modelName}`);
+        debugLog(`[ConfigManager] ⚡ Solution-name match (${children.length} candidates): ${nameMatch.modelName}`);
         return nameMatch;
       }
       console.error(`[ConfigManager] Workspace is ancestor of ${children.length} projects — ambiguous, not switching`);
@@ -738,6 +841,13 @@ class ConfigManager {
    */
   async ensureLoaded(): Promise<void> {
     await this.load();
+
+    // Settle the drive scan HERE, where waiting is free, rather than inside the
+    // synchronous getPackagePath() further down the same request. Both end up
+    // at the same cached answer; the difference is that a disconnected mapped
+    // drive costs its SMB timeout on the threadpool instead of on the event
+    // loop. Resolves immediately once warm, which it is after the first call.
+    await warmPackagesRoots();
 
     // Register the explicitly-configured custom models exactly once. The target
     // model resolved from configuration (D365FO_MODEL_NAME env var or a modelName
@@ -862,9 +972,9 @@ class ConfigManager {
     // If packagePath is explicitly set, use it
     if (context?.packagePath) {
       const resolved = normalizePath(context.packagePath);
-      console.error(
-        `[ConfigManager] Using explicit packagePath: ${resolved}`
-      );
+      // Per call, and getPackagePath() runs on most tool paths — as a stderr
+      // line it was a [warning] in VS Code on every request, saying nothing new.
+      debugLog(`[ConfigManager] Using explicit packagePath: ${resolved}`);
       return resolved;
     }
 
@@ -880,7 +990,7 @@ class ConfigManager {
         // Normalize path separators: D365FO paths are always Windows paths (backslashes)
         const extracted = match[1].replace(/\//g, '\\');
         const resolved = normalizePath(extracted);
-        console.error(
+        debugLog(
           `[ConfigManager] Extracted packagePath from workspacePath: ${resolved}`
         );
         return resolved;
@@ -1046,6 +1156,8 @@ class ConfigManager {
     isModelSourceAutoDetected: boolean;
     projectPath: string | null;
     projectSource: string;
+    /** Projects that build the resolved model when none was selected; else empty. */
+    ambiguousProjects: string[];
     packagePath: string | null;
     packageSource: string;
     customPackagesPath: string | null;
@@ -1134,10 +1246,18 @@ class ConfigManager {
       }
     }
 
+    // No project, but not "nothing found": the scan resolved the model and stopped
+    // short of guessing which of its projects to register writes into. Naming that
+    // state (and its alternatives) is what lets the caller act without a second call.
+    const ambiguousProjects = projectPath ? [] : this.getAmbiguousProjectPaths();
+    if (!projectPath && ambiguousProjects.length > 1) {
+      projectSource = `not selected — ${ambiguousProjects.length} projects build this model`;
+    }
+
     const isModelSourceAutoDetected = modelSource.includes('auto-detected');
     return {
       modelName, modelSource, isModelSourceAutoDetected,
-      projectPath, projectSource,
+      projectPath, projectSource, ambiguousProjects,
       packagePath, packageSource,
       customPackagesPath, customPackagesSource,
     };
@@ -1179,6 +1299,21 @@ class ConfigManager {
    */
   getWorkspaceProjectCandidates(): D365ProjectInfo[] {
     return this.workspaceProjectCandidates;
+  }
+
+  /**
+   * The .rnrproj files the SOLUTIONS-PATH scan refused to choose between, because
+   * several of them build the model it resolved. Empty whenever a project WAS
+   * selected, so a non-empty list always means "the model is known and the project
+   * is the caller's to name".
+   *
+   * Separate from getWorkspaceProjectCandidates(): that list is the workspace's own
+   * ambiguity and is empty on this route (the scan only runs because the workspace
+   * held no .rnrproj at all). Without this, the alternatives were recorded and then
+   * never shown — the caller got a bare "no projectPath could be resolved".
+   */
+  getAmbiguousProjectPaths(): string[] {
+    return this.autoDetectedProject?.ambiguousProjects ?? [];
   }
 
   /**

@@ -7,7 +7,8 @@ import { defaultPackagesRoot, findPackagesRoot } from '../../utils/packagesRoot.
 import { withOperationLock } from '../../utils/operationLocks.js';
 import { lookupSymbolsNocase, lookupSymbolNocase, type DbLike } from '../../utils/symbolLookup.js';
 import { compileModelLabels } from '../write/compileLabels.js';
-import { describeBuildFreshness } from '../../utils/buildMarker.js';
+import { buildFreshness, type BuildFreshnessStatus } from '../../utils/buildMarker.js';
+import { validateMoniker, BP_MONIKER_CATALOG } from '../../knowledge/bpMonikers/index.js';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -35,10 +36,21 @@ const INDEX_TYPE_TO_ELEMENT_TYPE: Record<string, string> = {
   form:              'form',
   'form-extension':  'formextension',
   enum:              'enum',
-  'enum-extension':  'enumextension',
   edt:               'edt',
-  'edt-extension':   'edtextension',
+  // No enum-extension / edt-extension rows: xppbp has no element type for them.
+  // Its own rejection lists every type it knows — "Class, Table, Form, View, Enum,
+  // ExtendedDataType, …, TableExtension, FormExtension, MenuExtension" — and an
+  // enum or EDT extension is not among them (Phase F, L3-print-mgmt-doctype-extension,
+  // 2026-08-30: 'enumextension' came back "The element type 'enumextension' is
+  // invalid"). Advertising them as translatable sent callers in a circle; see
+  // XPPBP_UNCHECKABLE_EXTENSIONS for the message they get instead.
   view:              'view',
+  // xppbp calls a data entity by its AOT element name, DataEntityView — the
+  // fall-through spelling `dataentity` is rejected outright. Grounded on a live
+  // run: targetElementType:"DataEntityView" checks the entity, `data-entity`
+  // (the token every other tool in this server takes) did not. Eval case
+  // L2-entity-query-range-roundtrip, 2026-08-23.
+  'data-entity':     'dataentityview',
   query:             'query',
   map:               'map',
   report:            'report',
@@ -48,6 +60,47 @@ const INDEX_TYPE_TO_ELEMENT_TYPE: Record<string, string> = {
 };
 
 const RESOLVABLE_INDEX_TYPES = Object.keys(INDEX_TYPE_TO_ELEMENT_TYPE);
+
+/**
+ * Extension kinds xppbp cannot check at all (no element type exists for them), keyed
+ * by the squashed token they would otherwise reach xppbp as, with the advice that
+ * actually helps: the values/properties an enum or EDT extension contributes are
+ * validated by the BUILD, and the base object is what xppbp can look at.
+ */
+const XPPBP_UNCHECKABLE_EXTENSIONS: Record<string, string> = {
+  enumextension:
+    'xppbp has no element type for enum extensions, so an enum extension cannot be BP-checked on its own — ' +
+    'its values are validated by the build (xppc); run the check on the BASE enum (objectType "enum") if you need its rules.',
+  edtextension:
+    'xppbp has no element type for EDT extensions, so an EDT extension cannot be BP-checked on its own — ' +
+    'its property modifications are validated by the build (xppc); run the check on the BASE EDT (objectType "edt") if you need its rules.',
+};
+
+/**
+ * The verdict line for a run that found nothing, given what has compiled the model.
+ *
+ * "✅ BP Check passed" is the line a caller reads and acts on, and it said that
+ * even when nothing had ever compiled the model — the caveat went on the line
+ * below, where it contradicted a green tick that had already been believed.
+ * Benchmark run 7b8de4ba spent 54 s on a check that answered "✅ BP Check passed
+ * — 3 objects checked, 0 with findings" directly above "⚠️ Not compiled", and
+ * then met two build failures. A verdict that depends on the next line being
+ * read is not a verdict; when the state is known to be uncompiled, the tick does
+ * not belong on it.
+ *
+ * The check itself still runs and still reports — xppbp findings are real
+ * without a build, and refusing would throw away the half that works. What
+ * changes is only the claim made about them.
+ *
+ * Unknown freshness (no dataDir, so no marker to read) stays green: nothing has
+ * been learned that would justify a warning, and inventing one would train the
+ * caller to ignore it.
+ */
+function passVerdict(status?: BuildFreshnessStatus): string {
+  if (status === 'never') return '⚠️ BP clean, NOT compiled';
+  if (status === 'stale') return '⚠️ BP clean, build is STALE';
+  return '✅ BP Check passed';
+}
 
 /**
  * Translate a caller-supplied objectType into the token xppbp accepts.
@@ -78,16 +131,42 @@ export function normalizeElementType(raw: string): string {
  * `✅ clean`, which is the one BP outcome worse than a failure: it is a pass the
  * caller will act on.
  */
-export function describeNonRun(output: string): string {
+export function describeNonRun(output: string, targetName?: string): string {
   const invalidType = output.match(/The element type '([^']*)' is invalid/i);
   if (invalidType) {
+    const uncheckable = XPPBP_UNCHECKABLE_EXTENSIONS[invalidType[1].toLowerCase().replace(/[-_\s]/g, '')];
+    if (uncheckable) return uncheckable;
+    // The old wording said "use the kebab-case objectType the other tools take"
+    // — which is what the caller had just passed when the translation table had
+    // no row for it, so the advice was circular and unactionable. Name the
+    // translatable set instead, and say what to do when the type is not in it.
     return `xppbp rejected the element type "${invalidType[1]}", so no rules were evaluated for this object. ` +
-      `Use the kebab-case objectType the other tools take (e.g. "table-extension") and it will be translated.`;
+      `Translatable objectTypes: ${RESOLVABLE_INDEX_TYPES.join(', ')}. ` +
+      `For anything else, pass xppbp's own element name in targetElementType (e.g. "DataEntityView").`;
   }
   if (/\b0 elements processed\b/i.test(output)) {
     return `xppbp processed 0 elements — the filter matched nothing, so this result is not evidence of a clean object.`;
   }
+  // When xppbp cannot find an element's compiler metadata it still runs the metadata-only
+  // rules and reports nothing for the rest — so a checked object can come back with no
+  // findings from rules that never looked at its X++ at all. Only the requested object is
+  // judged here: a module-wide run routinely carries this warning for unrelated elements
+  // (e.g. extensions of a class the environment does not have installed).
+  if (targetName && uncompiledElements(output).some(n => n.toLowerCase() === targetName.toLowerCase())) {
+    return `xppbp found no compiled metadata for "${targetName}" (CompilerMetadataMissing), so every rule that reads compiled X++ was skipped — ` +
+      `only the metadata-only rules ran. Build the model and check again. If it was just built successfully, then the -compilerMetadata root ` +
+      `xppbp was given is not the root the build wrote its XppMetadata to.`;
+  }
   return '';
+}
+
+/** Elements xppbp reported as not compiled (its CompilerMetadataMissing warning). */
+export function uncompiledElements(output: string): string[] {
+  const names = new Set<string>();
+  for (const m of output.matchAll(/The element '([A-Za-z0-9_]+)'[^\n]*appears not to have been compiled/gi)) {
+    names.add(m[1]);
+  }
+  return [...names];
 }
 
 // Tool registration (name, description, inputSchema) lives in
@@ -118,6 +197,171 @@ export function extractReportedElements(output: string): string[] {
     names.add(m[1]);
   }
   return [...names];
+}
+
+export interface ParsedBpFinding {
+  /**
+   * The rule name, or null when the line only carried a severity prefix
+   * ('BPError: …') and never named the rule — see BARE_PREFIXES below.
+   */
+  moniker: string | null;
+  /** Whatever xppbp printed after the moniker — usually a file path, sometimes free text. */
+  target: string;
+  /** From the extracted catalog (src/knowledge/bpMonikers/), when the moniker is known there. */
+  description: string | null;
+  /** False for a moniker xppbp printed that the catalog does not recognise at all — worth a second look, not necessarily wrong. */
+  knownMoniker: boolean;
+  /** 'Warning' | 'Error', from a detail line. Absent on the terse tally shape. */
+  severity?: string;
+  /** AOT element type the finding is on, e.g. 'AxClass'. Detail lines only. */
+  elementType?: string;
+  /**
+   * The `dynamics://…` URI the finding is against — THE value a suppression is
+   * keyed on. Detail lines only.
+   */
+  path?: string;
+  /** Source positions xppbp printed, e.g. '[(6,5),(8,6)]'. Detail lines only. */
+  position?: string;
+  /** The rule's own sentence about this occurrence. Detail lines only. */
+  message?: string;
+}
+
+// xppbp's plain-text mode prints one finding per line as `<Moniker>: <target>`.
+//
+// Two shapes appear in the real samples captured in tests/tools/runBpCheck.test.ts,
+// and they are NOT the same:
+//   BPErrorTableMissingFormRef: K:\Pkg\…\ConDemoTicket.xml   ← names the rule
+//   BPError: LocalVariableNotUsed                            ← names only the severity
+// The second is a bare severity prefix; treating its 'BPError' as a moniker
+// produced a "not in the catalog — verify the spelling" flag on output the
+// compiler itself had just emitted, which is the most expensive kind of false
+// alarm: it invites a round trip to re-verify something already authoritative.
+//
+const FINDING_LINE = /^\s*(BP[A-Za-z0-9]+)\s*:\s*(.+?)\s*$/;
+
+/**
+ * The DETAIL shape, which carries everything the terse line above drops.
+ *
+ * This used to be deliberately unmatched: `hasIssues` named the shape, but no
+ * captured sample existed in the repo, and a guessed regex that misreads
+ * non-finding lines is worse than a gap. A live run finally produced one
+ * (eval case L2-bp-suppression-lifecycle, 2026-08-23), verbatim:
+ *
+ *   BestPractices Warning: AxClass dynamics://Class/ConDemoSuppressProbe/Method/run: [(6,5),(8,6)]: BPXmlDocNoDocumentationComments: No XML documentation headers are provided for 'ConDemoSuppressProbe.run'.
+ *
+ * FINDING_LINE cannot match it — it anchors `BP…:` at the start of the line, and
+ * this one starts `BestPractices`. So the structured Findings section reported
+ * the moniker and a COUNT (off the tally line `BPXmlDocNoDocumentationComments: 1`)
+ * and dropped the path, severity, element type and message. The path is the one
+ * value `add-diagnostic-suppression` is keyed on, so suppressing a finding meant
+ * reading it out of the raw log by eye — the exact hand-reconstruction the
+ * op-spec's diagnosticElementType/diagnosticElementName exist to route around.
+ *
+ * The locus is split off separately rather than in one regex: the path is a
+ * `dynamics://` URI, so it carries colons of its own and cannot be delimited by
+ * one. `(.*?)` before `: <moniker>: ` backtracks to the LAST such boundary,
+ * which is why the URI survives intact.
+ */
+const BP_DETAIL_LINE =
+  /^\s*BestPractices\s+(Warning|Error)\s*:\s*(.*?):\s*(BP[A-Za-z0-9]+)\s*:\s*(.*?)\s*$/;
+
+/** Split `AxClass dynamics://…/run: [(6,5),(8,6)]` into its three parts. */
+function splitLocus(locus: string): { elementType?: string; path?: string; position?: string } {
+  const posAt = locus.lastIndexOf(': [');
+  const head = (posAt >= 0 ? locus.slice(0, posAt) : locus).trim();
+  const position = posAt >= 0 ? locus.slice(posAt + 1).trim() : undefined;
+  const sp = head.indexOf(' ');
+  if (sp < 0) return { path: head || undefined, position };
+  return { elementType: head.slice(0, sp), path: head.slice(sp + 1).trim(), position };
+}
+
+// Severity/family prefixes that are not themselves monikers. Verified against
+// the extracted catalog: none of these appears as a moniker in its own right.
+const BARE_PREFIXES = new Set(['bperror', 'bpwarning', 'bpinfo', 'bpcheck']);
+
+/**
+ * Pull `{moniker, target}` out of every plain-text finding line in a BP check's
+ * raw output, and cross-reference each moniker against the extracted catalog
+ * (src/knowledge/bpMonikers/) so its real description travels with the finding
+ * instead of being left as a name to look up by hand — the direct fix for a
+ * moniker only ever being identifiable by eye from the raw log.
+ *
+ * Pure and independent of any live BP-check run — takes the same `output` text
+ * this tool already produces, so it is unit-testable with no xppbp.exe needed.
+ */
+export function parseBpFindings(output: string): ParsedBpFinding[] {
+  const findings: ParsedBpFinding[] = [];
+  /** Monikers a DETAIL line already reported, so the tally line can be dropped. */
+  const detailed = new Set<string>();
+
+  for (const rawLine of output.split('\n')) {
+    // Detail shape first: it is strictly richer, and its line never matches
+    // FINDING_LINE anyway (that one anchors `BP…` at the start).
+    const detail = rawLine.match(BP_DETAIL_LINE);
+    if (detail) {
+      const [, severity, locus, moniker, message] = detail;
+      const { elementType, path, position } = splitLocus(locus);
+      const validation = validateMoniker(moniker);
+      detailed.add(moniker.toLowerCase());
+      findings.push({
+        moniker,
+        // `target` stays the one-line locus so existing readers keep working.
+        target: path ?? locus,
+        description: validation.entry?.description ?? null,
+        knownMoniker: validation.found,
+        severity, elementType, path, position, message,
+      });
+      continue;
+    }
+
+    const match = rawLine.match(FINDING_LINE);
+    if (!match) continue;
+    const [, name, target] = match;
+    // xppbp prints a per-moniker tally (`BPXmlDocNoDocumentationComments: 1`)
+    // alongside the detail lines. Once the detail is in hand the tally adds a
+    // count and loses everything else, so keeping both would report the same
+    // finding twice — once fully, once as a bare number.
+    if (detailed.has(name.toLowerCase()) && /^\d+$/.test(target.trim())) continue;
+    if (BARE_PREFIXES.has(name.toLowerCase())) {
+      // Severity prefix only — the rule is not named on this line, so there is
+      // nothing to cross-reference and nothing to flag as unrecognised.
+      findings.push({ moniker: null, target, description: null, knownMoniker: false });
+      continue;
+    }
+    const validation = validateMoniker(name);
+    findings.push({
+      moniker: name,
+      target,
+      description: validation.entry?.description ?? null,
+      knownMoniker: validation.found,
+    });
+  }
+  return findings;
+}
+
+/**
+ * Findings section appended to a BP check's text output — the moniker and its
+ * real description (when the catalog has one) laid out so the model never has
+ * to re-derive the moniker by eyeballing the raw log below it.
+ */
+export function renderFindingsSection(output: string): string {
+  const findings = parseBpFindings(output);
+  if (findings.length === 0) return '';
+  const lines = findings.map(f => {
+    if (f.moniker === null) return `  • ${f.target} (rule not named on this line)`;
+    const flag = f.knownMoniker ? '' : ' ⚠️ not in the extracted moniker catalog — verify the spelling';
+    const desc = f.description ? ` — ${f.description}` : '';
+    const head = `  • ${f.moniker}${desc} (${f.target})${flag}`;
+    if (!f.path) return head;
+    // The path is printed on its own line and labelled, because it is the value
+    // add-diagnostic-suppression takes VERBATIM as diagnosticPath. Leaving it
+    // inline among the prose is what sent agents back to the raw log to copy it
+    // out by eye.
+    const where = [f.severity, f.elementType, f.position].filter(Boolean).join(' ');
+    return `${head}\n      path: ${f.path}${where ? `\n      ${where}` : ''}` +
+      (f.message ? `\n      ${f.message}` : '');
+  });
+  return `\n\nFindings (moniker-checked against ${BP_MONIKER_CATALOG.length} known monikers):\n${lines.join('\n')}`;
 }
 
 /**
@@ -356,10 +600,27 @@ export const runBpCheckTool = async (params: any, context: any) => {
       }
     }
 
-    // metadataPath: X++ source XML (custom model metadata). compilerMetadataPath: compiled
-    // binaries + framework metadata (UDE: Microsoft packages root; CHE: same as metadataPath).
+    // metadataPath:         X++ source XML — the model store (UDE) or PLD (CHE).
+    // frameworkPath:        Microsoft packages root — labelc.exe lives there, and it holds the
+    //                       compiled binaries of the referenced Microsoft modules (-packagesRoot).
+    // compilerMetadataPath: the root xppc wrote its compiler metadata back to, i.e. where
+    //                       `<root>\<Module>\XppMetadata` actually is. That is the MODEL STORE,
+    //                       not the framework directory — build_d365fo_project passes
+    //                       `-compilermetadata=<model store>` (see XppcBuildContext.compilerMetadataPath).
+    //
+    // These are two different flags on xppbp, not two spellings of one:
+    //   -compilerMetadata = "the path to the compiler metadata"
+    //   -packagesRoot     = "the packages root containing binaries for modules"
+    // Pointing -compilerMetadata at the framework directory on UDE makes xppbp report EVERY
+    // element of the module as "appears not to have been compiled" (CompilerMetadataMissing)
+    // and skip the rules that need compiled X++. Verified against xppbp 7.0.7996.33: with a
+    // compiler-metadata root that held the module's XppMetadata the run was `Errors: 0` with the
+    // rules evaluated; with a root that lacked it, the checked class itself was reported
+    // uncompiled, every other element of the module followed, and xppbp exited non-zero.
+    // On CHE the two roots are the same path, so the split is a no-op there.
     const metadataPath = customPackagesPath || packagesRoot;
-    const compilerMetadataPath = microsoftPackagesPath || packagesRoot;
+    const frameworkPath = microsoftPackagesPath || packagesRoot;
+    const compilerMetadataPath = customPackagesPath || packagesRoot;
 
     // xppbp resolves @Model:Id against the compiled label assembly, so labels
     // that exist only as text in AxLabelFile are reported as BPErrorUnknownLabel
@@ -367,7 +628,7 @@ export const runBpCheckTool = async (params: any, context: any) => {
     // without a build in between — recompile stale labels here too, otherwise
     // creating a label and checking it immediately still produces the bogus
     // errors this costs about a second to prevent. Batch runs pay it once.
-    const labelResult = await compileModelLabels(compilerMetadataPath, metadataPath, modelName);
+    const labelResult = await compileModelLabels(frameworkPath, metadataPath, modelName);
     if (!labelResult.success) {
       console.error(`[run_bp_check] label compilation failed: ${labelResult.message}`);
     }
@@ -403,6 +664,10 @@ export const runBpCheckTool = async (params: any, context: any) => {
       `-module:${modelName}`,
       `-model:${modelName}`,
       `${compilerMetadataFlag}${compilerMetadataPath}`,
+      // Referenced Microsoft modules resolve from their binaries here, so that
+      // -compilerMetadata can stay on the model store where the module's own
+      // XppMetadata lives. Same path as -compilerMetadata on CHE.
+      `-packagesRoot:${frameworkPath}`,
       selector(target),
     ];
 
@@ -414,8 +679,14 @@ export const runBpCheckTool = async (params: any, context: any) => {
       `-metadata=${metadataPath}`,
       `-module=${modelName}`,
       `-model=${modelName}`,
-      // -compilerMetadata= is the newer flag; fall back to -packagesRoot= for older xppbp
-      compilerMetadata ? `-compilerMetadata=${compilerMetadataPath}` : `-packagesRoot=${compilerMetadataPath}`,
+      // -compilerMetadata= is the newer flag. When it is supported the two roots are passed
+      // separately — compiler metadata from the model store, referenced binaries from the
+      // framework directory. Older xppbp has only -packagesRoot, which then has to serve both;
+      // the framework directory is the historical choice and stays, since no version old enough
+      // to need it has been observed on a UDE split-root box.
+      ...(compilerMetadata
+        ? [`-compilerMetadata=${compilerMetadataPath}`, `-packagesRoot=${frameworkPath}`]
+        : [`-packagesRoot=${frameworkPath}`]),
       // `-all` is mutually exclusive with the positional filter: passing both
       // checks the whole model (#25).
       selector(target),
@@ -424,7 +695,7 @@ export const runBpCheckTool = async (params: any, context: any) => {
     // Style C — fallback when -compilerMetadata is not recognized
     const buildArgsFallbackStyle = (target: { name: string; elementType: string } | null): string[] => [
       `-metadata:${metadataPath}`,
-      `-packagesRoot:${compilerMetadataPath}`,
+      `-packagesRoot:${frameworkPath}`,
       `-module:${modelName}`,
       `-model:${modelName}`,
       selector(target),
@@ -502,16 +773,18 @@ export const runBpCheckTool = async (params: any, context: any) => {
     // "0 with findings". Say what has actually compiled the model — for a batch and
     // for a single object alike; a one-object check is no more of a compile than a
     // three-object one, and it used to carry no caveat at all.
-    const buildNote = context?.symbolIndex?.dataDir
-      ? `\n\n${describeBuildFreshness(context.symbolIndex.dataDir, modelName, targetFiles)}`
-      : '';
+    const freshness = context?.symbolIndex?.dataDir
+      ? buildFreshness(context.symbolIndex.dataDir, modelName, targetFiles)
+      : undefined;
+    const buildNote = freshness ? `\n\n${freshness.message}` : '';
+    const cleanVerdict = passVerdict(freshness?.status);
 
     // Single target (and the whole-model run) keep the original layout — there
     // is no preamble to share and existing callers read this shape.
     if (runTargets.length === 1) {
       const combined = combinedByTarget[0];
       const target = runTargets[0];
-      const notRun = describeNonRun(combined);
+      const notRun = describeNonRun(combined, target?.name);
       if (notRun) {
         return {
           content: [{
@@ -529,20 +802,22 @@ export const runBpCheckTool = async (params: any, context: any) => {
       return {
         content: [{
           type: 'text',
-          text: `${hasIssues(combined) ? '⚠️ BP Check completed with issues' : '✅ BP Check passed'}` +
+          text: `${hasIssues(combined) ? '⚠️ BP Check completed with issues' : cleanVerdict}` +
             buildNote +
             `\n\n${header}` +
             (target ? `\nFilter: ${selector(target)}` : '') +
             scopeNote +
             labelNote +
-            `\n\n${combined || '(no output)'}`
+            `\n\n${combined || '(no output)'}` +
+            renderFindingsSection(combined)
         }]
       };
     }
 
     // Batch: one preamble, findings grouped per object (#828).
     const { preamble, bodies } = splitSharedPreamble(combinedByTarget);
-    const nonRunByTarget = combinedByTarget.map(describeNonRun);
+    // Not `.map(describeNonRun)` — that would pass the array index as the target name.
+    const nonRunByTarget = combinedByTarget.map((output, i) => describeNonRun(output, runTargets[i]?.name));
     const notRunCount = nonRunByTarget.filter(Boolean).length;
     const issueCount = combinedByTarget.filter((o, i) => !nonRunByTarget[i] && hasIssues(o)).length;
 
@@ -558,14 +833,15 @@ export const runBpCheckTool = async (params: any, context: any) => {
       return (
         `── ${selector(target)} ── ${hasIssues(combined) ? '⚠️ issues' : '✅ clean'}` +
         (target ? describeScope(target.name, combined) : '') +
-        `\n${body || '(no findings)'}`
+        `\n${body || '(no findings)'}` +
+        renderFindingsSection(combined)
       );
     });
 
     const verdict =
       notRunCount > 0 ? `❌ BP Check incomplete — ${notRunCount} object(s) were NOT checked`
       : issueCount > 0 ? '⚠️ BP Check completed with issues'
-      : '✅ BP Check passed';
+      : cleanVerdict;
 
     return {
       content: [{

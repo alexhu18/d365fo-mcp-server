@@ -19,9 +19,12 @@ vi.mock('fs/promises', () => ({
   readFile: mockReadFile,
 }));
 
-import { describeFieldGroupRendering } from '../../src/tools/write/modifyD365File';
+import {
+  describeFieldGroupRendering,
+  describeUnrenderedFieldGroup,
+} from '../../src/tools/write/modifyD365File';
 
-const FORM_PATH = 'K:\\Packages\\AslFinanceCore\\AslFinanceCore\\AxForm\\TaxLog.xml';
+const FORM_PATH = 'K:\\Packages\\ContosoFinanceCore\\ContosoFinanceCore\\AxForm\\TaxLog.xml';
 
 /** SimpleList shape: Grid > Group[DataGroup=Modified], plus one unbound group. */
 const FORM_XML = `<?xml version="1.0" encoding="utf-8"?>
@@ -75,12 +78,12 @@ describe('add-field-to-field-group names the form the group already renders on',
 
   it('names the form, the control and the control the compiler will generate', async () => {
     const note = await describeFieldGroupRendering(
-      'TaxLog', 'Modified', 'AslFinSK_QualityTier', indexWith(ON_TAX_LOG),
+      'TaxLog', 'Modified', 'ConSK_QualityTier', indexWith(ON_TAX_LOG),
     );
 
     expect(note).toContain('TaxLog');
     expect(note).toContain('Modified');
-    expect(note).toContain('Modified_AslFinSK_QualityTier');
+    expect(note).toContain('Modified_ConSK_QualityTier');
     expect(note).toContain('already on the form');
     // The whole point: do not build the thing that then has to be undone.
     expect(note).toMatch(/form extension/i);
@@ -88,13 +91,13 @@ describe('add-field-to-field-group names the form the group already renders on',
 
   it('says nothing for a field group no control renders', async () => {
     expect(await describeFieldGroupRendering(
-      'TaxLog', 'Identification', 'AslFinSK_QualityTier', indexWith(ON_TAX_LOG),
+      'TaxLog', 'Identification', 'ConSK_QualityTier', indexWith(ON_TAX_LOG),
     )).toBe('');
   });
 
   it('says nothing when no form uses the table', async () => {
     expect(await describeFieldGroupRendering(
-      'TaxLog', 'Modified', 'AslFinSK_QualityTier', indexWith([]),
+      'TaxLog', 'Modified', 'ConSK_QualityTier', indexWith([]),
     )).toBe('');
   });
 
@@ -102,7 +105,7 @@ describe('add-field-to-field-group names the form the group already renders on',
     // Same group name on another table's datasource renders another table's
     // fields — claiming it would send the agent after the wrong form.
     const note = await describeFieldGroupRendering(
-      'TaxLog', 'Modified', 'AslFinSK_QualityTier',
+      'TaxLog', 'Modified', 'ConSK_QualityTier',
       indexWith([{ form_name: 'TaxLog', datasource_name: 'SomeOtherTable' }]),
     );
     expect(note).toBe('');
@@ -111,7 +114,7 @@ describe('add-field-to-field-group names the form the group already renders on',
   it('says nothing when the form XML cannot be read', async () => {
     mockReadFile.mockRejectedValue(new Error('ENOENT'));
     expect(await describeFieldGroupRendering(
-      'TaxLog', 'Modified', 'AslFinSK_QualityTier', indexWith(ON_TAX_LOG),
+      'TaxLog', 'Modified', 'ConSK_QualityTier', indexWith(ON_TAX_LOG),
     )).toBe('');
   });
 
@@ -119,5 +122,59 @@ describe('add-field-to-field-group names the form the group already renders on',
     const broken = { getReadDb: () => { throw new Error('no index'); } };
     expect(await describeFieldGroupRendering('TaxLog', 'Modified', 'F', broken)).toBe('');
     expect(await describeFieldGroupRendering('TaxLog', 'Modified', 'F', undefined)).toBe('');
+  });
+});
+
+/**
+ * The other half. A field group no container renders generates no controls, so a
+ * field parked in a new group on a table extension is on no form — and the agent
+ * that does not know it builds the form extension, hits the add-control guard and
+ * undoes the lot (run 81803f01, ~24 AIU).
+ */
+describe('a field group nothing renders names the groups that are rendered', () => {
+  beforeEach(() => {
+    mockReadFile.mockReset();
+    mockReadFile.mockResolvedValue(FORM_XML);
+  });
+
+  it('says the group reaches no form, and names the one that does', async () => {
+    const note = await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', indexWith(ON_TAX_LOG));
+
+    expect(note).toContain('QualityAssessment');
+    expect(note).toMatch(/no form/i);
+    expect(note).toContain('`Modified`');
+    expect(note).toContain('TaxLog');
+    // The cheap path, named as such.
+    expect(note).toMatch(/extendBaseFieldGroup=true/);
+  });
+
+  it('stays quiet when the group IS rendered — that is the other note\'s sentence', async () => {
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'Modified', indexWith(ON_TAX_LOG))).toBe('');
+    // Case-insensitively, as the form XML spells it however it likes.
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'modified', indexWith(ON_TAX_LOG))).toBe('');
+  });
+
+  it('says nothing when no form uses the table, or none carries a DataGroup', async () => {
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', indexWith([]))).toBe('');
+
+    mockReadFile.mockResolvedValue('<AxForm><Name>TaxLog</Name><Design><Controls /></Design></AxForm>');
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', indexWith(ON_TAX_LOG))).toBe('');
+  });
+
+  it('ignores a container bound to a different datasource', async () => {
+    const note = await describeUnrenderedFieldGroup(
+      'TaxLog', 'QualityAssessment',
+      indexWith([{ form_name: 'TaxLog', datasource_name: 'SomeOtherTable' }]),
+    );
+    expect(note).toBe('');
+  });
+
+  it('survives an unreadable form and an index that cannot answer', async () => {
+    mockReadFile.mockRejectedValue(new Error('ENOENT'));
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', indexWith(ON_TAX_LOG))).toBe('');
+
+    const broken = { getReadDb: () => { throw new Error('no index'); } };
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', broken)).toBe('');
+    expect(await describeUnrenderedFieldGroup('TaxLog', 'QualityAssessment', undefined)).toBe('');
   });
 });

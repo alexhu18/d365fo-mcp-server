@@ -1,6 +1,10 @@
 /**
  * MCP tool definition for `d365fo_file` (name/description/inputSchema).
  *
+ * `undo` was folded in from the retired `undo_last_modification` tool: the
+ * subject (a file this tool wrote) and the `filePath` parameter were already
+ * here, and the tool is already annotated destructive.
+ *
  * Deliberately carries the DISCRIMINATORS only (action / objectType /
  * operation as closed enums) — never the parameters behind them. The per-
  * operation and per-objectType contracts live in src/tools/d365foFileOpSpecs.ts
@@ -15,19 +19,20 @@
 
 export const d365foFileTool = {
     name: 'd365fo_file',
-    description: `Create, modify, or generate a D365FO AOT object. Choose an \`action\`:
+    description: `Create, modify, delete, undo, or generate a D365FO AOT object. Choose an \`action\`:
 • create → write a NEW object file into PackagesLocalDirectory (UTF-8 BOM, auto-added to .rnrproj). THE WRITE STEP — incomplete until isError=false; ⚠️/❌ = failure. Extensions: objectName="Base.PrefixExtension".
-• modify → edit an EXISTING object. APPLIES IMMEDIATELY, no dry-run — confirm with the user first; revert with undo_last_modification. Needs \`operation\`.
-• generate → XML as TEXT only, no write (Azure/Linux fallback). Try create first. create/modify need Windows.
+• modify → edit an EXISTING object. APPLIES IMMEDIATELY, no dry-run — confirm with the user first; revert with action="undo". Needs \`operation\`.
+• delete → remove an object's XML from disk AND un-register it from every .rnrproj of the model that lists it. IRREVERSIBLE — confirm with the user first.
+• undo → roll back \`filePath\`: git-tracked → git checkout HEAD, which discards ALL uncommitted changes to that file, not just the last edit; untracked → deleted.
+• generate → XML as TEXT only, no write (Azure/Linux fallback). Try create first. create/modify/delete/undo need Windows.
 📖 Parameters are NOT inlined here: get_knowledge(kind="op-spec", topic="<operation>"|"<objectType>") returns the contract for the one you picked — pass its values nested in \`params\` (modify) / \`properties\` (create), along with any packageName/packagePath/solutionPath/workspacePath override.
-Model + prefix auto-applied. Classes: member vars inside the class { }, methods after the closing }.`,
+Model + prefix auto-applied.`,
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['create', 'modify', 'generate'],
-          description: 'One of the three modes described above.',
+          enum: ['create', 'modify', 'delete', 'undo', 'generate'],
         },
         objectType: {
           type: 'string',
@@ -39,13 +44,14 @@ Model + prefix auto-applied. Classes: member vars inside the class { }, methods 
             'menu-item-display', 'menu-item-action', 'menu-item-output', 'menu',
             'security-privilege', 'security-duty', 'security-role',
             'security-duty-extension', 'security-role-extension',
+            'ignore-diagnostic-list', 'model-descriptor',
             'business-event', 'tile', 'kpi', 'map',
             'service', 'service-group',
             'macro', 'configuration-key', 'security-policy', 'aggregate-measurement', 'license-code',
           ],
           description:
             'Each security/menu-item type is its own AOT folder — NEVER use security-privilege for duty or role. ' +
-            '[modify]/[generate] cover the core families + their *-extension variants.'
+            '[modify]/[generate] cover the core families + their *-extension variants; [delete] takes the same enum as [create].'
         },
         objectName: {
           type: 'string',
@@ -64,10 +70,13 @@ Model + prefix auto-applied. Classes: member vars inside the class { }, methods 
           additionalProperties: true,
           description:
             '[create] Per-objectType creation properties (label, fields[], extends, enumValues[], primaryTable, …) — ' +
-            'NOT in this schema. Fetch yours: get_knowledge(kind="op-spec", topic="<objectType>").'
+            'not in this schema; fetch yours with the op-spec lookup above.'
         },
         addToProject: { type: 'boolean', description: 'Add to the ACTIVE .rnrproj — keep the default.', default: true },
-        projectPath: { type: 'string', description: 'Path to .rnrproj (auto-detected).' },
+        projectPath: {
+          type: 'string',
+          description: 'Path to .rnrproj. Set if known, else auto-detected.',
+        },
         xmlContent: { type: 'string', description: 'Complete XML written verbatim (+overwrite=true rewrites an object).' },
         overwrite: { type: 'boolean', description: 'Allow overwriting — never rewrite via PowerShell.', default: false },
         groundingToken: {
@@ -88,34 +97,39 @@ Model + prefix auto-applied. Classes: member vars inside the class { }, methods 
             'add-delete-action', 'remove-delete-action',
             'add-field-group', 'remove-field-group', 'add-field-to-field-group',
             'add-field-modification',
-            'add-data-source', 'add-control',
+            'add-data-source', 'add-control', 'remove-control',
+            'add-entry-point', 'remove-entry-point',
+            'remove-diagnostic-suppression', 'add-diagnostic-suppression',
+            'add-module-reference', 'remove-module-reference',
             'add-enum-value', 'modify-enum-value', 'remove-enum-value',
             'add-menu-item-to-menu',
             'modify-property',
+            'add-query-range', 'remove-query-range',
+            'report-design',
           ],
           description:
-            '[modify] REQUIRED unless using operations[]. add-method also UPDATES in place; replace-code is the surgical oldCode→newCode path. ' +
-            'Parameters: get_knowledge(kind="op-spec", topic="<operation>").'
+            '[modify] REQUIRED unless using operations[]. add-method also UPDATES in place; ' +
+            'replace-code is the surgical oldCode→newCode path.'
         },
         operations: {
           type: 'array',
           maxItems: 20,
           description:
-            '[modify] PREFERRED for 2+ edits to the SAME object — ONE call, not one per edit. ' +
+            '[modify|create] PREFERRED for 2+ edits to the SAME object — ONE call, not one per edit. ' +
+            'On create they run against the just-created object, under the name it actually got. ' +
             'Entries are {operation, …op-spec params}; objectType/objectName/modelName stay top-level. ' +
-            'Applied in order, stopped at the first failure, per-operation results back. ' +
-            '3 fields + their field groups + an index: 7 calls flat, 1 here.',
+            'Applied in order, stopped at the first failure, per-operation results back.',
           items: { type: 'object', additionalProperties: true },
         },
         params: {
           type: 'object',
           additionalProperties: true,
           description:
-            '[modify] Operation-specific parameters as ONE nested object, per get_knowledge(kind="op-spec", ' +
-            'topic="<operation>"). A missing/wrong one returns that COMPLETE spec — follow it, do not guess.',
+            '[modify] Operation-specific parameters as ONE nested object, per the op-spec lookup above. ' +
+            'A missing/wrong one returns that COMPLETE spec — follow it, do not guess.',
         },
         createBackup: { type: 'boolean', description: '[modify] Back up before modifying.', default: false },
-        filePath: { type: 'string', description: '[modify] Absolute XML path — bypasses symbol-DB lookup. Use for objects just created.' },
+        filePath: { type: 'string', description: '[modify|delete] Absolute XML path — bypasses symbol-DB lookup. Use for objects just created. [undo] REQUIRED: the file to roll back.' },
       },
       required: ['action'],
     },

@@ -16,8 +16,10 @@ import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { prepareChangeTool } from './prepareChange.js';
 import { prepareCreateTool } from './prepareCreate.js';
+import { prepareTestTool } from './prepareTest.js';
+import { getConfigManager } from '../../utils/configManager.js';
 
-export const PREPARE_MODES = ['change', 'create'] as const;
+export const PREPARE_MODES = ['change', 'create', 'test'] as const;
 export type PrepareMode = (typeof PREPARE_MODES)[number];
 
 const PrepareArgsSchema = z
@@ -27,7 +29,8 @@ const PrepareArgsSchema = z
       .default('change')
       .describe(
         'change (default) → aggregate context for extending/modifying an existing object; ' +
-          'create → aggregate context for a brand-new object.',
+          'create → aggregate context for a brand-new object; ' +
+          'test → aggregate context for writing a SysTest for an existing class.',
       ),
   })
   .passthrough();
@@ -60,10 +63,23 @@ interface PriorPrepare {
 
 const recentPrepares = new Map<string, PriorPrepare>();
 
-/** Same question = same (mode, type, operation, object, method). `goal` is deliberately excluded. */
+/**
+ * Same question = same (mode, type, operation, object, method, proposedName).
+ *
+ * `goal` is deliberately excluded — rewording the intent is not a new question.
+ * `proposedName` is deliberately INCLUDED, and it was not until the suppression
+ * started actually arming (the token moved out of the truncated tail and the cap
+ * rose): prepare runs naming validation only when `proposedName` is given, so a
+ * second call proposing a DIFFERENT name would have hit the cached answer,
+ * skipped the validation entirely, and handed back a grounding token for a name
+ * the check would have refused.
+ */
 function prepareKey(mode: string, args: Record<string, unknown>): string {
   const s = (v: unknown): string => (typeof v === 'string' ? v.toLowerCase() : '');
-  return [mode, s(args['objectType']), s(args['operation']), s(args['objectName']), s(args['methodName'])].join('|');
+  return [
+    mode, s(args['objectType']), s(args['operation']),
+    s(args['objectName']), s(args['methodName']), s(args['proposedName']),
+  ].join('|');
 }
 
 function extractToken(result: unknown): string | undefined {
@@ -93,6 +109,55 @@ export function resetRecentPrepares(): void {
   recentPrepares.clear();
 }
 
+/**
+ * Where the writes will land, stated once per process.
+ *
+ * get_workspace_info was the FIRST call in 10 of 10 sampled sessions, and every
+ * one of those replies was the same ~1.4 KB. What the opening call is actually
+ * for is the target model and where it writes — four lines. prepare is the tool
+ * that starts real work, so it carries them, once: repeating them on all 17
+ * prepares in those sessions would cost more than the call it removes.
+ *
+ * Deliberately NOT a substitute for get_workspace_info: that tool still answers
+ * project tables, roots, the stdio handshake and diagnostics=true. This is the
+ * subset an agent needs before its first write.
+ */
+let workspaceHeaderSent = false;
+
+/** Exported for tests — the flag is process-lifetime state. */
+export function resetWorkspaceHeader(): void {
+  workspaceHeaderSent = false;
+}
+
+function workspaceHeader(): string {
+  if (workspaceHeaderSent) return '';
+  workspaceHeaderSent = true;
+  try {
+    const { modelName, source, projectPath, workspacePath } = getConfigManager().getDetectionSummary();
+    const lines = [
+      `**Workspace** — model ${modelName ?? '(not detected)'} (via ${source})`,
+      projectPath  ? `Project: ${projectPath}`   : 'Project: (none resolved — pass projectPath to add files to a VS project)',
+    ];
+    if (workspacePath) lines.push(`Workspace: ${workspacePath}`);
+    lines.push('(get_workspace_info has the full picture: project table, roots, diagnostics.)');
+    return lines.join('\n') + '\n\n---\n\n';
+  } catch {
+    // Never let a config read failure turn a good prepare into an error.
+    return '';
+  }
+}
+
+/** Put the once-per-process header in front of a successful reply. */
+function withWorkspaceHeader(result: unknown): unknown {
+  const r = result as { content?: Array<{ type?: string; text?: string }>; isError?: boolean };
+  if (r?.isError) return result;
+  const first = r?.content?.[0];
+  if (!first || first.type !== 'text' || typeof first.text !== 'string') return result;
+  const header = workspaceHeader();
+  if (!header) return result;
+  return { ...r, content: [{ ...first, text: header + first.text }, ...r.content!.slice(1)] };
+}
+
 export async function prepareTool(request: CallToolRequest, context: XppServerContext) {
   const parsed = PrepareArgsSchema.safeParse(request.params.arguments ?? {});
   if (!parsed.success) {
@@ -101,7 +166,7 @@ export async function prepareTool(request: CallToolRequest, context: XppServerCo
     const modeMsg =
       modeArg === undefined
         ? `❌ prepare: missing required parameter "mode".\n\nUsage:\n  prepare(mode="change", objectName="...", methodName="...")  — extend/modify an existing object\n  prepare(mode="create", objectName="...", objectType="...")   — plan a new object`
-        : `❌ prepare: invalid mode "${modeArg}". Valid values: "change", "create".\n\n  prepare(mode="change", objectName="...", methodName="...")  — extend/modify an existing object\n  prepare(mode="create", objectName="...", objectType="...")   — plan a new object`;
+        : `❌ prepare: invalid mode "${modeArg}". Valid values: "change", "create", "test".\n\n  prepare(mode="change", objectName="...", methodName="...")  — extend/modify an existing object\n  prepare(mode="create", objectName="...", objectType="...")   — plan a new object`;
     return {
       content: [{ type: 'text', text: modeMsg }],
       isError: true,
@@ -139,7 +204,9 @@ export async function prepareTool(request: CallToolRequest, context: XppServerCo
   const result =
     mode === 'create'
       ? await prepareCreateTool(subRequest('prepare_create', rest), context)
-      : await prepareChangeTool(subRequest('prepare_change', rest), context);
+      : mode === 'test'
+        ? await prepareTestTool(subRequest('prepare_test', rest), context)
+        : await prepareChangeTool(subRequest('prepare_change', rest), context);
 
   // Only a call that actually issued a token is worth suppressing: an error reply has
   // no context to reuse, and repeating it is how the caller retries after fixing args.
@@ -151,7 +218,7 @@ export async function prepareTool(request: CallToolRequest, context: XppServerCo
       goal: typeof rest['goal'] === 'string' ? rest['goal'] : '',
     });
   }
-  return result;
+  return withWorkspaceHeader(result);
 }
 
 // Tool registration (name, description, inputSchema) lives in

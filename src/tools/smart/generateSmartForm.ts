@@ -5,26 +5,32 @@
 
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { XppSymbolIndex } from '../../metadata/symbolIndex.js';
-import { SmartXmlBuilder, FormDataSourceSpec, FormControlSpec } from '../../utils/smartXmlBuilder.js';
+import { SmartXmlBuilder, FormDataSourceSpec } from '../../utils/smartXmlBuilder.js';
 import { FormPatternTemplates } from '../../utils/formPatternTemplates.js';
 import { handleGetFormPatterns } from '../knowledge/getFormPatterns.js';
 import path from 'path';
 import fs from 'fs';
 import { getConfigManager } from '../../utils/configManager.js';
-import { defaultPackagesRoot, resolveIndexedFilePath } from '../../utils/packagesRoot.js';
+import { defaultPackagesRoot, isAotSourcePath, resolveIndexedFilePath } from '../../utils/packagesRoot.js';
 import { resolveObjectPrefix, applyObjectPrefix, getObjectSuffix, applyObjectSuffix } from '../../utils/modelClassifier.js';
 import { ProjectFileManager } from '../../workspace/projectFile.js';
 import { extractModelFromProject, findProjectInSolution } from '../../utils/projectUtils.js';
 import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { validateFormPatternXml } from '../../validation/formPatternValidator.js';
+import {
+  countFormControls,
+  findControlElementOrderViolations,
+  formatElementOrderViolations,
+} from '../../validation/formControlElementOrder.js';
 import { resolvePattern } from '../../knowledge/formPatterns/index.js';
 import { expandPatternToXml, canExpandPattern } from '../../utils/formControlExpander.js';
 import { cloneFormXml } from '../../utils/formCloner.js';
 import { methodStubsForPattern, injectMethodStubs } from '../../knowledge/formPatterns/methodStubs.js';
-import { findBaseFormXml } from '../write/modifyD365File.js';
+import { findBaseFormXml } from '../../utils/baseObjectXml.js';
 import { getFieldControlMap, getTableTitleField, type FieldControlMap } from '../../utils/fieldControlTypes.js';
 import { lookupSymbolNocase } from '../../utils/symbolLookup.js';
 import { scaffoldWriteRefusalResult } from '../write/writeAnchorGuard.js';
+import { upsertWrittenFileIntoIndex } from '../write/inlineIndexUpsert.js';
 
 /**
  * Symbol types a form datasource may bind to. Views are indexed as 'view'
@@ -111,7 +117,9 @@ export const generateSmartFormTool: Tool = {
       },
       generateControls: {
         type: 'boolean',
-        description: 'If true, auto-generate grid controls for datasource fields',
+        description: 'Default true. Set false to scaffold the pattern WITHOUT any datasource ' +
+          'field controls — the containers (ActionPane, Grid, Tab, groups) are written empty so ' +
+          'the caller can place every field itself via add-control.',
       },
       modelName: {
         type: 'string',
@@ -266,7 +274,6 @@ export async function handleGenerateSmartForm(
 
   const builder = new SmartXmlBuilder(symbolIndex);
   let dataSources: FormDataSourceSpec[] = [];
-  const controls: FormControlSpec[] = [];
   /** Note surfaced when the primary datasource resolved to a view, not a table. */
   let viewDataSourceNote = '';
 
@@ -322,7 +329,7 @@ export async function handleGenerateSmartForm(
     // A form datasource may be a VIEW as well as a table — the AOT accepts any of
     // them in <Table>. Resolving against 'table' alone rejected a view that
     // object_patterns resolves fine, so a form over a view was unbuildable through
-    // the scaffold (docs/eval-sweep-findings-2026-07-21.md, "Open — writers").
+    // the scaffold (the 2026-07-21 eval sweep, "Open — writers").
     let dataSourceIsView = false;
     try {
       const db = symbolIndex.getReadDb();
@@ -436,18 +443,7 @@ export async function handleGenerateSmartForm(
       primaryTitleField = getTableTitleField(db, dataSourceEffective);
 
       if (gridFields.length > 0) {
-        if (generateControls) {
-          const gridControl = builder.buildGridControl(
-            `${dataSourceEffective}Grid`,
-            dataSourceEffective,
-            gridFields,
-            fieldTypes,
-          );
-          controls.push(gridControl);
-          console.log(`[generateSmartForm] Generated grid with ${gridFields.length} fields`);
-        } else {
-          console.log(`[generateSmartForm] Collected ${gridFields.length} grid fields for pattern template`);
-        }
+        console.log(`[generateSmartForm] Collected ${gridFields.length} grid fields for pattern template`);
       }
     } catch (error) {
       console.warn(`[generateSmartForm] Failed to generate controls:`, error);
@@ -828,17 +824,57 @@ export async function handleGenerateSmartForm(
     if (mismatch) noteLines.push(`   ${mismatch}`);
     cloneNotes = `${viewDataSourceNote}\n${noteLines.join('\n')}`;
   } else {
+    // `generateControls: false` means the caller wants to place every field
+    // control itself. Until #978 the flag did NOTHING — the pattern templates
+    // bind the datasource fields from `gridFields`/`linesFields` whatever the
+    // flag says, so scaffolding with it true and with it omitted produced
+    // BYTE-IDENTICAL XML. An eval case whose requirement was "expose this field
+    // exclusively via add-control" could not be met at all: the control existed
+    // before the caller's own call, and four remove-control calls were needed to
+    // get back to an empty group.
+    //
+    // Withholding the field lists is the whole implementation — the templates
+    // already render `<Fields />` and an empty `<Controls>` for an empty list,
+    // and the structural controls (ActionPane, Grid, Tab, groups) still stand,
+    // so the result is a valid form of the requested pattern with no field
+    // controls in it. Default stays "generate them": that is what every caller
+    // before this got, and what the op-spec has always promised.
+    const emitFieldControls = generateControls !== false;
+    if (!emitFieldControls && (gridFields.length > 0 || linesFields.length > 0)) {
+      cloneNotes +=
+        `\n   ℹ️ generateControls=false — no datasource field controls were generated. ` +
+        `The pattern's containers are there and empty; add the fields you want with ` +
+        `d365fo_file(action="modify", operation="add-control").`;
+    }
+
+    // The templates' own captions are platform label ids now (#980), but the
+    // Design caption comes from the caller — or, when nothing was given and the
+    // table has no Label of its own, from the object NAME. That last case is
+    // raw text and xppbp will report BPErrorLabelIsText on it, exactly as
+    // d365fo_file(action="create") already warns for a raw `label` property.
+    // Say so rather than let the caller find out from a BP run.
+    const designCaption = resolveFormCaption(
+      caption, label, lookupTableLabel(symbolIndex, primaryDs?.table), finalName,
+    );
+    if (!designCaption.startsWith('@')) {
+      cloneNotes +=
+        `\n   ⚠️ BPErrorLabelIsText risk: the form's Caption is raw text ("${designCaption}"), not a label id. ` +
+        `Find or create one with labels(action="search", text="${designCaption}") and re-run with ` +
+        `label="@YourFile:YourId", or set the caption afterwards via ` +
+        `d365fo_file(action="modify", operation="modify-property").`;
+    }
+
     const templateOpts = {
       formName: finalName,
       dsName: primaryDs?.name,
       dsTable: primaryDs?.table,
-      caption: resolveFormCaption(caption, label, lookupTableLabel(symbolIndex, primaryDs?.table), finalName),
-      gridFields,
+      caption: designCaption,
+      gridFields: emitFieldControls ? gridFields : [],
       fieldTypes,
       titleField: primaryTitleField,
       linesDsName: linesDsNameResolved ?? (linesTableResolved || undefined),
       linesDsTable: linesTableResolved || undefined,
-      linesFields,
+      linesFields: emitFieldControls ? linesFields : [],
       linesFieldTypes,
     };
 
@@ -955,6 +991,13 @@ export async function handleGenerateSmartForm(
 
   console.log(`[generateSmartForm] Generated XML (${xml.length} bytes)`);
 
+  // The number reported to the caller is COUNTED FROM THE DOCUMENT, never from a
+  // variable that tracked an intention. It used to be the length of an array the
+  // XML was not built from, so the response said "Controls: 1" (or 0) about a
+  // form that held 16 — and an agent reading "Controls: 0" reasonably concluded
+  // it had to add the controls itself, duplicating ones already there (#978).
+  const controlsWritten = countFormControls(xml);
+
   // Self-test: generated XML must conform to its declared pattern.
   //  - Template path: errors mean template/catalog drift → hard-fail.
   //  - Clone path: a real source form may legitimately deviate from the
@@ -982,6 +1025,41 @@ export async function handleGenerateSmartForm(
       errorList.split('\n').map(l => `      ${l}`).join('\n');
   }
 
+  // Self-test 2: element ORDER, which the pattern validator cannot see — it
+  // parses with `explicitArray: false`, and no XML object model in this repo
+  // keeps sibling order.
+  //
+  // AOT metadata XML is order-sensitive and the deserializer says NOTHING when
+  // it is wrong: it skips the misplaced element and moves on. The
+  // SimpleListDetails template wrote <DataGroup>/<DataSource> above <Controls>
+  // on its Overview group, and the metadata provider therefore reported that
+  // group with no children — two controls that were in the file and invisible
+  // to the platform (#979, reproduced against the live provider and fixed by
+  // moving the two lines). Order errors are a hard fail on the template path
+  // for the same reason pattern drift is: nobody asked for that XML.
+  const orderViolations = findControlElementOrderViolations(xml);
+  const droppedByOrder = orderViolations.filter(v => v.kind === 'order');
+  if (droppedByOrder.length > 0) {
+    const list = formatElementOrderViolations(droppedByOrder);
+    if (!cloneFrom) {
+      return {
+        content: [{
+          type: 'text',
+          text:
+            `❌ generate internal error: the generated XML writes ${droppedByOrder.length} element(s) ` +
+            `out of the order shipped metadata uses, and the deserializer DROPS those silently — ` +
+            `the form would be written with content the platform cannot see. ` +
+            `This indicates template drift — please report it.\n\n${list}`,
+        }],
+        isError: true,
+      };
+    }
+    cloneNotes +=
+      `\n   ⚠️ ${droppedByOrder.length} element(s) in the cloned XML are out of canonical order; ` +
+      `the metadata deserializer will drop them silently:\n` +
+      list.split('\n').map(l => `      ${l}`).join('\n');
+  }
+
   // Warn when a datasource is bound to a table that does not exist in the index,
   // suggesting the closest real table name.
   //
@@ -1003,7 +1081,18 @@ export async function handleGenerateSmartForm(
       const row = lookupSymbolNocase(db, table, ['table']);
       // Package-relative file_path rows would always miss here and mark a
       // perfectly good table "stale" — see resolveIndexedFilePath.
-      const stale = row?.file_path && !fs.existsSync(resolveIndexedFilePath(row.file_path));
+      //
+      // A file_path pointing at the extracted-metadata JSON cache rather than the
+      // AOT source (see isAotSourcePath) is evidence of neither: that cache file
+      // exists whether or not the table still does. Calling it "stale — its file
+      // no longer exists on disk" would be a claim about a file that is right
+      // there, and the advice that follows it (run update_symbol_index) cannot
+      // help, since re-indexing rebuilds the same cache path. Judge only the paths
+      // that can be judged — the same rule isStaleIndexedPath applies in
+      // utils/indexedXmlLookup.ts, so the two do not drift apart.
+      const indexedPath = row?.file_path;
+      const stale = isAotSourcePath(indexedPath)
+        && !fs.existsSync(resolveIndexedFilePath(indexedPath));
       if (row && !stale) continue;
       const stem = table.replace(/s$/i, '');
       const alt = db.prepare(
@@ -1044,7 +1133,7 @@ export async function handleGenerateSmartForm(
           text: [
             `✅ Form XML generated for **${finalName}**`,
             resolvedModel ? `   Model: ${resolvedModel}` : `   ℹ️  No model resolved — no prefix applied. Pass modelName to set prefix.`,
-            `   DataSources: ${dataSources.length}, Controls: ${controls.length}`,
+            `   DataSources: ${dataSources.length}, Controls: ${controlsWritten}`,
             cloneNotes,
             noModelNote,
             ``,
@@ -1096,6 +1185,11 @@ export async function handleGenerateSmartForm(
   fs.writeFileSync(normalizedPath, normalizeD365Xml(xml), 'utf-8');
   console.log(`[generateSmartForm] Created file: ${normalizedPath}`);
 
+  // Tell the index about it, the way every create/modify path does.
+  // Without this the object is invisible to `search` — which is now answered
+  // from the index for untyped queries — in the very session that created it.
+  await upsertWrittenFileIntoIndex(normalizedPath, { symbolIndex });
+
   // Add to Visual Studio project if a projectPath is known
   let projectMessage = '';
   const effectiveProjectPath = resolvedProjectPath ||
@@ -1132,7 +1226,7 @@ export async function handleGenerateSmartForm(
           ``,
           `📁 File: ${normalizedPath}`,
           `📦 Model: ${resolvedModel}`,
-          `📊 DataSources: ${dataSources.length}, Controls: ${controls.length}`,
+          `📊 DataSources: ${dataSources.length}, Controls: ${controlsWritten}`,
           cloneNotes,
           projectMessage,
           ``,

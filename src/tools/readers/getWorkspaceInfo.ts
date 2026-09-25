@@ -12,12 +12,15 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../../types/context.js';
 import * as nodePath from 'path';
+import { readFile } from 'fs/promises';
 import { getConfigManager } from '../../utils/configManager.js';
 import { getStdioSessionInfo } from '../../utils/stdioSessionInfo.js';
 import { checkIndexStaleness } from '../../utils/indexStaleness.js';
 import {
-  isCustomModel, getObjectSuffix, getExtensionNamingStyle, deriveExtensionInfix,
+  isCustomModel, getObjectSuffix, getExtensionNamingStyle, getExtensionClassNamingStyle, deriveExtensionInfix,
+  unrecognisedNamingStyleSettings,
 } from '../../utils/modelClassifier.js';
+import { normalizeModelToken } from '../../utils/modelToken.js';
 import { buildPrefixDiagnostics, modelWritesLandIn } from '../analysis/prefixDiagnostics.js';
 import {
   buildContextSnapshot, renderContextSnapshotSection, renderContextSnapshotCompact,
@@ -25,6 +28,8 @@ import {
 import { selectProject, renderSelectionFailure } from '../../workspace/projectSelector.js';
 import { projectDisplayName } from '../../workspace/projectMembership.js';
 import { activeCrossModelAllowance } from '../../utils/crossModelWriteGuard.js';
+import { parseModuleReferences } from '../../metadata/modelDescriptor.js';
+import { findModelDescriptorPath } from '../../utils/objectFileLookup.js';
 
 export async function getWorkspaceInfoTool(
   request: CallToolRequest,
@@ -34,6 +39,23 @@ export async function getWorkspaceInfoTool(
   const configManager = getConfigManager();
   const args = (request as any).params?.arguments || {};
 
+  // changes=true — folded in from the retired `review_workspace_changes` tool.
+  // Answered INSTEAD of the configuration dump, not alongside it: the two have
+  // no reader in common, and appending a whole `git diff` to every workspace
+  // read would be the opposite of what this consolidation is for.
+  if (args.changes === true || args.changes === 'true') {
+    const { reviewWorkspaceChangesTool } = await import('../sdlc/reviewWorkspaceChanges.js');
+    return reviewWorkspaceChangesTool({ directoryPath: args.directoryPath }, context);
+  }
+
+  // A rejected projectName/projectPath is REPORTED, not returned on its own.
+  // This is the first call of every session and the argument is now something the
+  // caller is encouraged to pass from context, so a miss is expected traffic — and
+  // answering it with nothing but the refusal costs a whole round trip to re-ask
+  // the question the tool was already answering. The refusal still sets isError so
+  // a miss cannot be mistaken for a switch; the workspace facts just come with it.
+  let selectionFailure: string | null = null;
+
   // projectName: resolve to ONE project. A model name that several projects
   // build is not a selection — see projectSelector.ts for why picking the first
   // of them is the bug this replaced.
@@ -41,37 +63,27 @@ export async function getWorkspaceInfoTool(
     const allProjects = configManager.getAllDetectedProjects();
     const selection = selectProject(args.projectName as string, allProjects);
     if (selection.kind !== 'resolved') {
-      return {
-        content: [{ type: 'text', text: renderSelectionFailure(selection, allProjects) }],
-        isError: true,
-      };
+      selectionFailure = renderSelectionFailure(selection, allProjects);
+    } else if (!selection.project.projectPath) {
+      selectionFailure =
+        `❌ "${args.projectName}" resolved to model "${selection.project.modelName}", which has no .rnrproj on record — there is nothing to switch to.`;
+    } else {
+      args.projectPath = selection.project.projectPath;
     }
-    if (!selection.project.projectPath) {
-      return {
-        content: [{
-          type: 'text',
-          text: `❌ "${args.projectName}" resolved to model "${selection.project.modelName}", which has no .rnrproj on record — there is nothing to switch to.`,
-        }],
-        isError: true,
-      };
-    }
-    args.projectPath = selection.project.projectPath;
   }
 
   // projectPath: force-switch to specific .rnrproj
-  if (args.projectPath) {
+  if (args.projectPath && !selectionFailure) {
     const forced = await configManager.forceProject(args.projectPath);
     if (!forced) {
-      return {
-        content: [{ type: 'text', text: `❌ Could not read model name from: ${args.projectPath}\nMake sure the path points to a valid .rnrproj file.` }],
-        isError: true,
-      };
+      selectionFailure =
+        `❌ Could not read model name from: ${args.projectPath}\nMake sure the path points to a valid .rnrproj file.`;
     }
   }
 
   const {
     modelName, modelSource, isModelSourceAutoDetected,
-    projectPath, projectSource,
+    projectPath, projectSource, ambiguousProjects,
     packagePath, packageSource,
     customPackagesPath, customPackagesSource,
   } = await configManager.getWorkspaceInfoDiagnostics();
@@ -118,6 +130,14 @@ export async function getWorkspaceInfoTool(
   // Sources, confirmations and the per-project path table are diagnostics.
   const diagnostics = args.diagnostics === true;
 
+  // "(not detected)" reads as a broken configuration, which is the wrong thing to
+  // fix when the model resolved and only the project was left to the caller. Name
+  // that state, and name the projects it is between — without them the agent has
+  // to spend another call on diagnostics=true just to learn what to pass.
+  const projectDisplay = projectPath ?? (ambiguousProjects.length > 1
+    ? `(not selected — ${ambiguousProjects.length} projects build this model; pass projectName to pick one)`
+    : '(not detected)');
+
   const lines: string[] = diagnostics
     ? [
         `## D365FO Workspace Configuration`,
@@ -125,7 +145,7 @@ export async function getWorkspaceInfoTool(
         `Model name      : ${modelName ?? '(not configured)'}  (source: ${modelSource})`,
         `Custom write path: ${effectiveWritePath ?? '(not configured)'}  (custom metadata, source: ${effectiveWriteSource})`,
         `Framework dir   : ${msFrameworkPath ?? '(not applicable — single-root setup)'}  (Microsoft metadata, read-only)`,
-        `Project path    : ${projectPath ?? '(not detected)'}  (source: ${projectSource})`,
+        `Project path    : ${projectDisplay}  (source: ${projectSource})`,
         `Env type        : ${envType}`,
         ``,
         ...prefixVerboseLines,
@@ -136,9 +156,52 @@ export async function getWorkspaceInfoTool(
         `Model       : ${modelName ?? '(not configured)'}  (${modelSource})`,
         ...prefixLines,
         `Write path  : ${effectiveWritePath ?? '(not configured)'}`,
-        `Project     : ${projectPath ?? '(not detected)'}`,
+        `Project     : ${projectDisplay}`,
         `Env         : ${envType}`,
       ];
+
+  // What the model may SEE. Diagnostics-only on purpose: this block is paid for
+  // on a cold context (see the note above the default output), and the agent
+  // needs it at the moment it reaches for a type from another model, not at
+  // session start. It is the read side of
+  // d365fo_file(objectType="model-descriptor", operation="add/remove-module-reference"),
+  // and the same parser both of those and build_d365fo_project use — so what is
+  // printed here is exactly what xppc will resolve against.
+  if (diagnostics && modelName) {
+    // The writer's own lookup, so this reads the file add/remove-module-reference
+    // write: it also finds a model inside a differently-named package and tries
+    // every configured root, where a <root>/<Model>/Descriptor probe would call
+    // an ISV model's references UNKNOWN right after a successful add.
+    const descriptorRoot = effectiveWritePath ?? packagePath ?? null;
+    const found = await findModelDescriptorPath(modelName, descriptorRoot ?? undefined).catch(() => null);
+    let refs: string[] | null = null;
+    if (found) {
+      try {
+        refs = parseModuleReferences(await readFile(found.filePath, 'utf-8'));
+      } catch { /* unreadable — UNKNOWN, reported below */ }
+    }
+    lines.push(
+      `## Module References (${modelName})`,
+      ``,
+      ...(found && refs !== null ? [`Descriptor: ${found.filePath}`] : []),
+      // null is UNKNOWN, never "references nothing" — the distinction the reader
+      // is documented to preserve, and the difference between "add a reference"
+      // and "this server is looking in the wrong place".
+      refs === null
+        ? `⚠️  No readable descriptor for ${modelName} under ${descriptorRoot ?? 'the configured packages roots'} — ` +
+          `the reference set is UNKNOWN, not empty.`
+        : refs.length === 0
+          ? `(none) — this model can see only its own package. Any type from another model is a ` +
+            `compile error until its module is referenced.`
+          : refs.map(r => `  - ${r}`).join('\n'),
+      ``,
+      `xppc resolves types against these packages and no others, so a missing entry is a ` +
+      `classStr/delegateStr/"type not found" error at COMPILE time, not a code bug. Add one with ` +
+      `d365fo_file(action="modify", objectType="model-descriptor", operation="add-module-reference", ` +
+      `params: { moduleReference: "<Package>" }) — then run a FULL build.`,
+      ``,
+    );
+  }
 
   if (diagnostics) {
     lines.push(
@@ -164,20 +227,35 @@ export async function getWorkspaceInfoTool(
   // extensions that model already has ("…DEMOExtension") instead of being
   // derived from the prefix ("…DemoExtension").
   const extInfix = deriveExtensionInfix(effectivePrefix, writeModel ?? undefined);
-  const sampleClassExt = extNamingStyle === 'model-name' && writeModel
-    ? `CustTable_${writeModel}_Extension`
+  // The samples are names a write would PRODUCE, so they carry the same token the write
+  // path embeds — the model name with non-identifier characters removed (#892). The model
+  // name itself stays raw everywhere else here: the write path on disk is joined with it.
+  const writeModelToken = writeModel ? normalizeModelToken(writeModel) : '';
+  // Classes may follow their own style — the sample has to show the name a write
+  // would actually produce, which is the whole reason the two are asked separately.
+  const extClassNamingStyle = getExtensionClassNamingStyle();
+  const sampleClassExt = extClassNamingStyle === 'model-name' && writeModelToken
+    ? `CustTable_${writeModelToken}_Extension`
     : `CustTable${extInfix}_Extension`;
-  const sampleElemExt = extNamingStyle === 'model-name' && writeModel
-    ? `CustTable.${writeModel}`
+  const sampleElemExt = extNamingStyle === 'model-name' && writeModelToken
+    ? `CustTable.${writeModelToken}`
     : `CustTable.${extInfix}Extension`;
+  // A misspelled style falls back in silence; say so in both renderings, since the
+  // samples right below are then names under a style nobody configured.
+  const styleTypos = unrecognisedNamingStyleSettings().map(w => `⚠️  ${w}`);
   if (diagnostics) {
     lines.push(
       `## Extension Naming`,
       ``,
       `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
+      `EXTENSION_CLASS_NAMING_STYLE: ${process.env.EXTENSION_CLASS_NAMING_STYLE?.trim() || `(not set → inherits "${extNamingStyle}")`}`,
       extNamingStyle === 'model-name'
-        ? `✅ model-name style — extension token is the MODEL NAME (Visual Studio default).`
-        : `ℹ️  prefix style (default) — extension token is the EXTENSION_PREFIX infix.`,
+        ? `✅ model-name style — element extension token is the MODEL NAME (Visual Studio default).`
+        : `ℹ️  prefix style (default) — element extension token is the EXTENSION_PREFIX infix.`,
+      extClassNamingStyle === extNamingStyle
+        ? `   Extension classes follow the same style.`
+        : `✅ Extension classes follow "${extClassNamingStyle}" instead — set separately.`,
+      ...styleTypos,
       `  • Extension class  → ${sampleClassExt}`,
       `  • Element extension → ${sampleElemExt}`,
       `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,
@@ -189,6 +267,7 @@ export async function getWorkspaceInfoTool(
     lines.push(
       `Extensions  : ${sampleClassExt} · ${sampleElemExt}  ` +
       `(pass the BASE name to d365fo_file(create) — the tool applies the token)`,
+      ...styleTypos,
     );
   }
 
@@ -215,12 +294,26 @@ export async function getWorkspaceInfoTool(
       // agent did, landed on whichever of the fifteen came first, and wrote
       // there. The affordance itself was the bug; naming projects costs
       // fewer bytes than naming models did anyway.
-      const others = allProjects.length - 1;
+      // "besides the active one" counted an active project that may not exist:
+      // with none selected the subtraction dropped a real candidate and named a
+      // project the agent would then look for and not find.
+      const others = allProjects.length - (projectPath ? 1 : 0);
       lines.push(
         `Projects    : ${allProjects.length} in solution` +
-        (others > 0 ? ` (${others} besides the active one)` : '') +
+        (projectPath
+          ? (others > 0 ? ` (${others} besides the active one)` : '')
+          : ` (none selected)`) +
         `  — list with diagnostics=true; switch with projectName="<project file name>"`,
       );
+      // The names to pass, when the choice is what is blocking. Bounded: this
+      // line is paid for at session start, and only the ambiguous case earns it.
+      if (!projectPath && ambiguousProjects.length > 1) {
+        const shown = ambiguousProjects.slice(0, 5).map(projectDisplayName);
+        lines.push(
+          `  Build "${modelName}": ${shown.join(' · ')}` +
+          (ambiguousProjects.length > 5 ? ` · … and ${ambiguousProjects.length - 5} more` : ''),
+        );
+      }
     }
   }
 
@@ -230,7 +323,12 @@ export async function getWorkspaceInfoTool(
     const modelMetadataDir = effectiveWritePath && modelName
       ? nodePath.join(effectiveWritePath, modelName)
       : null;
-    const staleness = checkIndexStaleness(lastIndexedAt, modelMetadataDir);
+    // Non-blocking unless diagnostics asked for the full picture. The freshness
+    // check walks up to 5,000 XML files with synchronous statSync calls — see
+    // indexStaleness.ts — and this tool is the first call of a session, so it
+    // was carrying that walk on the response path. diagnostics=true still
+    // computes it on the spot, and the compact line says so when it is pending.
+    const staleness = checkIndexStaleness(lastIndexedAt, modelMetadataDir, { blocking: diagnostics });
     lines.push(...(diagnostics ? ['', ...staleness.lines] : staleness.compactLines));
   } catch {
     // Freshness reporting is best-effort — never break get_workspace_info
@@ -277,7 +375,10 @@ export async function getWorkspaceInfoTool(
 
   // Context Snapshot — recently edited objects + uncommitted X++ changes. Best-effort.
   try {
-    const snapshot = await buildContextSnapshot(context);
+    // Same trade as the freshness check above: the snapshot's symbol counts are
+    // a full index scan on a cold cache, so the default read takes the memoized
+    // value or reports that it is still being computed. diagnostics=true waits.
+    const snapshot = await buildContextSnapshot(context, { blocking: diagnostics });
     lines.push(...(diagnostics
       ? ['', ...renderContextSnapshotSection(snapshot)]
       : renderContextSnapshotCompact(snapshot)));
@@ -374,6 +475,16 @@ export async function getWorkspaceInfoTool(
     );
   } else if (diagnostics) {
     lines.push(``, `✅ Configuration looks valid. Proceed with D365FO operations using model "${modelName}".`);
+  }
+
+  // The refusal goes FIRST — it is the answer to what the caller asked for, and
+  // burying it under the configuration dump is how a rejected switch gets read as
+  // a completed one. isError keeps that unambiguous for clients that surface it.
+  if (selectionFailure) {
+    return {
+      content: [{ type: 'text', text: `${selectionFailure}\n\n---\n\n${lines.join('\n')}` }],
+      isError: true,
+    };
   }
 
   return { content: [{ type: 'text', text: lines.join('\n') }] };

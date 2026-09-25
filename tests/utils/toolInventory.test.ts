@@ -30,11 +30,15 @@ describe('tool inventory contract', () => {
   });
 
   it('exposes the expected total tool count', () => {
-    // 23 since get_method and suggest_edt were unpublished: their contracts moved
-    // into get_object_info(options.method) and prepare(fieldsHint), both of which
-    // already had the object in hand. Their handlers stay routable.
-    expect(mcpServerToolNames).toHaveLength(23);
-    expect(startupCatalogToolNames).toHaveLength(23);
+    // 20 since the 2026-08-25 audit's Phase C folded three more tools into the
+    // tools that already owned their subject: undo_last_modification ->
+    // d365fo_file(action="undo"), review_workspace_changes ->
+    // get_workspace_info(changes=true), trigger_db_sync ->
+    // build_d365fo_project(dbSync). Before that, get_method and suggest_edt were
+    // unpublished into get_object_info(options.method) and prepare(fieldsHint).
+    // Every one of those handlers stays routable under its old name.
+    expect(mcpServerToolNames).toHaveLength(20);
+    expect(startupCatalogToolNames).toHaveLength(20);
   });
 
   it('never states a tool count that disagrees with the published inventory', () => {
@@ -116,7 +120,12 @@ describe('tool inventory contract', () => {
     //
     // MCP_TOOLS.md and CHANGELOG.md are excluded on purpose: they are where the
     // retirement is documented, so naming the old tool there is the point.
-    const retiredButRoutable = ['get_method', 'suggest_edt', 'batch_get_info'];
+    const retiredButRoutable = [
+      'get_method', 'suggest_edt', 'batch_get_info',
+      // Phase C of the 2026-08-25 audit — folded into d365fo_file(action="undo"),
+      // get_workspace_info(changes=true) and build_d365fo_project(dbSync).
+      'undo_last_modification', 'review_workspace_changes', 'trigger_db_sync',
+    ];
     const readerFacing = [
       'README.md',
       '.github/copilot-instructions.md',
@@ -150,7 +159,11 @@ describe('tool inventory contract', () => {
       expect(publishedTools.has(toolName)).toBe(true);
     }
 
-    expect(LOCAL_TOOLS.size).toBe(9);
+    // 6, not 9: review_workspace_changes and undo_last_modification and
+    // trigger_db_sync left the published surface, and each fold landed in a tool
+    // whose locality already covered it (get_workspace_info and
+    // build_d365fo_project are LOCAL; d365fo_file is in ALWAYS_TOOLS).
+    expect(LOCAL_TOOLS.size).toBe(6);
     expect(mcpServerToolNames.filter(name => !LOCAL_TOOLS.has(name))).toHaveLength(14);
   });
 
@@ -235,7 +248,14 @@ describe('tool inventory contract', () => {
       expect(annotated.has(toolName), `missing TOOL_ANNOTATIONS entry for '${toolName}'`).toBe(true);
       const a = TOOL_ANNOTATIONS[toolName];
       expect(a.title.length, `empty title for '${toolName}'`).toBeGreaterThan(0);
-      expect(typeof a.readOnlyHint).toBe('boolean');
+      // readOnlyHint is asserted by MEANING, not by presence. A hint equal to
+      // its MCP spec default (`readOnlyHint: false`) says exactly what its
+      // absence says, and the ListTools payload is re-sent on every request
+      // against a 45,000-char ratchet — so the default-valued ones were dropped
+      // to pay for the report-design operation. What must stay true is that a
+      // read tool CLAIMS to be read-only; a write tool simply must not.
+      expect([true, undefined], `'${toolName}' readOnlyHint must be true or absent`)
+        .toContain(a.readOnlyHint);
       expect(a.openWorldHint).toBe(false);
     }
     // No orphan annotations for tools that no longer exist
@@ -247,13 +267,23 @@ describe('tool inventory contract', () => {
 
   it('marks write tools as non-read-only in annotations', () => {
     const writeTools = [
-      'd365fo_file', 'labels',
-      'undo_last_modification', 'generate_object',
+      'd365fo_file', 'labels', 'generate_object',
       'update_symbol_index', 'build_d365fo_project',
-      'trigger_db_sync', 'run_systest_class',
+      'run_systest_class',
     ];
     for (const toolName of writeTools) {
-      expect(TOOL_ANNOTATIONS[toolName]?.readOnlyHint, `'${toolName}' must not be read-only`).toBe(false);
+      // `false` and absent both mean "not read-only" — absent because that IS
+      // the MCP default. What must never happen is a write tool claiming true,
+      // which is what makes a client skip its write-confirmation dialog.
+      expect(TOOL_ANNOTATIONS[toolName]?.readOnlyHint, `'${toolName}' must not be read-only`)
+        .not.toBe(true);
+      // …and each one still declares whether it is destructive, explicitly.
+      // That hint is ALSO its own spec default (`true`), and it is kept anyway:
+      // a client that reads absence as "unknown" gets more cautious about a
+      // missing readOnlyHint and less cautious about a missing destructiveHint,
+      // and only the first direction is safe to take for free bytes.
+      expect(typeof TOOL_ANNOTATIONS[toolName]?.destructiveHint,
+        `'${toolName}' must state destructiveHint explicitly`).toBe('boolean');
     }
   });
 

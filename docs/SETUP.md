@@ -156,6 +156,8 @@ If auto-detection fails, add `D365FO_CUSTOM_PACKAGES_PATH` and `D365FO_MICROSOFT
 dotnet build -c Release -p:D365BinPath="<FrameworkDirectory>\bin"
 ```
 
+If you are *changing* bridge sources rather than just deploying them, build with `npm run bridge:build` instead — see [Changing bridge sources](#changing-bridge-sources--use-npm-run-bridgebuild).
+
 ## Scenario E — Local stdio ★ (single developer)
 
 VS spawns the server as a subprocess — no HTTP, no manual start. Build the index as in Scenario C, then:
@@ -226,6 +228,10 @@ Point a per-solution `.mcp.json` at the right port:
 
 > `npx d365fo-mcp doctor` checks every instance after an upgrade: index size, a pinned XPP config that no longer resolves, and any legacy `.env` that contradicts the instance config.
 
+### BP moniker catalog
+
+Each instance also gets its own `data\bp-moniker-catalog.json`, extracted from *that instance's* pinned D365FO version rather than the one shared snapshot compiled into the server (`src/knowledge/bpMonikers/catalog.generated.ts`) — clientA on 10.0.35 and clientB on 10.0.40 each see their own real moniker set instead of whichever box's snapshot happens to be checked in. It regenerates automatically as part of `instance rebuild`/`upgrade` (and the first-time `setup` wizard), only when the instance's resolved version has actually moved since the catalog was last stamped — every other rebuild is a no-op. Requires `pwsh` or `powershell.exe` on PATH; if neither is found, or extraction fails, the previous catalog (or the compiled-in default, if none exists yet) stays in use and a warning is logged — a stale BP catalog never blocks the metadata reindex.
+
 ---
 
 ## Building the C# bridge
@@ -237,9 +243,43 @@ cd bridge\D365MetadataBridge
 dotnet build -c Release        # output: bin\Release\D365MetadataBridge.exe (auto-detected)
 ```
 
+### Changing bridge sources — use `npm run bridge:build`
+
+The command above deploys a binary; it does **not** refresh `bridge/build-attestation.json`.
+That file holds a hash of the bridge sources and is the only evidence they compile, because no
+CI runner can build them — the D365FO metadata assemblies exist solely on a development machine.
+Edit anything under `bridge/` without refreshing it and the `bridge-attestation` check fails with
+`bridge sources changed but the attestation did not`.
+
+From the repo root:
+
+```powershell
+npm run bridge:build           # compiles, then rewrites bridge/build-attestation.json
+```
+
+Commit the refreshed `build-attestation.json` in the same change. The build goes to a scratch
+directory, so it is safe to run while an MCP client holds a lock on the deployed binary — and for
+the same reason it does **not** update `bin\Release`. Run the plain `dotnet build` above when you
+want the deployed binary replaced.
+
+**On a UDE box, pass the DLL path as an environment variable.** `bridge:build` does not forward
+`-p:D365BinPath`, and the project file only probes drive-letter `<X>:\AosService\PackagesLocalDirectory\bin`
+locations, which a UDE install does not have. MSBuild reads environment variables as properties,
+so this reaches the project file unchanged:
+
+```powershell
+$env:D365BinPath = "$env:LOCALAPPDATA\Microsoft\Dynamics365\<version>\PackagesLocalDirectory\bin"
+npm run bridge:build
+```
+
+It fails loudly rather than attesting a build that never saw the references — `Build succeeded but
+no metamodel version was reported … refusing to attest it`. A good run names the version it
+compiled against: `Bridge compiles against metamodel 7.0.xxxx.xxx from <path>`.
+
 | Situation | Action |
 |-----------|--------|
 | UDE box (DLLs not in `PackagesLocalDirectory\bin`) | `dotnet build -c Release -p:D365BinPath="<FrameworkDirectory>\bin"` |
+| You edited anything under `bridge/` | `npm run bridge:build` (see above) and commit the refreshed `bridge/build-attestation.json` |
 | `NU1101` restoring `System.Text.Json` / `Microsoft.NETFramework.ReferenceAssemblies.net48` | The bridge ships its own `NuGet.config` that merges nuget.org into whatever offline sources the VM already has, so this is usually already fixed. If it still fails (nuget.org blocked outright), restore once with `dotnet restore --source https://api.nuget.org/v3/index.json` |
 | After a D365FO version upgrade | rebuild to pick up new DLLs |
 
@@ -289,4 +329,4 @@ For a team-shared, project-scoped config, create `.mcp.json` in the solution roo
 
 ## Next steps
 
-[MCP_CONFIG.md](MCP_CONFIG.md) — every option · [MCP_TOOLS.md](MCP_TOOLS.md) — all 23 tools · [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) — real workflows · [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) — ISV/multi-model · [SETUP_AZURE.md § pipelines](SETUP_AZURE.md#azure-devops-pipelines) — automated index refresh
+[MCP_CONFIG.md](MCP_CONFIG.md) — every option · [MCP_TOOLS.md](MCP_TOOLS.md) — all 20 tools · [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) — real workflows · [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) — ISV/multi-model · [SETUP_AZURE.md § pipelines](SETUP_AZURE.md#azure-devops-pipelines) — automated index refresh

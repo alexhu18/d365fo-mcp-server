@@ -7,7 +7,8 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import path from 'path';
-import { renderObjectXml, objectXmlNotFound } from '../../src/tools/readers/objectXml';
+import { renderObjectXml, objectXmlNotFound, readObjectXml } from '../../src/tools/readers/objectXml';
+import type { SymbolFileLookupSource } from '../../src/utils/objectFileLookup';
 import { createPhaseTimer } from '../../src/utils/phaseTimer';
 
 const XML_LINES = Array.from({ length: 120 }, (_, i) => `\t<Line${i + 1}>value</Line${i + 1}>`);
@@ -59,11 +60,61 @@ describe('get_object_info(include="xml")', () => {
     expect(res.text).toContain('could not read it');
   });
 
-  it('names modelName as the fix when nothing was located', () => {
-    const res = objectXmlNotFound('table', 'NoSuchTable', 'MyModel');
+  it('names the models that hold the object, so the caller does not guess', () => {
+    const res = objectXmlNotFound('class', 'JournalVoucherNum', 'Application Foundation', ['Foundation']);
     expect(res.isError).toBe(true);
     expect(res.text).toContain('no file on disk');
-    expect(res.text).toContain('options.modelName');
+    // The model, not just the parameter to pass it in. Told only "pass
+    // options.modelName", an agent guessed "Application Foundation" and spent a
+    // third call getting to "Foundation" (2026-09-07).
+    expect(res.text).toContain('options.modelName="Foundation"');
+  });
+
+  it('says a retry cannot help when no model has the object at all', () => {
+    const res = objectXmlNotFound('class', 'NoSuchClass', 'MyModel', []);
+    expect(res.text).toContain('will not help');
+  });
+});
+
+/**
+ * include="xml" resolved the file through the CONFIGURED model's folder layout and
+ * nothing else, so every read of another model's object — a Microsoft class, another
+ * custom model's class — came back as "pass options.modelName" even though the same
+ * tool prints "**Model:** Foundation" in every other include mode. Three such pairs
+ * in one session on 2026-09-07, one of them three calls long because the guess was
+ * wrong.
+ */
+describe('get_object_info(include="xml") across models', () => {
+  const indexWith = (
+    rows: Array<{ file_path: string; model: string }>,
+    models: string[] = [],
+  ): SymbolFileLookupSource => ({
+    getReadDb: () => ({
+      prepare: (sql: string) => ({
+        all: () => (sql.includes('DISTINCT model') ? models.map(m => ({ model: m })) : rows),
+      }),
+    }),
+  });
+
+  it('finds the file through the index when the configured model does not hold it', async () => {
+    const res = await readObjectXml('table', 'MyTable', {
+      modelName: 'SomeOtherModel',
+      index: indexWith([{ file_path: file, model: 'Foundation' }]),
+    });
+
+    expect(res.isError).toBe(false);
+    expect(res.text).toContain('<Line1>value</Line1>');
+  });
+
+  it('treats an index row whose file is gone as not found, not as a read failure', async () => {
+    const res = await readObjectXml('table', 'Vanished', {
+      index: indexWith([{ file_path: path.join(root, 'not-there.xml'), model: 'Foundation' }],
+        ['Foundation']),
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain('no file on disk');
+    expect(res.text).toContain('stale');
   });
 });
 
@@ -103,5 +154,45 @@ describe('phase timing on a slow write', () => {
     await expect(t.time('boom', async () => { throw new Error('x'); })).rejects.toThrow('x');
     t.add('filler', 20_000);
     expect(t.render(10_000)).toContain('filler');
+  });
+
+  // A call that takes minutes is invisible WHILE it takes them: the phase block
+  // is only ever read afterwards. One create in benchmark run d79f62a3 took
+  // 341 s and reported all of it as `(unmeasured)` — nothing to look at, live or
+  // later. The heartbeat puts the phase in flight on stderr as it happens.
+  it('says on stderr what it is still doing', async () => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const t = createPhaseTimer();
+      let release: () => void = () => {};
+      const pending = t.time('C# bridge Create()', () => new Promise<void>(r => { release = r; }));
+      await vi.advanceTimersByTimeAsync(31_000);
+      release();
+      await pending;
+
+      const said = stderr.mock.calls.map(c => String(c[0])).join(String.fromCharCode(10));
+      expect(said).toContain('[slow-call]');
+      expect(said).toContain('C# bridge Create()');
+    } finally {
+      stderr.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops the heartbeat once the call has answered', async () => {
+    vi.useFakeTimers();
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const t = createPhaseTimer();
+      await t.time('quick', async () => undefined);
+      t.render(10_000);
+      stderr.mockClear();
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(stderr).not.toHaveBeenCalled();
+    } finally {
+      stderr.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

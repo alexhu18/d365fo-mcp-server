@@ -20,6 +20,7 @@ import {
 import { resolveSubPattern } from '../../knowledge/formPatterns/index.js';
 import { canonicalSymbolName } from '../../utils/symbolLookup.js';
 import { resolveIndexedFilePath } from '../../utils/packagesRoot.js';
+import { readXmlFile } from '../../utils/indexedXmlLookup.js';
 import {
   walkFormDesign,
   type FormControlNode,
@@ -108,7 +109,8 @@ export async function validateFormPatternTool(
       const row = db
         ?.prepare(`SELECT file_path FROM symbols WHERE type = 'form' AND name = ? LIMIT 1`)
         ?.get(canonicalForm) as { file_path?: string } | undefined;
-      if (!row?.file_path) {
+      const indexedPath = row?.file_path;
+      if (!indexedPath) {
         return {
           isError: true,
           content: [{
@@ -119,8 +121,25 @@ export async function validateFormPatternTool(
       }
       // The index stores some file_path values package-relative; read them
       // against the packages root, not the process cwd. See resolveIndexedFilePath.
-      const resolved = resolveIndexedFilePath(row.file_path);
-      formXml = await fs.readFile(resolved, 'utf-8');
+      const resolved = resolveIndexedFilePath(indexedPath);
+      // That path is not always the AOT source: a row whose cached object carried
+      // no sourcePath points at the extracted-metadata JSON instead (see
+      // isAotSourcePath). Handing that to the XML parser fails in a place with no
+      // useful message — but the JSON holds the original XML in `raw`, so the
+      // right move is to unwrap it, not to refuse. readXmlFile reads both shapes
+      // and returns null only when neither yields XML.
+      const indexedXml = await readXmlFile(resolved);
+      if (indexedXml === null) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: `❌ Form "${formName}" is indexed at ${resolved}, but no form XML could be read there. ` +
+              `Pass filePath or xml directly.`,
+          }],
+        };
+      }
+      formXml = indexedXml;
       source = `${formName} (${resolved})`;
     }
   } catch (error) {
@@ -284,6 +303,48 @@ export interface DataGroupRenderer {
   dataSource?: string;
   /** Control the compiler generates for a member field: <DataGroup>_<FieldName> */
   generatedNameFor: (fieldName: string) => string;
+  /** The field group it renders, as spelled in the form XML */
+  dataGroup: string;
+}
+
+/**
+ * Every container in a form that renders a table field group via <DataGroup>.
+ *
+ * {@link findDataGroupRenderers} answers "is THIS group on the form"; this one
+ * answers "which groups are", which is what a caller needs when the answer to
+ * the first is no — a field group nothing renders puts the field on no form, and
+ * naming the groups that ARE rendered turns that dead end into one call.
+ *
+ * Returns [] when the XML is unparseable or no container carries a <DataGroup>.
+ */
+export async function listDataGroupRenderers(baseFormXml: string): Promise<DataGroupRenderer[]> {
+  let parsed: any;
+  try {
+    const parser = new Parser({ explicitArray: false, mergeAttrs: true, trim: true });
+    parsed = await parser.parseStringPromise(baseFormXml);
+  } catch {
+    return [];
+  }
+  if (!parsed?.AxForm?.Design) return [];
+
+  const found: DataGroupRenderer[] = [];
+  const visit = (nodes: FormControlNode[]): void => {
+    for (const n of nodes) {
+      const dataGroup = n.properties?.DataGroup;
+      if (dataGroup) {
+        found.push({
+          controlName: n.name,
+          dataSource: n.properties?.DataSource,
+          generatedNameFor: (fieldName: string) => `${dataGroup}_${fieldName}`,
+          dataGroup,
+        });
+      }
+      visit(n.children);
+    }
+  };
+  visit(walkFormDesign(parsed.AxForm.Design).controls);
+
+  return found;
 }
 
 /**
@@ -302,35 +363,9 @@ export async function findDataGroupRenderers(
   baseFormXml: string,
   fieldGroupName: string,
 ): Promise<DataGroupRenderer[]> {
-  let parsed: any;
-  try {
-    const parser = new Parser({ explicitArray: false, mergeAttrs: true, trim: true });
-    parsed = await parser.parseStringPromise(baseFormXml);
-  } catch {
-    return [];
-  }
-  if (!parsed?.AxForm?.Design) return [];
-
-  const design = walkFormDesign(parsed.AxForm.Design);
   const needle = fieldGroupName.toLowerCase();
-  const found: DataGroupRenderer[] = [];
-
-  const visit = (nodes: FormControlNode[]): void => {
-    for (const n of nodes) {
-      const dataGroup = n.properties?.DataGroup;
-      if (dataGroup && dataGroup.toLowerCase() === needle) {
-        found.push({
-          controlName: n.name,
-          dataSource: n.properties?.DataSource,
-          generatedNameFor: (fieldName: string) => `${dataGroup}_${fieldName}`,
-        });
-      }
-      visit(n.children);
-    }
-  };
-  visit(design.controls);
-
-  return found;
+  return (await listDataGroupRenderers(baseFormXml))
+    .filter(r => r.dataGroup.toLowerCase() === needle);
 }
 
 /**

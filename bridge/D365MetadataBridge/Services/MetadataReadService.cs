@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using D365MetadataBridge.Models;
@@ -105,12 +105,55 @@ namespace D365MetadataBridge.Services
         /// </summary>
         private IMetadataProvider? PickProvider(Func<IMetadataProvider, bool> exists)
         {
-            try { if (exists(_provider)) return _provider; } catch { }
+            // The catch has to stay: the primary provider legitimately throws for
+            // an object only the reference (UDE) provider carries, and swallowing
+            // that is exactly what makes the fallback work.
+            //
+            // What must NOT stay is swallowing it when nobody could answer. Every
+            // caller maps a null from here to "Object not found" (-32001), so a
+            // provider that threw — a metamodel mismatch, a TypeLoadException, an
+            // unreadable model — was reported to the agent as "that object does
+            // not exist". An agent told an object is absent creates it, and now
+            // there are two. So: remember the failure, and surface it only when
+            // neither provider said yes.
+            Exception? firstFailure = null;
+            try { if (exists(_provider)) return _provider; }
+            catch (Exception ex) { firstFailure = ex; }
+
             if (_referenceProvider != null)
             {
-                try { if (exists(_referenceProvider)) return _referenceProvider; } catch { }
+                try { if (exists(_referenceProvider)) return _referenceProvider; }
+                catch (Exception ex) { firstFailure ??= ex; }
             }
+
+            if (firstFailure != null)
+            {
+                Console.Error.WriteLine(
+                    $"[ERROR] MetadataReadService: provider lookup failed - {firstFailure.GetType().Name}: {firstFailure.Message}");
+                throw new InvalidOperationException(
+                    $"Metadata provider could not answer the lookup ({firstFailure.GetType().Name}: {firstFailure.Message}). " +
+                    "This is a provider failure, NOT a missing object - do not treat it as 'does not exist'.",
+                    firstFailure);
+            }
+
             return null;
+        }
+
+        /// <summary>
+        /// PickProvider for a site that deliberately probes SEVERAL object kinds.
+        ///
+        /// PickProvider throws when a provider fails, so "not found" can never be
+        /// confused with "could not look" — correct for a single-kind lookup. But
+        /// GetMethodSource tries Classes then Tables, and GetCompletionMembers does
+        /// the same: there, a throw on the first kind used to abort the call before
+        /// the kind that would have answered was ever tried. So the failure is
+        /// captured and handed back to the caller, which surfaces it only if every
+        /// probe missed.
+        /// </summary>
+        private IMetadataProvider? PickProviderTolerant(Func<IMetadataProvider, bool> exists, ref Exception? firstFailure)
+        {
+            try { return PickProvider(exists); }
+            catch (Exception ex) { firstFailure ??= ex; return null; }
         }
 
         // ========================
@@ -395,7 +438,7 @@ namespace D365MetadataBridge.Services
 
             try { var mi = prov.Tables.GetModelInfo(tableName); if (mi?.Count > 0) result.Model = mi.First().Name; } catch { }
 
-            try { foreach (var f in table.Fields) result.Fields.Add(MapField(f)); } catch (Exception ex) { Warn("fields", tableName, ex); }
+            try { foreach (var f in table.Fields) result.Fields.Add(MapField(f, prov)); } catch (Exception ex) { Warn("fields", tableName, ex); }
             try { foreach (var g in table.FieldGroups) { var gm = new FieldGroupModel { Name = g.Name, Label = Safe(() => g.Label) }; try { foreach (var f in g.Fields) gm.Fields.Add(Safe(() => f.DataField) ?? f.Name); } catch { } result.FieldGroups.Add(gm); } } catch (Exception ex) { Warn("fieldGroups", tableName, ex); }
             try { foreach (var i in table.Indexes) { var im = new IndexInfoModel { Name = i.Name, AllowDuplicates = IsYes(() => i.AllowDuplicates), AlternateKey = IsYes(() => i.AlternateKey) }; try { foreach (var f in i.Fields) im.Fields.Add(new IndexFieldModel { DataField = Safe(() => f.DataField) ?? f.Name, IncludedColumn = IsYes(() => f.IncludedColumn) }); } catch { } result.Indexes.Add(im); } } catch (Exception ex) { Warn("indexes", tableName, ex); }
 
@@ -481,8 +524,12 @@ namespace D365MetadataBridge.Services
         {
             var result = new MethodSourceModel { ClassName = className, MethodName = methodName };
 
+            // Class then table, on purpose: a provider failure on the first kind
+            // must not decide the answer for the second. See PickProviderTolerant.
+            Exception? probeFailure = null;
+
             // Try class first (checks primary then reference provider)
-            var classProv = PickProvider(p => p.Classes.Exists(className));
+            var classProv = PickProviderTolerant(p => p.Classes.Exists(className), ref probeFailure);
             if (classProv != null)
             {
                 var cls = classProv.Classes.Read(className);
@@ -516,7 +563,7 @@ namespace D365MetadataBridge.Services
             }
 
             // Try table (checks primary then reference provider)
-            var tableProv = PickProvider(p => p.Tables.Exists(className));
+            var tableProv = PickProviderTolerant(p => p.Tables.Exists(className), ref probeFailure);
             if (tableProv != null)
             {
                 var table = tableProv.Tables.Read(className);
@@ -537,6 +584,19 @@ namespace D365MetadataBridge.Services
                     }
                     catch { }
                 }
+            }
+
+            // Nothing matched. If a provider FAILED along the way, that — not
+            // "no such method" — is the honest answer: reporting a lookup that
+            // could not run as an absent method is how an agent ends up writing
+            // a method that already exists.
+            if (!result.Found && probeFailure != null)
+            {
+                throw new InvalidOperationException(
+                    $"Metadata provider could not answer the lookup for '{className}.{methodName}' " +
+                    $"({probeFailure.GetType().Name}: {probeFailure.Message}). This is a provider " +
+                    "failure, NOT a missing method.",
+                    probeFailure);
             }
 
             return result;
@@ -592,17 +652,62 @@ namespace D365MetadataBridge.Services
             var edt = prov.Edts.Read(edtName);
             if (edt == null) return null;
 
+            // The provider hands the EDT back exactly as its own XML declares it and does NOT
+            // fill in what it inherits. When a derived string EDT declares no StringSize of its
+            // own, the instance reports the AxEdtString constructor default of 10 instead of
+            // the inherited size. Measured against 10.0.2645: ItemFreeTxt read back as 10 and
+            // is really 1000 (from ItemFreeTxtBase); ItemId and CustAccount read back as 10 and
+            // are really 20.
+            //
+            // A child CAN declare its own StringSize -- 228 derived EDTs in the shipped corpus
+            // do. The platform allows it when the base carries StringSizeIsExtensible = Yes
+            // ("StringSize cannot be set on child edt when StringSizeIsExtensible is not set to
+            // Yes"). A declared value is left alone here; only the unset case is filled in.
+            var declaredLocally = edt is AxEdtString local
+                ? SafeInt(() => local.StringSize, UnsetStringSize)
+                : 0;
+
+            // ONE walk of the Extends chain, shared by the Root EDT row, the provenance label
+            // and the resolver fallback. It costs a full XML deserialize per hop and readEdt is
+            // a loop caller -- createD365File issues one per distinct EDT of a new table -- so
+            // the walk returns immediately for a root EDT and reads each hop from the child's
+            // own provider before paying for a two-provider Exists probe.
+            var inherited = FindInheritedStringSize(edt, prov);
+            ResolveInheritedEdtProperties(edt, inherited, prov);
+
             var result = new EdtInfoModel
             {
                 Name = edt.Name,
                 BaseType = edt.GetType().Name.Replace("AxEdt", ""),
                 Extends = Safe(() => edt.Extends),
+                // Only when the walk actually reached a root. A chain that broke on a dangling
+                // Extends (AmountMST names MoneyMST, which ships no AxEdt file) or on a cycle
+                // ends at an ancestor that is NOT the root, and reporting that one as the root
+                // would be a wrong answer rather than a missing one.
+                RootEdt = inherited.ChainComplete ? inherited.Root : null,
                 Label = Safe(() => edt.Label),
                 HelpText = Safe(() => edt.HelpText),
             };
 
             try { var mi = prov.Edts.GetModelInfo(edtName); if (mi?.Count > 0) result.Model = mi.First().Name; } catch { }
-            if (edt is AxEdtString s) result.StringSize = SafeInt(() => s.StringSize, 0);
+            if (edt is AxEdtString s)
+            {
+                result.StringSize = SafeInt(() => s.StringSize, 0);
+                // Provenance only when the reported number is not what this EDT's own XML said.
+                // That covers the unset case, and the case where an ancestor's value overrode a
+                // declared one (PartyName declares 100, reports DirPartyName's 160).
+                //
+                // The second half of the test is what keeps the label honest. The NUMBER comes
+                // from Microsoft's resolver and the ATTRIBUTION from the walk above -- two
+                // different algorithms -- so without agreeing on the value they can disagree on
+                // the ancestor, and the report would credit one that declares something else.
+                // When they disagree the number still stands; only the claim about where it
+                // came from is dropped.
+                if (result.StringSize != declaredLocally && inherited.Value == result.StringSize)
+                {
+                    result.StringSizeInheritedFrom = inherited.DeclaredBy;
+                }
+            }
             if (edt is AxEdtEnum en) result.EnumType = Safe(() => en.EnumType);
             try { result.ReferenceTable = Safe(() => ((dynamic)edt).ReferenceTable?.Table); } catch { }
 
@@ -610,7 +715,10 @@ namespace D365MetadataBridge.Services
             try { result.FormHelp = Safe(() => edt.FormHelp); } catch { }
             try { result.ConfigurationKey = Safe(() => ((dynamic)edt).ConfigurationKey); } catch { }
             try { result.Alignment = Safe(() => ((dynamic)edt).Alignment?.ToString()); } catch { }
-            try { result.DisplayLength = SafeInt(() => ((dynamic)edt).DisplayLength, 0); if (result.DisplayLength == 0) result.DisplayLength = null; } catch { }
+            // "Not set" for DisplayLength is -1, not 0 (verified against the AxEdtString
+            // constructor on 10.0.2645) — so the old `== 0` test never fired and every EDT
+            // without a local DisplayLength, 24 446 of the 25 332 indexed, reported -1.
+            try { result.DisplayLength = SafeInt(() => ((dynamic)edt).DisplayLength, -1); if (result.DisplayLength < 0) result.DisplayLength = null; } catch { }
             try { result.RelationType = Safe(() => ((dynamic)edt).RelationType?.ToString()); } catch { }
 
             // AxEdtReal specific
@@ -1150,68 +1258,65 @@ namespace D365MetadataBridge.Services
             // seen set prevents duplicate names when the same object exists in both providers
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            void Search(string objType, IList<string> keys)
+            // Takes the getter, not a materialized list: as an ARGUMENT, Keys(...) ran to
+            // completion before this method could return, so every collection was fully
+            // enumerated even when the result budget was already full. For the default
+            // "all" filter that is 14 primary-key lists per search, on both providers.
+            void Search(string objType, Func<IEnumerable<string>> getter)
             {
-                if (keys == null) return;
-                foreach (var n in keys)
+                // Budget spent — do not touch this collection at all.
+                if (result.Results.Count >= maxResults) return;
+                try
                 {
-                    if (result.Results.Count >= maxResults) return;
-                    if (n.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 && seen.Add(n))
-                        result.Results.Add(new SearchItemModel { Name = n, Type = objType });
+                    var raw = getter();
+                    if (raw == null) return;
+                    foreach (var n in raw)
+                    {
+                        // Stops ENUMERATING, not merely adding.
+                        if (result.Results.Count >= maxResults) return;
+                        if (n.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 && seen.Add(n))
+                            result.Results.Add(new SearchItemModel { Name = n, Type = objType });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[WARN] Search: could not list '{objType}': {ex.GetType().Name}: {ex.Message}");
                 }
             }
 
-            // Materialize primary keys from a provider collection.
-            // IMPORTANT: these are accessed STRONGLY-TYPED through the public
+            // Collections are accessed STRONGLY-TYPED through the public
             // Microsoft.Dynamics.AX.Metadata.Providers.IMetadataProvider interface — NOT via
             // `dynamic`. The concrete provider (DiskMetadataProvider) is an internal type, and
             // the DLR cannot bind to public members of an internal type from this assembly:
             // `dynamic dyn = prov; dyn.MenuItemDisplays` throws RuntimeBinderException
             // ("'object' does not contain a definition for 'MenuItemDisplays'") and silently
             // yields nothing — which is exactly how menu items/security stayed invisible.
-            // Interface access binds at compile time and works. Keys are enumerated (not cast
-            // to IList<string>) so a lazy IEnumerable<string> return is handled safely too.
-            List<string> Keys(string label, Func<IEnumerable<string>> getter)
-            {
-                var list = new List<string>();
-                try
-                {
-                    var raw = getter();
-                    if (raw != null)
-                        foreach (var k in raw) list.Add(k);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"[WARN] Search: could not list '{label}': {ex.GetType().Name}: {ex.Message}");
-                }
-                return list;
-            }
-
+            // Interface access binds at compile time and works.
             void SearchProvider(IMetadataProvider prov)
             {
                 try
                 {
                     switch (type.ToLowerInvariant())
                     {
-                        case "table": Search("table", Keys("table", () => prov.Tables.GetPrimaryKeys())); break;
-                        case "class": Search("class", Keys("class", () => prov.Classes.GetPrimaryKeys())); break;
-                        case "enum": Search("enum", Keys("enum", () => prov.Enums.GetPrimaryKeys())); break;
-                        case "edt": Search("edt", Keys("edt", () => prov.Edts.GetPrimaryKeys())); break;
-                        case "form": Search("form", Keys("form", () => prov.Forms.GetPrimaryKeys())); break;
-                        case "query": Search("query", Keys("query", () => prov.Queries.GetPrimaryKeys())); break;
-                        case "view": Search("view", Keys("view", () => prov.Views.GetPrimaryKeys())); break;
+                        case "table": Search("table", () => prov.Tables.GetPrimaryKeys()); break;
+                        case "class": Search("class", () => prov.Classes.GetPrimaryKeys()); break;
+                        case "enum": Search("enum", () => prov.Enums.GetPrimaryKeys()); break;
+                        case "edt": Search("edt", () => prov.Edts.GetPrimaryKeys()); break;
+                        case "form": Search("form", () => prov.Forms.GetPrimaryKeys()); break;
+                        case "query": Search("query", () => prov.Queries.GetPrimaryKeys()); break;
+                        case "view": Search("view", () => prov.Views.GetPrimaryKeys()); break;
                         case "data-entity":
-                        case "dataentity": Search("data-entity", Keys("data-entity", () => prov.DataEntityViews.GetPrimaryKeys())); break;
+                        case "dataentity": Search("data-entity", () => prov.DataEntityViews.GetPrimaryKeys()); break;
 
-                        case "menu-item-display": Search("menu-item-display", Keys("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys())); break;
-                        case "menu-item-action": Search("menu-item-action", Keys("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys())); break;
-                        case "menu-item-output": Search("menu-item-output", Keys("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys())); break;
+                        case "menu-item-display": Search("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys()); break;
+                        case "menu-item-action": Search("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys()); break;
+                        case "menu-item-output": Search("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys()); break;
 
-                        case "security-privilege": Search("security-privilege", Keys("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys())); break;
-                        case "security-duty": Search("security-duty", Keys("security-duty", () => prov.SecurityDuties.GetPrimaryKeys())); break;
-                        case "security-role": Search("security-role", Keys("security-role", () => prov.SecurityRoles.GetPrimaryKeys())); break;
+                        case "security-privilege": Search("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys()); break;
+                        case "security-duty": Search("security-duty", () => prov.SecurityDuties.GetPrimaryKeys()); break;
+                        case "security-role": Search("security-role", () => prov.SecurityRoles.GetPrimaryKeys()); break;
 
-                        case "table-extension": Search("table-extension", Keys("table-extension", () => prov.TableExtensions.GetPrimaryKeys())); break;
+                        case "table-extension": Search("table-extension", () => prov.TableExtensions.GetPrimaryKeys()); break;
                         // IMetadataProvider has no ClassExtensions collection — CoC/augmentation
                         // classes live in the regular Classes collection (named *_Extension). The
                         // bridge can't filter them out here, so return nothing and let the caller
@@ -1219,28 +1324,28 @@ namespace D365MetadataBridge.Services
                         case "class-extension":
                             Console.Error.WriteLine("[DEBUG] Search: class-extension requested — no IMetadataProvider collection; falling back to SQLite index");
                             break;
-                        case "form-extension": Search("form-extension", Keys("form-extension", () => prov.FormExtensions.GetPrimaryKeys())); break;
-                        case "enum-extension": Search("enum-extension", Keys("enum-extension", () => prov.EnumExtensions.GetPrimaryKeys())); break;
-                        case "edt-extension": Search("edt-extension", Keys("edt-extension", () => prov.EdtExtensions.GetPrimaryKeys())); break;
-                        case "data-entity-extension": Search("data-entity-extension", Keys("data-entity-extension", () => prov.DataEntityViewExtensions.GetPrimaryKeys())); break;
+                        case "form-extension": Search("form-extension", () => prov.FormExtensions.GetPrimaryKeys()); break;
+                        case "enum-extension": Search("enum-extension", () => prov.EnumExtensions.GetPrimaryKeys()); break;
+                        case "edt-extension": Search("edt-extension", () => prov.EdtExtensions.GetPrimaryKeys()); break;
+                        case "data-entity-extension": Search("data-entity-extension", () => prov.DataEntityViewExtensions.GetPrimaryKeys()); break;
 
                         default:
                             // "all" (or any unrecognized filter): enumerate every object kind so
                             // nothing — menu items included — is silently invisible to search.
-                            Search("table", Keys("table", () => prov.Tables.GetPrimaryKeys()));
-                            Search("class", Keys("class", () => prov.Classes.GetPrimaryKeys()));
-                            Search("enum", Keys("enum", () => prov.Enums.GetPrimaryKeys()));
-                            Search("edt", Keys("edt", () => prov.Edts.GetPrimaryKeys()));
-                            Search("form", Keys("form", () => prov.Forms.GetPrimaryKeys()));
-                            Search("query", Keys("query", () => prov.Queries.GetPrimaryKeys()));
-                            Search("view", Keys("view", () => prov.Views.GetPrimaryKeys()));
-                            Search("data-entity", Keys("data-entity", () => prov.DataEntityViews.GetPrimaryKeys()));
-                            Search("menu-item-display", Keys("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys()));
-                            Search("menu-item-action", Keys("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys()));
-                            Search("menu-item-output", Keys("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys()));
-                            Search("security-privilege", Keys("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys()));
-                            Search("security-duty", Keys("security-duty", () => prov.SecurityDuties.GetPrimaryKeys()));
-                            Search("security-role", Keys("security-role", () => prov.SecurityRoles.GetPrimaryKeys()));
+                            Search("table", () => prov.Tables.GetPrimaryKeys());
+                            Search("class", () => prov.Classes.GetPrimaryKeys());
+                            Search("enum", () => prov.Enums.GetPrimaryKeys());
+                            Search("edt", () => prov.Edts.GetPrimaryKeys());
+                            Search("form", () => prov.Forms.GetPrimaryKeys());
+                            Search("query", () => prov.Queries.GetPrimaryKeys());
+                            Search("view", () => prov.Views.GetPrimaryKeys());
+                            Search("data-entity", () => prov.DataEntityViews.GetPrimaryKeys());
+                            Search("menu-item-display", () => prov.MenuItemDisplays.GetPrimaryKeys());
+                            Search("menu-item-action", () => prov.MenuItemActions.GetPrimaryKeys());
+                            Search("menu-item-output", () => prov.MenuItemOutputs.GetPrimaryKeys());
+                            Search("security-privilege", () => prov.SecurityPrivileges.GetPrimaryKeys());
+                            Search("security-duty", () => prov.SecurityDuties.GetPrimaryKeys());
+                            Search("security-role", () => prov.SecurityRoles.GetPrimaryKeys());
                             break;
                     }
                 }
@@ -1298,8 +1403,17 @@ namespace D365MetadataBridge.Services
                 }
                 catch { }
 
-                // Find parent duties that contain this privilege
+                // Find parent duties that contain this privilege.
+                //
+                // `parentDutiesComplete` is the honest part: this is a scan over
+                // every duty, and a failure anywhere in it used to return an
+                // EMPTY list that reads as "this privilege is in no duty" — the
+                // exact claim BPErrorPrivilegeNotCoveredByDuty is about, and the
+                // one an agent acts on by adding it to a duty it may already be
+                // in. A per-duty read that fails only makes THAT duty unknown;
+                // a failure of the enumeration makes the whole answer unusable.
                 var parentDuties = new List<object>();
+                var parentDutiesComplete = true;
                 try
                 {
                     foreach (var dutyName in _provider.SecurityDuties.GetPrimaryKeys())
@@ -1317,10 +1431,14 @@ namespace D365MetadataBridge.Services
                                 }
                             }
                         }
-                        catch { }
+                        catch { parentDutiesComplete = false; }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    parentDutiesComplete = false;
+                    Console.Error.WriteLine($"[WARN] parent-duty scan for privilege '{name}' failed: {ex.Message}");
+                }
 
                 return new
                 {
@@ -1331,6 +1449,7 @@ namespace D365MetadataBridge.Services
                     model,
                     entryPoints,
                     parentDuties,
+                    parentDutiesComplete,
                     _source = "C# bridge (IMetadataProvider)"
                 };
             }
@@ -1792,11 +1911,279 @@ namespace D365MetadataBridge.Services
         private static int SafeInt(Func<int> f, int d) { try { return f(); } catch { return d; } }
         private static void Warn(string section, string obj, Exception ex) => Console.Error.WriteLine($"[WARN] Error reading {section} for {obj}: {ex.Message}");
 
+        /// <summary>
+        /// The value an AxEdtString reports when its XML declares no StringSize: the constructor
+        /// default. The serializer omits a property equal to its default, so a declared 10 and an
+        /// undeclared one are the same bytes on disk and the same value here -- and the compiler
+        /// treats both the same way, by inheriting. Verified against 10.0.2645, where an explicit
+        /// StringSize of 10 appears in none of the 25 332 shipped EDTs.
+        /// </summary>
+        private const int UnsetStringSize = 10;
+
+        /// <summary>
+        /// Microsoft's EDT-level virtual-property resolver, bound by name. Null on a platform
+        /// whose assemblies do not carry it. See <see cref="FindStaticHelper"/> for why this is
+        /// reflection and not a call.
+        /// </summary>
+        private static readonly Lazy<System.Reflection.MethodInfo?> ResolveVirtualPropertiesHelper =
+            new Lazy<System.Reflection.MethodInfo?>(() => FindStaticHelper(
+                "Microsoft.Dynamics.AX.Metadata.MetaModel.Extensions.MetaEdtExtensions",
+                "ResolveVirtualProperties", typeof(AxEdt), typeof(IMetadataProvider), typeof(bool)));
+
+        /// <summary>
+        /// Microsoft's field-level string-size resolver, bound the same way and for the same
+        /// reason.
+        /// </summary>
+        private static readonly Lazy<System.Reflection.MethodInfo?> GetStringSizeHelper =
+            new Lazy<System.Reflection.MethodInfo?>(() => FindStaticHelper(
+                "Microsoft.Dynamics.AX.Metadata.MetaModel.Extensions.MetaTableFieldExtensions",
+                "GetStringSize", typeof(AxTableFieldString), typeof(IMetadataProvider), typeof(bool)));
+
+        /// <summary>
+        /// Finds a public static method by type name and method name, accepting any parameter
+        /// list the given argument types fit. Returns null when the type or the method is absent,
+        /// which is the signal to take the hand-rolled path.
+        ///
+        /// Why by name and not by a call. A direct call binds this project to a helper that only
+        /// some platform versions ship, and wrapping that call in try/catch does NOT make the
+        /// binding optional: the CLR resolves a method token when it JITs the method CONTAINING
+        /// the call, so a MissingMethodException surfaces at that method's own call site, one
+        /// frame up, and the inner catch never runs. Measured on .NET Framework 4 x64 against an
+        /// assembly with the helper removed: the inner catch did not fire, the fallback below it
+        /// was unreachable, and the exception escaped into the caller.
+        ///
+        /// The compile side matters more. The bridge ships as source and is built on each user's
+        /// own machine against that machine's PackagesLocalDirectory bin, so a direct call would
+        /// not merely lose the fallback on an older platform -- it would fail the build there and
+        /// leave the user with no bridge at all, where today they get one that reports the wrong
+        /// number. Binding by name keeps both the compile and the fallback intact.
+        ///
+        /// Both helpers live in Microsoft.Dynamics.AX.Metadata.dll, the same assembly as AxEdt,
+        /// which this process has loaded long before anything asks for them -- so the lookup
+        /// starts there and only then scans what else is loaded.
+        /// </summary>
+        private static System.Reflection.MethodInfo? FindStaticHelper(
+            string typeName, string methodName, params Type[] argTypes)
+        {
+            try
+            {
+                Type? type = null;
+                try { type = typeof(AxEdt).Assembly.GetType(typeName, false); } catch { }
+                if (type == null)
+                {
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        try { type = asm.GetType(typeName, false); } catch { }
+                        if (type != null) break;
+                    }
+                }
+                if (type == null)
+                {
+                    Console.Error.WriteLine(
+                        $"[WARN] {typeName} is absent from this platform's metadata assemblies; " +
+                        "falling back to the hand-rolled string-size walk.");
+                    return null;
+                }
+
+                foreach (var m in type.GetMethods(
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+                {
+                    if (m.Name != methodName) continue;
+                    var ps = m.GetParameters();
+                    if (ps.Length != argTypes.Length) continue;
+                    var fits = true;
+                    for (var i = 0; i < ps.Length; i++)
+                    {
+                        if (!ps[i].ParameterType.IsAssignableFrom(argTypes[i])) { fits = false; break; }
+                    }
+                    if (fits) return m;
+                }
+
+                Console.Error.WriteLine(
+                    $"[WARN] {typeName}.{methodName} has no overload this bridge can call on this " +
+                    "platform; falling back to the hand-rolled string-size walk.");
+            }
+            catch (Exception ex)
+            {
+                Warn("bindStaticHelper", $"{typeName}.{methodName}", ex);
+            }
+            return null;
+        }
+
+        /// <summary>Unwraps the TargetInvocationException reflection wraps a callee's throw in.</summary>
+        private static Exception Unwrap(Exception ex) =>
+            ex is System.Reflection.TargetInvocationException tie && tie.InnerException != null
+                ? tie.InnerException
+                : ex;
+
+        /// <summary>Where a derived EDT's string size comes from, when it does not declare one.</summary>
+        private sealed class InheritedStringSize
+        {
+            /// <summary>
+            /// Last ancestor the walk reached. It is the root of the hierarchy only when
+            /// <see cref="ChainComplete"/> is true; null when the EDT is itself a root.
+            /// </summary>
+            public string? Root;
+            /// <summary>Nearest ancestor that declares a StringSize; null when none does.</summary>
+            public string? DeclaredBy;
+            /// <summary>That ancestor's declared StringSize.</summary>
+            public int? Value;
+            /// <summary>
+            /// True when the walk ended at an EDT that extends nothing. False when it stopped
+            /// early -- a dangling Extends, a cycle, or a provider that could not answer -- in
+            /// which case <see cref="Root"/> is simply the last thing seen.
+            /// </summary>
+            public bool ChainComplete;
+        }
+
+        /// <summary>
+        /// Walks <c>Extends</c> once, recording the end of the hierarchy and the nearest ancestor
+        /// that actually declares a StringSize -- the value an undeclared child takes.
+        ///
+        /// A dangling <c>Extends</c> ends the walk where it breaks -- AmountMST names MoneyMST,
+        /// which ships no AxEdt file -- and a name already seen ends it too, so a metadata cycle
+        /// cannot spin. Either way the result is marked incomplete rather than passed off as a
+        /// root.
+        /// </summary>
+        private InheritedStringSize FindInheritedStringSize(AxEdt edt, IMetadataProvider prov)
+        {
+            var found = new InheritedStringSize();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { edt.Name };
+            var next = Safe(() => edt.Extends);
+
+            while (!string.IsNullOrEmpty(next))
+            {
+                if (!seen.Add(next!)) return found;
+
+                var parent = ReadAncestorEdt(next!, prov);
+                if (parent == null) return found;
+
+                found.Root = parent.Name;
+                if (found.DeclaredBy == null && parent is AxEdtString ps)
+                {
+                    var size = SafeInt(() => ps.StringSize, UnsetStringSize);
+                    if (size != UnsetStringSize)
+                    {
+                        found.DeclaredBy = parent.Name;
+                        found.Value = size;
+                    }
+                }
+                next = Safe(() => parent.Extends);
+            }
+
+            found.ChainComplete = true;
+            return found;
+        }
+
+        /// <summary>
+        /// Reads one ancestor for the chain walk, or null when nobody has it.
+        ///
+        /// The child's own provider answers for very nearly every hop, so it is asked first and
+        /// <see cref="PickProvider"/> -- which costs an Exists probe against both providers -- is
+        /// only paid when that misses. That case is real (UDE: a custom EDT extending a Microsoft
+        /// one), just rare.
+        ///
+        /// The catch around PickProvider is load-bearing: PickProvider THROWS when a provider
+        /// fails, deliberately, so that a single-kind lookup can never report "does not exist"
+        /// for "could not look". Here the lookup is a side quest of a read that has already
+        /// succeeded, and letting that throw would turn a good EDT read -- or, from MapField, a
+        /// whole table's field list -- into an error over an ancestor nobody asked about.
+        /// </summary>
+        private AxEdt? ReadAncestorEdt(string name, IMetadataProvider prov)
+        {
+            try { var own = prov.Edts.Read(name); if (own != null) return own; } catch { }
+
+            var other = PickProviderForEdt(name);
+            if (other == null || ReferenceEquals(other, prov)) return null;
+
+            try { return other.Edts.Read(name); } catch { return null; }
+        }
+
+        /// <summary>
+        /// <see cref="PickProvider"/> for an EDT lookup that is a side quest of a read which has
+        /// already succeeded, and so must not be able to fail that read. See
+        /// <see cref="ReadAncestorEdt"/> for why the throw is swallowed here.
+        /// </summary>
+        private IMetadataProvider? PickProviderForEdt(string edtName)
+        {
+            try { return PickProvider(p => p.Edts.Exists(edtName)); } catch { return null; }
+        }
+
+        /// <summary>
+        /// Fills in the string size a derived EDT inherits rather than declares, so the reported
+        /// value is the one X++ compiles against.
+        /// </summary>
+        private void ResolveInheritedEdtProperties(AxEdt edt, InheritedStringSize inherited, IMetadataProvider prov)
+        {
+            if (string.IsNullOrEmpty(Safe(() => edt.Extends))) return;
+
+            // Microsoft's own resolver, which encodes a rule a reimplementation would get
+            // wrong: a declared size does not always win. Measured over the 182 derived EDTs
+            // that declare a size and have a declaring ancestor --
+            //   StringSizeIsExtensible = Yes  -> the declaration wins either way
+            //                                    (InvoiceId 50 over Num 20; CustInvoiceId 20
+            //                                    under InvoiceId 50)
+            //   otherwise, declared smaller   -> the ancestor's value wins (4 EDTs: PartyName
+            //                                    declares 100 under DirPartyName's 160 and
+            //                                    reports 160, ITMJourneyId, TAMRebateInvoice,
+            //                                    PSNPurchasingCardProviderName)
+            //   otherwise, declared larger    -> UNVERIFIED; no such EDT ships, so this code
+            //                                    does not assume a direction and simply lets
+            //                                    the resolver decide.
+            var helper = ResolveVirtualPropertiesHelper.Value;
+            if (helper != null)
+            {
+                try
+                {
+                    // isFlightEnabled: false, and the flag is not a detail. With true, an
+                    // EDT-level read of CustInvoiceId returns 50 while the FIELD-level resolver
+                    // returns 20 for CustInvoiceJour.InvoiceId -- a field typed with that very
+                    // EDT -- so the bridge would contradict itself between get_object_info(edt)
+                    // and get_object_info(table). With false the two agree at 20. false also
+                    // confines this to the actual defect (an undeclared size) rather than
+                    // rewriting values an EDT does declare, and the flag changes nothing for any
+                    // of the broken cases (ItemFreeTxt 1000, ItemId 20, AccountNumber_IN 20 under
+                    // either value).
+                    helper.Invoke(null, new object?[] { edt, prov, false });
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // The resolver was found but threw. Unlike an absent one -- which is already
+                    // handled by helper == null -- this is a genuine per-EDT failure, so it warns
+                    // and drops through to the walk rather than being taken as a verdict on the
+                    // platform.
+                    Warn("resolveVirtualProperties", edt.Name, Unwrap(ex));
+                }
+            }
+
+            // Fallback: fill in ONLY an undeclared size, from the nearest ancestor that declares
+            // one. That is exactly the population the defect affects, and the rule matched the
+            // resolver on 148 of 148 such EDTs. It deliberately does not reproduce the rule for
+            // a declared-but-smaller value -- leaving a declared number alone is the honest
+            // failure mode, and that case covers 4 EDTs in the shipped corpus.
+            //
+            // NoOfDecimals is left alone throughout. It looks similar but is NOT virtual: a child
+            // real EDT may declare its own (AccruedAmountMST_IT declares 2 while its base reports
+            // -1), so copying an ancestor's would overwrite a real local value.
+            if (edt is AxEdtString derived && inherited.Value.HasValue)
+            {
+                try
+                {
+                    if (derived.StringSize == UnsetStringSize)
+                    {
+                        derived.StringSize = inherited.Value.Value;
+                    }
+                }
+                catch { }
+            }
+        }
+
         // ========================
         // DIAGNOSTIC: Probe IMetadataProvider write capability
         // ========================
 
-        private FieldInfoModel MapField(AxTableField field)
+        private FieldInfoModel MapField(AxTableField field, IMetadataProvider prov)
         {
             var m = new FieldInfoModel
             {
@@ -1808,9 +2195,86 @@ namespace D365MetadataBridge.Services
                 Mandatory = IsYes(() => field.Mandatory),
                 AllowEdit = Safe(() => field.AllowEdit.ToString()),
             };
-            if (field is AxTableFieldString s) m.StringSize = SafeInt(() => s.StringSize, 0);
+            if (field is AxTableFieldString s) m.StringSize = EffectiveFieldStringSize(s, prov);
             if (field is AxTableFieldEnum en) m.EnumType = Safe(() => en.EnumType);
             return m;
+        }
+
+        /// <summary>
+        /// Set once the field-level resolver has thrown, so a systemic failure puts one line on
+        /// stderr instead of one per string field per table read (103 for CustTable alone).
+        ///
+        /// It gates the WARNING only, never the call. An absent helper is already handled by
+        /// binding it by name, so what reaches the catch is a per-field failure -- one malformed
+        /// field, a dangling ExtendedDataType -- and letting that permanently downgrade every
+        /// later table read in the process would trade a loud narrow fault for a silent wide one.
+        /// </summary>
+        private bool _fieldStringSizeHelperWarned;
+
+        /// <summary>
+        /// The string size a field really has. An EDT-typed field almost never declares its own
+        /// size -- it takes the EDT's, and through the EDT its ancestors' -- but the raw property
+        /// returns the AxTableFieldString constructor default of 10 regardless. Measured across
+        /// ten core tables on 10.0.2645, that was wrong for 310 of 564 string fields (55 %):
+        /// InventTable.ItemId reported 10 against a real 20, InventTable.AltConfigId reported 10
+        /// against a real 50.
+        /// </summary>
+        private int EffectiveFieldStringSize(AxTableFieldString field, IMetadataProvider prov)
+        {
+            var helper = GetStringSizeHelper.Value;
+            if (helper != null)
+            {
+                try
+                {
+                    // Microsoft's own resolver: field -> EDT -> its ancestors. isFlightEnabled is
+                    // passed false to match ReadEdt, so the two agree on the same type; measured,
+                    // this resolver returned the same value under either flag for every field
+                    // tried (CustInvoiceJour.InvoiceId 20, DirPartyTable.Name 160,
+                    // InventTable.ItemId 20).
+                    var resolved = helper.Invoke(null, new object?[] { field, prov, false });
+                    if (resolved is int size) return size;
+                }
+                catch (Exception ex)
+                {
+                    if (!_fieldStringSizeHelperWarned)
+                    {
+                        _fieldStringSizeHelperWarned = true;
+                        Warn("effectiveStringSize", field.Name, Unwrap(ex));
+                    }
+                }
+            }
+
+            // Fallback for a platform without the helper, and for the single field it could not
+            // answer for. A field that declares its own size keeps it; otherwise take the field's
+            // EDT, and from there the nearest declaring ancestor, exactly as ReadEdt does.
+            //
+            // Note what "declares its own size" can and cannot mean here. The 10-is-unset
+            // argument was MEASURED for EDTs (no explicit 10 among the 25 332 shipped) and is
+            // only carried over to fields, where it rests on the AxTableFieldString constructor
+            // default alone. A field that really did declare 10 over a 20-character EDT would be
+            // reported as 20 on this path. Microsoft's resolver above has no such gap, so this
+            // costs nothing on a current platform.
+            var declared = SafeInt(() => field.StringSize, UnsetStringSize);
+            if (declared != UnsetStringSize) return declared;
+
+            var edtName = Safe(() => field.ExtendedDataType);
+            if (!string.IsNullOrEmpty(edtName))
+            {
+                var edtProv = PickProviderForEdt(edtName!) ?? prov;
+                AxEdt? edt = null;
+                try { edt = edtProv.Edts.Read(edtName!); } catch { }
+                if (edt != null)
+                {
+                    if (edt is AxEdtString es)
+                    {
+                        var own = SafeInt(() => es.StringSize, UnsetStringSize);
+                        if (own != UnsetStringSize) return own;
+                    }
+                    var inherited = FindInheritedStringSize(edt, edtProv);
+                    if (inherited.Value.HasValue) return inherited.Value.Value;
+                }
+            }
+            return declared;
         }
     }
 }

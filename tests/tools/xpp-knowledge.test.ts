@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { xppKnowledgeTool } from '../../src/tools/knowledge/xppKnowledge';
+import { xppKnowledgeTool, KNOWLEDGE_BASE } from '../../src/tools/knowledge/xppKnowledge';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
 const req = (args: Record<string, unknown> = {}): CallToolRequest => ({
@@ -302,5 +302,143 @@ describe('get_xpp_knowledge', () => {
     const text = getText(result);
     expect(text).toContain('FormRun');
     expect(text).toContain('init');
+  });
+});
+
+/**
+ * Run 7b8de4ba asked for "enum2str global function convert enum value to label
+ * text" and was answered — without a caveat — by the extensible-enum topic,
+ * because the token `enum2str` CONTAINS the keyword `enum` and scoreEntry credits
+ * that direction. The only conversion example in the answer takes two arguments,
+ * so the caller wrote enum2Str with two, and paid a 76 s failed build.
+ *
+ * The base now documents enum2Str, so that exact query is answered properly. What
+ * is pinned here is the general guard: a name the base does not carry must come
+ * back saying so, instead of quietly serving its nearest neighbour.
+ */
+describe('unknown distinctive tokens', () => {
+  it('says so when an identifier-shaped word is not documented by name', async () => {
+    const text = getText(await xppKnowledgeTool(req({ topic: 'SysFooBar2Baz conversion helper' })));
+    expect(text).toContain('`SysFooBar2Baz` is not documented by name');
+    // The results still come — this annotates them, it does not withhold them.
+    expect(text).toContain('##');
+    // The lesson from the run that motivated it.
+    expect(text).toContain('do NOT infer a signature, an argument count');
+  });
+
+  it('names several unknowns and counts the rest', async () => {
+    const text = getText(await xppKnowledgeTool(
+      req({ topic: 'conFooOne conFooTwo conFooThree conFooFour enum' }),
+    ));
+    expect(text).toContain('are not documented by name');
+    expect(text).toContain('(and 1 more)');
+  });
+
+  it('stays quiet for a name the base does document', async () => {
+    // enum2Str earns its silence the only way that counts: it is in the base.
+    const text = getText(await xppKnowledgeTool(
+      req({ topic: 'enum2str global function convert enum value to label text' }),
+    ));
+    expect(text).not.toContain('is not documented by name');
+    expect(text).toContain('ONE argument');
+  });
+
+  it('stays quiet for ordinary prose, however unmatched', async () => {
+    // Only identifier-shaped words qualify: a digit against letters, internal
+    // camelCase or an underscore. Plain words are the score guard's business.
+    const text = getText(await xppKnowledgeTool(req({ topic: 'batch job' })));
+    expect(text).not.toContain('not documented by name');
+  });
+
+  it('leaves every shipped entry id unflagged', async () => {
+    // An id that tripped its own guard would be a scoring bug, not a warning.
+    for (const topic of ['set-based', 'coc-authoring', 'enum-conversions', 'formrun-lifecycle']) {
+      const text = getText(await xppKnowledgeTool(req({ topic })));
+      expect(text, topic).not.toContain('not documented by name');
+    }
+  });
+});
+
+/**
+ * Scanner/barcode routing (SCM audit, 2026-08-30).
+ *
+ * Before the `warehouse-mobile-app` / `barcode-scanning` topics existed, the base
+ * answered the scanner half of WHS like this: `barcode`, `gs1` and `scanning`
+ * returned "❌ No matching knowledge entries found", `item barcode` returned the
+ * *menu* topic (the token `item` hits the keyword `menu item`), `license plate`
+ * returned ISV *license codes*, and `scanner` returned **Electronic Reporting** —
+ * scoreEntry credits `token.includes(keyword)`, and "scanner" contains "er".
+ *
+ * A wrong topic is worse than no topic: it reads as authoritative. These pin the
+ * routing, not the prose — the failure they guard against is a future keyword
+ * edit silently handing scanner questions back to an unrelated framework.
+ */
+describe('warehouse scanner / barcode routing', () => {
+  const routes: Array<[string, string]> = [
+    ['barcode', 'barcode-scanning'],
+    ['gs1', 'barcode-scanning'],
+    ['gtin', 'barcode-scanning'],
+    ['item barcode', 'barcode-scanning'],
+    ['application identifier', 'barcode-scanning'],
+    ['scanner', 'warehouse-mobile-app'],
+    ['scanning', 'warehouse-mobile-app'],
+    ['warehouse mobile app', 'warehouse-mobile-app'],
+    ['mobile device menu item', 'warehouse-mobile-app'],
+    ['license plate', 'warehouse-mobile-app'],
+    ['handheld', 'warehouse-mobile-app'],
+    // The action half: a scanner reads a code and then DOES something.
+    ['scan action', 'warehouse-mobile-app'],
+    ['indirect activity', 'warehouse-mobile-app'],
+    ['work confirmation', 'warehouse-mobile-app'],
+    ['activity code', 'warehouse-mobile-app'],
+  ];
+
+  const titleOf = (id: string) => KNOWLEDGE_BASE.find(e => e.id === id)!.title;
+
+  for (const [topic, expectedId] of routes) {
+    it(`"${topic}" is answered by ${expectedId}`, async () => {
+      const text = getText(await xppKnowledgeTool(req({ topic })));
+      expect(text, topic).not.toContain('❌ No matching');
+      // The top result is the first "## <title>" heading in the rendered answer.
+      expect(text.split('\n').find(l => l.startsWith('## ')), topic)
+        .toBe(`## ${titleOf(expectedId)}`);
+    });
+  }
+
+  it('keeps the topics the scanner keywords used to be stolen from', async () => {
+    // The other half of the same defect: widening keywords must not push a
+    // neighbouring topic off its own query.
+    const unchanged: Array<[string, string]> = [
+      ['electronic reporting', 'electronic-reporting'],
+      ['license code', 'license-codes'],
+      ['menu item', 'menu-navigation'],
+      ['wave template', 'warehouse-management'],
+      ['inventory on-hand', 'inventory-management'],
+    ];
+    for (const [topic, id] of unchanged) {
+      const text = getText(await xppKnowledgeTool(req({ topic })));
+      expect(text.split('\n').find(l => l.startsWith('## ')), topic)
+        .toBe(`## ${titleOf(id)}`);
+    }
+  });
+
+  it('teaches the invariants a scanner customization gets wrong', async () => {
+    const step = getText(await xppKnowledgeTool(req({ topic: 'warehouse-mobile-app', format: 'detailed' })));
+    // Stateless round trips — state in the container, not in member variables.
+    expect(step).toMatch(/stateless/i);
+    expect(step).toContain('NEVER in class member variables');
+
+    // The action half. A scanner reads a code and performs an action, so the
+    // topic has to answer what runs (menu item mode + activity, i.e. setup),
+    // in what transaction (one round trip), and what happens on the retry the
+    // device WILL send. Transport-only guidance is what this pins against.
+    expect(step).toContain('ONE ROUND TRIP = ONE TRANSACTION');
+    expect(step).toContain('idempotent');
+    expect(step).toMatch(/menu item binds a MODE/);
+
+    const scan = getText(await xppKnowledgeTool(req({ topic: 'barcode-scanning', format: 'detailed' })));
+    // A scan is not an item number; AIs are parsed, not sliced at offsets.
+    expect(scan).toContain('GTIN is not an item number');
+    expect(scan).toContain('FNC1');
   });
 });

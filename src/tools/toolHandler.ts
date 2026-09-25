@@ -3,7 +3,7 @@ import { CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { XppServerContext } from '../types/context.js';
 import { getConfigManager } from '../utils/configManager.js';
 import {
-  SERVER_MODE, LOCAL_TOOLS, TOOL_PROFILE,
+  SERVER_MODE, LOCAL_TOOLS, DB_BACKED_LOCAL_TOOLS, TOOL_PROFILE,
   isToolAllowedInMode, isToolInProfile,
 } from '../server/serverMode.js';
 import { BRIDGE_BACKED_TOOLS, awaitBridgeReady } from '../bridge/bridgeReadiness.js';
@@ -11,6 +11,9 @@ import {
   BRIDGE_FAILURE_MARKER, runWithBridgeFailureScope, renderBridgeFailureNote,
 } from '../bridge/bridgeFailure.js';
 import type { BridgeFailure } from '../bridge/bridgeFailure.js';
+import {
+  runWithSideEffectScope, renderSideEffectNote, type WriteSideEffect,
+} from '../utils/writeSideEffects.js';
 import * as debouncedRefresh from '../bridge/debouncedRefresh.js';
 import { searchUnifiedTool } from './analysis/searchUnified.js';
 import { getObjectInfoTool } from './readers/getObjectInfo.js';
@@ -37,15 +40,24 @@ import { undoLastModificationTool } from './sdlc/undoLastModification.js';
 import { validateCodeTool } from './analysis/validateCode.js';
 import { prepareTool } from './prepare/prepare.js';
 import { getWorkspaceInfoTool } from './readers/getWorkspaceInfo.js';
-import { recordToolStart, startMetricsLogging, recordCallSequence, reportSlowCall } from '../utils/toolMetrics.js';
+import { recordToolStart, startMetricsLogging, recordCallSequence, occurrencesInEpoch, reportSlowCall } from '../utils/toolMetrics.js';
 import {
   DEDUP_EXCLUDED_TOOLS, DEDUP_TTL_MS,
   dedupKey, getDedupedResult, storeDedupResult, appendNote,
   getInFlight, registerInFlight, clearInFlight,
+  MUTATING_TOOLS, currentWriteEpoch, bumpWriteEpoch,
 } from '../utils/callDedup.js';
-import { truncateOnBlockBoundary } from '../utils/payloadBudget.js';
+import { capToolResponse } from './responseCaps.js';
+
+/**
+ * Tools whose call can WRITE to the model. Used only to pick the right wording
+ * when the bridge failed but the tool still returned OK — see the note in the
+ * dispatch loop.
+ */
+const WRITE_CAPABLE_TOOLS = new Set(['d365fo_file', 'labels']);
 import { buildProgressMessage } from '../utils/toolProgressMessage.js';
-import { createProgressReporter } from '../utils/progressReporter.js';
+import { createProgressReporter, startProgressHeartbeat } from '../utils/progressReporter.js';
+import { describeDbWait } from '../utils/startupProgress.js';
 
 
 /**
@@ -94,49 +106,28 @@ function extractWorkspaceFromMeta(meta: any): string | null {
  * Centralized tool handler that dispatches to individual tool implementations
  */
 
-/** Per-tool response cap sizes. 'uncapped' = no truncation. */
-const TOOL_CAP_SIZES: Record<string, number | 'uncapped'> = {
-  // Uncapped — XML generation, file writes, or long structured output
-  generate_object:                  'uncapped',
-  d365fo_file:                      'uncapped',
-  get_object_info:                  'uncapped', // can return reports (RDL) and full class bodies
-  get_method:                       'uncapped', // partial method source is useless
-  build_d365fo_project:             'uncapped', // compiler errors can appear late in long logs
-  security_info:                    8000,
-  extension_info:                   6000,
-  // Default output is ~1 KB. The higher cap exists for diagnostics=true, whose
-  // whole point is the full dump — truncating that at 5000 hid the stdio
-  // handshake section behind the project table.
-  get_workspace_info:               20000,
-  default:                          5000,
-};
+/**
+ * Published tools that answer from IN-REPO STATIC DATA and so must not queue
+ * behind dbReady. VERIFIED LIVE (2026-08-25): five parallel first calls at
+ * server start all exceeded 120 s and were pushed to the background, including
+ * `get_knowledge(kind="op-spec")` — 2 ms warm, no database in its path, waiting
+ * only because the gate is "not in LOCAL_TOOLS → await dbReady (55 s)".
+ *
+ * EXEMPTED, one tool, on the strict bar that the handler cannot reach the index
+ * even in principle:
+ *  • get_knowledge — dispatched as `getKnowledgeTool(request)`, without
+ *    `context`, so it has no symbolIndex to read; its answers come from
+ *    src/knowledge/** and the op-spec tables shipped in this repo.
+ * REJECTED (each genuinely reads the index, and would answer wrong or empty
+ * before dbReady): object_patterns (domain="table" queries symbols),
+ * validate_code + validate_object_naming (label/name lookups), and
+ * prepare / generate_object / d365fo_file (all ground writes in indexed metadata).
+ * The bridge-readiness wait below is untouched — different, much shorter gate.
+ */
+const DB_FREE_TOOLS = new Set(['get_knowledge']);
 
-function getCapForTool(toolName: string): number | 'uncapped' {
-  return TOOL_CAP_SIZES[toolName] ?? TOOL_CAP_SIZES['default'];
-}
-
-
-export function capToolResponse(toolName: string, result: any): any {
-  const cap = getCapForTool(toolName);
-  if (cap === 'uncapped' || !result?.content) return result;
-  const content = result.content.map((item: any) => {
-    if (item.type !== 'text' || typeof item.text !== 'string') return item;
-    if (item.text.length <= (cap as number)) return item;
-    // Cut on a block boundary: a raw slice ended responses mid-XML-element
-    // (`<AxTableField Nam`), which reads as corrupt metadata, not truncated.
-    const kept = truncateOnBlockBoundary(item.text, cap as number);
-    return {
-      ...item,
-      // The advice used to say `compact=false`, which makes the response BIGGER
-      // — the caller followed it and hit the cap again with more content cut.
-      text: kept +
-        `\n\n> ✂️ Response truncated at ${cap} chars (${item.text.length - kept.length} omitted). ` +
-        `Ask for LESS, not more: page with methodOffset/fieldsOffset, narrow with fieldFilter/searchControl/prefix, ` +
-        `keep compact=true, and read one object per call instead of objects[].`,
-    };
-  });
-  return { ...result, content };
-}
+/** Tools that drive the progress reporter themselves, and must not be doubled up on. */
+const SELF_REPORTING_TOOLS = new Set(['build_d365fo_project']);
 
 export function registerToolHandler(server: Server, context: XppServerContext): void {
   startMetricsLogging();
@@ -166,26 +157,41 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
     // ctx.dbReady resolves once the real symbol database is loaded; await it so
     // tools use the real index instead of silently returning empty results.
-    // LOCAL_TOOLS need no DB (filesystem/in-memory config only) and skip the wait.
-    if (context.dbReady && !LOCAL_TOOLS.has(toolName)) {
+    // LOCAL_TOOLS need no DB (filesystem/in-memory config only) and skip the
+    // wait — except DB_BACKED_LOCAL_TOOLS, which are local AND read the index, and
+    // whose exemption cost them the 55 s ceiling too. DB_FREE_TOOLS also skip it,
+    // their answer being in-repo static data.
+    const skipsDbWait =
+      (LOCAL_TOOLS.has(toolName) && !DB_BACKED_LOCAL_TOOLS.has(toolName)) ||
+      DB_FREE_TOOLS.has(toolName);
+    if (context.dbReady && !skipsDbWait) {
       const t0 = Date.now();
       // Race dbReady against a 55-second timeout so VS Code's ~60 s client
       // timeout doesn't silently cancel the request. If the DB is still loading
       // after 55 s, return an informative message instead of hanging forever.
       const DB_WAIT_TIMEOUT_MS = 55_000;
-      const timeoutPromise = new Promise<'timeout'>(resolve =>
-        setTimeout(() => resolve('timeout'), DB_WAIT_TIMEOUT_MS),
-      );
-      const result = await Promise.race([
-        context.dbReady.then(() => 'ready' as const),
-        timeoutPromise,
-      ]);
+      // The handle is cleared below: an uncleared 55 s timer per call kept the
+      // event loop alive for up to 55 s after the last call, and on a busy server
+      // held one pending timer per in-flight call for no reason.
+      let dbWaitTimer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<'timeout'>(resolve => {
+        dbWaitTimer = setTimeout(() => resolve('timeout'), DB_WAIT_TIMEOUT_MS);
+      });
+      let result: 'ready' | 'timeout';
+      try {
+        result = await Promise.race([
+          context.dbReady.then(() => 'ready' as const),
+          timeoutPromise,
+        ]);
+      } finally {
+        if (dbWaitTimer !== undefined) clearTimeout(dbWaitTimer);
+      }
       if (result === 'timeout') {
+        // Wording lives in startupProgress: on a first start the build behind
+        // this refusal runs for tens of minutes, and the answer has to say which
+        // model it has reached or every retry reads identically.
         return {
-          content: [{
-            type: 'text',
-            text: `⏳ The MCP server is still loading the X++ symbol database (takes 30–90 s on first start). Please retry the request in a few seconds.`,
-          }],
+          content: [{ type: 'text', text: describeDbWait(toolName) }],
           isError: true,
         };
       }
@@ -245,7 +251,14 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
     // Loop detection + duplicate-call dedup
     const callKey = dedupKey(toolName, request.params.arguments);
-    const occurrences = recordCallSequence(toolName, callKey);
+    // Captured HERE, not after the tool runs: it tags this occurrence in the
+    // sequence buffer, so the loop advisory below can tell a genuine loop from a
+    // legitimate re-read that follows a write.
+    const epochAtStart = currentWriteEpoch();
+    // Side effect: records this occurrence (and the duplicate-call metric) in the
+    // sequence buffer, tagged with the epoch. The raw repeat count is deliberately
+    // NOT used for the loop advisory — see occurrencesInEpoch below.
+    recordCallSequence(toolName, callKey, epochAtStart);
     if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
       const cached = getDedupedResult(callKey);
       if (cached !== undefined) {
@@ -275,14 +288,22 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
 
     const finishMetrics = recordToolStart(toolName);
     const callStartedAt = Date.now();
+    // `epochAtStart` is captured further up, before the sequence buffer records
+    // this call. It is still the pre-run epoch that storeDedupResult needs: a read
+    // overlapping a concurrent write computed a pre-write answer and must not be
+    // cached as current.
     let result: any;
     // Anything the C# bridge throws during this call lands here (see
     // bridge/bridgeFailure.ts). Without it a bridge outage is invisible: the read
     // wrappers return null, the tool serves the SQLite index instead, and the
     // answer — including "not found" — looks like it came from live metadata.
     const bridgeFailures: BridgeFailure[] = [];
+    // Anything this call commits before it fails — a label written on the way to
+    // an operation that is then refused. Same scope shape as the failure sink.
+    const sideEffects: WriteSideEffect[] = [];
     try {
-    result = await runWithBridgeFailureScope(bridgeFailures, async () => {
+    result = await runWithSideEffectScope(sideEffects, () =>
+      runWithBridgeFailureScope(bridgeFailures, async () => {
       // Build the progress description for this tool call.
       const args = request.params.arguments as Record<string, any> | undefined;
       const progressMsg = buildProgressMessage(toolName, args);
@@ -291,7 +312,17 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       // supplied a progressToken, notifications/message otherwise) live in one
       // reporter so long-running tools can keep using it after this first step.
       const reportProgress = createProgressReporter(server, extra as any);
-      await reportProgress(progressMsg, 0);
+      // Deliberately not awaited. This is a UI notification, and awaiting it put two
+      // client round trips (notifications/progress + notifications/message) in front
+      // of every tool — including the ones that answer in single-digit milliseconds.
+      // The reporter never rejects (both sends are try/caught inside), and the
+      // transport writes in call order, so the notification still precedes the result.
+      void reportProgress(progressMsg, 0);
+
+      // …and then nothing, for however long the tool takes — see startProgressHeartbeat.
+      const stopHeartbeat = SELF_REPORTING_TOOLS.has(toolName)
+        ? null
+        : startProgressHeartbeat(reportProgress, progressMsg);
 
       return (async () => { switch (toolName) {
       case 'search':
@@ -307,9 +338,13 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         return findReferencesTool(request, context);
       // get_method and suggest_edt are no longer PUBLISHED (their contracts moved
       // into get_object_info options.method and prepare's fieldsHint, which both
-      // already had the object in hand). The routes stay so an agent still holding
-      // the old name from an earlier session gets its answer plus a pointer,
-      // rather than an "unknown tool" it cannot recover from.
+      // already had the object in hand). Same for undo_last_modification,
+      // review_workspace_changes and trigger_db_sync, folded into
+      // d365fo_file(action="undo"), get_workspace_info(changes=true) and
+      // build_d365fo_project(dbSync) respectively. The routes stay so an agent
+      // still holding the old name from an earlier session gets its answer,
+      // rather than an "unknown tool" it cannot recover from — and, for
+      // trigger_db_sync, so a partial sync with no rebuild stays reachable.
       case 'get_method':
         return getMethodTool(request, context);
       case 'labels':
@@ -362,8 +397,8 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           ],
           isError: true,
         };
-    } })();
-    });
+    } })().finally(() => stopHeartbeat?.());
+    }));
     } catch (err) {
       // Safety net: convert any thrown error into a tool result with isError:true
       // instead of an opaque JSON-RPC protocol error.
@@ -392,8 +427,21 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
           (item: any) => typeof item?.text === 'string' && item.text.includes(BRIDGE_FAILURE_MARKER),
         );
         if (!alreadyReported) {
-          capped = appendNote(capped, renderBridgeFailureNote(bridgeFailures));
+          // A write that came back OK completed through the direct-XML fallback,
+          // so it needs the "it landed, do not repeat it" wording rather than the
+          // reader's "treat this as unproven and re-run".
+          const writeSucceeded = WRITE_CAPABLE_TOOLS.has(toolName) && capped?.isError !== true;
+          capped = appendNote(capped, renderBridgeFailureNote(bridgeFailures, { writeSucceeded }));
         }
+      }
+
+      // A FAILED call that had already committed something says so, because its
+      // own "nothing was written" is about the operation, not about everything
+      // the call touched — a label resolved on the way to a refused add-field is
+      // on disk, and undo does not take it back. Only on failure: on success the
+      // tool reports the effect in its own words.
+      if (capped?.isError === true && sideEffects.length > 0) {
+        capped = appendNote(capped, renderSideEffectNote(sideEffects));
       }
 
       // Record metrics: detect empty result (no content or first text item is empty)
@@ -403,13 +451,19 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       reportSlowCall(toolName, Date.now() - callStartedAt, request.params.arguments);
 
       if (!DEDUP_EXCLUDED_TOOLS.has(toolName)) {
-        storeDedupResult(callKey, capped);
-        // Loop hint: 3+ identical calls in the recent window means the model is cycling.
-        if (occurrences >= 3) {
+        storeDedupResult(callKey, capped, epochAtStart);
+        // Loop hint: 3+ identical calls in the recent window means the model is
+        // cycling — but ONLY if no write landed in between. Counting raw repeats
+        // told an agent "the answer does not change between calls" while handing it
+        // content this server's own writes had just changed twice (eval case
+        // L2-entity-query-range-roundtrip, 2026-08-24). Re-reading after a write is
+        // correct behaviour, and discouraging it undoes the cache-invalidation fix.
+        const repeatsThisEpoch = occurrencesInEpoch(toolName, callKey, epochAtStart);
+        if (repeatsThisEpoch >= 3) {
           capped = appendNote(
             capped,
-            `> ⚠️ Loop detected: this is occurrence #${occurrences} of the exact same ${toolName} call. ` +
-            `The answer does not change between calls. If you are missing information, ` +
+            `> ⚠️ Loop detected: this is occurrence #${repeatsThisEpoch} of the exact same ${toolName} call ` +
+            `with no write in between, so the answer does not change. If you are missing information, ` +
             `use a DIFFERENT tool or different parameters (see suggestions above), or ask the user.`,
           );
         }
@@ -420,6 +474,21 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
       console.error(`[toolHandler] ⚠️ ${toolName}: response post-processing failed: ${err}`);
       capped = result;
     } finally {
+      // Invalidate every cached read, whatever the outcome: a write that threw
+      // may still have changed the disk, and serving a pre-write body afterwards
+      // is the failure this guards against.
+      if (MUTATING_TOOLS.has(toolName)) {
+        bumpWriteEpoch();
+        // Same reasoning, second cache: WorkspaceScanner holds a 15s TTL cache of
+        // the .xml files on disk, and its own doc comment claimed writes invalidated
+        // it — nothing did, so for up to 15s after a create the workspace-backed
+        // readers (hybridSearch, get_object_info/completion with includeWorkspace)
+        // and workspace://files, workspace://active could not see a file this
+        // server had just written. Full clear, not per-path: the write's workspace
+        // is not reliably known here, and clearing a Map is cheaper than guessing
+        // wrong. The next scan re-globs.
+        context.workspaceScanner?.invalidate();
+      }
       inFlightHandle?.resolve(capped);
       clearInFlight(callKey);
     }

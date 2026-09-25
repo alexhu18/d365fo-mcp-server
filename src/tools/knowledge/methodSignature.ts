@@ -9,6 +9,7 @@
 
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { readMethodCall } from '../../utils/methodBodyHint.js';
 import type { XppServerContext } from '../../types/context.js';
 import { buildObjectTypeMismatchMessage } from '../../utils/metadataResolver.js';
 import type { BridgeClient } from '../../bridge/bridgeClient.js';
@@ -17,6 +18,7 @@ import { parseXppDeclaration } from '../../metadata/xppDeclaration.js';
 import { canonicalSymbolName } from '../../utils/symbolLookup.js';
 import { inheritedOwnerCandidates } from '../../utils/inheritanceChain.js';
 import { indexedPathIsMissing, renderStaleIndexNote } from '../../utils/indexedXmlLookup.js';
+import { hasTableDataMethods, lookupTableDataMethod } from '../../knowledge/tableDataMethods.js';
 
 /** Object types that can own methods. */
 const OBJECT_TYPES = ['class', 'table', 'view', 'data-entity'] as const;
@@ -155,11 +157,37 @@ export async function getMethodSignatureTool(request: CallToolRequest, context: 
         content: [{
           type: 'text',
           text: `ℹ️ \`${className}.classDeclaration\` is the class header, not a method — it has no signature.\n\n` +
-            `Use \`get_method(className="${className}", methodName="classDeclaration", include="source")\` to read the declaration source, ` +
+            `Use \`${readMethodCall('class', className, 'classDeclaration', 'source')}\` to read the declaration source, ` +
             `or \`get_object_info(objectType="class", name="${className}")\` for the class overview.`,
         }],
         isError: true,
       };
+    }
+
+    // A table's data methods come from a kernel type with no AOT metadata, so
+    // every reader above misses them and the "not found" underneath would be
+    // false — for the single most common CoC target there is (see
+    // src/knowledge/tableDataMethods.ts).
+    if (!methodRow && hasTableDataMethods(classRow.type)) {
+      const inherited = lookupTableDataMethod(methodName);
+      if (inherited) {
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `# Method: \`${className}.${inherited.name}\`\n` +
+              `**Model:** ${classRow.model}\n` +
+              `_Source: inherited from \`${inherited.declaredOn}\` — a kernel type with no AOT metadata, ` +
+              `so neither the index nor the bridge has a row for it._\n\n` +
+              '```xpp\n' +
+              `${inherited.signature}\n` +
+              '```\n\n' +
+              `${inherited.purpose}\n\n` +
+              `**Contract for \`${inherited.name}\`:**\n` +
+              inherited.contract.map(line => `- ${line}`).join('\n') + '\n',
+          }],
+        };
+      }
     }
 
     // Delegates and SubscribesTo handlers are commonly absent from the index.

@@ -53,8 +53,16 @@ vi.mock('fs/promises', () => ({
   readdir: vi.fn(async () => []),
   // The direct-XML writes go through writeFileAtomic: a temp sibling written with
   // writeFile, then renamed over the target (rm cleans the temp up on failure).
-  rename: vi.fn(async () => {}),
-  rm: vi.fn(async () => {}),
+  // The rename has to MOVE the entry, not merely succeed: a no-op leaves the
+  // content parked under the temp path, so the target reads back as whatever it
+  // held before the write and the assertions below silently test nothing.
+  rename: vi.fn(async (from: string, to: string) => {
+    const content = files.get(from);
+    if (content === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    files.set(to, content);
+    files.delete(from);
+  }),
+  rm: vi.fn(async (p: string) => { files.delete(p); }),
 }));
 
 vi.mock('../../src/bridge/bridgeAdapter', async (orig) => {
@@ -99,6 +107,8 @@ vi.mock('../../src/utils/modelClassifier', () => ({
   getObjectSuffix: vi.fn(() => ''),
   applyObjectSuffix: vi.fn((name: string) => name),
   getExtensionNamingStyle: vi.fn(() => 'prefix'),
+  // Unset EXTENSION_CLASS_NAMING_STYLE inherits the style above; these tests never switch it.
+  getExtensionClassNamingStyle: vi.fn(() => 'prefix'),
   isCustomModel: vi.fn(() => true),
   isStandardModel: vi.fn(() => false),
 }));
@@ -307,6 +317,32 @@ describe('reconcileTableCreateProperties', () => {
     });
     expect(r.patched).toEqual([]);
     expect(r.unhonoured).toEqual([]);
+  });
+
+  it('treats cacheLookup:"None" as honoured by absence, and WRITES NotInTTS', () => {
+    // The omitted-default table named the wrong member here, and it cost two
+    // defects pointing opposite ways. RecordCacheLevel.None = 0 (reflection over
+    // Microsoft.Dynamics.AX.Metadata.Core.dll), so the serializer omits it: of the
+    // 1,444 <CacheLookup> elements in 6,995 shipped tables, ZERO say None, while
+    // NotInTTS appears 301 times and 95 shipped Transaction tables carry no
+    // element at all.
+    //
+    // Before the fix: "None" was patched in as an element the platform never
+    // writes — every later metadata round trip normalised it away again, which the
+    // 2026-08-31 capture run read as "a bridge modify destroys properties this
+    // server wrote" — while "NotInTTS", a real non-default value, was reported as
+    // honoured and never written at all.
+    // The real shape: the bridge wrote no <CacheLookup> at all, because the value
+    // it set (None, for a Transaction table) is the one the serializer omits.
+    const noElement = base.replace(/\t<CacheLookup>Found<\/CacheLookup>\n/, '');
+
+    const none = reconcileTableCreateProperties(noElement, { cacheLookup: 'None' });
+    expect(none.patched).toEqual([]);
+    expect(none.unhonoured).toEqual([]);
+    expect(none.xml).toBe(noElement);
+
+    const notInTts = reconcileTableCreateProperties(noElement, { cacheLookup: 'NotInTTS' });
+    expect(notInTts.xml).toContain('<CacheLookup>NotInTTS</CacheLookup>');
   });
 
   it('writes a NON-default NoYes property with the XML spelling, not true/false', () => {

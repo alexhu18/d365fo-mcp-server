@@ -9,6 +9,8 @@ import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { buildObjectTypeMismatchMessage, detectObjectTypeInDb } from '../../utils/metadataResolver.js';
 import { tryBridgeReferences } from '../../bridge/bridgeAdapter.js';
+import * as fs from 'fs';
+import { readIndexedMethodSources } from '../../utils/indexedMethodSource.js';
 
 const FindReferencesArgsSchema = z.object({
   // "name" is accepted as an alias for "targetName"
@@ -82,6 +84,99 @@ function buildScopedEmptyResult(displayName: string, bridgeTargets: string[]): {
   for (const t of bridgeTargets) out += `- \`${t}\`\n`;
   out += `\n**If you expected results:** verify the owner type and method name, `;
   out += `or pass an explicit AOT path as \`targetName\` (e.g. \`/Classes/MyClass/Methods/myMethod\`).\n`;
+  return { content: [{ type: 'text', text: out }] };
+}
+
+/**
+ * targetTypes the name-based fallback can actually search for. The tool schema
+ * advertises five more (edt, form, query, view, report) that have no branch in
+ * the scan below, so asking for one ran NO query at all and reported
+ * "Total References Found: 0" — a confident zero that meant "never searched".
+ * Those are answered by describeUnsearchableType() instead.
+ */
+const FALLBACK_SEARCHABLE_TYPES = new Set(['method', 'class', 'table', 'field', 'enum', 'all']);
+
+/**
+ * Why the xref bridge did not answer, as a clause for the "_Source:_" line.
+ * Every fallback used to be labelled "xref bridge unavailable", including the
+ * common case where the bridge was up and healthy and simply had no rows for the
+ * target — which reads as an outage and sends the reader off diagnosing one that
+ * isn't happening. That mislabel cost a real investigation: an EDT where-used
+ * returned this text while the bridge was serving 161 label references fine.
+ */
+function bridgeFallbackReason(status: 'empty' | 'error' | 'unavailable'): string {
+  switch (status) {
+    case 'empty': return 'the cross-reference database returned no rows for this target';
+    case 'error': return 'the cross-reference query failed';
+    case 'unavailable': return 'the cross-reference bridge is unavailable in this server mode';
+  }
+}
+
+/**
+ * Answer for a targetType the name-based fallback cannot serve. Returning the
+ * scan's empty result here would be a lie by omission: the scan reads only X++
+ * method bodies (and only each method's first ten indexed lines), while an EDT,
+ * form, query, view or report is referenced mostly from declarative metadata —
+ * table fields, control properties, dataset bindings — that the text index does
+ * not contain. So there is no number to report, only that fact.
+ *
+ * Unless the bridge answered. See the 'empty' branch.
+ */
+function describeUnsearchableType(
+  targetName: string,
+  targetType: string,
+  status: 'empty' | 'error' | 'unavailable',
+): { content: Array<{ type: 'text'; text: string }> } {
+  // 'empty' is a real zero, not a missing answer. tryBridgeReferences returns it
+  // only when every candidate query ran and none of them errored — anything else
+  // is 'error' — so the count is as authoritative as a non-zero one, and the label
+  // path above already reports its own 'empty' that way.
+  //
+  // It is authoritative for these five types specifically BECAUSE of the container
+  // fix in this change: a bare name now expands to /Edts/, /Forms/, /Queries/,
+  // /Views/ and /Reports/, so the query reaches the rows that exist instead of
+  // matching nothing by construction. Calling that "inconclusive" would put back
+  // the defect this function was written to remove, one layer down — and the text
+  // did worse than hedge, telling the reader to "re-run once the xref bridge is
+  // available" at the moment the bridge had finished answering them.
+  if (status === 'empty') {
+    let out = `# References to \`${targetName}\`\n\n`;
+    out += `**Target Type:** ${targetType}\n`;
+    out += `**Total References Found:** 0\n`;
+    out += `_Source: C# bridge (DYNAMICSXREFDB)_\n\n`;
+    out += `The cross-reference database was queried and matched no rows. For a \`${targetType}\` `;
+    out += `that is the entire answer: its usages live in declarative metadata (table fields, form `;
+    out += `control properties, dataset bindings) that only the xref DB records, so no other source `;
+    out += `here could add to it.\n\n`;
+    out += `Before concluding it is unused, confirm the name is written exactly as stored — a `;
+    out += `misspelling is indistinguishable from a genuine miss. Check it with \`search\`/\`get_object_info\`.\n`;
+    return { content: [{ type: 'text', text: out }] };
+  }
+
+  // 'error'/'unavailable': no query ran, so there is no number — only that fact.
+  // The explicit AOT path is worth suggesting only here. On 'empty' it would be
+  // noise: the bare name already expanded to that same path and a strict subset
+  // of what was just queried, so re-running it cannot change the answer.
+  const suggestion = targetName.startsWith('/') ? null : ({
+    edt: `/Edts/${targetName}`, report: `/Reports/${targetName}`,
+    form: `/Forms/${targetName}`, query: `/Queries/${targetName}`, view: `/Views/${targetName}`,
+  } as Record<string, string>)[targetType];
+
+  let out = `# References to \`${targetName}\`\n\n`;
+  out += `**Target Type:** ${targetType}\n`;
+  out += `**Result:** inconclusive — this is NOT a count of zero\n\n`;
+  out += `A \`${targetType}\` where-used needs the cross-reference database (DYNAMICSXREFDB), `;
+  out += `and ${bridgeFallbackReason(status)}.\n\n`;
+  out += `The name-based index fallback cannot stand in for it here: it scans only X++ method `;
+  out += `bodies, and only the first ten lines of each, whereas a ${targetType} is referenced `;
+  out += `mostly from declarative metadata that is not in the text index at all. Running it would `;
+  out += `have produced a number with no relationship to the real answer.\n\n`;
+  out += `**What to do:**\n`;
+  out += `- Re-run once the xref bridge is available (full server mode with a UDE/local xref DB)\n`;
+  if (suggestion) {
+    out += `- Or pass the explicit AOT path as \`targetName\`: \`${suggestion}\`\n`;
+  }
+  out += `- Confirm the name with \`search\`/\`get_object_info\` — a misspelling is indistinguishable from a miss\n`;
   return { content: [{ type: 'text', text: out }] };
 }
 
@@ -183,6 +278,13 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       return buildScopedEmptyResult(targetName, bridgeTargets);
     }
 
+    // The scan below has no branch for edt/form/query/view/report, so for those a
+    // "0" would mean "not searched" rather than "not found". Say that outright
+    // instead of running a scan that structurally cannot see their usages.
+    if (targetType && !FALLBACK_SEARCHABLE_TYPES.has(targetType)) {
+      return describeUnsearchableType(targetName, targetType, bridgeOutcome.status);
+    }
+
     // FTS fallback (xref bridge unavailable) — name-based heuristic, cannot scope
     // a method to its declaring type; match on the bare member name.
     const ftsName = isAotPath
@@ -221,6 +323,16 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       references.push(...enumRefs);
     }
 
+    // 6. The previews cannot show a call site past line 10 of its caller, and
+    // intra-type calls are where that bites hardest. Recover them from the
+    // declaring type's own source — one indexed lookup and up to three files.
+    const intraTypeRefs = wantsMethod
+      ? scanDeclaringTypeSource(symbolIndex, ftsName, limit).filter(
+          r => !references.some(existing => existing.file === r.file && existing.context === r.context),
+        )
+      : [];
+    references.push(...intraTypeRefs);
+
     totalReferences = references.length;
     const limitedReferences = references.slice(0, limit);
     const summary = generateReferenceSummary(limitedReferences);
@@ -232,9 +344,20 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       output += `**Target Type:** ${targetType}\n`;
     }
     output += `**Scope:** ${scope}\n`;
-    output += `_Source: name-based index scan (xref bridge unavailable) — heuristic; not scoped to a declaring type._\n`;
-    if (wantsMethod && !owner && !isAotPath) {
-      output += `> ℹ️ This counts every method named \`${ftsName}\` regardless of owner. For a type-scoped where-used, pass \`ownerName\` or qualify as \`Owner.${ftsName}\`.\n`;
+    output += `_Source: name-based index scan — ${bridgeFallbackReason(bridgeOutcome.status)}; heuristic, not scoped to a declaring type._\n`;
+    if (intraTypeRefs.length > 0) {
+      output += `_${intraTypeRefs.length} of these came from reading the declaring type's source directly — ` +
+        `the index only previews a method's first 10 lines, so calls below that are invisible to the scan above._\n`;
+    }
+    if (wantsMethod && !isAotPath) {
+      // The note used to print only when no owner was given, so a caller who DID
+      // scope the lookup got an unscoped answer that looked scoped — the worse of
+      // the two cases, and the one silently ignoring the parameter it accepted.
+      output += owner
+        ? `> ⚠️ \`ownerName\` could NOT be honoured: this fallback matches the bare method name, ` +
+          `so a same-named method on an unrelated type is counted as a hit. Only the xref bridge ` +
+          `can scope a member to its declaring type.\n`
+        : `> ℹ️ This counts every method named \`${ftsName}\` regardless of owner. For a type-scoped where-used, pass \`ownerName\` or qualify as \`Owner.${ftsName}\`.\n`;
     }
     output += `\n`;
 
@@ -244,11 +367,22 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       : '';
 
     if (limitedReferences.length === 0) {
-      output += `No references found for \`${targetName}\`.\n\n`;
-      output += `**Possible reasons:**\n`;
-      output += `- Symbol might be unused\n`;
-      output += `- Symbol might be defined but not yet indexed\n`;
-      output += `- Try search without targetType to broaden results\n`;
+      // A zero from this path is NOT evidence of anything. The xref bridge is
+      // down, so the answer comes from a name scan over whatever source the index
+      // extracted — and if the target's own source was never extracted, the scan
+      // had nothing to match in the first place. Reported live on the VM: an
+      // agent read `Total References Found: 0 … Symbol might be unused` for a
+      // method with two real call sites, and acted on it.
+      output += `No references found for \`${targetName}\` — **this is not evidence that it is unused.**\n\n`;
+      output += `⚠️ Because ${bridgeFallbackReason(bridgeOutcome.status)}, call sites are matched against each method's indexed ` +
+        `\`source_snippet\`, which holds only its FIRST TEN LINES. A call on line 11 or later of its ` +
+        `caller cannot be seen from here, and long methods are exactly where calls hide. The declaring ` +
+        `type's own source was read directly and had none either, which is the strongest statement ` +
+        `this run can make.\n\n`;
+      output += `**Before treating this as "unused":**\n`;
+      output += `- Re-run once the xref bridge (DYNAMICSXREFDB) is available; it is the only authoritative where-used\n`;
+      output += `- Read the callers you suspect — a caller in another type is still invisible past its tenth line\n`;
+      output += `- Confirm the name and spelling with \`search\`/\`get_object_info\` — a wrong name also returns zero here\n`;
       if (typeMismatchSection) {
         output += `\n${typeMismatchSection}`;
       }
@@ -327,7 +461,7 @@ function ftsMethodSearch(db: any, term: string, limit: number, extraColumns?: st
   const ftsQuery = `${cols} : "${safe}"`;
   try {
     const stmt = db.prepare(`
-      SELECT s.name, s.parent_name, s.file_path, s.model, s.source_snippet
+      SELECT s.name, s.parent_name, s.file_path, s.model, s.source_snippet, s.source
       FROM symbols s
       WHERE s.type = 'method'
         AND s.id IN (SELECT rowid FROM symbols_fts WHERE symbols_fts MATCH ?)
@@ -339,6 +473,117 @@ function ftsMethodSearch(db: any, term: string, limit: number, extraColumns?: st
   }
 }
 
+/**
+ * The text a matched row's context is extracted from: the whole indexed body,
+ * falling back to the ten-line preview.
+ *
+ * The FTS index covers `source_snippet`, not `source`, so what this can and
+ * cannot FIND is unchanged — a caller whose first ten lines never mention the
+ * name is still invisible, and fixing that means indexing `source` into
+ * symbols_fts, which is a schema change and a re-index, not this.
+ *
+ * What it changes is what happens AFTER a match. The extractors were handed the
+ * same ten lines FTS matched on, so a method that mentions the name in its
+ * preview (a declaration, a comment, an early call) but makes the call being
+ * reported further down yielded no context and was silently dropped from the
+ * results — a row FTS had correctly matched, discarded at the rendering step.
+ */
+function bodyOf(row: { source?: string | null; source_snippet?: string | null }): string {
+  return row.source || row.source_snippet || '';
+}
+
+/**
+ * The blind spot this fallback cannot see out of, and the one read that covers
+ * the commonest case.
+ *
+ * `source_snippet` is the method's FIRST TEN LINES — a preview, by construction
+ * (xmlParser.ts, enhancedParser.ts: "First 10 lines for preview"). The FTS
+ * fallback matches against those previews, so a call site on line 11 or later of
+ * ANY caller is structurally invisible to it. Measured on the VM:
+ * `find_references(buildAdjustIn)` returned `Total References Found: 0 … Symbol
+ * might be unused` while `WHSWorkExecuteDisplayAdjustIn.displayForm` — hundreds
+ * of lines long — calls it twice; the single "hit" the tool did report on a
+ * sibling method was that method's own declaration, which of course sits in its
+ * own first ten lines.
+ *
+ * Intra-type calls are both the commonest miss and the cheapest to recover: the
+ * declaring type is one indexed lookup away and its source is ONE file. This
+ * reads that file and returns the real call sites, rather than telling the
+ * caller to go and do it by hand.
+ */
+function scanDeclaringTypeSource(symbolIndex: any, methodName: string, limit: number): Reference[] {
+  const found: Reference[] = [];
+  if (!methodName) return found;
+  try {
+    const db = symbolIndex?.getReadDb?.();
+    if (!db) return found;
+    // Declaring types for this member — indexed by name, never a scan. Bounded:
+    // a name shared by many types is exactly the unscoped case, and reading
+    // every one of their files would cost more than the answer is worth.
+    const owners = db
+      .prepare(
+        `SELECT DISTINCT parent_name, file_path FROM symbols
+         WHERE name = ? AND type = 'method' AND parent_name IS NOT NULL AND file_path IS NOT NULL
+         LIMIT 3`,
+      )
+      .all(methodName) as Array<{ parent_name: string; file_path: string }>;
+
+    for (const owner of owners) {
+      let source: string | undefined;
+      // "Reachable but deliberately not read" is not the same as "cannot be
+      // read": falling through to the index for an 8 MB owner would spend the
+      // very cost this guard exists to refuse, just on a different source.
+      let refusedByGuard = false;
+      try {
+        const stat = fs.statSync(owner.file_path);
+        // An AOT class file is source; anything enormous is not worth the read.
+        if (stat.isFile() && stat.size <= 8_000_000) {
+          source = fs.readFileSync(owner.file_path, 'utf-8');
+        } else {
+          refusedByGuard = true;
+        }
+      } catch { /* not reachable from here — try the index below */ }
+      if (refusedByGuard) continue;
+
+      // The file is a Windows-VM path, so on Azure the read above can never
+      // succeed and this recovery returned nothing at all. The same bodies are
+      // in the index — each scanned on its own, NOT concatenated: the rows come
+      // back in no particular order, so a call on a body's first line would take
+      // its leading context line from the closing brace of an unrelated method
+      // and show the agent source that does not exist anywhere.
+      let texts: string[];
+      if (source !== undefined) {
+        texts = [source];
+      } else {
+        const bodies = readIndexedMethodSources(db, owner.parent_name);
+        if (bodies.size === 0) continue;
+        texts = [...bodies.values()].map(m => m.source);
+      }
+
+      for (const text of texts) {
+        if (found.length >= limit) break;
+        const lines = text.split('\n');
+        for (let i = 0; i < lines.length && found.length < limit; i++) {
+          // `this.m(` and `Type::m(` are calls; `m(` alone would match the
+          // declaration and every same-named member in the file.
+          if (!/\bthis\.(\w+)\(/.test(lines[i]) && !new RegExp(`::${methodName}\\s*\\(`).test(lines[i])) continue;
+          if (!lines[i].includes(methodName + '(')) continue;
+          found.push({
+            file: owner.file_path,
+            model: '',
+            context: lines.slice(Math.max(0, i - 1), Math.min(lines.length, i + 2)).join('\n').trim(),
+            referenceType: 'call',
+            caller: owner.parent_name,
+          });
+        }
+      }
+    }
+  } catch {
+    // Best-effort recovery — it must never turn a degraded answer into no answer.
+  }
+  return found;
+}
+
 function findMethodReferences(symbolIndex: any, methodName: string, _scope: string, limit: number): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
@@ -346,7 +591,11 @@ function findMethodReferences(symbolIndex: any, methodName: string, _scope: stri
   const rows = ftsMethodSearch(rdb, methodName, limit * 3, 'signature');
 
   for (const row of rows) {
-    const context = extractMethodCallContext(row.source_snippet, methodName);
+    // Match on the preview, render from the whole body. FTS can only find a
+    // method whose FIRST TEN LINES mention the name, but once it has, the call
+    // being reported is often further down — and extracting context from the
+    // preview then returned nothing, dropping a row FTS had correctly matched.
+    const context = extractMethodCallContext(bodyOf(row), methodName);
     if (context) {
       references.push({
         file: row.file_path,
@@ -412,7 +661,7 @@ function findClassReferences(symbolIndex: any, className: string, _scope: string
   // FTS5: search for className in source_snippet; extractInstantiationContext filters for 'new ClassName('
   const instRows = ftsMethodSearch(rdb, className, limit);
   for (const row of instRows) {
-    const context = extractInstantiationContext(row.source_snippet, className);
+    const context = extractInstantiationContext(bodyOf(row), className);
     if (context) {
       references.push({
         file: row.file_path,
@@ -431,7 +680,7 @@ function findClassReferences(symbolIndex: any, className: string, _scope: string
   for (const row of typeRefRows) {
     const caller = row.parent_name ? `${row.parent_name}.${row.name}` : row.name;
     if (existingCallers.has(caller)) continue; // skip duplicates
-    const context = extractTableReferenceContext(row.source_snippet, className);
+    const context = extractTableReferenceContext(bodyOf(row), className);
     if (context) {
       references.push({
         file: row.file_path,
@@ -454,7 +703,7 @@ function findTableReferences(symbolIndex: any, tableName: string, _scope: string
   const rows = ftsMethodSearch(rdb, tableName, limit);
 
   for (const row of rows) {
-    const context = extractTableReferenceContext(row.source_snippet, tableName);
+    const context = extractTableReferenceContext(bodyOf(row), tableName);
     if (context) {
       references.push({
         file: row.file_path,
@@ -476,7 +725,7 @@ function findFieldReferences(symbolIndex: any, fieldName: string, _scope: string
   const rows = ftsMethodSearch(rdb, fieldName, limit);
 
   for (const row of rows) {
-    const context = extractFieldAccessContext(row.source_snippet, fieldName);
+    const context = extractFieldAccessContext(bodyOf(row), fieldName);
     if (context) {
       references.push({
         file: row.file_path,
@@ -498,7 +747,7 @@ function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, 
   const rows = ftsMethodSearch(rdb, enumName, limit);
 
   for (const row of rows) {
-    const context = extractEnumReferenceContext(row.source_snippet, enumName);
+    const context = extractEnumReferenceContext(bodyOf(row), enumName);
     if (context) {
       references.push({
         file: row.file_path,

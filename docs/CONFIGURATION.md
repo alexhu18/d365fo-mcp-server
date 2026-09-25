@@ -48,6 +48,7 @@ Which developer box this is and where its X++ packages live.
 | --- | --- | --- | --- | --- |
 | `environment.type` | setup | `D365FO_DEV_ENVIRONMENT_TYPE` | — | Classic AOSService VM ("traditional") or Unified Developer Experience / Power Platform Tools ("ude"). The wizard preselects the one it detects — UDE when XPP config files exist in %LOCALAPPDATA%\\Microsoft\\Dynamics365\\XPPConfig. Left unset, the server falls back to that same detection. Values: `traditional` — classic AOSService VM with PackagesLocalDirectory; `ude` — Unified Developer Experience / Power Platform Tools. |
 | `environment.packagePath` | setup | `D365FO_PACKAGE_PATH` | — | AOT packages folder (PackagesLocalDirectory) used as the read-only source for indexing. Machine-wide on a traditional VM; UDE resolves it from the XPP config instead. Left empty, the server scans the machine's drives for AosService\\PackagesLocalDirectory — which volume that is depends on the VM image (K:, C:, J:, …). |
+| `environment.scanDrives` | advanced | `D365FO_SCAN_DRIVES` | — | Comma-separated letters the packages-root scan probes when no packagePath is configured, e.g. "C,K". Empty probes C: to Z: — the letters that have ever held AosService first, the rest inside a 2 s budget. Set it on a machine with a disconnected mapped network drive: one stat on such a drive stalls for the SMB timeout, and the scan runs on the first tool call of a session. |
 | `environment.customModels` | setup | `CUSTOM_MODELS` | — | Your own (non-Microsoft) models, comma-separated. They are indexed with priority and treated as writable. Find them in VS → Dynamics 365 → Model Management → View models. UDE detects these automatically. |
 | `environment.xppConfigName` | setup | `XPP_CONFIG_NAME` | — | Name of a config file in %LOCALAPPDATA%\\Microsoft\\Dynamics365\\XPPConfig. Pinning one keeps the server on a specific environment/version; leave empty to always use the newest config. |
 | `environment.customPackagesPath` | advanced | `D365FO_CUSTOM_PACKAGES_PATH` | — | Where custom model XML is written and tracked by git. Normally read from the XPP config — override only when your working tree lives somewhere else. |
@@ -61,7 +62,7 @@ The model/project the server writes to. Auto-detected from the IDE when left emp
 | --- | --- | --- | --- | --- |
 | `workspace.modelName` | setup | `D365FO_MODEL_NAME` | — | The model new objects are created in. Leave empty to let the server detect it from the IDE workspace or the .rnrproj file — set it explicitly when one server instance always serves one model. |
 | `workspace.path` | setup | `D365FO_WORKSPACE_PATH` | — | Two-level AOT path of the model being worked on. Used to resolve the package root and the write target when the IDE does not report a workspace. |
-| `workspace.solutionsPath` | setup | `D365FO_SOLUTIONS_PATH` | — | Scanned once at startup so the server can switch model automatically when you open another solution or git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring. |
+| `workspace.solutionsPath` | setup | `D365FO_SOLUTIONS_PATH` | — | Scanned once at startup so the server can switch model automatically when you open another solution or git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring. The scan resolves the MODEL; it does not pick a project when several .rnrproj under it build that model — get_workspace_info then reports `Project : (not selected)` and names them, and anything that registers a file needs an explicit projectName/projectPath. Picking one meant every write landed in whichever project the scan saw first. |
 | `workspace.projectPath` | advanced | `D365FO_PROJECT_PATH` | — | Forces one specific project instead of auto-detection. Rarely needed outside CI. |
 | `workspace.solutionPath` | advanced | `D365FO_SOLUTION_PATH` | — | Forces one specific solution instead of auto-detection. Rarely needed outside CI. |
 | — | — | `D365FO_CROSS_MODEL_WRITE_MODELS` | — | Comma-separated models this workspace may write into besides its own. By default any create/modify/label write into another custom model is refused and the extension route in the active model is offered instead — see [Objects owned by another model](CUSTOM_EXTENSIONS.md#objects-owned-by-another-model). Consent lives here, in configuration, because a tool parameter is something the agent can grant itself. Re-read from `.env` before every decision, so an edit applies to the next attempt without a restart. |
@@ -74,9 +75,10 @@ How generated objects, extensions and fields are named.
 | Key | Asked | Env var | Default | Description |
 | --- | --- | --- | --- | --- |
 | `naming.prefix` | setup | `EXTENSION_PREFIX` | — | Your ISV/customer prefix. Prepended to every generated object, field and method name and enforced by the naming validator, so BP checks pass on the first build. Used as the **fallback**: when the active model's existing objects already show a prefix, that one wins — see [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). |
-| — | — | `EXTENSION_PREFIX_SOURCE` | — | Set to `config` to make `EXTENSION_PREFIX` authoritative again instead of learning each model's prefix from its own objects. |
+| `naming.prefixSource` | advanced | `EXTENSION_PREFIX_SOURCE` | `model` | Whether the effective prefix is learned from the active model's own objects or pinned to the configured `naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns the shared stem, while the objects you write need the full one. See [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). Values: `model` — the model's own objects decide, falling back to naming.prefix; `config` — always naming.prefix, inference off (pre-1.8.2 behaviour). |
 | `naming.suffix` | advanced | `EXTENSION_SUFFIX` | — | Optional suffix appended to new object names (MyTableZZ with suffix "ZZ"). Most projects use only a prefix — leave empty unless your convention requires one. |
 | `naming.extensionStyle` | advanced | `EXTENSION_NAMING_STYLE` | `prefix` | Whether extension classes/elements embed the prefix (per the Microsoft prefix guideline) or the model name (the Visual Studio default). Use model-name when your model name is long but your prefix is a short abbreviation. Values: `prefix` — CustTable.CrExtension — embeds the extension prefix; `model-name` — CustTable.ContosoRobotics — embeds the model name (VS default). |
+| `naming.extensionClassStyle` | advanced | `EXTENSION_CLASS_NAMING_STYLE` | `inherit` | Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one or the other. Leave on inherit unless your convention names classes differently from elements. Values: `inherit` — follow naming.extensionStyle — the default, behaviour unchanged; `prefix` — CustTableCtso_Extension — embeds the extension prefix; `model-name` — CustTable_ContosoRobotics_Extension — embeds the model name. |
 
 ### Metadata index
 
@@ -90,8 +92,11 @@ What gets extracted into the SQLite index and where it is stored.
 | `index.dbPath` | advanced | `DB_PATH` | `./data/xpp-metadata.db` | SQLite file holding the indexed X++ metadata. Relative paths resolve from the config file directory. |
 | `index.labelsDbPath` | advanced | `LABELS_DB_PATH` | `./data/xpp-metadata-labels.db` | Second SQLite file for labels (dual-database architecture keeps label writes from locking metadata reads). Defaults to <dbPath>-labels.db. |
 | `index.metadataPath` | advanced | `METADATA_PATH` | `./extracted-metadata` | Working folder for the XML dumped during extraction, before it is loaded into the database. |
+| `index.bpCatalogPath` | advanced | `BP_CATALOG_PATH` | — | Per-instance JSON catalog of real BP-check monikers, extracted from this instance's own D365FO version (scripts/extract-bp-catalog.ps1). Falls back to the compiled-in snapshot when absent — this setting is only written once an instance has regenerated its own catalog. |
 | `index.labelSortOrder` | advanced | `LABEL_SORT_ORDER` | `alphabetical` | Alphabetical keeps .label.txt files sorted (smaller diffs, matches most teams); append adds new labels at the end of the file (preserves manual grouping). Values: `alphabetical` — insert in sorted position; `append` — add at the end of the file. |
 | `index.computeStats` | advanced | `COMPUTE_STATS` | `false` | Adds per-object usage counts used for ranking. Noticeably slows down large builds. |
+| `index.warmup` | advanced | `INDEX_WARMUP` | `on` | Reads the indexes the request paths use into the OS file cache, on a worker thread, before the first question needs them. Measured on the reference environment: the first covering scan of the symbol-name index costs 83 s cold and 0.11 s warm, and the label join behind every label search 31 s cold. Turn it off where a second reader of the same file is not free. Values: `on` — warm in the background at startup (default); `off` — first query pays for the cold cache, as before. |
+| `index.warmupBudgetMs` | advanced | `INDEX_WARMUP_BUDGET_MS` | `600000` | The warm-up stops beginning new steps once it has run this long; steps are ordered by what the request paths wait on longest, so the budget cuts the least useful ones first. |
 
 ### Server runtime
 
@@ -100,10 +105,10 @@ Transport, timeouts and logging of the MCP server process.
 | Key | Asked | Env var | Default | Description |
 | --- | --- | --- | --- | --- |
 | `server.mode` | advanced | `MCP_SERVER_MODE` | `full` | Which half of the toolset this process exposes. "full" is a single local server; the hybrid deployment splits into an Azure "read-only" instance plus a local "write-only" companion that owns the C# bridge. Values: `full` — all tools — single local server; `read-only` — search/inspect only — Azure-hosted shared index; `write-only` — create/modify/build only — local companion. |
-| `server.toolProfile` | advanced | `MCP_TOOL_PROFILE` | `full` | How many tools this server advertises. "full" publishes all 23. "core" publishes only the plan → discover → write → build → verify loop (18 tools) and leaves out the specialist ones (extension_info, analyze_code, validate_code, security_info, run_systest_class). Worth switching when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool. Values: `full` — all 23 tools; `core` — 18-tool create-and-build loop. |
+| `server.toolProfile` | advanced | `MCP_TOOL_PROFILE` | `full` | How many tools this server advertises. "full" publishes all 20. "core" publishes only the plan → discover → write → build → verify loop (15 tools) and leaves out the specialist ones (extension_info, analyze_code, validate_code, security_info, run_systest_class). Worth switching when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool. Values: `full` — all 20 tools; `core` — 15-tool create-and-build loop. |
 | `server.extraTools` | advanced | `MCP_EXTRA_TOOLS` | — | Tool names to publish in addition to the core profile, e.g. security_info,run_systest_class. Ignored when the tool profile is "full". |
 | `server.port` | setup | `PORT` | `8080` | Port for the HTTP transport. Only relevant when clients connect over http://localhost:<port>/mcp/ — an IDE that spawns the server itself uses stdio and ignores this. |
-| `server.host` | advanced | `HOST` | `0.0.0.0` | Interface the HTTP transport binds to. The default accepts connections from anywhere, which is what a container or App Service needs; set 127.0.0.1 to make a local server unreachable from the network. |
+| `server.host` | advanced | `HOST` | `0.0.0.0` | Interface the HTTP transport binds to. Left unset it follows the API key: 0.0.0.0 once a key (or ALLOW_UNAUTHENTICATED) is configured, which is what a container or App Service needs, and 127.0.0.1 when neither is, so an unauthenticated server stays off the network. Setting it to a public interface without a key is refused at startup. |
 | `server.shutdownTimeoutMs` | advanced | `SHUTDOWN_TIMEOUT_MS` | `5000` | How long SIGTERM/SIGINT handling waits for in-flight work (bridge writes, database checkpoints) before the process exits anyway. Clamped to a minimum of 1000. |
 | — | — | `OPERATION_LOCK_HEARTBEAT_MS` | `60000` | How often the holder of a long-running operation lock (build, DB sync) touches it so the stale-lock reaper can tell a live owner from an abandoned one. Lower it only if a reaper is killing locks that are still working; the reaper already refuses to age out a lock whose owner pid is alive. |
 | `server.debugLogging` | advanced | `DEBUG_LOGGING` | `false` | Prints per-step diagnostics to stderr. Useful when a tool misbehaves; noisy otherwise. |
@@ -117,7 +122,8 @@ Transport, timeouts and logging of the MCP server process.
 | `server.operationLockPollMs` | advanced | `OPERATION_LOCK_POLL_MS` | `250` | How often the waiting process re-checks the lock. |
 | `server.operationLockStaleMs` | advanced | `OPERATION_LOCK_STALE_MS` | `1200000` | A lock older than this is treated as left behind by a crashed process and broken. |
 | `server.slowCallLogMs` | advanced | `SLOW_CALL_LOG_MS` | `10000` | Writes one line per tool call that exceeds this, with the tool name and a short argument digest. Aggregate metrics cannot say which specific call cost five minutes; this can. Set LOG_FILE to keep the lines. |
-| `server.apiKey` | secret | `API_KEY` | — | When set, every HTTP request must present this key. Leave empty for a localhost-only server; set it whenever the port is reachable from another machine. |
+| `server.slowCallHeartbeatMs` | advanced | `SLOW_CALL_HEARTBEAT_MS` | `30000` | While a tool call is still running, print the phase it is in to stderr at this interval. The phase block in the reply is only ever read afterwards; a create that took 341 s and reported all of it as unmeasured left nothing to look at either way. 0 turns it off. |
+| `server.apiKey` | secret | `API_KEY` | — | Every HTTP request must present this key as X-Api-Key (or Authorization: Bearer). Required for any server reachable from the network — without it the listener serves your indexed X++ source to anyone who can reach the port, so with no key set the server binds 127.0.0.1 instead, and refuses to start if HOST asks for a public interface anyway. May be left empty only for a localhost-only development server. Generate with `openssl rand -hex 32`. |
 
 ### C# bridge
 
@@ -165,6 +171,7 @@ Downloading a pre-built index from blob storage instead of building it locally.
   "environment": {
     "type": "traditional",
     "packagePath": "C:\\AOSService\\PackagesLocalDirectory",
+    "scanDrives": "C,K",
     "customModels": "ContosoRobotics,ContosoBank",
     "xppConfigName": "",
     "customPackagesPath": "",
@@ -179,8 +186,10 @@ Downloading a pre-built index from blob storage instead of building it locally.
   },
   "naming": {
     "prefix": "ISV_",
+    "prefixSource": "model",
     "suffix": "",
-    "extensionStyle": "prefix"
+    "extensionStyle": "prefix",
+    "extensionClassStyle": "inherit"
   },
   "index": {
     "extractMode": "all",
@@ -191,8 +200,11 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "dbPath": "./data/xpp-metadata.db",
     "labelsDbPath": "./data/xpp-metadata-labels.db",
     "metadataPath": "./extracted-metadata",
+    "bpCatalogPath": "",
     "labelSortOrder": "alphabetical",
-    "computeStats": false
+    "computeStats": false,
+    "warmup": "on",
+    "warmupBudgetMs": 600000
   },
   "server": {
     "mode": "full",
@@ -211,7 +223,8 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "operationLockTimeoutMs": 900000,
     "operationLockPollMs": 250,
     "operationLockStaleMs": 1200000,
-    "slowCallLogMs": 10000
+    "slowCallLogMs": 10000,
+    "slowCallHeartbeatMs": 30000
   },
   "bridge": {
     "readyTimeoutMs": 30000,

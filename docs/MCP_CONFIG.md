@@ -71,8 +71,8 @@ Set in the `env` block. The legacy `"context": {...}` block is **deprecated** �
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MCP_SERVER_MODE` | `full` | `full` (23 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
-| `MCP_TOOL_PROFILE` | `full` | `full` (all 23) / `core` (18-tool create-and-build loop) — shrinks the catalogue when the workspace already runs other MCP servers |
+| `MCP_SERVER_MODE` | `full` | `full` (20 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
+| `MCP_TOOL_PROFILE` | `full` | `full` (all 20) / `core` (15-tool create-and-build loop) — shrinks the catalogue when the workspace already runs other MCP servers |
 | `MCP_EXTRA_TOOLS` | — | comma-separated tool names added back on top of `core` (e.g. `security_info,run_systest_class`) |
 | `DB_PATH` / `LABELS_DB_PATH` | repo `data/` | absolute paths to the SQLite databases — **required in stdio mode** |
 | `GROUNDING_ENFORCE` | off | fail-closed grounding gate for write tools — opt in |
@@ -101,9 +101,9 @@ Get-Content "C:\Temp\d365fo-bridge.log" -Encoding UTF8 -Wait -Tail 50
 
 **Write target (traditional):** tool argument `packagePath` → `D365FO_PACKAGE_PATH` → derived from `D365FO_WORKSPACE_PATH` → drive scan for `<drive>:\AosService\PackagesLocalDirectory`
 
-The drive scan walks C: to Z: and keeps every volume that has an `AosService\PackagesLocalDirectory`, preferring one that looks populated over an empty stub. That is what makes the server work unconfigured on any VM image — K: on cloud-hosted environments, C: on the downloadable VHD, J: on newer images — without a hardcoded drive letter anywhere. `d365fo-mcp doctor` prints what it found.
+The drive scan walks C: to Z: and keeps every volume that has an `AosService\PackagesLocalDirectory`, preferring one that looks populated over an empty stub. That is what makes the server work unconfigured on any VM image — K: on cloud-hosted environments, C: on the downloadable VHD, J: on newer images — without a hardcoded drive letter anywhere. The scan is bounded: C:, K:, J: and I: are probed first and always, the other letters only inside a 2 s budget, because one stat on a disconnected mapped network drive stalls for the SMB timeout and the scan runs on the first tool call of a session. `D365FO_SCAN_DRIVES` (e.g. `C,K`) pins the probed letters on a machine where that happens. `d365fo-mcp doctor` prints what it found, what it skipped, and which probe was slow.
 
-**Write target (UDE):** explicit env paths → XPP config auto-detection (`%LOCALAPPDATA%\Microsoft\Dynamics365\XPPConfig\`, selected by `XPP_CONFIG_NAME` or newest) → `PACKAGES_PATH` fallback
+**Write target (UDE):** explicit env paths → XPP config auto-detection (`%LOCALAPPDATA%\Microsoft\Dynamics365\XPPConfig\`, selected by `XPP_CONFIG_NAME` or newest) → `D365FO_PACKAGE_PATH` fallback (the legacy `PACKAGES_PATH` spelling still works)
 
 **Model name:** `D365FO_MODEL_NAME` → last segment of `D365FO_WORKSPACE_PATH` (AOT paths only) → auto-detected from `.rnrproj` (MCP roots / `D365FO_SOLUTIONS_PATH` scan)
 
@@ -129,7 +129,12 @@ Startup logs confirm the filtering:
 [MCP Server] Tool list filtered for write-only mode
 ```
 
-> When deploying via the Bicep template or the DevOps pipeline, `MCP_SERVER_MODE=read-only` is set automatically on the App Service — write tools are never advertised on the public URL.
+> When deploying via the Bicep template or the DevOps pipeline, `MCP_SERVER_MODE=read-only` is set automatically on the App Service, so the `LOCAL_TOOLS` set (build, DB sync, BP checks, undo, workspace inspection) is not advertised there.
+>
+> Two caveats, so this is not mistaken for a security boundary:
+>
+> - `ALWAYS_TOOLS` — `get_object_info`, `labels`, `d365fo_file` — are advertised in **every** mode. `labels` and `d365fo_file` carry write actions; on Azure those fail because there is no `K:\`, not because the mode blocks them.
+> - `read-only` limits *which tools* are reachable, not *who* may reach them. The full read surface returns `source_snippet` fields containing your X++. Authentication is what protects it — see [`API_KEY`](SETUP_AZURE.md#step-2--configure-app-settings), which is required in production.
 
 ---
 

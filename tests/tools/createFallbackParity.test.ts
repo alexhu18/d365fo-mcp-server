@@ -31,6 +31,17 @@ vi.mock('fs/promises', () => ({
   }),
   writeFile: vi.fn(async (p: string, content: string) => { files.set(p, content); }),
   copyFile: vi.fn(async () => {}),
+  // writeFileAtomic writes a temp sibling and renames it over the target, so a
+  // mock without these two makes every write throw and the tool report failure.
+  // The rename has to MOVE the entry: a no-op leaves the content parked under
+  // the temp path and the assertions below read an empty target.
+  rename: vi.fn(async (from: string, to: string) => {
+    const content = files.get(from);
+    if (content === undefined) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    files.set(to, content);
+    files.delete(from);
+  }),
+  rm: vi.fn(async (p: string) => { files.delete(p); }),
   mkdir: vi.fn(async () => {}),
   access: vi.fn(async (p: string) => {
     if (/^[A-Za-z]:[\\/]?$/.test(p) || p === '/') return;
@@ -81,6 +92,8 @@ vi.mock('../../src/utils/modelClassifier', () => ({
   getObjectSuffix: vi.fn(() => ''),
   applyObjectSuffix: vi.fn((name: string) => name),
   getExtensionNamingStyle: vi.fn(() => 'prefix'),
+  // Unset EXTENSION_CLASS_NAMING_STYLE inherits the style above; these tests never switch it.
+  getExtensionClassNamingStyle: vi.fn(() => 'prefix'),
   isCustomModel: vi.fn(() => true),
   isStandardModel: vi.fn(() => false),
 }));
@@ -132,7 +145,7 @@ const TABLE_PROPERTIES = {
 };
 
 describe('#11 XML fallback must name what it could not apply', () => {
-  it('reports the dropped indexes, relations and field groups instead of a bare ✅', async () => {
+  it('reports the dropped indexes and relations instead of a bare ✅, and stops naming what it now writes', async () => {
     const result = await handleCreateD365File(
       req({
         objectType: 'table',
@@ -149,17 +162,30 @@ describe('#11 XML fallback must name what it could not apply', () => {
     const text = result.content[0].text as string;
     const xml = [...files.values()].join('\n');
 
-    // The write itself still happened, and the template really did drop them —
-    // if either stops being true this test is measuring the wrong thing.
-    expect(text).toContain('Successfully created');
-    expect(xml).toContain('<Indexes />');
+    // The write itself still happened, and the template really did drop the
+    // relation — if either stops being true this test is measuring the wrong thing.
+    expect(text).toMatch(/^✅ Created /);
+    expect(text).not.toContain('via IMetadataProvider');
+    expect(xml).toContain('<Relations />');
     expect(xml).not.toContain('ConSettingRel');
 
     expect(text).toContain('NOT APPLIED');
-    expect(text).toContain('SettingIdx');
     expect(text).toContain('ConSettingRel');
-    expect(text).toContain('ConCustomGroup');
-    expect(text).toContain('add-index');
+    expect(text).toContain('add-relation');
+
+    // Field groups and indexes are no longer among them: the template writes
+    // both now, so the honesty check — which reads the XML that was ACTUALLY
+    // written rather than a maintained capability list — falls silent about them
+    // on its own. A report here would mean one was dropped again.
+    //
+    // The index matters beyond tidiness: `add-index`, the repair the report used
+    // to offer, needs the C# bridge, so on the template path there was no way to
+    // get an index at all.
+    expect(xml).toContain('ConCustomGroup');
+    expect(text).not.toContain('ConCustomGroup');
+    expect(xml).toContain('<Name>SettingIdx</Name>');
+    expect(xml).toContain('<AllowDuplicates>No</AllowDuplicates>');
+    expect(text).not.toContain('SettingIdx');
   });
 
   it('says the bridge is the reason the template ran', async () => {

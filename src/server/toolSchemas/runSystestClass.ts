@@ -6,13 +6,13 @@
 
 export const runSystestClassTool = {
     name: 'run_systest_class',
-    description: 'Execute a D365FO unit test class via SysTestConsole.exe. Needs an interactive console session — fails headless.',
+    description: 'Execute a D365FO unit test class via SysTestConsole.exe (/unattended), returning per-method results.',
     inputSchema: {
       type: 'object',
       properties: {
         className: { type: 'string', description: 'The name of the SysTest class to run (e.g. "MyModuleTest")' },
-        modelName: { type: 'string', description: 'The model containing the test class. Auto-detected from .mcp.json if omitted.' },
-        packagePath: { type: 'string', description: 'PackagesLocalDirectory root path. Auto-detected from .mcp.json if omitted.' },
+        modelName: { type: 'string', description: 'The model containing the test class. Auto-detected if omitted.' },
+        packagePath: { type: 'string', description: 'PackagesLocalDirectory root path. Auto-detected if omitted.' },
         testMethod: { type: 'string', description: 'Optional: run only this specific test method within the class (e.g. "testValidation").' },
       },
       required: ['className'],

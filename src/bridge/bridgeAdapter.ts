@@ -23,13 +23,15 @@
 
 import type { BridgeClient } from './bridgeClient.js';
 import { recordBridgeFailure } from './bridgeFailure.js';
+import { markRefreshStarted } from './debouncedRefresh.js';
 import type { BridgeAttempt } from './bridgeFailure.js';
 import * as debouncedRefresh from './debouncedRefresh.js';
 import { debugLog } from '../utils/logger.js';
 import { xppMethodSourceForXml } from '../utils/xppFormat.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../utils/xppDocGen.js';
-import { parseXppDeclaration } from '../metadata/xppDeclaration.js';
+import { parseXppDeclaration, parseXppClassHeader } from '../metadata/xppDeclaration.js';
 import { rankCustomFirst, isExactNameMatch } from '../utils/exactMatchRanking.js';
+import { COMPACT_METHODS_HINT, fullBodyHint } from '../utils/methodBodyHint.js';
 import {
   pageFields, fieldsHeading, fieldsFooter,
   createControlBudget, chargeControl, chargeSkippedSubtree, controlsFooter,
@@ -69,25 +71,111 @@ export interface ToolResult {
 
 const TABLE_METHOD_PAGE_SIZE = 25;
 
+/**
+ * ── SEAM for the C#-side method paging (deliberately left for a later phase) ──
+ *
+ * MEASURED: `readTable("CustTable")` ships all ~120 methods WITH full source
+ * across the pipe, and this adapter then renders one page of 25 (15 for a class).
+ * Everything else was parsed out of JSON and dropped on the floor. The same is
+ * true of `readClass`.
+ *
+ * The C# side cannot be changed in this phase (another agent owns bridge/), so
+ * the paging is made EXPLICIT here instead of implicit in a `.slice()`: this is
+ * the single place that decides which methods a table response needs and whether
+ * it needs their bodies. When `readTable` grows `includeSource` / `methodLimit` /
+ * `methodOffset` request parameters, they are populated from exactly this object
+ * — `bridge.readTable(tableName, methodPageRequest(methodOffset, wantBodies))` —
+ * and nothing below has to change, because the renderer already asks for no more
+ * than it prints.
+ *
+ * Same shape is intended for classes (CLASS_METHOD_PAGE_SIZE, formatClass).
+ */
+export interface BridgeMethodPageRequest {
+  /** First method to render (the caller's methodOffset). */
+  offset: number;
+  /** How many methods this response renders — never more than one page. */
+  limit: number;
+  /** Whether the BODIES are actually rendered; false = signature lines only. */
+  includeSource: boolean;
+}
+
+/**
+ * MEASURED before you build the C# half: do not.
+ *
+ * The obvious next step from this seam is to push offset/limit into readTable /
+ * readClass so the bridge stops shipping every method (and its Source) for a
+ * response that renders 25 of them. It buys nothing. First, uncached reads over
+ * stdio against the real metadata, 2026-08-25:
+ *
+ *     table SalesLine          808 methods   255 ms
+ *     table CustTable          222 methods   962 ms   <- first bridge read overall
+ *     class SalesFormLetter    179 methods   368 ms
+ *     table CustPaymModeTable   39 methods   254 ms
+ *     table CustGroup           16 methods    66 ms
+ *
+ * Method count does not predict latency — four times the methods runs four
+ * times faster — and every repeat read is 1-2 ms. CustTable's 962 ms is the
+ * provider warming up, not serialisation. The bytes that mattered were the ones
+ * reaching the MODEL, and those are already gone: this reader went from 20,199
+ * to ~7,000 chars by rendering less, not by transferring less.
+ *
+ * The seam stays because paging the RENDER is worth doing and this is where it
+ * is decided. If a future change makes the transfer itself expensive, re-measure
+ * first — this table is what to beat.
+ */
+export function methodPageRequest(
+  offset: number, includeSource: boolean, limit = TABLE_METHOD_PAGE_SIZE,
+): BridgeMethodPageRequest {
+  return { offset: Math.max(0, offset), limit, includeSource };
+}
+
+/**
+ * What a table response renders beyond the always-present fields/indexes.
+ *
+ * MEASURED (live harness, 2026-08-25): `get_object_info(objectType="table",
+ * name="CustTable")` returned 20,199 chars — 50 fields, 20 indexes, ALL 75
+ * relations in full, and 25 methods WITH their bodies — and `options:{compact:true}`
+ * returned byte-identical 20,199 chars, i.e. compact did nothing for tables. The
+ * class reader answers the same question in 1,241 chars because it is
+ * signature-only by default. This is the most-called tool in the corpus (286 of
+ * 1,400 calls) and its result is re-read by every later request in the session,
+ * so those bytes are paid many times over.
+ */
+export interface TableRenderOptions {
+  /** false → method BODIES (the old default). Default true: signatures only. */
+  compact?: boolean;
+  /** true → the full relation list with its constraints. Default false. */
+  relations?: boolean;
+}
+
 export async function tryBridgeTable(
   bridge: BridgeClient | undefined,
   tableName: string,
   methodOffset = 0,
   fieldsOffset = 0,
   fieldFilter?: string,
+  render: TableRenderOptions = {},
 ): Promise<ToolResult | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
     const t = await bridge.readTable(tableName);
     if (!t) return null;
-    return { content: [{ type: 'text', text: formatTable(t, methodOffset, fieldsOffset, fieldFilter) }] };
+    return { content: [{ type: 'text', text: formatTable(t, methodOffset, fieldsOffset, fieldFilter, render) }] };
   } catch (e) {
     recordBridgeFailure(`readTable(${tableName})`, e);
     return null;
   }
 }
 
-function formatTable(t: BridgeTableInfo, methodOffset: number, fieldsOffset = 0, fieldFilter?: string): string {
+function formatTable(
+  t: BridgeTableInfo,
+  methodOffset: number,
+  fieldsOffset = 0,
+  fieldFilter?: string,
+  render: TableRenderOptions = {},
+): string {
+  const compact = render.compact !== false;
+  const showRelations = render.relations === true || !compact;
   let out = `# Table: ${t.name}\n\n`;
   if (t.label) out += `**Label:** ${t.label}\n`;
   if (t.tableGroup) out += `**Table Group:** ${t.tableGroup}\n`;
@@ -124,42 +212,63 @@ function formatTable(t: BridgeTableInfo, methodOffset: number, fieldsOffset = 0,
     out += `- **${idx.name}**: [${fieldNames}]${unique}\n`;
   }
 
-  // Relations
-  out += `\n## Relations (${t.relations.length})\n\n`;
-  for (const rel of t.relations) {
-    out += `- **${rel.name}** → ${rel.relatedTable}\n`;
-    for (const c of rel.constraints) {
-      if (c.field && c.relatedField) {
-        out += `  - ${c.field} = ${c.relatedField}\n`;
-      } else if (c.field && c.value) {
-        out += `  - ${c.field} = (fixed: ${c.value})\n`;
+  // Relations — the single largest block on a Microsoft table (CustTable: 75 of
+  // them, ~7 KB with their constraints) and the one least often the reason the
+  // table was read. Withheld by default, never silently: the count and the exact
+  // option that returns them are printed, so nothing disappears without saying so.
+  if (showRelations) {
+    out += `\n## Relations (${t.relations.length})\n\n`;
+    for (const rel of t.relations) {
+      out += `- **${rel.name}** → ${rel.relatedTable}\n`;
+      for (const c of rel.constraints) {
+        if (c.field && c.relatedField) {
+          out += `  - ${c.field} = ${c.relatedField}\n`;
+        } else if (c.field && c.value) {
+          out += `  - ${c.field} = (fixed: ${c.value})\n`;
+        }
       }
     }
+  } else if (t.relations.length > 0) {
+    out += `\n## Relations (${t.relations.length}) — not listed\n\n` +
+      `> 💡 ${t.relations.length} relation(s) exist. \`options:{"relations":true}\` lists them with their constraints.\n`;
   }
 
-  // Methods (paginated)
+  // Methods — signature lines by default, the same shape the class reader has
+  // always used. `compact:false` restores the bodies.
   if (t.methods.length > 0) {
-    const visible = t.methods.slice(methodOffset, methodOffset + TABLE_METHOD_PAGE_SIZE);
+    const page = methodPageRequest(methodOffset, !compact);
+    const visible = t.methods.slice(page.offset, page.offset + page.limit);
     const total = t.methods.length;
-    const hasMore = methodOffset + TABLE_METHOD_PAGE_SIZE < total;
+    const hasMore = page.offset + page.limit < total;
 
     out += `\n## Methods (${total} total`;
-    if (total > TABLE_METHOD_PAGE_SIZE) {
-      out += `, showing ${methodOffset + 1}–${Math.min(methodOffset + TABLE_METHOD_PAGE_SIZE, total)}`;
+    if (total > page.limit) {
+      out += `, showing ${page.offset + 1}–${Math.min(page.offset + page.limit, total)}`;
     }
     out += `)\n\n`;
 
     for (const m of visible) {
-      out += `### ${m.name}\n\n`;
-      if (m.source) {
-        const preview = m.source.substring(0, 500);
-        out += `\`\`\`xpp\n${preview}${m.source.length > 500 ? '\n// ...' : ''}\n\`\`\`\n\n`;
+      if (page.includeSource) {
+        out += `### ${m.name}\n\n`;
+        if (m.source) {
+          const preview = m.source.substring(0, 500);
+          out += `\`\`\`xpp\n${preview}${m.source.length > 500 ? `\n// ... (${fullBodyHint(m.name)})` : ''}\n\`\`\`\n\n`;
+        }
+      } else {
+        out += `- \`${methodSignatureLine(m.name, m.source)}\`\n`;
       }
     }
 
     if (hasMore) {
-      out += `> ⚠️ **${total - methodOffset - TABLE_METHOD_PAGE_SIZE} more methods.** Call again with \`methodOffset: ${methodOffset + TABLE_METHOD_PAGE_SIZE}\`.\n\n`;
+      out += `\n> ⚠️ **${total - page.offset - page.limit} more methods.** Call again with \`methodOffset: ${page.offset + page.limit}\`.\n`;
     }
+    // Same escape hatch the class view prints, for the same reason: this list is
+    // the only place a caller who did not read the tool schema learns that bodies
+    // exist and were withheld rather than absent.
+    if (!page.includeSource && visible.some(m => m.source)) {
+      out += `\n${COMPACT_METHODS_HINT}\n`;
+    }
+    out += `\n`;
   }
 
   return out;
@@ -226,9 +335,21 @@ function formatClass(cls: BridgeClassInfo, compact: boolean, methodOffset: numbe
   if (cls.isAbstract) modifiers.push('abstract');
   const modStr = modifiers.length > 0 ? ` (${modifiers.join(', ')})` : '';
 
+  // The bridge sends no access modifier of its own, but it does send the
+  // declaration verbatim — and that is where the modifier lives, since AxClass
+  // XML has no element for it either. Parsed rather than regexed so a modifier
+  // named in an attribute or a doc comment cannot be mistaken for the real one.
+  const visibility = cls.declaration
+    ? parseXppClassHeader(cls.declaration)?.visibility
+    : undefined;
+
   let out = `# Class: ${cls.name}${modStr}\n\n`;
   if (cls.extends) out += `**Extends:** ${cls.extends}\n`;
   if (cls.model) out += `**Model:** ${cls.model}\n`;
+  // Printed on every path, so a reader comparing two classes is not left to infer
+  // package scope from a line's absence. Silent only when there was no
+  // declaration to read at all (#902).
+  if (cls.declaration) out += `**Access:** ${visibility ?? 'public'}\n`;
   out += `**Abstract:** ${cls.isAbstract ? 'Yes' : 'No'}\n`;
   out += `**Final:** ${cls.isFinal ? 'Yes' : 'No'}\n`;
   out += `_Source: C# bridge (IMetadataProvider)_\n\n`;
@@ -254,13 +375,36 @@ function formatClass(cls: BridgeClassInfo, compact: boolean, methodOffset: numbe
       out += `### ${m.name}\n\n`;
       if (m.source) {
         const preview = m.source.substring(0, 500);
-        out += `\`\`\`xpp\n${preview}${m.source.length > 500 ? '\n// ... (use get_method(include="source") for full body)' : ''}\n\`\`\`\n\n`;
+        // Same call syntax as COMPACT_METHODS_HINT below — two different ways to
+        // ask for one method body, fifteen lines apart, is the inconsistency
+        // this hint exists to remove.
+        out += `\`\`\`xpp\n${preview}${m.source.length > 500 ? `\n// ... (${fullBodyHint(m.name)})` : ''}\n\`\`\`\n\n`;
       }
     }
   }
 
   if (hasMore) {
     out += `> ⚠️ **${total - methodOffset - CLASS_METHOD_PAGE_SIZE} more methods.** Call again with \`methodOffset: ${methodOffset + CLASS_METHOD_PAGE_SIZE}\`.\n\n`;
+  }
+
+  // compact=true is the default, and this list is the only place a caller who
+  // didn't read the tool schema learns that bodies exist but were withheld —
+  // the DB-only fallback (classInfo.ts buildDbOnlyResponse) already says this;
+  // the bridge path (the primary, "always available on VM" path) silently gave
+  // signatures with no pointer to the escape hatch, which read as "no source
+  // available for this class" when it was really "not requested".
+  //
+  // Gated on the RENDERED page carrying source, not on `total`. Bridge method
+  // source is Safe(() => method.Source) and BridgeMethodInfo.source is
+  // optional, so a class can come back with none: the compact:false branch
+  // above then prints `### name` and no code block at all (`if (m.source)`),
+  // which is strictly LESS than the signature line compact just gave — a round
+  // trip spent to lose information, on exactly the classes where the caller was
+  // already unsure whether source existed. The same guard covers an out-of-range
+  // methodOffset, where `visible` is empty and there is no signature on the page
+  // for "signatures only" to be describing.
+  if (compact && visible.some(m => m.source)) {
+    out += `${COMPACT_METHODS_HINT}\n\n`;
   }
 
   return out;
@@ -355,10 +499,18 @@ function formatEdt(edt: BridgeEdtInfo): string {
   out += `## 🔧 Core Properties\n\n`;
   out += `| Property | Value |\n|---|---|\n`;
   out += `| Base Type | ${edt.baseType ?? '—'}${edt.extends ? ` (Extends: ${edt.extends})` : ''} |\n`;
+  if (edt.rootEdt && edt.rootEdt !== edt.extends) out += `| Root EDT | ${edt.rootEdt} |\n`;
   if (edt.enumType) out += `| Enum Type | ${edt.enumType} |\n`;
   if (edt.referenceTable) out += `| Reference Table | ${edt.referenceTable} |\n`;
   if (edt.relationType) out += `| Relation Type | ${edt.relationType} |\n`;
-  if (edt.stringSize) out += `| String Size | ${edt.stringSize} |\n`;
+  // A derived EDT usually inherits its StringSize rather than declaring one, and a value it
+  // does declare can still be overridden by an ancestor's. Say where the number came from
+  // whenever it is not what this EDT's own XML said.
+  if (edt.stringSize) {
+    const from = edt.stringSizeInheritedFrom ? ` (inherited from ${edt.stringSizeInheritedFrom})` : '';
+    const size = edt.stringSize === -1 ? '-1 (memo, unlimited)' : String(edt.stringSize);
+    out += `| String Size | ${size}${from} |\n`;
+  }
   if (edt.displayLength) out += `| Display Length | ${edt.displayLength} |\n`;
   if (edt.label) out += `| Label | ${edt.label} |\n`;
   if (edt.helpText) out += `| Help Text | ${edt.helpText} |\n`;
@@ -751,7 +903,7 @@ export interface BridgeSearchOptions {
    * exact match can be missing entirely. Any candidate absent from the bridge
    * window is spliced in and ranked first.
    */
-  exactMatches?: Array<{ name: string; type: string }>;
+  exactMatches?: Array<{ name: string; type: string; model?: string }>;
   /**
    * Keyword hits from CUSTOM/ISV models the caller resolved from the SQLite
    * index (model-scoped, FTS-driven). The bridge enumerates a single merged
@@ -760,7 +912,28 @@ export interface BridgeSearchOptions {
    * These are spliced in and ranked directly after the exact matches (ahead of
    * Microsoft standard hits) so custom code is always visible.
    */
-  customMatches?: Array<{ name: string; type: string }>;
+  customMatches?: Array<{ name: string; type: string; model?: string; parentName?: string }>;
+  /**
+   * Fills in the MODEL for rows the bridge itself returns.
+   *
+   * The C# `SearchItemModel` carries a `model` property but SearchObjects never
+   * populates it (Models.cs / MetadataReadService.cs), so a bridge row is name +
+   * type and nothing else — while `search`'s published schema promises "returns
+   * name, type, model". Rather than a second round trip per hit, the caller
+   * passes a resolver backed by the SQLite index (see
+   * tools/analysis/search.ts#buildBridgeMetaResolver), keyed by
+   * `name.toLowerCase()::type`.
+   *
+   * Optional on purpose: with no resolver the rows render exactly as before.
+   */
+  resolveMeta?: (
+    rows: Array<{ name: string; type: string }>,
+  ) => Map<string, { model?: string }>;
+}
+
+/** Key of the resolveMeta map — must match tools/analysis/search.ts#metaKey. */
+function searchMetaKey(name: string, type: string): string {
+  return `${String(name).toLowerCase()}::${type}`;
 }
 
 export async function tryBridgeSearch(
@@ -776,9 +949,25 @@ export async function tryBridgeSearch(
     if (!sr) return null;
 
     // Splice in exact matches the bridge's truncated window missed (#15).
-    const bridgeHits = sr.results ?? [];
+    //
+    // …but first, honour the type filter the caller asked for, because the bridge
+    // does not always honour it. Its C#-side type map has no entry for every AOT
+    // kind — `report` is one — and an unmapped type runs the query UNFILTERED, so
+    // `search(type="report")` answered with tables and queries and looked
+    // authoritative doing it ("Cust" returned six tables). A report reached the
+    // caller only when the SQLite exact-name splice happened to carry one, which
+    // is why the failure looked intermittent rather than total.
+    //
+    // Only the BRIDGE's hits are filtered. The spliced exact and custom matches
+    // are deliberately allowed to differ in type — a `table-extension` is a
+    // wanted answer to a `type="table"` search for the table it extends — and
+    // filtering those too would delete that behaviour.
+    const rawBridgeHits = sr.results ?? [];
+    const bridgeHits = objectType && objectType !== 'all'
+      ? rawBridgeHits.filter(r => r.type === objectType)
+      : rawBridgeHits;
     const known = new Set(bridgeHits.map(r => `${r.name.toLowerCase()}\0${r.type}`));
-    const spliced: Array<{ name: string; type: string; fromIndex?: boolean }> = [];
+    const spliced: Array<{ name: string; type: string; model?: string; fromIndex?: boolean }> = [];
     for (const cand of opts?.exactMatches ?? []) {
       if (!isExactNameMatch(query, cand.name)) continue;
       if (known.has(`${cand.name.toLowerCase()}\0${cand.type}`)) continue;
@@ -796,13 +985,26 @@ export async function tryBridgeSearch(
     const customKeys = new Set((opts?.customMatches ?? []).map(c => key(c.name, c.type)));
     const customSpliced = (opts?.customMatches ?? [])
       .filter(c => !exactKeys.has(key(c.name, c.type)) && !bridgeKeys.has(key(c.name, c.type)))
-      .map(c => ({ name: c.name, type: c.type, fromIndex: true as const, custom: true as const }));
+      .map(c => ({
+        name: c.name, type: c.type, model: c.model, parentName: c.parentName,
+        fromIndex: true as const, custom: true as const,
+      }));
     const splicedCustom = customSpliced.length;
 
-    const merged: Array<{ name: string; type: string; fromIndex?: boolean; custom?: boolean }> = [
+    const merged: Array<{
+      name: string; type: string; fromIndex?: boolean; custom?: boolean;
+      model?: string; parentName?: string;
+    }> = [
       ...spliced.map(s => ({ ...s })),
       ...customSpliced,
-      ...bridgeHits.map(r => ({ name: r.name, type: r.type, custom: customKeys.has(key(r.name, r.type)) })),
+      ...bridgeHits.map(r => ({
+        name: r.name,
+        type: r.type,
+        // The bridge leaves this undefined in practice (see BridgeSearchOptions
+        // .resolveMeta); read it anyway so a later C#-side fix needs no change here.
+        model: r.model ?? undefined,
+        custom: customKeys.has(key(r.name, r.type)),
+      })),
     ];
     if (merged.length === 0) return null;
 
@@ -814,9 +1016,18 @@ export async function tryBridgeSearch(
     out += `**Results:** ${ranked.length}\n`;
     out += `_Source: C# bridge (IMetadataProvider)_\n\n`;
 
+    // Model on every row, and the owning object on a method/field row.
+    //
+    // These rows used to render as `- **Name** (type)` while the tool's own
+    // schema promised "returns name, type, model" — so the caller either guessed
+    // the model or spent a get_object_info call to find out where the hit lives,
+    // which is the expensive half of an answer the server already had.
+    const meta = opts?.resolveMeta?.(ranked) ?? new Map<string, { model?: string }>();
     for (const r of ranked) {
       const exact = isExactNameMatch(query, r.name) ? ' ⭐ exact match' : '';
-      out += `- **${r.name}** (${r.type})${exact}\n`;
+      const model = r.model ?? meta.get(searchMetaKey(r.name, r.type))?.model;
+      const owner = r.parentName ? `${r.parentName}.` : '';
+      out += `- **${owner}${r.name}** (${r.type})${model ? ` — ${model}` : ''}${exact}\n`;
     }
 
     if (spliced.length > 0) {
@@ -1251,8 +1462,32 @@ const BRIDGE_MODIFY_OPS = new Set([
   'modify-property',
   'add-enum-value', 'modify-enum-value', 'remove-enum-value',
   'add-control', 'add-data-source',
+  // Removal of a control, and of a privilege's entry point, have no C# op either
+  // (MetadataWriteService exposes no RemoveControl, and security objects have no
+  // bridge write path at all) — both are served by a direct-XML writer and still
+  // pass through this gate.
+  // add-entry-point shipped its schema entry, op-spec, dispatcher case and writer
+  // without ever being listed here, so canBridgeModify() short-circuited and the
+  // whole feature was unreachable from the tool surface — dead code behind a ✅
+  // schema. Both this set AND XML_ONLY_MODIFY_PAIRS have to name it; either alone
+  // still returns false. (eval case L2-object-delete-and-entry-point-cleanup)
+  'remove-control', 'add-entry-point', 'remove-entry-point',
+  // AxIgnoreDiagnosticList is not an AOT object at all — MetadataWriteService has
+  // no concept of it — so this is XML-only for the same structural reason as the
+  // two above.
+  'remove-diagnostic-suppression', 'add-diagnostic-suppression',
+  // A model descriptor is not an AOT object either — it is the package's own
+  // manifest, outside the AOT entirely — so the same XML-only reasoning applies.
+  'add-module-reference', 'remove-module-reference',
   'add-display-method', 'add-table-method',
   'add-field-modification', 'add-menu-item-to-menu',
+  // No C# op exists for query ranges on entities — served entirely by a
+  // direct-XML writer (data-entity is already in BRIDGE_MODIFY_TYPES).
+  'add-query-range', 'remove-query-range',
+  // Routed straight to the XML writer by XML_ONLY_MODIFY_PAIRS below, but the
+  // dispatch gate is checked FIRST — an op absent here is refused as unknown
+  // before the pair table is ever consulted.
+  'report-design',
 ]);
 
 /**
@@ -1270,6 +1505,35 @@ const BRIDGE_MODIFY_TYPES = new Set([
 ]);
 
 /**
+ * Operation → the object types it may target that BRIDGE_MODIFY_TYPES does not
+ * cover, because a direct-XML writer serves the pair and the bridge never will.
+ *
+ * This gate is what EVERY modify operation clears before dispatch, whether or not
+ * a C# op backs it, so an XML-only writer for an XML-only type has nowhere else to
+ * be admitted. The pairing is per-operation rather than per-type on purpose:
+ * dropping 'security-privilege' into BRIDGE_MODIFY_TYPES would also claim
+ * add-method, replace-code and modify-property work on a privilege, which they do
+ * not — the bridge has no write path for security objects at all (the same reason
+ * they are absent from BRIDGE_CREATE_TYPES: a generic
+ * Dictionary<string,string> cannot carry <EntryPoints>). The caller would then get
+ * a bridge resolution failure instead of "not supported for this object type".
+ */
+const XML_ONLY_MODIFY_PAIRS: Record<string, ReadonlySet<string>> = {
+  'add-entry-point': new Set(['security-privilege']),
+  'remove-entry-point': new Set(['security-privilege']),
+  'remove-diagnostic-suppression': new Set(['ignore-diagnostic-list']),
+  'add-diagnostic-suppression': new Set(['ignore-diagnostic-list']),
+  'add-module-reference': new Set(['model-descriptor']),
+  'remove-module-reference': new Set(['model-descriptor']),
+  // An AxReport has no bridge write path at all — IMetadataProvider cannot express
+  // a dataset field or a report parameter through a Dictionary<string,string> — and
+  // `report` is deliberately absent from BRIDGE_MODIFY_TYPES for that reason. Without
+  // this pair the caller would get "the bridge could not resolve the object" instead
+  // of the operation actually running.
+  'report-design': new Set(['report']),
+};
+
+/**
  * Names the properties the bridge could not write, for appending to a success message.
  *
  * The C# side has reported `unsupportedProperties` for a while, but nothing on this side
@@ -1283,6 +1547,38 @@ export function unappliedSuffix(result: { unsupportedProperties?: string[] }): s
   return `\n⚠️ NOT applied — this object type has nowhere to store them: ${dropped.join(', ')}`;
 }
 
+/** What a bridge write returns when it declined to do anything. */
+export interface BridgeSkippable {
+  skipped?: boolean;
+  reason?: string;
+}
+
+/**
+ * Renders a bridge result that declined the write, or null when it did write.
+ *
+ * The bridge has long been able to answer `{ success: true, skipped: true, reason }`
+ * — it did the honest thing and said it changed nothing. Nothing on this side read
+ * `skipped`, so every decline fell through the caller's `result.success` branch and
+ * was rendered "✅ … added": a write that never happened, reported as one, with the
+ * bridge's own explanation discarded on the way past.
+ *
+ * `success` from the bridge means "this did not fail", NOT "the object changed".
+ * Any wrapper whose operation can skip must ask this before claiming a write.
+ *
+ * Exactly the lesson unappliedSuffix() above was added for, one field over — which
+ * is why both live here together.
+ */
+export function skippedMessage(result: BridgeSkippable, subject: string): string | null {
+  if (result.skipped !== true) return null;
+  const reason = result.reason?.trim();
+  return (
+    `⏭️ NOT written — ${subject} was skipped by the bridge` +
+    (reason ? `: ${reason}` : ' (no reason given)') +
+    `\n   Nothing changed on disk. If you meant to replace what is already there, ` +
+    `remove or rename it first — re-sending this operation will skip again.`
+  );
+}
+
 /**
  * Checks if bridge can handle this create operation.
  */
@@ -1294,7 +1590,10 @@ export function canBridgeCreate(objectType: string): boolean {
  * Checks if bridge can handle this modify operation.
  */
 export function canBridgeModify(objectType: string, operation: string): boolean {
-  return BRIDGE_MODIFY_TYPES.has(objectType.toLowerCase()) && BRIDGE_MODIFY_OPS.has(operation.toLowerCase());
+  const type = objectType.toLowerCase();
+  const op = operation.toLowerCase();
+  if (!BRIDGE_MODIFY_OPS.has(op)) return false;
+  return BRIDGE_MODIFY_TYPES.has(type) || (XML_ONLY_MODIFY_PAIRS[op]?.has(type) ?? false);
 }
 
 /**
@@ -1358,6 +1657,12 @@ export async function bridgeCreateObject(
   try {
     const result = await bridge.createObject(documentAndFormat(params));
     if (result.success) {
+      // The C# dispatcher runs RefreshProvider() itself after a successful
+      // createObject/createSmartTable (RequestDispatcher.cs, refreshAfterSuccess),
+      // so the provider has ALREADY been rebuilt by the time this returns.
+      // Recording it here lets the caller skip its own refresh instead of
+      // paying for a second full DiskProvider rebuild of the same tree.
+      markRefreshStarted();
       return {
         success: true,
         filePath: result.filePath,
@@ -1404,6 +1709,12 @@ export async function bridgeCreateSmartTable(
   try {
     const result = await bridge.createSmartTable(params);
     if (result.success) {
+      // The C# dispatcher runs RefreshProvider() itself after a successful
+      // createObject/createSmartTable (RequestDispatcher.cs, refreshAfterSuccess),
+      // so the provider has ALREADY been rebuilt by the time this returns.
+      // Recording it here lets the caller skip its own refresh instead of
+      // paying for a second full DiskProvider rebuild of the same tree.
+      markRefreshStarted();
       console.error(`[BridgeAdapter] ✅ Smart table created: ${result.filePath} (${result.api})`);
       return result;
     } else {
@@ -1449,7 +1760,11 @@ export async function bridgeAddMethod(
         : `Bridge addMethod returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addMethod(${objectType}, ${objectName}, ${methodName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addMethod(${objectType}, ${objectName}, ${methodName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1471,7 +1786,7 @@ export async function bridgeAddField(
   mandatory?: boolean,
   label?: string,
   mapped?: { dataField?: string; dataSource?: string; fieldGroupName?: string },
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
 
   try {
@@ -1481,12 +1796,17 @@ export async function bridgeAddField(
     );
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Field '${fieldName}'`) ?? (result.success
         ? `✅ Field '${fieldName}' added via ${result.api}`
-        : `Bridge addField returned success=false`,
+        : `Bridge addField returned success=false`),
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addField(${tableName}, ${fieldName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addField(${tableName}, ${fieldName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1513,7 +1833,11 @@ export async function bridgeSetProperty(
         : `Bridge setProperty returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] setProperty(${objectType}, ${objectName}, ${propertyPath}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`setProperty(${objectType}, ${objectName}, ${propertyPath})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1541,7 +1865,11 @@ export async function bridgeReplaceCode(
         : `Bridge replaceCode returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] replaceCode(${objectType}, ${objectName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`replaceCode(${objectType}, ${objectName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1567,7 +1895,11 @@ export async function bridgeRemoveMethod(
         : `Bridge removeMethod returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeMethod(${objectType}, ${objectName}, ${methodName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeMethod(${objectType}, ${objectName}, ${methodName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1593,7 +1925,11 @@ export async function bridgeAddIndex(
         : `Bridge addIndex returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addIndex(${tableName}, ${indexName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addIndex(${tableName}, ${indexName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1616,7 +1952,11 @@ export async function bridgeRemoveIndex(
         : `Bridge removeIndex returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeIndex(${tableName}, ${indexName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeIndex(${tableName}, ${indexName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1643,7 +1983,11 @@ export async function bridgeAddFullTextIndex(
         : `Bridge addFullTextIndex returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addFullTextIndex(${tableName}, ${indexName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addFullTextIndex(${tableName}, ${indexName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1664,7 +2008,11 @@ export async function bridgeRemoveFullTextIndex(
         : `Bridge removeFullTextIndex returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeFullTextIndex(${tableName}, ${indexName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeFullTextIndex(${tableName}, ${indexName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1687,7 +2035,11 @@ export async function bridgeAddTableMapping(
         : `Bridge addTableMapping returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addTableMapping(${tableName}, ${mapName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addTableMapping(${tableName}, ${mapName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1708,7 +2060,11 @@ export async function bridgeRemoveTableMapping(
         : `Bridge removeTableMapping returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeTableMapping(${tableName}, ${mapName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeTableMapping(${tableName}, ${mapName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1747,7 +2103,11 @@ export async function bridgeAddRelation(
         : `Bridge addRelation returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addRelation(${tableName}, ${relationName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addRelation(${tableName}, ${relationName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1770,7 +2130,11 @@ export async function bridgeRemoveRelation(
         : `Bridge removeRelation returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeRelation(${tableName}, ${relationName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeRelation(${tableName}, ${relationName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1795,7 +2159,11 @@ export async function bridgeAddFieldGroup(
         : `Bridge addFieldGroup returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addFieldGroup(${tableName}, ${groupName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addFieldGroup(${tableName}, ${groupName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1818,7 +2186,11 @@ export async function bridgeRemoveFieldGroup(
         : `Bridge removeFieldGroup returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeFieldGroup(${tableName}, ${groupName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeFieldGroup(${tableName}, ${groupName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1832,7 +2204,7 @@ export async function bridgeAddFieldToFieldGroup(
   groupName: string,
   fieldName: string,
   extendBaseFieldGroup?: boolean,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
     const result = await bridge.addFieldToFieldGroup(tableName, groupName, fieldName, extendBaseFieldGroup);
@@ -1845,12 +2217,17 @@ export async function bridgeAddFieldToFieldGroup(
       : '<FieldGroups>';
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Field '${fieldName}' → group '${groupName}'`) ?? (result.success
         ? `✅ Field '${fieldName}' added to group '${groupName}' in ${target} via ${result.api}`
-        : `Bridge addFieldToFieldGroup returned success=false`,
+        : `Bridge addFieldToFieldGroup returned success=false`),
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addFieldToFieldGroup(${tableName}, ${groupName}, ${fieldName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addFieldToFieldGroup(${tableName}, ${groupName}, ${fieldName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1874,7 +2251,11 @@ export async function bridgeModifyField(
         : `Bridge modifyField returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] modifyField(${tableName}, ${fieldName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`modifyField(${tableName}, ${fieldName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1898,7 +2279,11 @@ export async function bridgeRenameField(
         : `Bridge renameField returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] renameField(${tableName}, ${oldName} → ${newName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`renameField(${tableName}, ${oldName} → ${newName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1921,7 +2306,11 @@ export async function bridgeRemoveField(
         : `Bridge removeField returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeField(${tableName}, ${fieldName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeField(${tableName}, ${fieldName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1944,7 +2333,11 @@ export async function bridgeReplaceAllFields(
         : `Bridge replaceAllFields returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] replaceAllFields(${tableName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`replaceAllFields(${tableName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1970,7 +2363,11 @@ export async function bridgeAddEnumValue(
         : `Bridge addEnumValue returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addEnumValue(${enumName}, ${valueName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addEnumValue(${enumName}, ${valueName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -1994,7 +2391,11 @@ export async function bridgeModifyEnumValue(
         : `Bridge modifyEnumValue returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] modifyEnumValue(${enumName}, ${valueName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`modifyEnumValue(${enumName}, ${valueName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2017,7 +2418,11 @@ export async function bridgeRemoveEnumValue(
         : `Bridge removeEnumValue returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] removeEnumValue(${enumName}, ${valueName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`removeEnumValue(${enumName}, ${valueName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2045,7 +2450,11 @@ export async function bridgeAddControl(
         : `Bridge addControl returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addControl(${formName}, ${controlName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addControl(${formName}, ${controlName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2061,18 +2470,24 @@ export async function bridgeAddDataSource(
   table: string,
   joinSource?: string,
   linkType?: string,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   try {
     const result = await bridge.addDataSource(objectType, objectName, dsName, table, joinSource, linkType);
+    const skip = skippedMessage(result, `DataSource '${dsName}'`);
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skip ?? (result.success
         ? `✅ DataSource '${dsName}' added via ${result.api}`
-        : `Bridge addDataSource returned success=false`,
+        : `Bridge addDataSource returned success=false`),
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addDataSource(${objectType}, ${objectName}, ${dsName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addDataSource(${objectType}, ${objectName}, ${dsName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2101,7 +2516,11 @@ export async function bridgeAddFieldModification(
         : `Bridge addFieldModification returned success=false`,
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addFieldModification(${extensionName}, ${fieldName}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addFieldModification(${extensionName}, ${fieldName})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2116,19 +2535,24 @@ export async function bridgeAddMenuItemToMenu(
   menuName: string,
   menuItemToAdd: string,
   menuItemToAddType?: string,
-): Promise<{ success: boolean; message: string } | null> {
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
 
   try {
     const result = await bridge.addMenuItemToMenu(menuName, menuItemToAdd, menuItemToAddType);
     return {
       success: result.success,
-      message: result.success
+      skipped: result.skipped === true,
+      message: skippedMessage(result, `Menu item '${menuItemToAdd}'`) ?? (result.success
         ? `✅ Menu item '${menuItemToAdd}' added via ${result.api}`
-        : `Bridge addMenuItemToMenu returned success=false`,
+        : `Bridge addMenuItemToMenu returned success=false`),
     };
   } catch (e) {
-    console.error(`[BridgeAdapter] addMenuItemToMenu(${menuName}, ${menuItemToAdd}) failed: ${e}`);
+    // Record into the per-call failure sink as well as returning the
+    // message: without this a bridge write that THREW reached the model
+    // as an ordinary failure string, with nothing saying the bridge was
+    // what broke. Same stderr line as before.
+    recordBridgeFailure(`addMenuItemToMenu(${menuName}, ${menuItemToAdd})`, e);
     return { success: false, message: String(e) };
   }
 }
@@ -2138,6 +2562,18 @@ export async function bridgeAddMenuItemToMenu(
 /**
  * Executes multiple write operations on a single object in one bridge call.
  * Returns a formatted ToolResult or null if bridge unavailable.
+ *
+ * NOT REACHED BY ANY PUBLISHED TOOL, and that is deliberate — do not wire
+ * `d365fo_file(operations:[…])` to it on the assumption that it is the faster
+ * path. See the comment on `runModifyBatch` in src/tools/d365foFile.ts: the
+ * round trip worth saving is the MCP one, and bridge IPC is local and costs
+ * milliseconds, while this RPC bypasses path containment, backups, prefix
+ * application, .rnrproj registration, the per-operation validation and the
+ * direct-XML fallbacks — several of which exist because a bridge write failed.
+ *
+ * Kept rather than deleted: the C# counterpart (RequestDispatcher.HandleBatchModify)
+ * is ~300 lines whose three known defects are fixed, and a future caller that
+ * accepts those trade-offs has somewhere to start. Retired, not broken.
  */
 export async function bridgeBatchModify(
   bridge: BridgeClient | undefined,
@@ -2282,6 +2718,16 @@ function formatSecurityPrivilege(priv: BridgeSecurityPrivilegeResult, _includeCh
   if (priv.parentDuties.length > 0) {
     out += `\nUsed in Duties (${priv.parentDuties.length}):\n`;
     out += `  ${priv.parentDuties.map(d => d.name).join(', ')}\n`;
+  } else if (priv.parentDutiesComplete === false) {
+    // Not the same as "none". The bridge scans every duty to answer this, and a
+    // scan that could not finish used to come back as an empty list — read as
+    // "this privilege is in no duty", which is exactly the claim
+    // BPErrorPrivilegeNotCoveredByDuty is about and the one an agent acts on by
+    // adding the privilege to a duty it may already be in.
+    out += `\nUsed in Duties: UNKNOWN — the duty scan could not complete, so this is NOT ` +
+      `evidence the privilege is uncovered.\n`;
+  } else {
+    out += `\nUsed in Duties: none\n`;
   }
 
   return out;
@@ -2481,6 +2927,30 @@ export async function tryBridgeCompletion(
   }
 }
 
+/**
+ * One line of a member list — NAME first, always.
+ *
+ * This used to print the signature INSTEAD of the name whenever a signature
+ * existed, which made a member unidentifiable the moment the signature was
+ * wrong. It is sometimes wrong: the bridge's extractor hands back the line
+ * preceding the body when a macro sits between the doc block and the signature,
+ * so `SysQuery.range` was listed as `#ISOCountryRegionCodes`. Filtering runs on
+ * the NAME, so asking for prefix "range" returned "1 member" that appeared to be
+ * something else entirely — and a member list that renders a public API as
+ * another string argues the API does not exist. An eval run concluded exactly
+ * that and worked around a method that was there all along.
+ *
+ * The signature is still shown, as detail, and only when it plausibly belongs to
+ * this member. Fixing the extractor is a separate, C#-side change; this makes the
+ * output honest either way.
+ */
+function memberLine(m: { name: string; signature?: string }): string {
+  const sig = m.signature?.trim();
+  const belongs = sig && new RegExp(`\\b${m.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`, 'i').test(sig);
+  if (belongs) return `\`${sig}\``;
+  return sig ? `**${m.name}** _(signature unavailable)_` : `**${m.name}**`;
+}
+
 function formatCompletion(r: BridgeCompletionResult, prefix?: string): string {
   let members = r.members;
   if (prefix) {
@@ -2506,8 +2976,9 @@ function formatCompletion(r: BridgeCompletionResult, prefix?: string): string {
     const inheritedCount = methodMembers.filter(m => m.inheritedFrom).length;
     out += `## Methods (${methodMembers.length})\n`;
     for (const m of methodMembers) {
-      const body = m.signature ? `\`${m.signature}\`` : m.name;
-      out += m.inheritedFrom ? `- ${body} _(inherited from ${m.inheritedFrom})_\n` : `- ${body}\n`;
+      out += m.inheritedFrom
+        ? `- ${memberLine(m)} _(inherited from ${m.inheritedFrom})_\n`
+        : `- ${memberLine(m)}\n`;
     }
     if (inheritedCount > 0) {
       out += `\n> ${inheritedCount} of these are inherited — callable on ${r.symbolName}, but ` +
@@ -2561,20 +3032,81 @@ function formatCocExtensions(r: BridgeExtensionClassResult, methodNameFilter?: s
     );
   }
 
-  out += `Found ${filtered.length} extension class(es)${methodNameFilter ? ` wrapping "${methodNameFilter}"` : ''}:\n\n`;
-  const seen = new Set<string>();
+  // Dedupe by class name ONCE, before anything is counted. A class carries a single
+  // [ExtensionOf] and the bridge keys its results by class name, so a duplicate cannot
+  // reach here today — but the count and the list it introduces have to agree whatever
+  // arrives, and skipping an entry inside the render loop after the heading above it had
+  // already counted that entry is exactly how the two come apart.
+  const byClassName = new Map<string, (typeof filtered)[number]>();
   for (const ext of filtered) {
-    if (seen.has(ext.className)) continue;
-    seen.add(ext.className);
-    out += `- **${ext.className}**`;
-    if (ext.module) out += ` (${ext.module})`;
-    if (ext.wrappedMethods && ext.wrappedMethods.length > 0) {
-      out += `\n    Wraps methods: ${ext.wrappedMethods.join(', ')}`;
-      out += `\n    Uses 'next' keyword: ✓`;
+    if (!byClassName.has(ext.className)) byClassName.set(ext.className, ext);
+  }
+  const unique = [...byClassName.values()];
+
+  out += `Found ${unique.length} extension class(es)${methodNameFilter ? ` wrapping "${methodNameFilter}"` : ''}:\n\n`;
+
+  // Grouped by the element each class actually extends, never pooled into one list. A name can
+  // denote several objects at once — "SalesTable" is a table (14 extensions) AND a form (17),
+  // and the form's data sources, controls and data fields are each extended separately again
+  // (31 more across 12 elements). Reporting "49 extensions of SalesTable" told an agent about
+  // to write a table CoC that 34 form extensions were its concern, and hid which of the form's
+  // NINE data sources with an `active` method was already wrapped.
+  const groups = new Map<string, typeof unique>();
+  for (const ext of unique) {
+    const key = ext.extendedElement ?? '';
+    const bucket = groups.get(key) ?? [];
+    bucket.push(ext);
+    groups.set(key, bucket);
+  }
+
+  for (const [element, exts] of groups) {
+    // Elements sort with the requested object first and its nested members after (the bridge
+    // orders by path); the heading names the element so the reader never has to infer it.
+    if (element) out += `### ${describeXrefElement(element)} — ${exts.length}\n\n`;
+    for (const ext of exts) {
+      out += `- **${ext.className}**`;
+      if (ext.module) out += ` (${ext.module})`;
+      if (ext.wrappedMethods && ext.wrappedMethods.length > 0) {
+        // Deliberately no `Uses 'next' keyword: ✓` line on THIS path, unlike the index /
+        // filesystem path in findCocExtensions.ts. That one earns it — fsExtensionScanner
+        // builds cocMethods by testing each method body against /\bnext\s+\w/i — whereas
+        // here the claim was printed unconditionally for anything with a non-empty
+        // wrappedMethods, and nothing had read a line of source. It therefore asserted a
+        // `next` in classes that contained none, back when wrappedMethods was every base
+        // method the class called. The list is now the same-named base-method call that IS
+        // the `next`, but that is inferred from xref shape rather than seen, so the list
+        // stands on its own instead of carrying a tick it cannot back.
+        out += `\n    Wraps methods: ${ext.wrappedMethods.join(', ')}`;
+      }
+      out += `\n`;
     }
     out += `\n`;
   }
   return out;
+}
+
+/**
+ * Human-readable name for an xref element path, for the CoC grouping headings.
+ *   /Tables/SalesTable                                  -> Table SalesTable
+ *   /Forms/SalesTable                                   -> Form SalesTable
+ *   /Forms/SalesTable/DataSources/SalesLine             -> Form SalesTable › DataSource SalesLine
+ *   /Forms/X/DataSources/Y/DataFields/Z                 -> Form X › DataSource Y › DataField Z
+ * Falls back to the raw path for any shape not seen in the corpus, so a new [ExtensionOf]
+ * intrinsic degrades to something still readable rather than being mislabelled.
+ */
+function describeXrefElement(path: string): string {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length < 2) return path;
+  const singular: Record<string, string> = {
+    Classes: 'Class', Tables: 'Table', Forms: 'Form', Views: 'View', Maps: 'Map',
+    Queries: 'Query', DataEntityViews: 'Data entity',
+    DataSources: 'DataSource', Controls: 'Control', DataFields: 'DataField',
+  };
+  const segs: string[] = [];
+  for (let i = 0; i + 1 < parts.length; i += 2) {
+    segs.push(`${singular[parts[i]] ?? parts[i]} ${parts[i + 1]}`);
+  }
+  return segs.join(' › ');
 }
 
 // FIND EVENT HANDLERS via XREF (Phase 6)
@@ -2669,3 +3201,10 @@ function formatApiUsageCallers(r: BridgeApiUsageCallersResult): string {
 
   return out;
 }
+
+/**
+ * Internals exposed for tests only. `formatCompletion` renders a member list,
+ * and a member list that cannot be trusted to name its members is worse than no
+ * list at all — see tests/bridge/completionMemberLine.test.ts.
+ */
+export const __testing = { formatCompletion, memberLine };

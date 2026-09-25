@@ -11,6 +11,137 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { getConfigManager, fallbackPackagePath } from './configManager.js';
 import { PackageResolver } from './packageResolver.js';
+import { findDescriptorPath } from '../metadata/modelDescriptor.js';
+
+/**
+ * objectType → the Ax* metadata folder its XML lives in. Module-level because
+ * two functions answer questions about that layout now: findD365FileOnDisk
+ * (where the file IS) and expectedD365FilePath (where it WOULD be).
+ */
+const AOT_FOLDER_BY_OBJECT_TYPE: Record<string, string> = {
+  class: 'AxClass',
+  table: 'AxTable',
+  form: 'AxForm',
+  enum: 'AxEnum',
+  query: 'AxQuery',
+  view: 'AxView',
+  edt: 'AxEdt',
+  'data-entity': 'AxDataEntityView',
+  report: 'AxReport',
+  'table-extension': 'AxTableExtension',
+  'class-extension': 'AxClass',
+  'form-extension': 'AxFormExtension',
+  'enum-extension': 'AxEnumExtension',
+  'edt-extension': 'AxEdtExtension',
+  'data-entity-extension': 'AxDataEntityViewExtension',
+  'menu-item-display': 'AxMenuItemDisplay',
+  'menu-item-action': 'AxMenuItemAction',
+  'menu-item-output': 'AxMenuItemOutput',
+  'menu-item-display-extension': 'AxMenuItemDisplayExtension',
+  'menu-item-action-extension': 'AxMenuItemActionExtension',
+  'menu-item-output-extension': 'AxMenuItemOutputExtension',
+  menu: 'AxMenu',
+  'menu-extension': 'AxMenuExtension',
+  'security-privilege': 'AxSecurityPrivilege',
+  'security-duty': 'AxSecurityDuty',
+  'security-role': 'AxSecurityRole',
+  'ignore-diagnostic-list': 'AxIgnoreDiagnosticList',
+};
+
+/**
+ * Resolve a MODEL DESCRIPTOR's path: <root>/<Package>/Descriptor/<Model>.xml.
+ *
+ * Deliberately NOT an entry in the table above. Every type there lives at
+ * <Package>/<Model>/Ax<Type>/<Name>.xml; a descriptor is one level shallower and
+ * sits beside the model folder rather than inside it, so a 'Descriptor' entry
+ * would have both functions build a path that does not exist.
+ *
+ * The <Package> segment is resolved the same way, though — package == model is
+ * the common case, not the rule, and an ISV model inside a differently named
+ * package has its descriptor under THAT package. findDescriptorPath does that
+ * probe (and the bounded sweep behind it) against one root; this tries the
+ * caller's root, then the custom write root, then the configured one, in the
+ * same order findD365FileOnDisk prefers.
+ *
+ * Returns null when no descriptor exists under any of them — the caller reports
+ * that rather than writing one, since a model without a descriptor is a wrong
+ * path or a wrong model name, not a model waiting to be given a manifest.
+ */
+export async function findModelDescriptorPath(
+  modelName?: string,
+  explicitPackagePath?: string,
+): Promise<{ filePath: string; packageName: string; model: string } | null> {
+  const configManager = getConfigManager();
+  await configManager.ensureLoaded();
+
+  const resolvedModel =
+    (modelName && modelName !== 'any' ? modelName : null) ||
+    configManager.getModelName() ||
+    (await configManager.getAutoDetectedModelName()) ||
+    process.env.D365FO_MODEL_NAME ||
+    null;
+  if (!resolvedModel) return null;
+
+  const roots = [
+    explicitPackagePath,
+    await configManager.getCustomPackagesPath().catch(() => null),
+    configManager.getPackagePath() || fallbackPackagePath(),
+  ].filter(Boolean) as string[];
+
+  for (const root of roots) {
+    const found = findDescriptorPath(root, resolvedModel);
+    if (found) return { ...found, model: resolvedModel };
+  }
+  return null;
+}
+
+/**
+ * Does the module being referenced actually exist on this box?
+ *
+ * A `<ModuleReferences>` entry is a package FOLDER name. A typo ("ApplicationSuit",
+ * "Ledgers") is not rejected by anything: the descriptor is well-formed, xppc
+ * resolves nothing extra through it, and the failure surfaces as the very
+ * classStr/type error the reference was added to fix — with the descriptor now
+ * looking like it was already handled.
+ *
+ * So the folder is probed under every configured root. The answer is a NOTE, not
+ * a refusal: a package can legitimately be absent from a dev box and present on
+ * the build agent (an ISV model installed later in the pipeline), and refusing
+ * there would block a correct edit. When no root can be resolved at all, that is
+ * said too — "not found" and "could not look" are different claims, and only one
+ * of them is evidence of a typo.
+ */
+export async function moduleExistenceNote(
+  moduleName: string,
+  explicitPackagePath?: string,
+): Promise<string> {
+  const configManager = getConfigManager();
+  await configManager.ensureLoaded();
+  const roots = [
+    explicitPackagePath,
+    await configManager.getCustomPackagesPath().catch(() => null),
+    configManager.getPackagePath(),
+    await configManager.getMicrosoftPackagesPath().catch(() => null),
+  ].filter(Boolean) as string[];
+
+  if (roots.length === 0) {
+    return `ℹ️ Could not verify that "${moduleName}" exists — no packages root is configured, ` +
+      `so nothing was checked. Confirm the spelling matches the package folder exactly.\n`;
+  }
+
+  for (const root of roots) {
+    try {
+      await fs.access(path.join(root, moduleName));
+      return '';
+    } catch { /* try the next root */ }
+  }
+
+  return `⚠️ No package folder named "${moduleName}" exists under ${roots.length === 1 ? 'the configured root' : 'any configured root'} ` +
+    `(${roots.join(', ')}). The reference was written anyway — a package can be absent here and ` +
+    `present on the build agent — but a MISSPELLED module name produces exactly this, and it fails ` +
+    `later as the compile error the reference was meant to fix. Check the spelling against the ` +
+    `package folder name.\n`;
+}
 
 /**
  * Filesystem fallback for findD365File.
@@ -23,36 +154,7 @@ export async function findD365FileOnDisk(
   modelName?: string,
   explicitPackagePath?: string,
 ): Promise<string | null> {
-  const folderMap: Record<string, string> = {
-    class: 'AxClass',
-    table: 'AxTable',
-    form: 'AxForm',
-    enum: 'AxEnum',
-    query: 'AxQuery',
-    view: 'AxView',
-    edt: 'AxEdt',
-    'data-entity': 'AxDataEntityView',
-    report: 'AxReport',
-    'table-extension': 'AxTableExtension',
-    'class-extension': 'AxClass',
-    'form-extension': 'AxFormExtension',
-    'enum-extension': 'AxEnumExtension',
-    'edt-extension': 'AxEdtExtension',
-    'data-entity-extension': 'AxDataEntityViewExtension',
-    'menu-item-display': 'AxMenuItemDisplay',
-    'menu-item-action': 'AxMenuItemAction',
-    'menu-item-output': 'AxMenuItemOutput',
-    'menu-item-display-extension': 'AxMenuItemDisplayExtension',
-    'menu-item-action-extension': 'AxMenuItemActionExtension',
-    'menu-item-output-extension': 'AxMenuItemOutputExtension',
-    menu: 'AxMenu',
-    'menu-extension': 'AxMenuExtension',
-    'security-privilege': 'AxSecurityPrivilege',
-    'security-duty': 'AxSecurityDuty',
-    'security-role': 'AxSecurityRole',
-  };
-
-  const objectFolder = folderMap[objectType];
+  const objectFolder = AOT_FOLDER_BY_OBJECT_TYPE[objectType];
   if (!objectFolder) return null;
 
   const configManager = getConfigManager();
@@ -173,4 +275,177 @@ export async function findD365FileOnDisk(
   }
 
   return null;
+}
+
+/**
+ * The read surface findD365FileViaIndex needs, stated structurally so a util does
+ * not have to import the symbol index (and, through it, half the server) to ask
+ * one question of it. XppSymbolIndex satisfies it as-is.
+ */
+export interface SymbolFileLookupSource {
+  getReadDb(): { prepare(sql: string): { all(...params: any[]): any[] } };
+}
+
+/** Where the index says an object lives, once the path has been verified on disk. */
+export interface IndexedObjectFile {
+  filePath: string;
+  model: string;
+}
+
+/**
+ * Locate an object's XML through the SYMBOL INDEX rather than through the
+ * configured model's folder layout.
+ *
+ * findD365FileOnDisk answers "where would an object of this name be, in the model
+ * I am configured for" — which is the right question for a write and the wrong one
+ * for a read. Reads span every model: get_object_info(include="xml") on a Microsoft
+ * class, or on another custom model's class, hit the model-shaped lookup, missed,
+ * and were answered with "pass options.modelName" — a whole round trip to supply a
+ * fact the same server had already printed ("**Model:** Foundation") one call
+ * earlier, and one the caller then has to GUESS. Observed 2026-09-07: three such
+ * pairs in one session, one of which took three calls because the guess
+ * ("Application Foundation") was wrong.
+ *
+ * The index stores some paths absolute and some relative to a packages root (582
+ * of 60,918 classes on the production DB), so a relative row is resolved against
+ * the same roots findD365FileOnDisk prefers. Every candidate is checked on disk
+ * before it is returned: an index row whose file is gone is exactly the stale
+ * state `search` already warns about, and returning its path would turn a clean
+ * "not found" into "found it, but could not read it".
+ */
+export async function findD365FileViaIndex(
+  index: SymbolFileLookupSource,
+  objectType: string,
+  objectName: string,
+  modelName?: string,
+): Promise<IndexedObjectFile | null> {
+  // Types with no folder of their own are not objects this can read a file for.
+  if (!AOT_FOLDER_BY_OBJECT_TYPE[objectType]) return null;
+
+  let rows: Array<{ file_path: string; model: string }>;
+  try {
+    const db = index.getReadDb();
+    // parent_name IS NULL keeps methods and fields of the same name out; the
+    // (type, name) index carries this lookup, so it costs a seek, not a scan.
+    const sql =
+      `SELECT file_path, model FROM symbols
+       WHERE type = ? AND name = ? AND parent_name IS NULL` +
+      (modelName ? ` AND model = ?` : ``) +
+      ` LIMIT 20`;
+    const params = modelName ? [objectType, objectName, modelName] : [objectType, objectName];
+    rows = db.prepare(sql).all(...params) as Array<{ file_path: string; model: string }>;
+  } catch {
+    return null; // index unavailable (stub context during startup, :memory:) — caller falls back
+  }
+  if (rows.length === 0) return null;
+
+  // Resolved on first need: most rows carry an absolute path (60,336 of 60,918
+  // classes on the production DB), and those need no config at all.
+  let roots: string[] | null = null;
+  const packageRoots = async (): Promise<string[]> => {
+    if (roots) return roots;
+    const configManager = getConfigManager();
+    await configManager.ensureLoaded();
+    roots = [
+      await configManager.getCustomPackagesPath(),
+      configManager.getPackagePath() || fallbackPackagePath(),
+      await configManager.getMicrosoftPackagesPath(),
+    ].filter((r): r is string => !!r);
+    return roots;
+  };
+
+  for (const row of rows) {
+    const candidates = path.isAbsolute(row.file_path)
+      ? [row.file_path]
+      : (await packageRoots()).map(root => path.join(root, row.file_path));
+    for (const candidate of candidates) {
+      try {
+        await fs.access(candidate);
+        return { filePath: candidate, model: row.model };
+      } catch { /* next candidate */ }
+    }
+  }
+  return null;
+}
+
+/**
+ * The models that hold an object of this type and name, for a "not found" message
+ * that can name the answer instead of asking the caller to guess it.
+ */
+export function modelsHoldingObject(
+  index: SymbolFileLookupSource,
+  objectType: string,
+  objectName: string,
+  limit = 5,
+): string[] {
+  try {
+    const rows = index.getReadDb().prepare(
+      `SELECT DISTINCT model FROM symbols
+       WHERE type = ? AND name = ? AND parent_name IS NULL
+       ORDER BY model LIMIT ?`
+    ).all(objectType, objectName, limit) as Array<{ model: string }>;
+    return rows.map(r => r.model);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The path an object's XML WOULD have, whether or not it exists yet.
+ *
+ * findD365FileOnDisk gates every candidate on fs.access and returns null when
+ * none of them exists — correct for a lookup, and a dead end for the one
+ * operation that legitimately targets a file that is not there yet:
+ * add-diagnostic-suppression on a model that has never suppressed anything has
+ * no {Model}_BPSuppressions.xml to find. Without this, that whole path was
+ * reachable only by passing filePath by hand, and the tool answered the
+ * documented call ("objectName is the file's own base name") with "File not
+ * found — re-run action=create", which cannot create this type at all.
+ *
+ * Existence is what is dropped here, NOT the layout: the <Package> segment
+ * still comes from PackageResolver (a package can differ from the model it
+ * carries), and the write root is the same one findD365FileOnDisk prefers, so
+ * the returned path lands where a real object of that type lives. The caller
+ * still passes it through assertWritePathAllowed like any other write target.
+ */
+export async function expectedD365FilePath(
+  objectType: string,
+  objectName: string,
+  modelName?: string,
+  explicitPackagePath?: string,
+): Promise<string | null> {
+  const objectFolder = AOT_FOLDER_BY_OBJECT_TYPE[objectType];
+  if (!objectFolder) return null;
+
+  const configManager = getConfigManager();
+  await configManager.ensureLoaded();
+
+  const resolvedModel =
+    (modelName && modelName !== 'any' ? modelName : null) ||
+    configManager.getModelName() ||
+    (await configManager.getAutoDetectedModelName()) ||
+    process.env.D365FO_MODEL_NAME ||
+    null;
+  if (!resolvedModel) return null;
+
+  const configPackagePath = configManager.getPackagePath() || fallbackPackagePath();
+  const customWritePath = await configManager.getCustomPackagesPath();
+
+  // The package that actually carries this model, when it can be determined —
+  // package == model is only the common case, not the rule.
+  try {
+    const roots = [explicitPackagePath, customWritePath, configPackagePath].filter(Boolean) as string[];
+    if (roots.length > 0) {
+      const resolved = await new PackageResolver(roots).resolve(resolvedModel);
+      if (resolved) {
+        return path.join(
+          resolved.rootPath, resolved.packageName, resolvedModel, objectFolder, `${objectName}.xml`,
+        );
+      }
+    }
+  } catch { /* fall through to the package == model layout */ }
+
+  const root = explicitPackagePath || customWritePath || configPackagePath;
+  if (!root) return null;
+  return path.join(root, resolvedModel, resolvedModel, objectFolder, `${objectName}.xml`);
 }

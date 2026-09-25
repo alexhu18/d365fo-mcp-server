@@ -98,10 +98,29 @@ const AX_FOLDER_BY_OBJECT_TYPE: Record<string, string> = {
   'security-policy': 'AxSecurityPolicy',
   'aggregate-measurement': 'AxAggregateMeasurement',
   'license-code': 'AxLicenseCode',
+  'ignore-diagnostic-list': 'AxIgnoreDiagnosticList',
 };
 
 export function axFolderForObjectType(objectType: string): string {
   return AX_FOLDER_BY_OBJECT_TYPE[objectType] || 'AxClass';
+}
+
+/**
+ * Does this object type live in an Ax* folder at all?
+ *
+ * The 'AxClass' fallback above is a convenience for callers that need SOME
+ * folder, and a trap for callers that need a TRUE one: `model-descriptor` is
+ * absent from the map because a descriptor is the package's manifest, sitting
+ * beside the model folder rather than in an AOT folder inside it. Asked for its
+ * folder, the fallback answers 'AxClass', and a .rnrproj membership question
+ * built on that reports a missing `AxClass\<Model>` — inventing both a location
+ * and a defect, underneath a write that succeeded.
+ *
+ * Callers deciding WHETHER to ask a membership question gate on this; callers
+ * that already know the type has a folder keep using axFolderForObjectType.
+ */
+export function hasAxFolder(objectType: string): boolean {
+  return Object.hasOwn(AX_FOLDER_BY_OBJECT_TYPE, objectType);
 }
 
 /** AOT folder name (any case) → object type. Used to read objects back out of a project. */
@@ -115,13 +134,30 @@ export function objectTypeForAxFolder(axFolder: string): string | undefined {
 }
 
 /**
+ * An `Include` attribute reduced to the identity Visual Studio actually gives it.
+ *
+ * Two spellings, one item. VS matches includes case-insensitively and the
+ * generators are not consistent ("…CtsoFinExtension" on disk against
+ * "…CtsoFINExtension" in the XML), and the writer emits `AxEnum\Name` while a
+ * hand-edited project may carry `AxEnum\Name.xml`. Every question this module and
+ * ProjectFileManager ask about an include — does the project list it, is it
+ * already there, remove it — has to be asked in this form, or two of them answer
+ * differently about the same entry: one reports the object registered while the
+ * other adds a duplicate or fails to remove it.
+ *
+ * THE definition. Anything comparing an Include goes through this or through a
+ * key built by includeKey, never through `===` on the raw attribute.
+ */
+export function normalizeInclude(include: string): string {
+  return include.replace(/\.xml$/i, '').toLowerCase();
+}
+
+/**
  * The `Content Include` a given object has in a .rnrproj: AOT folder, backslash,
- * object name, no extension. Lowercased — VS is case-insensitive here and the
- * generators are not consistent about it ("…CtsoFinExtension" on disk against
- * "…CtsoFINExtension" in the XML, say), which is not a reason to report a miss.
+ * object name, no extension — in normalizeInclude form, ready to compare.
  */
 export function includeKey(axFolder: string, objectName: string): string {
-  return `${axFolder}\\${objectName}`.toLowerCase();
+  return normalizeInclude(`${axFolder}\\${objectName}`);
 }
 
 /**
@@ -157,9 +193,7 @@ export async function readProjectIncludes(projectPath: string): Promise<Set<stri
     const contents: any[] = Array.isArray(group?.Content) ? group.Content : [];
     for (const c of contents) {
       const inc: string | undefined = c?.$?.Include;
-      // Includes are written without .xml, but tolerate one: a hand-edited
-      // project should not read as a miss.
-      if (inc) includes.add(inc.replace(/\.xml$/i, '').toLowerCase());
+      if (inc) includes.add(normalizeInclude(inc));
     }
   }
 

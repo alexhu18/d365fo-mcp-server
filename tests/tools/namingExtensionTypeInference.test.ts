@@ -2,7 +2,7 @@
  * An extension name asked about under its base type is a question about the extension.
  *
  * Run f2e7b71a asked validate_object_naming for
- * "AslFinCore_TaxTransReportChangeLog.AslFinSKExtension" with objectType="form". The
+ * "ConCore_TaxTransReportChangeLog.ConSKExtension" with objectType="form". The
  * non-extension underscore rule fired and returned a hard ERROR — "Non-extension
  * objects must not contain underscores" — for a name that is obviously an extension.
  * The agent then re-asked with objectType="form-extension" (T56 → T59): one wasted
@@ -105,7 +105,7 @@ describe('extension type inferred from the proposed name', () => {
     // The underscore rule exists for exactly this: a plain form whose underscore is not
     // the model's prefix separator (the prefix here is "ConSK"), and nothing about the
     // name that says "extension". This is the shape the run's name shared — it began
-    // "AslFinCore_" while the prefix was "AslFinSK" — minus the extension suffix.
+    // "ConCore_" while the prefix was "ConSK" — minus the extension suffix.
     const out = await validate({
       objectType: 'form',
       proposedName: 'ConCore_TaxReportDetail',
@@ -133,5 +133,27 @@ describe('extension type inferred from the proposed name', () => {
     });
 
     expect(out).toContain('as query');
+  });
+});
+
+describe('objectType="report" (Phase D)', () => {
+  it('suggests the SSRS companion-object roster', async () => {
+    const out = await validate({
+      objectType: 'report',
+      proposedName: 'ConSK_CustAging',
+    });
+    expect(out).toContain('ConSK_CustAgingTmp');
+    expect(out).toContain('ConSK_CustAgingContract');
+    expect(out).toContain('ConSK_CustAgingDP');
+    expect(out).toContain('ConSK_CustAgingController');
+    expect(out).toContain('generate_object(mode="scaffold", objectType="report")');
+  });
+
+  it('warns when the report name carries a companion-class suffix', async () => {
+    const out = await validate({
+      objectType: 'report',
+      proposedName: 'ConSK_CustAgingDP',
+    });
+    expect(out).toContain('COMPANION-class suffix');
   });
 });

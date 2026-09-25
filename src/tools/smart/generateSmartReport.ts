@@ -5,7 +5,7 @@
  * Generates up to 7+ D365FO objects in a single call:
  *   1. TmpTable(s) (AxTable, TableType=TempDB) — holds report rows; extras for additionalDatasets
  *   2. Contract class (DataContractAttribute) — dialog parameters, optional validate()
- *   3. DP class (SrsReportDataProviderBase/PreProcess) — fills TmpTable, query-based or manual
+ *   3. DP class (SrsReportDataProviderBase/PreProcessTempDB) — fills TmpTable, query-based or manual
  *   4. Controller class (SrsReportRunController/SrsPrintMgmtController) — optional
  *   5. Output menu item (AxMenuItemOutput) — generated together with Controller
  *   6. Report (AxReport + RDL) — multi-dataset, page header, optional GroupedWithTotals tablix
@@ -24,7 +24,7 @@
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { XppSymbolIndex } from '../../metadata/symbolIndex.js';
 import { SmartXmlBuilder, TableFieldSpec } from '../../utils/smartXmlBuilder.js';
-import { XmlTemplateGenerator } from '../write/createD365File.js';
+import { XmlTemplateGenerator } from '../xml/xmlTemplateGenerator.js';
 import {
   resolveBestEdt,
   suggestEdtFromFieldName as heuristicEdtFromFieldName,
@@ -43,6 +43,24 @@ import { extractModelFromProject, findProjectInSolution } from '../../utils/proj
 import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { canonicalSymbolName, lookupSymbolNocase } from '../../utils/symbolLookup.js';
 import { scaffoldWriteRefusalResult } from '../write/writeAnchorGuard.js';
+import { upsertWrittenFileIntoIndex } from '../write/inlineIndexUpsert.js';
+
+/**
+ * The field a report temp table's unique index is built on.
+ *
+ * `buildPrimaryKeyIndex` always emits a UNIQUE index, and this scaffold used to
+ * hand it the table's FIRST field. A report temp table has no natural key — it is
+ * a bag of rows produced by processReport() — so that made the first column
+ * unique by accident, and under `designStyle="GroupedWithTotals"` the first
+ * column is by construction the GROUP key: the table could then hold exactly one
+ * row per group, and the second customer in a group failed on a duplicate key.
+ * At RUN time. The metadata builds clean and nothing else notices, which is why
+ * an eval run had to find it.
+ *
+ * RecId is the honest answer: every table has one, it is always unique, and it
+ * asserts nothing false about the data.
+ */
+const REPORT_TMP_KEY_FIELD = 'RecId';
 
 interface ReportFieldSpec {
   /** Field name on the TmpTable (e.g. "ItemId", "Amount") */
@@ -89,10 +107,18 @@ interface GenerateSmartReportArgs {
   aotQuery?: string;
   /** Table name of the caller record (e.g. "CustTable") — generates parmArgs() pre-fill in Controller prePromptModifyContract() */
   callerTableName?: string;
-  /** When true, DP extends SrsReportDataProviderPreProcess instead of SrsReportDataProviderBase */
+  /**
+   * When true, DP extends SrsReportDataProviderPreProcessTempDB instead of SrsReportDataProviderBase.
+   * The TempDB variant is the one that pairs with the TempDB tmp table this scaffold always emits
+   * (332 of the 370 shipped pre-processed DPs); SrsReportDataProviderPreProcess is the REGULAR-table
+   * (createdTransactionId) variant. xppc accepts either base with either table type — the pairing is a
+   * runtime contract, not a compile-time one (VM-verified 2026-08-30, L4-ssrs-report-preprocess).
+   */
   preProcess?: boolean;
   /** Controller variant: "simple" (SrsReportRunController) or "printMgmt" (SrsPrintMgmtController) */
   controllerType?: 'simple' | 'printMgmt';
+  /** When true, also emits a <Name>UIBuilder class bound on the Contract via [SysOperationContractProcessing] */
+  uiBuilder?: boolean;
   /** Additional datasets — each generates an extra TmpTable (TempDB) and a get<Table>() method in the DP */
   additionalDatasets?: Array<{ name: string; fieldsHint?: string; fields?: ReportFieldSpec[] }>;
   /** Model name (auto-detected from projectPath) */
@@ -113,13 +139,13 @@ export const generateSmartReportTool: Tool = {
 Generates:
 1. TmpTable(s) (TempDB) — report data rows; extra tables for each additionalDatasets entry
 2. Contract class — dialog parameters with optional auto-generated validate()
-3. DP class (SrsReportDataProviderBase or PreProcess) — with query-based or manual processReport()
+3. DP class (SrsReportDataProviderBase or SrsReportDataProviderPreProcessTempDB) — with query-based or manual processReport()
 4. Controller class (SrsReportRunController or SrsPrintMgmtController) — optional
 5. Output menu item (AxMenuItemOutput) — generated together with Controller
 6. AxReport XML + RDL — multi-dataset, page header (company/title/date), optional GroupedWithTotals tablix
 
 Strategies:
-- fieldsHint: comma-separated field names → auto-suggest EDTs, build TmpTable + report fields
+- fieldsHint: comma-separated field names → auto-suggest EDTs (a field of that name already in the target model wins), build TmpTable + report fields
 - fields: structured field specs with explicit EDTs and data types
 - contractParams: dialog parameters → Contract class with parm methods + validate()
 - copyFrom: copy field structure from existing report's TmpTable
@@ -127,7 +153,8 @@ Strategies:
 - aotQuery: query-based DP using this.parmQuery() instead of manual while-select
 - callerTableName: pre-fill contract from args.record() in prePromptModifyContract()
 - controllerType: "simple" (default) or "printMgmt" (SrsPrintMgmtController)
-- preProcess: true → SrsReportDataProviderPreProcess with preProcess() stub
+- preProcess: true → DP extends SrsReportDataProviderPreProcessTempDB (data staged on the AOS before the render request; processReport() IS that step — no extra hook method exists)
+- uiBuilder: true → <Name>UIBuilder class bound via [SysOperationContractProcessing]
 - additionalDatasets: extra TmpTables + DP getters for multi-dataset reports
 
 Examples:
@@ -144,7 +171,9 @@ Examples:
       },
       caption: {
         type: 'string',
-        description: 'Human-readable caption/title for the report (e.g. "Inventory by Zones"). Used in RDL header and menu item.',
+        description: 'Human-readable caption/title for the report (e.g. "Inventory by Zones"). Titles the RDL page header. '
+          + 'Pass a label ID ("@Module:LabelId") to also label the tmp table and the output menu item — a Label property '
+          + 'must hold a label ID, so prose leaves them unlabelled instead of earning a BPErrorLabelIsText.',
       },
       fieldsHint: {
         type: 'string',
@@ -219,11 +248,15 @@ Examples:
       },
       preProcess: {
         type: 'boolean',
-        description: 'When true, DP extends SrsReportDataProviderPreProcess instead of SrsReportDataProviderBase. Generates a preProcess() stub and removes [SRSReportParameterAttribute] (contract passed via Controller).',
+        description: 'When true, DP extends SrsReportDataProviderPreProcessTempDB instead of SrsReportDataProviderBase — a pre-processed report stages its data on the AOS before the SSRS render request, which is how a DP escapes the ~10-minute interactive timeout. The TempDB base matches the TempDB tmp table this scaffold emits; [SRSReportParameterAttribute] stays (every shipped pre-processed DP carries it) and there is no extra hook method — processReport() is the pre-processing step.',
       },
       controllerType: {
         type: 'string',
-        description: '"simple" (default — SrsReportRunController) or "printMgmt" (SrsPrintMgmtController with parmPrintMgmtDocType). Only relevant when generateController=true.',
+        description: '"simple" (default — SrsReportRunController) or "printMgmt" (SrsPrintMgmtController: the abstract runPrintMgmt() is implemented for you and initPrintMgmtReportRun() constructs the PrintMgmtReportRun — replace its hierarchy/node/document-type placeholders). Only relevant when generateController=true.',
+      },
+      uiBuilder: {
+        type: 'boolean',
+        description: 'When true, also generates <Name>UIBuilder (extends SrsReportDataContractUIBuilder) and binds it on the Contract via [SysOperationContractProcessing] — for custom dialog lookups/field events.',
       },
       additionalDatasets: {
         type: 'array',
@@ -264,6 +297,7 @@ export async function handleGenerateSmartReport(
     callerTableName,
     preProcess = false,
     controllerType = 'simple',
+    uiBuilder = false,
     additionalDatasets = [],
     modelName,
     projectPath,
@@ -344,13 +378,18 @@ export async function handleGenerateSmartReport(
   const contractClassName = `${finalName}Contract`;
   const dpClassName = `${finalName}DP`;
   const controllerClassName = `${finalName}Controller`;
+  const uiBuilderClassName = `${finalName}UIBuilder`;
   const reportCaption = caption || finalName;
 
-  // Only decorate a plain-text caption with the suffix; appending to a label
-  // reference (e.g. "@Module:LabelId") would create mixed content that xppbp
-  // flags as BPErrorLabelIsText.
-  const tmpTableLabel = (suffix: string): string =>
-    reportCaption.startsWith('@') ? reportCaption : `${reportCaption}${suffix}`;
+  // A Label property holds a label ID or nothing: prose there is a
+  // BPErrorLabelIsText, and shipped metadata omits the Label freely (39 of 200
+  // sampled TempDB tables, 3 of 400 AxMenuItemOutput). The caption still titles
+  // the RDL and the doc comments; `labelAdvisory` tells the caller what is missing.
+  const labelRef: string | undefined = reportCaption.startsWith('@') ? reportCaption : undefined;
+  const labelAdvisory: string | undefined = labelRef ? undefined :
+    `⚠️ No label written: the caption ${caption ? 'is prose, not a label ID' : 'was not given'}, so the tmp `
+    + `table and the output menu item carry no Label — a raw-text one fails xppbp BPErrorLabelIsText. `
+    + `Find or create one with labels(action="search"/"create"), then re-run with caption="@Model:LabelId".`;
 
   const rdb = symbolIndex.getReadDb();
 
@@ -421,7 +460,7 @@ export async function handleGenerateSmartReport(
   // Strategy 2: structuredFields (explicit specs from the caller)
   if (structuredFields && structuredFields.length > 0 && reportFields.length === 0) {
     for (const f of structuredFields) {
-      const edt = f.edt || suggestEdtFromFieldName(f.name, rdb);
+      const edt = f.edt || suggestEdtFromFieldName(f.name, rdb, resolvedModel);
       reportFields.push({
         ...f,
         edt,
@@ -435,7 +474,7 @@ export async function handleGenerateSmartReport(
   if (fieldsHint && reportFields.length === 0) {
     const hints = fieldsHint.split(',').map(s => s.trim()).filter(Boolean);
     for (const h of hints) {
-      const edt = suggestEdtFromFieldName(h, rdb);
+      const edt = suggestEdtFromFieldName(h, rdb, resolvedModel);
       reportFields.push({
         name: h,
         edt,
@@ -479,7 +518,7 @@ export async function handleGenerateSmartReport(
     const dsFields: ReportFieldSpec[] = [];
     if (ds.fields && ds.fields.length > 0) {
       for (const f of ds.fields) {
-        const edt = f.edt || suggestEdtFromFieldName(f.name, rdb);
+        const edt = f.edt || suggestEdtFromFieldName(f.name, rdb, resolvedModel);
         dsFields.push({
           ...f,
           edt,
@@ -489,7 +528,7 @@ export async function handleGenerateSmartReport(
     } else if (ds.fieldsHint) {
       const hints = ds.fieldsHint.split(',').map((s: string) => s.trim()).filter(Boolean);
       for (const h of hints) {
-        const edt = suggestEdtFromFieldName(h, rdb);
+        const edt = suggestEdtFromFieldName(h, rdb, resolvedModel);
         dsFields.push({ name: h, edt, dataType: resolveRdlDataType(await primitiveOf(edt)) });
       }
     }
@@ -522,11 +561,11 @@ export async function handleGenerateSmartReport(
   const builder = new SmartXmlBuilder(symbolIndex);
   const tmpTableXml = builder.buildTableXml({
     name: tmpTableName,
-    label: tmpTableLabel(' (temp)'),
+    label: labelRef,
     tableGroup: 'Main',
     tableType: 'TempDB',
     fields: tableFields,
-    indexes: [builder.buildPrimaryKeyIndex(tmpTableName, [tableFields[0]?.name || 'RecId'])],
+    indexes: [builder.buildPrimaryKeyIndex(tmpTableName, [REPORT_TMP_KEY_FIELD])],
   });
 
   generatedObjects.push({
@@ -545,11 +584,11 @@ export async function handleGenerateSmartReport(
     }
     const dsTblXml = builder.buildTableXml({
       name: ds.tmpTableName,
-      label: tmpTableLabel(` - ${ds.name} (temp)`),
+      label: labelRef,
       tableGroup: 'Main',
       tableType: 'TempDB',
       fields: ds.tableFields,
-      indexes: [builder.buildPrimaryKeyIndex(ds.tmpTableName, [ds.tableFields[0]?.name || 'RecId'])],
+      indexes: [builder.buildPrimaryKeyIndex(ds.tmpTableName, [REPORT_TMP_KEY_FIELD])],
     });
     generatedObjects.push({
       objectType: 'table',
@@ -631,12 +670,17 @@ export async function handleGenerateSmartReport(
     `    }`,
   ].join('\n') : '';
 
+  // With a UI builder the contract binds it via SysOperationContractProcessing.
+  const contractClassAttr = uiBuilder
+    ? `[\n    DataContractAttribute,\n    SysOperationContractProcessing(classStr(${uiBuilderClassName}))\n]`
+    : `[DataContractAttribute]`;
+
   const contractSourceCode = [
     `/// <summary>`,
     `/// Data contract for the ${reportCaption} report.`,
     `/// Defines dialog parameters shown to the user before report execution.`,
     `/// </summary>`,
-    `[DataContractAttribute]`,
+    contractClassAttr,
     `public class ${contractClassName}`,
     `{`,
     contractMemberDecls || '    // No dialog parameters',
@@ -659,6 +703,48 @@ export async function handleGenerateSmartReport(
   });
   log(`Generated Contract: ${contractClassName} (${contractParms.length} params)`);
 
+  // 2b. UI builder class (optional) — custom dialog behaviour for the contract
+  if (uiBuilder) {
+    const exampleParm = contractParms[0]
+      ? `parm${contractParms[0].name.charAt(0).toUpperCase()}${contractParms[0].name.slice(1)}`
+      : 'parmMyParameter';
+    const uiBuilderSourceCode = [
+      `/// <summary>`,
+      `/// UI builder for the ${reportCaption} report dialog.`,
+      `/// Customizes dialog fields (lookups, dependent fields, events).`,
+      `/// </summary>`,
+      `public class ${uiBuilderClassName} extends SrsReportDataContractUIBuilder`,
+      `{`,
+      `}`,
+      ``,
+      `    /// <summary>`,
+      `    /// Builds the dialog and customizes its fields.`,
+      `    /// </summary>`,
+      `    public void build()`,
+      `    {`,
+      `        super();`,
+      ``,
+      `        // TODO: customize dialog fields, e.g.:`,
+      `        // ${contractClassName} contract = this.dataContractObject() as ${contractClassName};`,
+      `        // DialogField df = this.bindInfo().getDialogField(contract, methodStr(${contractClassName}, ${exampleParm}));`,
+      `        // df.registerOverrideMethod(methodStr(FormStringControl, lookup), methodStr(${uiBuilderClassName}, myParameterLookup), this);`,
+      `    }`,
+    ].join('\n');
+
+    const uiBuilderXml = XmlTemplateGenerator.generateAxClassXml(
+      uiBuilderClassName,
+      uiBuilderSourceCode
+    );
+
+    generatedObjects.push({
+      objectType: 'class',
+      objectName: uiBuilderClassName,
+      aotFolder: 'AxClass',
+      content: uiBuilderXml,
+    });
+    log(`Generated UI builder: ${uiBuilderClassName}`);
+  }
+
   // ──────────────────────────────────────────────────────────────────────────
   // 3. DP class (Data Provider)
   // ──────────────────────────────────────────────────────────────────────────
@@ -666,20 +752,25 @@ export async function handleGenerateSmartReport(
   const contractVarName = 'contract';
 
   // Determine base class
-  const dpBaseClass = preProcess ? 'SrsReportDataProviderPreProcess' : 'SrsReportDataProviderBase';
+  // PreProcessTempDB, not PreProcess: the tmp table above is TempDB, and that is the base
+  // the shipped code pairs it with (332 of 370 pre-processed DPs). Phase F built both
+  // pairings on the VM — xppc accepts either, so the compiler is no guard here.
+  const dpBaseClass = preProcess ? 'SrsReportDataProviderPreProcessTempDB' : 'SrsReportDataProviderBase';
 
   // Class-level attributes
-  // PreProcess: no [SRSReportParameterAttribute] — contract is passed via Controller
+  // [SRSReportParameterAttribute] on EVERY variant: a pre-processed DP still binds its
+  // contract this way (AssetCardDP, AgreementFollowUpDP, AgreementConfirmationDP …) —
+  // dropping it "because the controller passes the contract" left parmDataContract() empty.
   // aotQuery: add [SRSReportQueryAttribute]
   const dpAttrLines: string[] = [];
-  if (!preProcess) dpAttrLines.push(`    SRSReportParameterAttribute(classStr(${contractClassName}))`);
+  dpAttrLines.push(`    SRSReportParameterAttribute(classStr(${contractClassName}))`);
   if (aotQuery)   dpAttrLines.push(`    SRSReportQueryAttribute(queryStr(${aotQuery}))`);
   const dpClassAttr = dpAttrLines.length > 0
     ? `[\n${dpAttrLines.join(',\n')}\n]`
     : '';
 
-  // Contract parameter fetch (skip for PreProcess — contract accessed differently)
-  const contractFetchLines = (contractParms.length > 0 && !preProcess)
+  // Contract parameter fetch — identical for the pre-processed variant
+  const contractFetchLines = (contractParms.length > 0)
     ? [
         `        ${contractClassName} ${contractVarName} = this.parmDataContract() as ${contractClassName};`,
         ...contractParms.map(p => {
@@ -740,18 +831,11 @@ export async function handleGenerateSmartReport(
     ].join('\n');
   }
 
-  // preProcess() stub (Improvement 6)
-  const preProcessMethodLines = preProcess ? [
-    ``,
-    `    /// <summary>`,
-    `    /// Called before the report dialog is shown. Use for heavy pre-processing.`,
-    `    /// </summary>`,
-    `    public void preProcess()`,
-    `    {`,
-    `        // TODO: Implement pre-processing logic (called BEFORE the report dialog).`,
-    `        // Prepare data, validate prerequisites, or set session-scoped variables.`,
-    `    }`,
-  ] : [];
+  // No preProcess() stub: the framework has no such hook. SrsReportDataProviderPreProcessInterface
+  // declares only cleanUp/initialize/parm* members, and the only "preProcess" method on a DP class
+  // in the whole AOT was the one this scaffold used to invent. processReport() runs on the AOS
+  // before the render request — it IS the pre-processing step (Phase F, 2026-08-30).
+  const preProcessMethodLines: string[] = [];
 
   // Additional member variable declarations for extra datasets
   const extraDpMembers = resolvedExtraDatasets
@@ -828,7 +912,12 @@ export async function handleGenerateSmartReport(
     const isPrintMgmt = controllerType === 'printMgmt';
     const ctrlBaseClass = isPrintMgmt ? 'SrsPrintMgmtController' : 'SrsReportRunController';
 
-    // Build main() — differs between simple and printMgmt
+    // Build main() — differs between simple and printMgmt.
+    // printMgmt: SrsPrintMgmtController has NO parmPrintMgmtDocType (the earlier scaffold
+    // invented it — xppc: "does not contain a definition for method 'parmPrintMgmtDocType'");
+    // the document type is fixed in initPrintMgmtReportRun() below, the way every shipped
+    // direct subclass does it (BankPaymAdviceCustController, CustAccountStatementController_FR,
+    // TMSLoadTenderController …). Phase F, L3-print-mgmt-doctype-extension, 2026-08-30.
     const mainMethod = isPrintMgmt ? [
       `    /// <summary>`,
       `    /// Entry point. Creates a print-management controller and starts the report.`,
@@ -838,8 +927,6 @@ export async function handleGenerateSmartReport(
       `    {`,
       `        ${controllerClassName} controller = new ${controllerClassName}();`,
       `        controller.parmArgs(_args);`,
-      `        // TODO: Replace SalesOrderConfirmation with the correct PrintMgmtDocumentType`,
-      `        controller.parmPrintMgmtDocType(PrintMgmtDocumentType::SalesOrderConfirmation);`,
       `        controller.parmReportName(ssrsReportStr(${finalName}, Report));`,
       `        controller.startOperation();`,
       `    }`,
@@ -881,10 +968,13 @@ export async function handleGenerateSmartReport(
         `        }`,
       ].join('\n');
     } else {
+      // Nothing to pre-fill without a caller record, so the contract fetch stays in
+      // the example — a declared-but-never-read local is a BPLocalVariableNotUsed.
       prePromptBody = [
-        `        ${contractClassName} ${contractVarName} = this.parmReportContract().parmRdpContract() as ${contractClassName};`,
-        `        // TODO: Set default parameter values here`,
-        `        // Example: ${contractVarName}.parmFromDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));`,
+        `        // TODO: set default parameter values here. Fetch the contract where you read it:`,
+        `        // Example:`,
+        `        //     ${contractClassName} ${contractVarName} = this.parmReportContract().parmRdpContract() as ${contractClassName};`,
+        `        //     ${contractVarName}.parmFromDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));`,
       ].join('\n');
     }
 
@@ -899,6 +989,40 @@ export async function handleGenerateSmartReport(
       `    }`,
     ].join('\n');
 
+    // SrsPrintMgmtController is abstract on runPrintMgmt() — a subclass that does not
+    // implement it does not compile. initPrintMgmtReportRun() is where the shipped
+    // subclasses construct the PrintMgmtReportRun for their hierarchy/node/document type
+    // and hand the controller to it before super(); runPrintMgmt() loads the settings
+    // for the record being printed and outputs. The placeholders are the ones to replace.
+    const printMgmtMethods = isPrintMgmt ? [
+      ``,
+      `    /// <summary>`,
+      `    /// Creates the print-management run for this document type and hands it the controller.`,
+      `    /// </summary>`,
+      `    protected void initPrintMgmtReportRun()`,
+      `    {`,
+      `        // TODO: replace the hierarchy, node and document type with the ones this document belongs to`,
+      `        printMgmtReportRun = PrintMgmtReportRun::construct(`,
+      `            PrintMgmtHierarchyType::Sales,`,
+      `            PrintMgmtNodeType::SalesTable,`,
+      `            PrintMgmtDocumentType::SalesOrderConfirmation);`,
+      `        printMgmtReportRun.parmReportRunController(this);`,
+      ``,
+      `        super();`,
+      `    }`,
+      ``,
+      `    /// <summary>`,
+      `    /// Loads the print-management settings for the record being printed and outputs the report.`,
+      `    /// </summary>`,
+      `    protected void runPrintMgmt()`,
+      `    {`,
+      `        // TODO: pass the query buffer, the referenced buffer and the language the settings are resolved for`,
+      `        printMgmtReportRun.load(this.parmArgs().record(), this.parmArgs().record(), Global::currentUserLanguage());`,
+      ``,
+      `        this.outputReports();`,
+      `    }`,
+    ].join('\n') : '';
+
     const controllerSourceCode = [
       `/// <summary>`,
       `/// Controller for the ${reportCaption} report.`,
@@ -912,6 +1036,7 @@ export async function handleGenerateSmartReport(
       mainMethod,
       ``,
       prePromptMethod,
+      printMgmtMethods,
     ].join('\n');
 
     const controllerXml = XmlTemplateGenerator.generateAxClassXml(
@@ -934,7 +1059,7 @@ export async function handleGenerateSmartReport(
       {
         targetObject: controllerClassName,
         objectType: 'Class',
-        label: reportCaption,
+        label: labelRef ?? null,
       }
     );
     generatedObjects.push({
@@ -1054,6 +1179,7 @@ export async function handleGenerateSmartReport(
           `✅ SSRS Report generated: **${finalName}** (${generatedObjects.length} objects)`,
           resolvedModel ? `   Model: ${resolvedModel}` : `   ℹ️ No model resolved — no prefix applied.`,
           objectSummary,
+          ...(labelAdvisory ? ['', labelAdvisory] : []),
           ``,
           `ℹ️ MCP server is running on Azure/Linux — file writing is handled by the local Windows companion.`,
           ``,
@@ -1107,6 +1233,9 @@ export async function handleGenerateSmartReport(
     }
 
     fs.writeFileSync(normalizedPath, normalizeD365Xml(obj.content), 'utf-8');
+    // Same reason as the other generators: an object the index never hears
+    // about is missing from the untyped `search` that now answers from it.
+    await upsertWrittenFileIntoIndex(normalizedPath, { symbolIndex });
 
     let projectMsg = '';
     if (effectiveProjectPath) {
@@ -1136,6 +1265,7 @@ export async function handleGenerateSmartReport(
         ``,
         `📦 Model: ${resolvedModel}`,
         results.join('\n'),
+        ...(labelAdvisory ? ['', labelAdvisory] : []),
         ``,
         `⛔ DO NOT call \`d365fo_file(action="create")\` — all files are already written to disk.`,
         `⛔ DO NOT call \`generate\` again — task is COMPLETE.`,
@@ -1362,10 +1492,10 @@ function injectGroupedTablix(
  * which is a superset of the one deleted here. Without a DB (Azure/Linux) the
  * heuristic is used directly, so the two paths agree in both cases.
  */
-function suggestEdtFromFieldName(fieldName: string, db?: any): string {
+function suggestEdtFromFieldName(fieldName: string, db?: any, model?: string): string {
   if (db) {
     try {
-      return resolveBestEdt(fieldName, db);
+      return resolveBestEdt(fieldName, db, { model });
     } catch {
       /* DB unusable — fall through to the shared heuristic */
     }

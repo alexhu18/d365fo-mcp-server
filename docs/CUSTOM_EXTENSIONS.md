@@ -15,21 +15,26 @@ This guide explains how to configure, extract, and index your custom X++ models 
 
 ### Traditional (PackagesLocalDirectory)
 
-Add to your `.env` file:
+The setup wizard (`npm run setup`, or later `npx d365fo-mcp config environment`) asks for all of this and writes it to `config/d365fo-mcp.json`. The keys involved — each overridable by its environment variable (a `.env` from an older installation keeps working as a fallback):
 
-```env
-# Standard D365 packages path
-PACKAGES_PATH=C:\AOSService\PackagesLocalDirectory
-
-# Your custom models (comma-separated package/model names)
-CUSTOM_MODELS=ISV_CustomModule1,ISV_CustomModule2,CompanyExtensions
-
-# ISV prefix — used by search(scope="extensions") for prefix filtering and by code-gen tools
-# for naming validation (e.g. class names must start with this prefix)
-EXTENSION_PREFIX=ISV_
-
-# Extraction mode: 'custom' (your models only), 'standard', or 'all'
-EXTRACT_MODE=custom
+```jsonc
+{
+  "environment": {
+    // Standard D365 packages path                       (env: D365FO_PACKAGE_PATH)
+    "packagePath": "C:\\AOSService\\PackagesLocalDirectory",
+    // Your custom models (comma-separated model names)  (env: CUSTOM_MODELS)
+    "customModels": "ISV_CustomModule1,ISV_CustomModule2,CompanyExtensions"
+  },
+  "naming": {
+    // ISV prefix — used by search(scope="extensions") for prefix filtering and by
+    // code-gen tools for naming validation               (env: EXTENSION_PREFIX)
+    "prefix": "ISV_"
+  },
+  "index": {
+    // 'custom' (your models only), 'standard', or 'all'  (env: EXTRACT_MODE)
+    "extractMode": "custom"
+  }
+}
 ```
 
 **How custom model detection works:** Everything listed in `CUSTOM_MODELS` is treated as your code. All other models are automatically classified as Microsoft standard. The server never requires you to maintain a static list of Microsoft model names — the list auto-adapts to new D365FO versions.
@@ -40,10 +45,14 @@ EXTRACT_MODE=custom
 
 In UDE environments, custom models are **auto-detected** from the custom packages path (`ModelStoreFolder` in your XPP config file). You do not need to set `CUSTOM_MODELS`:
 
-```env
-D365FO_DEV_ENVIRONMENT_TYPE=ude
-XPP_CONFIG_NAME=MyConfig    # name from %LOCALAPPDATA%\Microsoft\Dynamics365\XppConfig\
-EXTENSION_PREFIX=ISV_
+```jsonc
+{
+  "environment": {
+    "type": "ude",                 // env: D365FO_DEV_ENVIRONMENT_TYPE
+    "xppConfigName": "MyConfig"    // env: XPP_CONFIG_NAME — name from %LOCALAPPDATA%\Microsoft\Dynamics365\XPPConfig\
+  },
+  "naming": { "prefix": "ISV_" }   // env: EXTENSION_PREFIX
+}
 ```
 
 Every model under `ModelStoreFolder` is automatically treated as custom; everything under `FrameworkDirectory` is Microsoft standard. Run `npm run select-config` to list available XPP configs.
@@ -94,9 +103,13 @@ Inference is conservative: a model whose objects show no consistent prefix (fewe
 
 Compound prefixes are read in full, up to three PascalCase segments: a model whose objects are `ContosoFinSKVendPaymentTable`, `ContosoFinSKCustInvoiceJour`… yields `ContosoFinSK`, not `ContosoFin`. Where the model's extensions state the infix outright (`VendTable.ContosoFinSKExtension`), that spelling wins over anything derived.
 
-```env
-EXTENSION_PREFIX_SOURCE=config   # pin step 2 above step 1 (pre-1.8.2 behaviour)
+To pin step 2 above step 1 (pre-1.8.2 behaviour) — worth doing when one model carries several feature prefixes sharing a stem, so inference learns the shared stem while your objects need the full one:
+
+```json
+{ "naming": { "prefix": "CRXCore", "prefixSource": "config" } }
 ```
+
+`npx d365fo-mcp config naming` asks for it in the advanced pass. The equivalent environment variable, `EXTENSION_PREFIX_SOURCE=config`, still works and still outranks the config file.
 
 ## Objects owned by another model
 
@@ -154,9 +167,27 @@ EXTENSION_NAMING_STYLE=prefix        # default — or "model-name"
 | `model-name` | `CustTable.ContosoRobotics` | `CustTable_ContosoRobotics_Extension` |
 
 - **`prefix`** embeds the `EXTENSION_PREFIX` infix (Microsoft's prefix-based naming guideline).
-- **`model-name`** embeds the **model name**, matching the Visual Studio developer-tools default (which uses the model name because it is already guaranteed unique). Use this when your model name is long/customer-specific (e.g. `ContosoRobotics`) but your prefix is a short abbreviation (e.g. `CR`) — the prefix still applies to **new** objects (`CRMyTable`) and to fields/methods added inside extensions (`CRApprovingWorker`); only the extension element/class token switches to the model name.
+- **`model-name`** embeds the **model name** — with any character an AOT identifier cannot hold removed, so a model called `Contoso Robotics` yields `CustTable.ContosoRobotics` (the same spelling the platform itself derives: `<Name>Monitoring and Telemetry</Name>` → `<ModelModule>MonitoringandTelemetry</ModelModule>`) — matching the Visual Studio developer-tools default (which uses the model name because it is already guaranteed unique). Use this when your model name is long/customer-specific (e.g. `ContosoRobotics`) but your prefix is a short abbreviation (e.g. `CR`) — the prefix still applies to **new** objects (`CRMyTable`) and to fields/methods added inside extensions (`CRApprovingWorker`); only the extension element/class token switches to the model name.
 
 Run `get_workspace_info` to see the active style and worked examples of exactly what the tools will emit.
+
+### Classes named differently from elements
+
+Some conventions spell the two halves differently — Visual Studio element extensions (`CustTable.ContosoRobotics`) with prefix-style CoC classes (`CustTableCr_Extension`), or the reverse. A single style cannot express that: `model-name` rewrites the class to `CustTable_ContosoRobotics_Extension`, `prefix` rewrites the element to `CustTable.CrExtension`. Set the class style separately:
+
+```env
+EXTENSION_NAMING_STYLE=model-name          # element extensions
+EXTENSION_CLASS_NAMING_STYLE=prefix        # extension classes — default: inherit
+```
+
+Unset (or `inherit`), `EXTENSION_CLASS_NAMING_STYLE` follows `EXTENSION_NAMING_STYLE`, so existing setups behave exactly as before. `get_workspace_info` and `validate_object_naming` report both styles when they differ.
+
+**There is no custom naming template.** The name is normalised in code on every create and modify:
+
+- An **element extension** always gets the style's token after the dot — `ProdTable.BKU_TableExtension` is written as `ProdTable.BKUExtension`.
+- An **extension class** given a bare base name gets `{Base}{Infix}_Extension` (`ProdTable` → `ProdTableBKU_Extension`). A full name whose part before `_Extension` already *ends* with the infix is kept as passed, so `ProdTable_BKU_Extension` survives — but only when the agent passes that exact name.
+
+The extension patterns in `copilot-instructions.md` (or any other rules file) only *describe* this behaviour: editing them does not change what the tool writes, and it leaves the agent's instructions contradicting the tool. To switch styles, run `d365fo-mcp config naming` (or set `EXTENSION_NAMING_STYLE`) and restart the server. With `prefix`, the infix follows `EXTENSION_PREFIX`, or the spelling the model's existing extensions already use.
 
 ---
 
@@ -192,13 +223,13 @@ The server uses the two-level workspace path (`PackagesLocalDirectory\PackageNam
 
 ## Multiple Clients / Instances
 
-If you work on several D365FO environments (different clients, different ISV prefixes), use the multi-instance scripts in `instances/`:
+If you work on several D365FO environments (different clients, different ISV prefixes), use the instance commands:
 
 ```powershell
-.\instances\add-instance.ps1    # creates instances\clientA\ with its own .env
+npx d365fo-mcp instance add     # creates instances\clientA\ with its own config, database and port
 ```
 
-Each instance has its own `CUSTOM_MODELS`, `EXTENSION_PREFIX`, and database. See [Scenario F in SETUP.md](SETUP.md#scenario-f--multiple-instances).
+Each instance has its own `customModels`, `naming.prefix`, and database. The `instances\*.ps1` scripts remain for installations still configured through per-instance `.env` files. See [Scenario F in SETUP.md](SETUP.md#scenario-f--multiple-instances).
 
 ---
 

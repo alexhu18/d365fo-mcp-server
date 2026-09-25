@@ -59,7 +59,14 @@ async function buildFts(): Promise<void> {
     process.exit(1);
   }
 
-  const symbolIndex = new XppSymbolIndex(OUTPUT_DB, OUTPUT_LABELS_DB);
+  // Same two opt-outs as build-database.ts: this script takes locking_mode =
+  // EXCLUSIVE below, which an index worker's second write connection cannot
+  // coexist with, and the label load should not maintain the indexes it will
+  // build once at the end. See XppSymbolIndexOptions.
+  const symbolIndex = new XppSymbolIndex(OUTPUT_DB, OUTPUT_LABELS_DB, {
+    backgroundIndexBuilds: false,
+    deferFilePathIndexes: true,
+  });
 
   // Close read-pool connections before setting EXCLUSIVE locking mode.
   // SQLite cannot grant locking_mode = EXCLUSIVE while any other connection
@@ -104,14 +111,41 @@ async function buildFts(): Promise<void> {
       }
       // else: no filter — index all models
 
-      const { totalLabels, modelsIndexed } = await indexAllLabels(
-        symbolIndex,
-        PACKAGES_PATH,
-        labelModelFilter,
-      );
+      // Bulk load with only the UNIQUE index live; the read accelerators are rebuilt
+      // below. Cheaper as one CREATE INDEX per index over the finished table than as
+      // eight B-tree updates on every one of ~500 K inserts.
+      const droppedIndexes = symbolIndex.dropLabelSecondaryIndexes();
+
+      let totalLabels = 0;
+      let modelsIndexed = 0;
+      let ftsPending = false;
+      let indexMs = 0;
+      try {
+        ({ totalLabels, modelsIndexed, ftsRebuildPending: ftsPending } = await indexAllLabels(
+          symbolIndex,
+          PACKAGES_PATH,
+          labelModelFilter,
+          { skipFtsRebuild: true },
+        ));
+      } finally {
+        // finally, not the happy path only: leaving the database without its label
+        // indexes turns every later label lookup into a full-table scan, and nothing
+        // would recreate them until the next successful build.
+        indexMs = symbolIndex.createLabelSecondaryIndexes(droppedIndexes);
+      }
+
+      const insertDuration = ((Date.now() - labelStart) / 1000).toFixed(2);
+      console.log(`   ✅ ${totalLabels} label entries indexed across ${modelsIndexed} models in ${insertDuration}s`);
+      console.log(`   🔑 Label indexes rebuilt in ${(indexMs / 1000).toFixed(2)}s`);
+
+      if (ftsPending) {
+        const ftsStart = Date.now();
+        symbolIndex.rebuildLabelsFts();
+        console.log(`   🔍 Labels FTS rebuilt in ${((Date.now() - ftsStart) / 1000).toFixed(2)}s`);
+      }
 
       const labelDuration = ((Date.now() - labelStart) / 1000).toFixed(2);
-      console.log(`   ✅ ${totalLabels} label entries indexed across ${modelsIndexed} models in ${labelDuration}s`);
+      console.log(`   ⏱️  Label phase total: ${labelDuration}s`);
 
       const labelCount = symbolIndex.getLabelCount();
       console.log(`   📊 Total labels in database: ${labelCount}`);
@@ -119,6 +153,12 @@ async function buildFts(): Promise<void> {
   } else {
     console.log('\n⏭️  Skipping label indexing (INCLUDE_LABELS=false)');
   }
+
+  // ── file_path indexes: deferred past the load, built inline on the writer ──
+  console.log('\n🔑 Building file_path indexes...');
+  const filePathIdxStart = Date.now();
+  symbolIndex.ensureDeferredIndexes();
+  console.log(`   ✅ Done in ${((Date.now() - filePathIdxStart) / 1000).toFixed(2)}s`);
 
   // ── Finalize: convert to WAL mode for production ───────────────────────────
   console.log('\n🔄 Converting databases to WAL mode for production...');

@@ -11,6 +11,7 @@
  */
 
 import { getInferredModelPrefix, toExtensionInfixCase } from './modelPrefixInference.js';
+import { normalizeModelToken } from './modelToken.js';
 
 // Runtime registry for auto-detected custom models
 const autoDetectedCustomModels = new Set<string>();
@@ -94,6 +95,53 @@ export function getExtensionNamingStyle(): 'prefix' | 'model-name' {
   return process.env.EXTENSION_NAMING_STYLE?.trim().toLowerCase() === 'model-name'
     ? 'model-name'
     : 'prefix';
+}
+
+/**
+ * The same choice, for extension CLASSES only.
+ *
+ * One style drove both halves of the naming, and a convention that spells them
+ * differently could not be expressed at all. It is not a hypothetical shape: a
+ * model whose element extensions are the Visual Studio `CustTable.ContosoRobotics`
+ * while its CoC classes are prefix-first `CtsoCustTableTbl_Extension` has to pick
+ * one and break the other — 'model-name' rewrites the class to
+ * `CtsoCustTableTbl_ContosoRobotics_Extension`, 'prefix' rewrites the element to
+ * `CustTable.CtsoExtension`. Splitting the knob is the whole fix; each branch of
+ * applyObjectPrefix now asks the question that belongs to it.
+ *
+ * Configured via EXTENSION_CLASS_NAMING_STYLE. Unset — or any value that is
+ * neither 'prefix' nor 'model-name' — inherits getExtensionNamingStyle(), so a
+ * setup that never sets it behaves exactly as before.
+ */
+export function getExtensionClassNamingStyle(): 'prefix' | 'model-name' {
+  const configured = process.env.EXTENSION_CLASS_NAMING_STYLE?.trim().toLowerCase();
+  if (configured === 'prefix') return 'prefix';
+  if (configured === 'model-name') return 'model-name';
+  return getExtensionNamingStyle();
+}
+
+/**
+ * The naming-style variables that hold a value neither getter above recognises.
+ *
+ * Both getters fall back without a word — getExtensionNamingStyle to 'prefix',
+ * getExtensionClassNamingStyle to inheriting it — so a typo such as "prefx" or
+ * "modelname" silently means the default, and every name written afterwards
+ * follows a convention nobody chose. get_workspace_info renders these lines.
+ */
+export function unrecognisedNamingStyleSettings(): string[] {
+  const out: string[] = [];
+  const element = process.env.EXTENSION_NAMING_STYLE?.trim();
+  if (element && !['prefix', 'model-name'].includes(element.toLowerCase())) {
+    out.push(`EXTENSION_NAMING_STYLE="${element}" is not a known value (prefix | model-name) — treated as "prefix".`);
+  }
+  const cls = process.env.EXTENSION_CLASS_NAMING_STYLE?.trim();
+  if (cls && !['inherit', 'prefix', 'model-name'].includes(cls.toLowerCase())) {
+    out.push(
+      `EXTENSION_CLASS_NAMING_STYLE="${cls}" is not a known value (inherit | prefix | model-name) — ` +
+      `treated as "inherit", i.e. "${getExtensionNamingStyle()}".`,
+    );
+  }
+  return out;
 }
 
 /**
@@ -267,7 +315,15 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
 
   // model-name style embeds the model name instead of the prefix infix for extension
   // elements/classes only (VS default); regular new objects are unaffected.
-  const useModelName = !!modelName && getExtensionNamingStyle() === 'model-name';
+  // Elements and classes are asked separately: a convention may spell one with the
+  // model name and the other with the prefix, and EXTENSION_CLASS_NAMING_STYLE is
+  // what lets it say so. Unset, both resolve identically and nothing changes.
+  const useModelNameForElement = !!modelName && getExtensionNamingStyle() === 'model-name';
+  const useModelNameForClass = !!modelName && getExtensionClassNamingStyle() === 'model-name';
+
+  // The model name as it may appear inside an object name — identical to modelName
+  // unless the name carries characters an AOT identifier cannot (see #892).
+  const modelToken = modelName ? normalizeModelToken(modelName) : '';
 
   // Extension infix form — PascalCase without underscore (e.g. "XY" → "Xy" when env had "XY_"),
   // or the model's own infix when its existing extensions state one.
@@ -292,8 +348,8 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
     const suffixPart = objectName.slice(dotIdx + 1);
 
     // Replaces whatever follows the dot, so re-running is idempotent.
-    if (useModelName) {
-      return `${basePart}.${modelName}`;
+    if (useModelNameForElement) {
+      return `${basePart}.${modelToken}`;
     }
 
     if (suffixPart.toLowerCase().endsWith('extension')) {
@@ -313,21 +369,44 @@ export function applyObjectPrefix(objectName: string, prefix: string, modelName?
 
     // Strip any trailing model-name token first so re-running stays idempotent
     // (avoids Base_ModelName_ModelName_Extension).
-    if (useModelName) {
+    if (useModelNameForClass) {
       let cleanBase = baseName.replace(/_+$/, '');
-      const lowerModel = modelName!.toLowerCase();
+      // Match on the TOKEN, not the raw model name: the token is what an existing
+      // name can contain, so comparing against "contoso robotics" never fired and
+      // CustTable_ContosoRobotics_Extension grew a second token on every pass.
+      const lowerModel = modelToken.toLowerCase();
       if (cleanBase.toLowerCase().endsWith('_' + lowerModel)) {
         cleanBase = cleanBase.slice(0, cleanBase.length - lowerModel.length - 1);
       } else if (cleanBase.toLowerCase().endsWith(lowerModel)) {
         cleanBase = cleanBase.slice(0, cleanBase.length - lowerModel.length);
       }
       cleanBase = cleanBase.replace(/_+$/, '');
-      return `${cleanBase}_${modelName}_Extension`;
+      return `${cleanBase}_${modelToken}_Extension`;
     }
 
     // Check if the extension infix is already present at the end (case-insensitive)
     if (baseName.toLowerCase().endsWith(extensionInfix.toLowerCase())) {
       return objectName; // Already has the correct infix, return as-is
+    }
+
+    // …or at the START, which is where it sits on a class that is NOT named after
+    // a base object. `_Extension` does not only mean "CoC wrapper": Microsoft
+    // ships SysQueryRangeUtil_Extension, and a model's own ConDemoRanges_Extension
+    // is the same shape. Only checking the END turned that into
+    // ConDemoRangesCon_Extension — the prefix at both ends — and the declaration
+    // was rewritten to match, so the name the case asked for was unreachable
+    // through any grounded path.
+    //
+    // The discriminator is the PascalCase boundary, which keeps a real base name
+    // that merely begins with the same letters safe: "ConDemoRanges" is Con|D…
+    // (already prefixed), while "ConfigKey" is Con|f… (a word, not a prefix), so
+    // ConfigKey_Extension still becomes ConfigKeyCon_Extension as it should.
+    const infixLower = extensionInfix.toLowerCase();
+    if (baseName.toLowerCase().startsWith(infixLower)) {
+      const rest = baseName.slice(extensionInfix.length);
+      if (rest.length > 0 && rest[0] === rest[0].toUpperCase() && /[A-Za-z]/.test(rest[0])) {
+        return objectName;
+      }
     }
 
     // Inject the extension infix before "_Extension"

@@ -103,3 +103,65 @@ describe('shipped taxonomy', () => {
     expect(unexplained.map(r => r.leaf.id)).toEqual([]);
   });
 });
+
+/**
+ * The flags are derived, so a leaf's `note` is the one part of the matrix that can
+ * lie — and 37 of them did, still claiming "golden pending VM capture" months after
+ * the capture, one of them in the published COVERAGE.md.
+ */
+describe('taxonomy notes match the catalog', () => {
+  const cases = new Map(loadCases().map(c => [c.id, c]));
+
+  it('no note claims a pending golden for a case that is captured', () => {
+    const lying = TAXONOMY
+      // Any phrasing of "pending", not the one literal string: three notes said
+      // "goldens pending VM capture" and "golden capture pending on the VM" and
+      // slipped this gate for weeks.
+      .filter(l => /pending/i.test(l.note ?? ''))
+      .filter(l => (l.caseIds ?? []).every(id => cases.get(id)?.goldenPending === false))
+      .map(l => l.id);
+
+    expect(lying).toEqual([]);
+  });
+
+  it('no note claims a captured golden for a case that is still pending', () => {
+    const lying = TAXONOMY
+      .filter(l => /golden captured/i.test(l.note ?? ''))
+      .filter(l => (l.caseIds ?? []).some(id => cases.get(id)?.goldenPending === true))
+      .map(l => l.id);
+
+    expect(lying).toEqual([]);
+  });
+
+  /**
+   * The "pending" gate above was written against the phrasing that had drifted at
+   * the time, and seven more notes drifted past it in the very next wave using
+   * completely different words — "No case yet.", "no captured case yet", "X is the
+   * one to author", "none proven by a case". Every one named a case that had been
+   * captured on 2026-08-31, so COVERAGE.md rendered a green row beside a sentence
+   * saying the proof did not exist.
+   *
+   * Matching the FUTURE-TENSE shapes rather than a literal keeps the gate honest
+   * for the next phrasing too: a note that promises a case is wrong the moment the
+   * case it names is captured, whatever words it uses.
+   */
+  it('no note promises a case that already exists', () => {
+    const promises = [
+      /\bno case yet\b/i,
+      /\bno captured case\b/i,
+      /\bis the (?:one|case) to author\b/i,
+      /\bthe case to author is\b/i,
+      /\bnone proven by a case\b/i,
+      /\bcase (?:still )?to be (?:authored|captured)\b/i,
+    ];
+    const lying = TAXONOMY
+      .filter(l => promises.some(re => re.test(l.note ?? '')))
+      // A promise is only a lie once EVERY case the leaf names is captured; a leaf
+      // still waiting on one of several cases may legitimately say so.
+      .filter(l => (l.caseIds ?? []).length > 0
+        && (l.caseIds ?? []).every(id => cases.get(id)?.goldenPending === false))
+      .map(l => l.id);
+
+    expect(lying).toEqual([]);
+  });
+});

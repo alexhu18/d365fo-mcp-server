@@ -1,6 +1,6 @@
 /**
  * Oracle / scoring-integrity regressions from the 2026-07-21 golden-capture sweep
- * (docs/eval-sweep-findings-2026-07-21.md #24, #2, #3).
+ * (the 2026-07-21 eval sweep, findings #24, #2, #3).
  *
  * All three are measurement defects: the oracle either failed a faithful
  * reproduction for a cosmetic reason, or reported a number that was never
@@ -14,6 +14,7 @@ import * as path from 'path';
 import {
   evaluate, evaluateMulti, scoreRun, canonicalizePrefix, normalizeAotXml,
   artifactKey, artifactKeyMap, GOLDEN_CAPTURE_PREFIXES,
+  aotRootElement, declaredObjectNameOf,
 } from '../../src/eval/oracle/index';
 import { resolveActualFile, buildActualArtifactsMap } from '../../src/eval/oracle/actualArtifactResolution';
 import { buildReport, bpState, renderReport, type RunForReport } from '../../src/eval/improver/report';
@@ -204,6 +205,49 @@ describe('#2 — legacy golden FILENAMES pair with the actual files the VM produ
     }
   });
 
+  it('resolveActualFile pairs a golden with the bare AOT .xml the VM writes', () => {
+    // --actual-dir pointed at <Model>/<Model>/AxClass sees plain .xml, not
+    // .metadata.xml. That used to match nothing and score every artifact missing —
+    // a silent zero (L2-attribute-authoring-reflection capture, 2026-08-30).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-artifact-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'ConDemoRouteTargetAttribute.xml'), '<AxClass/>');
+      const hit = resolveActualFile(dir, 'ConDemoRouteTargetAttribute.metadata.xml', GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES);
+      expect(hit && path.basename(hit)).toBe('ConDemoRouteTargetAttribute.xml');
+
+      // A legacy golden name still reaches it through the logical key.
+      const legacy = resolveActualFile(dir, 'DemoRouteTargetAttribute.AxClass.metadata.xml', GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES);
+      expect(legacy && path.basename(legacy)).toBe('ConDemoRouteTargetAttribute.xml');
+
+      // A .metadata.xml neighbour wins when both shapes are present.
+      fs.writeFileSync(path.join(dir, 'ConDemoRouteTargetAttribute.metadata.xml'), '<AxClass/>');
+      const preferred = resolveActualFile(dir, 'DemoRouteTargetAttribute.AxClass.metadata.xml', GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES);
+      expect(preferred && path.basename(preferred)).toBe('ConDemoRouteTargetAttribute.metadata.xml');
+
+      // And an unrelated object still misses.
+      expect(resolveActualFile(dir, 'SomethingElse.metadata.xml', GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES)).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('buildActualArtifactsMap keys a bare AOT .xml in the golden filename shape', () => {
+    // Resolving the file is only half of it: keyed as ".xml" the pair still diffed
+    // as missing + extra, because the golden side keys as ".metadata.xml".
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-artifact-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'ConDemoRouteTargetAttribute.xml'), '<AxClass/>');
+      const { actualArtifacts, matchedActualFiles } = buildActualArtifactsMap(
+        dir, ['ConDemoRouteTargetAttribute.metadata.xml'], GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES);
+
+      expect(Object.keys(actualArtifacts)).toEqual(['ConDemoRouteTargetAttribute.metadata.xml']);
+      // …while the caller still learns which file on disk was actually consumed.
+      expect([...matchedActualFiles]).toEqual(['ConDemoRouteTargetAttribute.xml']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('end-to-end: a legacy-named multi-artifact golden dir scores golden_match: 1', async () => {
     const probe = classXml({ name: 'ConDemoEnumExtProbe', classDoc: 'a', methodDoc: 'b' });
     const res = await evaluateMulti({
@@ -311,14 +355,122 @@ describe('committed goldens under the tolerant default prefixes', () => {
     }
   });
 
-  it('no golden DIR contains two artifacts whose logical keys collide', () => {
-    const dirs = fs.existsSync(GOLDENS) ? fs.readdirSync(GOLDENS) : [];
-    for (const d of dirs) {
-      const dir = path.join(GOLDENS, d);
-      if (!fs.statSync(dir).isDirectory()) continue;
-      const names = fs.readdirSync(dir).filter(f => f.endsWith('.metadata.xml'));
-      const keys = new Set(names.map(n => artifactKey(n, GOLDEN_CAPTURE_PREFIXES)));
-      expect(keys.size, `${d}: ${names.join(', ')}`).toBe(names.length);
+  /**
+   * This used to assert "no golden DIR contains two artifacts whose logical keys
+   * collide", which banned a legitimate D365FO shape: a display menu item named
+   * after the form it opens (a table's `FormRef` takes a MENU ITEM name, so the
+   * pairing is forced — L3-enum-field-form-downgrade-guard). `artifactKey` is
+   * DELIBERATELY lossy (it strips the `.Ax<Type>` infix so legacy golden names
+   * pair at all), so colliding keys are expected; what must never happen is a
+   * golden that cannot be pinned to its OWN actual file.
+   *
+   * So the invariant is the one that matters: simulate the capture directory
+   * from the goldens' own contents and require a bijection.
+   */
+  // Use the shipped readers rather than re-deriving them here: a duplicate
+  // regex drifts from the code under test, and the comment-stripping version
+  // this used to carry was the same fragile single-pass strip CodeQL flags.
+  const declaredName = declaredObjectNameOf;
+  const rootElement = aotRootElement;
+
+  /**
+   * The flat `--actual-dir` a capture produces: every AOT file is named after the
+   * object it holds (`<Name>.xml`). Two objects sharing one name cannot both have
+   * it, so all but one carry a type marker — and WHICH one gets the undecorated
+   * name is the operator's choice, not a contract, so `rotate` tries the other
+   * assignment as well (only where the types actually differ; artifacts that
+   * share a name AND a type can be told apart by nothing but their filename).
+   */
+  function simulateCaptureDir(dir: string, names: string[], rotate: boolean): Map<string, string> {
+    const contents = new Map(names.map(n => [n, fs.readFileSync(path.join(dir, n), 'utf8')]));
+    const groups = new Map<string, string[]>();
+    for (const n of names) {
+      const key = declaredName(contents.get(n)!) ?? n;
+      groups.set(key, [...(groups.get(key) ?? []), n]);
     }
+    const out = new Map<string, string>();
+    const taken = new Set<string>();
+    const claim = (name: string): string => {
+      expect(taken.has(name), `simulated capture dir would need two files called ${name}`).toBe(false);
+      taken.add(name);
+      return name;
+    };
+    for (const [objectName, members] of groups) {
+      const types = members.map(m => rootElement(contents.get(m)!));
+      const typed = types.every(t => !!t) && new Set(types).size === members.length;
+      // The member the capture would name plainly: the one whose golden stem IS
+      // the object name, else the first.
+      const ordered = [...members].sort((a, b) =>
+        Number(b.replace(/\.metadata\.xml$/i, '') === objectName) -
+        Number(a.replace(/\.metadata\.xml$/i, '') === objectName));
+      const bare = rotate && typed ? ordered[ordered.length - 1] : ordered[0];
+      for (const m of members) {
+        if (m === bare) { out.set(m, claim(`${objectName}.xml`)); continue; }
+        const type = rootElement(contents.get(m)!);
+        out.set(m, claim(typed && type
+          ? `${objectName}.${type}.xml`
+          : `${m.replace(/\.metadata\.xml$/i, '')}.xml`));
+      }
+    }
+    return out;
+  }
+
+  const goldenDirs = (fs.existsSync(GOLDENS) ? fs.readdirSync(GOLDENS) : [])
+    .filter(d => fs.statSync(path.join(GOLDENS, d)).isDirectory())
+    .map(d => ({ id: d, dir: path.join(GOLDENS, d) }))
+    .map(g => ({ ...g, names: fs.readdirSync(g.dir).filter(f => f.endsWith('.metadata.xml')) }))
+    .filter(g => g.names.length > 0);
+
+  it.each([false, true])(
+    'every golden artifact resolves to its OWN actual file (rotated capture names: %s)',
+    rotate => {
+      expect(goldenDirs.length).toBeGreaterThan(50); // a silent empty scan would pass forever
+      const failures: string[] = [];
+      for (const { id, dir, names } of goldenDirs) {
+        const goldenContents: Record<string, string> = Object.fromEntries(
+          names.map(n => [n, fs.readFileSync(path.join(dir, n), 'utf8')]),
+        );
+        const simulated = simulateCaptureDir(dir, names, rotate);
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'golden-capture-'));
+        try {
+          for (const [golden, actualName] of simulated) {
+            fs.writeFileSync(path.join(tmp, actualName), goldenContents[golden]);
+          }
+          for (const golden of names) {
+            const hit = resolveActualFile(tmp, golden, GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES, goldenContents[golden]);
+            const got = hit ? path.basename(hit) : '(unresolved)';
+            if (got !== simulated.get(golden)) {
+              failures.push(`${id}: ${golden} → ${got}, expected ${simulated.get(golden)}`);
+            }
+          }
+          const { matchedActualFiles, pairingProblems } = buildActualArtifactsMap(
+            tmp, names, GOLDEN_CAPTURE_PREFIXES, GOLDEN_CAPTURE_PREFIXES, goldenContents);
+          if (pairingProblems.length > 0) {
+            failures.push(`${id}: ${pairingProblems.map(p => `${p.golden} ${p.reason}`).join('; ')}`);
+          }
+          if (matchedActualFiles.size !== names.length) {
+            failures.push(`${id}: ${matchedActualFiles.size} of ${names.length} artifacts paired`);
+          }
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      }
+      expect(failures, failures.join('\n')).toEqual([]);
+    });
+
+  it('two artifacts CAN share a logical key — the type is what keeps them apart', () => {
+    // The shape the old assertion banned: a form and the display menu item a
+    // table's FormRef requires. Both are needed and both are named alike.
+    const dir = path.join(GOLDENS, 'L3-enum-field-form-downgrade-guard');
+    const names = fs.existsSync(dir) ? fs.readdirSync(dir).filter(f => f.endsWith('.metadata.xml')) : [];
+    const collide = names.filter(n => artifactKey(n, GOLDEN_CAPTURE_PREFIXES)
+      === artifactKey('ConDemoTaxChangeLogDetails.metadata.xml', GOLDEN_CAPTURE_PREFIXES));
+    expect(collide.sort()).toEqual([
+      'ConDemoTaxChangeLogDetails.AxMenuItemDisplay.metadata.xml',
+      'ConDemoTaxChangeLogDetails.metadata.xml',
+    ]);
+    // …and their AOT types differ, which is what the resolver pairs on.
+    const types = collide.map(n => rootElement(fs.readFileSync(path.join(dir, n), 'utf8')));
+    expect(new Set(types).size).toBe(collide.length);
   });
 });

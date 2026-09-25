@@ -94,3 +94,23 @@ deployment.zip
 
 # Transient git worktrees created by Claude Code subagents
 .claude/worktrees/
+
+# Local symbol-index databases (multi-GB, rebuilt by `npm run index-metadata`)
+data/
+
+# Machine-specific eval-sandbox wiring: absolute VM paths + the throwaway model
+# name, same category as config/d365fo-mcp.json above.
+config/d365fo-mcp-eval.json
+
+# Oracle harness outputs (scripts/oracles) — measurements, not artefacts.
+# The scripts are committed so anyone can re-measure; the results are a snapshot
+# of one machine at one platform version and go stale silently.
+.oracle-*.json
+.oracle-*.log
+.oracle-probes/
+
+# Staging folder written by `d365fo-mcp setup` (src/cli/copilotFiles.ts) when the
+# user skips the direct copy into their solutions folder. On a git checkout dataRoot()
+# is the repo root, so it lands here. Holds a copy of the tracked
+# .github/copilot-instructions.md plus a README with this machine's absolute paths.
+copilot-setup/
