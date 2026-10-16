@@ -6,7 +6,7 @@
 
 export const findReferencesTool = {
     name: 'find_references',
-    description: 'Find all references (where-used) to a class, method, field, table, enum, EDT, or LABEL. Essential for impact analysis before refactoring. For a method, SCOPE it to its declaring type — pass "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable"), set ownerName alongside a bare method name, or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name (no owner) matches that name on every type and over-reports. For a label, pass the label id as targetName (e.g. "@WAX2194" or "@MyLabelFile:MyLabel"); results span every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), not just code, and require the xref database (DYNAMICSXREFDB, full server mode).',
+    description: 'Find all references (where-used) to a class, method, field, table, enum, EDT, or LABEL. For a method, SCOPE it to its declaring type — pass "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable"), set ownerName alongside a bare method name, or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name (no owner) matches that name on every type and over-reports. For a label, pass the label id as targetName (e.g. "@WAX2194" or "@MyLabelFile:MyLabel"); results span every referencing object type (tables, forms, EDTs, enums, reports, menu items, …), not just code, and require the xref database (DYNAMICSXREFDB, full server mode).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -16,9 +16,8 @@ export const findReferencesTool = {
         },
         targetType: {
           type: 'string',
-          enum: ['class', 'method', 'field', 'table', 'enum', 'edt', 'form', 'query', 'view', 'report', 'label', 'all'],
-          description: 'Type of the target to search for. Use "label" for label where-used (or just pass an "@…" / "/Labels/@…" targetName).',
-          default: 'all'
+          enum: ['class', 'method', 'field', 'table', 'enum', 'edt', 'form', 'query', 'view', 'data-entity', 'map', 'report', 'menu-item', 'index', 'field-group', 'label', 'all'],
+          description: 'Scopes a bare name to that type. An enum value: "Enum::Value" with "enum"; an index or field group: "Table.Name".'
         },
         ownerName: {
           type: 'string',

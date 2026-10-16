@@ -34,6 +34,8 @@ import { updateSymbolIndexTool } from './sdlc/updateSymbolIndex.js';
 import { buildProjectTool } from './sdlc/buildProject.js';
 import { dbSyncTool } from './sdlc/dbSync.js';
 import { runBpCheckTool } from './sdlc/runBpCheck.js';
+import { axdbSqlTool } from './sdlc/axdbSql.js';
+import { traceD365foTool } from './sdlc/traceD365fo.js';
 import { sysTestRunnerTool } from './sdlc/sysTestRunner.js';
 import { reviewWorkspaceChangesTool } from './sdlc/reviewWorkspaceChanges.js';
 import { undoLastModificationTool } from './sdlc/undoLastModification.js';
@@ -372,19 +374,18 @@ export function registerToolHandler(server: Server, context: XppServerContext): 
         return await buildProjectTool(request.params.arguments as any, context, reportProgress);
       case 'trigger_db_sync':
         return await dbSyncTool(request.params.arguments as any, context);
-      case 'run_bp_check':
-        return await runBpCheckTool(request.params.arguments as any, context);
+      case 'run_bp_check':          return await runBpCheckTool(request.params.arguments as any, context);
+      case 'axdb_sql':              return await axdbSqlTool(request.params.arguments, context);
+      case 'trace_d365fo':          return await traceD365foTool(request.params.arguments, context);
       case 'run_systest_class':
         return await sysTestRunnerTool(request.params.arguments as any, context);
       case 'review_workspace_changes':
         return await reviewWorkspaceChangesTool(request.params.arguments as any, context);
       case 'undo_last_modification':
         return await undoLastModificationTool(request.params.arguments as any, context);
-      case 'get_knowledge':
-        return getKnowledgeTool(request);
+      case 'get_knowledge':         return getKnowledgeTool(request);
       case 'validate_code':        return validateCodeTool(request, context);
-      case 'prepare':
-        return prepareTool(request, context);
+      case 'prepare':               return prepareTool(request, context);
       case 'get_workspace_info':
         return getWorkspaceInfoTool(request, context);
       default:

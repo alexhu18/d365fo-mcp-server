@@ -8,9 +8,11 @@
 import * as fs from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { p } from '../ui.js';
-import { settingByPath } from '../../config/settings.js';
+import { serializeValue, settingByPath } from '../../config/settings.js';
+import { bridgeFreshness, type BridgeFreshness } from '../bridgeSources.js';
 import { bridgeBuildCommand, dataRoot, installMode, isWindows, paths, repoRoot } from '../context.js';
 import { commandExists } from '../exec.js';
+import { freeBytes, requiredFreeMB, sizeLimitMB } from '../../tools/sdlc/trace/capture.js';
 import { isLegacyInstanceLayout, listInstances, type Instance } from '../instances.js';
 import { checkRelease } from '../npmRegistry.js';
 import { conflictingLegacyValues, readPath, readSetting, settingSource, type SettingsStore } from '../settingsStore.js';
@@ -344,7 +346,25 @@ export function checkPrefixResolution(
   modelObjectNames: string[],
   label: string,
   pinned = false,
+  noPrefix = false,
 ): CheckResult[] {
+  // naming.prefixSource=none: no prefix by decision (#1085), so there is nothing
+  // to infer, pin or warn about — only what the server does instead.
+  if (noPrefix) {
+    if (configuredPrefix) {
+      return [{
+        severity: 'warn',
+        message: `${label}: naming.prefixSource=none ignores naming.prefix "${configuredPrefix}" — new objects ` +
+          `get no prefix; extensions embed the model name`,
+        fix: `clear naming.prefix, or set naming.prefixSource=model/config to use it (${SETUP_COMMAND})`,
+      }];
+    }
+    return [{
+      severity: 'ok',
+      message: `${label}: no prefix (naming.prefixSource=none) — new objects keep the name as given; ` +
+        `extensions embed the model name${modelName ? ` ("${modelName}")` : ''}`,
+    }];
+  }
   const inferred = modelName ? inferPrefixFromObjectNames(modelObjectNames, modelName) : null;
   const bare = (s: string) => s.replace(/_+$/, '').toLowerCase();
 
@@ -374,7 +394,7 @@ export function checkPrefixResolution(
       return [{
         severity: 'warn',
         message: `${label}: no prefix configured and none inferable — new objects will be prefixed with the model name`,
-        fix: `set naming.prefix to your ISV prefix (${SETUP_COMMAND})`,
+        fix: `set naming.prefix to your ISV prefix, or naming.prefixSource=none for no prefix at all (${SETUP_COMMAND})`,
       }];
     }
     return [{ severity: 'ok', message: `${label}: prefix "${configuredPrefix}" (naming.prefix)` }];
@@ -456,6 +476,45 @@ function layoutChecks(inst: Instance): CheckResult[] {
 }
 
 /**
+ * A SQL server configured while SQL itself stays off.
+ *
+ * axdb_sql is published only when sql.enabled is true AND a server is set
+ * (isAxDbConfigured). The wizard writes both together, but a config edited by
+ * hand can carry the server alone — and then the tool is simply absent, with
+ * nothing saying why.
+ *
+ * Same precedence the server applies (loadEnv): a variable the real environment
+ * defines — even as empty — outranks the config file. A config value is read the
+ * way the server projects it onto the environment (serializeValue), so a quoted
+ * `"false"` is off here exactly as it is at runtime.
+ */
+export function checkSqlSwitch(
+  store: SettingsStore,
+  label: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CheckResult | null {
+  const effective = (settingPath: string): { value: string; fromEnv: boolean } => {
+    const setting = settingByPath(settingPath)!;
+    if (env[setting.env] !== undefined) return { value: env[setting.env]!.trim(), fromEnv: true };
+    return { value: (serializeValue(setting, readSetting(store, setting)) ?? '').trim(), fromEnv: false };
+  };
+  const server = effective('sql.server');
+  const enabled = effective('sql.enabled');
+  if (!server.value) return null;
+  if (/^(true|1|yes|on)$/i.test(enabled.value)) return null;
+  const where = (fromEnv: boolean, name: string) => (fromEnv ? `${name} (environment)` : name);
+  return {
+    severity: 'warn',
+    message:
+      `${label}: ${where(server.fromEnv, 'sql.server')} is set (${server.value}) but ` +
+      `${where(enabled.fromEnv, 'sql.enabled')} is not true — axdb_sql is not published`,
+    fix: enabled.fromEnv
+      ? 'set D365FO_SQL_ENABLED=true in the environment that starts the server, or remove it so the config file decides'
+      : `set sql.enabled to true in ${store.configPath}, or run: d365fo-mcp config sql`,
+  };
+}
+
+/**
  * The symbol index is SQLite, served by node:sqlite — core since Node 22, and
  * the reason this package has no native dependency and installs without
  * lifecycle scripts. Two things can still be absent on an unusual runtime: the
@@ -481,6 +540,33 @@ async function checkSqliteEngine(): Promise<CheckResult> {
       fix: `install Node 24 or newer (running ${process.version})`,
     };
   }
+}
+
+/**
+ * Tracing switched on: where captures will go and whether that drive can take one.
+ *
+ * A capture of a busy batch grows by tens of MB per second; the tool refuses to start
+ * without room, so a full drive is better said here than discovered mid-investigation.
+ */
+export function checkTrace(store: SettingsStore, label: string, free: (dir: string) => number | undefined = freeBytes): CheckResult | null {
+  if (readSetting(store, settingByPath('trace.enabled')!) !== true) return null;
+  if (!isWindows) {
+    return { severity: 'warn', message: `${label}: trace.enabled is true, but ETW capture runs only on the Windows D365FO VM — trace_d365fo will refuse`, fix: `set trace.enabled to false in ${store.configPath}` };
+  }
+  const dir = readSetting(store, settingByPath('trace.outputDir')!);
+  if (typeof dir !== 'string' || !dir.trim()) {
+    return { severity: 'ok', message: `${label}: tracing enabled — no trace.outputDir; the first capture proposes a drive with space and remembers it. Needs Administrators or Performance Log Users.` };
+  }
+  const bytes = free(dir);
+  const gb = bytes === undefined ? undefined : Math.round(bytes / 2 ** 30 * 10) / 10;
+  // What start requires for the longest capture the setup allows, so "ok" here means start will not refuse.
+  const limit = (path: string, fallback: number) => Number(readSetting(store, settingByPath(path)!) ?? fallback) || fallback;
+  const neededMB = requiredFreeMB(sizeLimitMB(limit('trace.maxSeconds', 120), limit('trace.maxSizeMB', 4096)));
+  if (bytes === undefined || bytes / 2 ** 20 < neededMB) {
+    const neededGB = Math.ceil(neededMB / 1024 * 10) / 10;
+    return { severity: 'warn', message: `${label}: trace.outputDir ${dir} has ${gb === undefined ? 'no readable volume' : `${gb} GB free`} — a capture at the configured limits needs about ${neededGB} GB`, fix: 'point trace.outputDir at a drive with space: d365fo-mcp config trace' };
+  }
+  return { severity: 'ok', message: `${label}: tracing enabled — captures in ${dir} (${gb} GB free). Needs Administrators or Performance Log Users.` };
 }
 
 /**
@@ -514,6 +600,58 @@ async function probeHealth(port: number, label: string): Promise<CheckResult> {
     return { severity: 'info', message: `${label}: starting on port ${port} (${body.status ?? res.status})` };
   } catch {
     return { severity: 'info', message: `${label}: not running on port ${port} (fine unless you expect an HTTP server)` };
+  }
+}
+
+/**
+ * A traditional VM with no cross-reference database configured. Its XPP config
+ * does not exist, so nothing else names DYNAMICSXREFDB, and find_references
+ * silently answers from a name-based search that misses metadata references
+ * (relations, form data sources, fields using an EDT). Null when configured.
+ */
+export function checkXrefConfigured(store: SettingsStore): CheckResult | null {
+  // Same precedence the server applies: the real environment (an .mcp.json
+  // `env` block) outranks the config file.
+  const name = (
+    process.env.D365FO_XREF_DB_NAME?.trim()
+    || String(readSetting(store, settingByPath('bridge.xrefDbName')!) ?? '').trim()
+  );
+  if (name) return null;
+  return {
+    severity: 'info',
+    message: 'Cross-reference database not configured — find_references uses a name-based search instead of DYNAMICSXREFDB',
+    fix: 'set bridge.xrefDbName to DYNAMICSXREFDB (and bridge.xrefDbServer if it is not localhost), then restart the server',
+  };
+}
+
+/**
+ * A built bridge, judged against the sources it was compiled from (#1115). An
+ * update can leave an old binary in place while it moves the bridge sources,
+ * and parts of the adapter tolerate an older bridge without a word — so a
+ * bridge that merely exists is not enough to call healthy.
+ */
+export function checkBuiltBridge(
+  exePath: string,
+  freshness: Exclude<BridgeFreshness, 'missing'>,
+  buildCommand: string,
+): CheckResult {
+  // The running server holds the exe open, and the build cannot replace it.
+  const fix = `stop the MCP server (VS Code / Visual Studio), then: ${buildCommand}`;
+  switch (freshness) {
+    case 'current':
+      return { severity: 'ok', message: `C# bridge built from the current sources (${exePath})` };
+    case 'stale':
+      return {
+        severity: 'warn',
+        message: `C# bridge built from older sources (${exePath}) — the server runs this version's code against the old bridge`,
+        fix,
+      };
+    case 'unstamped':
+      return {
+        severity: 'info',
+        message: `C# bridge built (${exePath}), but before builds recorded their sources — whether it matches this version is unknown`,
+        fix,
+      };
   }
 }
 
@@ -559,9 +697,13 @@ export async function doctorCommand(): Promise<void> {
   for (const r of checkPackagesRoot(root.store, 'Root')) emit(r);
   for (const r of checkPathSetting(root.store, 'Root', 'environment.customPackagesPath')) emit(r);
   for (const r of checkPathSetting(root.store, 'Root', 'environment.microsoftPackagesPath')) emit(r);
+  const rootSql = checkSqlSwitch(root.store, 'Root');
+  if (rootSql) emit(rootSql);
 
   // Database (root)
   emit(checkDb(root.store, paths.defaultDb, 'Root'));
+  const rootTrace = checkTrace(root.store, 'Root');
+  if (rootTrace) emit(rootTrace);
 
   // Which source resolves the workspace, and the prefix that follows from it —
   // both were previously only inferable from a tool error (#833).
@@ -578,13 +720,14 @@ export async function doctorCommand(): Promise<void> {
     ?? String(readSetting(root.store, settingByPath('naming.prefixSource')!) ?? '')
   ).trim().toLowerCase();
   for (const r of checkPrefixResolution(
-    configuredPrefix, detection.modelName, names, 'Naming', prefixSource === 'config',
+    configuredPrefix, detection.modelName, names, 'Naming', prefixSource === 'config', prefixSource === 'none',
   )) emit(r);
 
   // C# bridge: the only write path; Windows-only.
   if (isWindows) {
-    if (fs.existsSync(paths.bridgeExe)) {
-      emit({ severity: 'ok', message: `C# bridge built (${paths.bridgeExe})` });
+    const freshness = bridgeFreshness();
+    if (freshness !== 'missing') {
+      emit(checkBuiltBridge(paths.bridgeExe, freshness, bridgeBuildCommand()));
     } else if (await commandExists('dotnet')) {
       // Absolute path: outside a checkout the user is nowhere near the bridge,
       // and a relative `cd bridge\...` would just fail.
@@ -601,6 +744,10 @@ export async function doctorCommand(): Promise<void> {
       emit({ severity: 'ok', message: `UDE: ${configs.length} XPP config(s) in ${dir}` });
     } else {
       emit({ severity: 'info', message: 'No UDE XPPConfig directory — traditional VM or UDE tools not installed' });
+      // Only UDE's XPP config names the cross-reference database; a traditional
+      // VM has to configure it, or find_references never uses it.
+      const xref = checkXrefConfigured(root.store);
+      if (xref) emit(xref);
     }
   } else {
     emit({ severity: 'info', message: `C# bridge skipped (Windows-only) — platform is ${process.platform}` });
@@ -618,7 +765,11 @@ export async function doctorCommand(): Promise<void> {
       for (const r of checkPackagesRoot(target.store, `Instance '${inst.name}'`)) emit(r);
       for (const r of checkPathSetting(target.store, `Instance '${inst.name}'`, 'environment.customPackagesPath')) emit(r);
       for (const r of checkPathSetting(target.store, `Instance '${inst.name}'`, 'environment.microsoftPackagesPath')) emit(r);
+      const instanceSql = checkSqlSwitch(target.store, `Instance '${inst.name}'`);
+      if (instanceSql) emit(instanceSql);
       emit(checkDb(target.store, resolve(inst.dir, 'data', 'xpp-metadata.db'), `Instance '${inst.name}'`));
+      const instanceTrace = checkTrace(target.store, `Instance '${inst.name}'`);
+      if (instanceTrace) emit(instanceTrace);
       if (isWindows && isXppConfigStale(target.store)) {
         emit({
           severity: 'warn',

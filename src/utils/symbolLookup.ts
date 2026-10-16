@@ -69,13 +69,24 @@ export function lookupSymbolsNocase(
   ).all(name, ...tf.params, limit) as SymbolHit[];
   if (exact.length >= limit) return exact;
 
+  // The type filter goes INTO the FTS match as well as the SQL re-check. A name
+  // shared by tens of thousands of method/field rows (`insert`, `description`)
+  // otherwise turns every FTS candidate into a random symbols-row read before the
+  // type filter can drop it: 17.6 s / 26 s cold for a `['table']` lookup that
+  // finds nothing. The FTS type phrase only narrows (`"table"` also matches
+  // `table-extension`); the exact `s.type IN (...)` below decides. Untyped
+  // lookups keep the old shape: excluding method/field inside FTS (`NOT`)
+  // measured slower, since it decodes those 1M-row doclists.
+  const typeMatch = opts.types && opts.types.length > 0
+    ? ` AND {type} : (${opts.types.map(ftsPhrase).join(' OR ')})`
+    : '';
   const fts = db.prepare(
     `SELECT ${HIT_COLS} FROM symbols_fts fts
      JOIN symbols s ON s.id = fts.rowid
      WHERE symbols_fts MATCH ?
        AND s.name = ? COLLATE NOCASE${tf.sql} AND s.parent_name IS NULL
      LIMIT ?`,
-  ).all(`{name} : ${ftsPhrase(name)}`, name, ...tf.params, limit) as SymbolHit[];
+  ).all(`{name} : ${ftsPhrase(name)}${typeMatch}`, name, ...tf.params, limit) as SymbolHit[];
 
   const key = (r: SymbolHit) => `${r.name}\0${r.type}\0${r.model ?? ''}`;
   const seen = new Set(exact.map(key));

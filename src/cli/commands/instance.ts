@@ -12,7 +12,8 @@ import { maybePrepareCopilotInstructions } from '../copilotFiles.js';
 import { createInstance, getInstance, listInstances, normalizeInstanceLayout, suggestPort } from '../instances.js';
 import { mcpJsonNote, placementNote, stdioServer } from '../mcpJson.js';
 import { selectXppConfig } from './config.js';
-import { askAdvanced, askSetting, askSettings } from '../settingsPrompt.js';
+import { configureSqlForEnvironment } from '../sqlEnvironmentSetup.js';
+import { askAdvanced, askNaming, askSetting, askSettings } from '../settingsPrompt.js';
 import { openInstanceStore, readPath, readSetting, saveStore, writeSetting } from '../settingsStore.js';
 import { instanceTarget } from '../target.js';
 import { askConfirm, askSelect, askText, p } from '../ui.js';
@@ -99,18 +100,20 @@ export async function instanceAddCommand(name: string | undefined, portArg: stri
   }));
   if (envType === 'ude') {
     await selectXppConfig(store);
+    await configureSqlForEnvironment(store, 'ude');
   } else {
-    await askSetting(store, settingByPath('environment.packagePath')!, {
+    const packagesRoot = await askSetting(store, settingByPath('environment.packagePath')!, {
       required: true,
       initial: findPackagesRoot() ?? undefined,
     });
     await askSetting(store, settingByPath('environment.customModels')!, { required: true });
+    await configureSqlForEnvironment(store, 'traditional', typeof packagesRoot === 'string' ? packagesRoot : undefined);
   }
   p.log.step('Workspace and naming');
   await askSetting(store, settingByPath('workspace.modelName')!);
   await askSetting(store, settingByPath('workspace.path')!);
   await askSetting(store, settingByPath('workspace.solutionsPath')!);
-  await askSettings(store, settingsInSection('naming', 'basic'));
+  await askNaming(store);
   p.log.step('Metadata index');
   await askSettings(store, settingsInSection('index', 'basic'));
   await askAdvanced(store, ['environment', 'workspace', 'index', 'server', 'bridge', 'behavior']);

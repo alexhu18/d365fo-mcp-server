@@ -1,6 +1,6 @@
 {
   "name": "d365fo-mcp",
-  "version": "1.17.4",
+  "version": "1.21.0",
   "description": "MCP Server for X++ Code Completion in D365 Finance & Operations",
   "type": "module",
   "main": "dist/index.js",
@@ -90,7 +90,7 @@
     "@modelcontextprotocol/sdk": "^1.27.0",
     "commander": "^15.0.0",
     "compression": "^1.8.1",
-    "dotenv": "^17.4.2",
+    "dotenv": "^18.0.4",
     "express": "^5.2.1",
     "express-rate-limit": "^8.4.1",
     "xml2js": "^0.6.2",
@@ -102,11 +102,11 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.0.1",
     "@types/xml2js": "^0.4.14",
-    "@vitest/coverage-v8": "^4.1.4",
+    "@vitest/coverage-v8": "^5.0.2",
     "esbuild": "^0.28.1",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.4"
+    "vitest": "^5.0.2"
   },
   "engines": {
     "node": ">=24.0.0"

@@ -13,6 +13,9 @@ public class ConDemoWorkerBonusRate extends common
 		<Methods />
 	</SourceCode>
 	<Label>@SYS32359</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>WorkerId</TitleField1>
 	<TitleField2>BonusRate</TitleField2>

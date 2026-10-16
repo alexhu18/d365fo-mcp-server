@@ -7,6 +7,8 @@
 // Protocol types
 // ===========================
 
+export type AxDbMethod = 'axdbStatus' | 'axdbSchema' | 'axdbQuery';
+
 export interface BridgeRequest {
   id: string;
   method: string;
@@ -25,6 +27,7 @@ export interface BridgeError {
 }
 
 export interface BridgeReadyPayload {
+  axdbSqlAvailable?: boolean;
   version: string;
   status: 'ready';
   packagesPath: string;
@@ -54,6 +57,10 @@ export interface BridgeTableInfo {
   clusteredIndex?: string;
   primaryIndex?: string;
   saveDataPerCompany?: string;
+  /** "Read=Allow, Create=Deny" — the permissions the AccessGrant sets; absent when none are. */
+  subscriberAccessLevel?: string;
+  /** "Yes" when set; absent from bridges built before it was read. */
+  allowRowVersionChangeTracking?: string;
   extends?: string;
   supportInheritance?: string;
   instanceRelationType?: string;
@@ -350,7 +357,11 @@ export interface BridgeReportDesign {
 
 export interface BridgeReferenceResult {
   objectPath: string;
+  /** Rows returned — capped per target shape (X++ code, declarative metadata). */
   count: number;
+  /** Every matching reference, and how many of them are declarative metadata. Absent from older bridges. */
+  total?: number;
+  metadataTotal?: number;
   references: BridgeReferenceInfo[];
   /** Set by the C# bridge when the xref query failed in-band (e.g. SQL error) — count is 0 but this is NOT an authoritative "no references". */
   error?: string;

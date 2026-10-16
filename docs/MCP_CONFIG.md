@@ -71,8 +71,8 @@ Set in the `env` block. The legacy `"context": {...}` block is **deprecated** �
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MCP_SERVER_MODE` | `full` | `full` (20 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
-| `MCP_TOOL_PROFILE` | `full` | `full` (all 20) / `core` (15-tool create-and-build loop) — shrinks the catalogue when the workspace already runs other MCP servers |
+| `MCP_SERVER_MODE` | `full` | `full` (22 tools) / `read-only` (Azure) / `write-only` (hybrid companion) |
+| `MCP_TOOL_PROFILE` | `full` | `full` (all 22) / `core` (17-tool create-and-build loop) — shrinks the catalogue when the workspace already runs other MCP servers. `axdb_sql` and `trace_d365fo` are published in either only once configured |
 | `MCP_EXTRA_TOOLS` | — | comma-separated tool names added back on top of `core` (e.g. `security_info,run_systest_class`) |
 | `DB_PATH` / `LABELS_DB_PATH` | repo `data/` | absolute paths to the SQLite databases — **required in stdio mode** |
 | `GROUNDING_ENFORCE` | off | fail-closed grounding gate for write tools — opt in |

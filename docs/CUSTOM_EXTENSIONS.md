@@ -111,6 +111,22 @@ To pin step 2 above step 1 (pre-1.8.2 behaviour) — worth doing when one model 
 
 `npx d365fo-mcp config naming` asks for it in the advanced pass. The equivalent environment variable, `EXTENSION_PREFIX_SOURCE=config`, still works and still outranks the config file.
 
+### No prefix at all
+
+Some teams use no prefix — a suffix convention such as `CustomerSettings_ABC`, `ProductService_ABC`. Leaving `naming.prefix` empty does **not** mean "no prefix": steps 1–3 above still run, and step 3 prefixes every new object with the model name. Say so explicitly instead:
+
+```json
+{ "naming": { "prefixSource": "none", "suffix": "_ABC" } }
+```
+
+With `prefixSource: none` (env `EXTENSION_PREFIX_SOURCE=none`):
+
+- New objects, fields and methods keep the name as given — nothing is inferred from the model, `naming.prefix` is ignored, and the model name is never used as a prefix. `naming.suffix` (optional) is still appended to new objects, and its own underscore is not flagged by the naming check.
+- Extension elements and classes still need a token that keeps two models' extensions apart, so they embed the **model name**, as Visual Studio does: `CustTable.ABC`, `CustTable_ABC_Extension` (whatever `extensionStyle` / `extensionClassStyle` say — a prefix style has no prefix to embed). A CoC class you name yourself in a `{Base}_{Kind}_{Model}_Extension` shape, e.g. `CustTable_Table_ABC_Extension`, is kept as given.
+- `validate_object_naming` stops asking for a prefix, and `get_workspace_info` / `doctor` report the choice instead of warning that no prefix is set.
+
+`npx d365fo-mcp setup` asks for this when you leave the prefix empty.
+
 ## Objects owned by another model
 
 A customer solution is commonly split across several **custom** models — a shared `ContosoFinanceCore` plus country models `ContosoFinanceSK` / `ContosoFinanceCZ` that extend it. The workspace targets exactly one of them; every other model is code this workspace only consumes.
@@ -185,9 +201,28 @@ Unset (or `inherit`), `EXTENSION_CLASS_NAMING_STYLE` follows `EXTENSION_NAMING_S
 **There is no custom naming template.** The name is normalised in code on every create and modify:
 
 - An **element extension** always gets the style's token after the dot — `ProdTable.BKU_TableExtension` is written as `ProdTable.BKUExtension`.
-- An **extension class** given a bare base name gets `{Base}{Infix}_Extension` (`ProdTable` → `ProdTableBKU_Extension`). A full name whose part before `_Extension` already *ends* with the infix is kept as passed, so `ProdTable_BKU_Extension` survives — but only when the agent passes that exact name.
+- An **extension class** given a bare base name gets `{Base}{Infix}_Extension` (`ProdTable` → `ProdTableBKU_Extension`). A full name whose part before `_Extension` already *ends* with the infix is kept as passed, so `ProdTable_BKU_Extension` survives — but only when the agent passes that exact name. The infix counts only as its own PascalCase word: with infix `Le`, `SalesTable_Extension` is a base that still needs it (`SalesTableLe_Extension`), not one that already ends in it. A base that itself *starts* with the infix as a word (`ProjTable` under infix `Proj`) cannot be told apart from an already-prefixed name, so pass the bare base (`objectName: "ProjTable"`, `objectType: "class-extension"`) to get `ProjTableProj_Extension`; a full `ProjTable_Extension` is kept as given.
 
 The extension patterns in `copilot-instructions.md` (or any other rules file) only *describe* this behaviour: editing them does not change what the tool writes, and it leaves the agent's instructions contradicting the tool. To switch styles, run `d365fo-mcp config naming` (or set `EXTENSION_NAMING_STYLE`) and restart the server. With `prefix`, the infix follows `EXTENSION_PREFIX`, or the spelling the model's existing extensions already use.
+
+### Prefix leading the class name
+
+Both `prefix` and `model-name` put the token right before `_Extension` — `CustTableCr_Extension`, `CustTable_ContosoRobotics_Extension`. Some conventions instead lead the class name with the token, e.g. the Avanade D365FO Development Guidelines: `CRCustTableDbt_Extension`, not `CustTableDbtCR_Extension`. `EXTENSION_CLASS_NAMING_STYLE=prefix-leading` writes that shape:
+
+```env
+EXTENSION_PREFIX=CR
+EXTENSION_CLASS_NAMING_STYLE=prefix-leading   # extension classes only — elements keep EXTENSION_NAMING_STYLE
+```
+
+| Base name | Written as |
+|-----------|------------|
+| `CustTable` | `CRCustTable_Extension` |
+| `CustTableDbt` (a caller-embedded type abbreviation — the tool has no notion of `Dbt`/`Frm`/`Cls` itself) | `CRCustTableDbt_Extension` |
+| `whsWorkExecute` (a camelCase base) | `CRWhsWorkExecute_Extension` — the base's first letter is upper-cased so the prefix stays recognisable on re-run; X++ names are case-insensitive |
+
+The prefix is recognised only as a separate PascalCase word, so a base whose name merely starts or ends with the same letters keeps them: with `EXTENSION_PREFIX=Le`, `SalesTable` becomes `LeSalesTable_Extension`. One case cannot be told apart from the name alone — a base that itself starts with the prefix as a word (`ProjTable` under prefix `Proj`). Pass the bare base (`objectName: "ProjTable"`, `objectType: "class-extension"`) and it is written as `ProjProjTable_Extension`; a name you pass already ending in `_Extension` (`ProjTable_Extension`) is read as already prefixed and kept as given.
+
+Element extensions are unaffected — `prefix-leading` only exists for classes, because `Base.{Infix}Extension` is Microsoft's own dot-notation shape and leading the infix there would not parse as an AOT name. A name already written under the trailing `prefix` style is converted rather than double-prefixed the first time it is normalised (`CustTableCr_Extension` → `CRCustTable_Extension`).
 
 ---
 

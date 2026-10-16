@@ -6,8 +6,8 @@
  * A label written through `labels(action="create")` lands as a line in
  * `<model>\AxLabelFile\LabelResources\<lang>\<file>.<lang>.label.txt`. Nothing
  * reads that text file at compile time: the compiler and the best-practice
- * checker resolve `@Model:Id` against the compiled resource assembly at
- * `<model>\Resources\<model>.dll`, which only labelc.exe produces.
+ * checker resolve `@LabelFile:Id` against the compiled resource assembly at
+ * `<model>\Resources\<LabelFile>.dll`, which only labelc.exe produces.
  *
  * This server never ran labelc, so on a model whose labels had only ever been
  * created through the MCP tools the `Resources` folder did not exist at all —
@@ -130,9 +130,12 @@ export async function findLabelFileDirs(packageDir: string): Promise<string[]> {
   return hits;
 }
 
-/** Newest mtime anywhere under `dirs`, or 0 when they hold nothing readable. */
-async function newestMtime(dirs: string[]): Promise<number> {
-  let newest = 0;
+/**
+ * Newest source mtime per label file ID under `dirs`: its
+ * `<id>.<lang>.label.txt` files and its `<id>_<lang>.xml` descriptors.
+ */
+async function newestSourcePerLabelFile(dirs: string[]): Promise<Map<string, number>> {
+  const newest = new Map<string, number>();
   const stack = [...dirs];
   while (stack.length > 0) {
     const dir = stack.pop()!;
@@ -148,9 +151,11 @@ async function newestMtime(dirs: string[]): Promise<number> {
         stack.push(full);
         continue;
       }
+      const id = /^(.+)\.[^.]+\.label\.txt$/i.exec(entry.name)?.[1] ?? /^(.+)_[^_]+\.xml$/i.exec(entry.name)?.[1];
+      if (!id) continue;
       try {
         const { mtimeMs } = await stat(full);
-        if (mtimeMs > newest) newest = mtimeMs;
+        if (mtimeMs > (newest.get(id) ?? 0)) newest.set(id, mtimeMs);
       } catch { /* vanished mid-scan */ }
     }
   }
@@ -168,15 +173,27 @@ async function newestMtime(dirs: string[]): Promise<number> {
 export async function labelAssembliesAreStale(
   labelDirs: string[],
   resourcesDir: string,
-  moduleName: string,
 ): Promise<boolean> {
-  let builtAt: number;
-  try {
-    builtAt = (await stat(path.join(resourcesDir, `${moduleName}.dll`))).mtimeMs;
-  } catch {
-    return true; // never compiled
+  // labelc emits one assembly per LABEL FILE — Resources\<LabelFileId>.dll —
+  // not one per module. Looking for Resources\<module>.dll found nothing on any
+  // model whose label file is named differently (VLTBase / VLTLabel on the VM),
+  // so labelc ran on every build and rewrote Resources. Each assembly is held
+  // to its OWN sources: on that model the other nine label files' assemblies
+  // are older than VLTLabel's latest edit, and measured against the model's
+  // newest source they would keep it stale forever.
+  const sources = await newestSourcePerLabelFile(labelDirs);
+  // An AxLabelFile folder with no label sources (its last label file deleted,
+  // or a model scaffolded with the empty folder) has nothing to compile:
+  // answering "stale" ran labelc on every build for no output.
+  if (sources.size === 0) return false;
+  for (const [id, newestSource] of sources) {
+    try {
+      if (newestSource > (await stat(path.join(resourcesDir, `${id}.dll`))).mtimeMs) return true;
+    } catch {
+      return true; // this label file was never compiled
+    }
   }
-  return (await newestMtime(labelDirs)) > builtAt;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +249,7 @@ export async function compileModelLabels(
     return { skipped: true, success: true, message: `${modelName} has no label files` };
   }
 
-  if (!force && !(await labelAssembliesAreStale(labelDirs, resourcesDir, modelName))) {
+  if (!force && !(await labelAssembliesAreStale(labelDirs, resourcesDir))) {
     return { skipped: true, success: true, message: 'label assemblies are up to date' };
   }
 

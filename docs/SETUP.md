@@ -243,6 +243,11 @@ cd bridge\D365MetadataBridge
 dotnet build -c Release        # output: bin\Release\D365MetadataBridge.exe (auto-detected)
 ```
 
+Every build also writes `D365MetadataBridge.sources.json` next to the exe: a hash of the sources it
+compiled. An update can change those sources and leave the exe in place (`git pull` never touches
+`bin\Release`; `npm install -g` never touches the data directory), so `d365fo-mcp update` requires
+a rebuild when the stamp is missing or differs, and `d365fo-mcp doctor` warns about it.
+
 ### Changing bridge sources — use `npm run bridge:build`
 
 The command above deploys a binary; it does **not** refresh `bridge/build-attestation.json`.
@@ -329,4 +334,4 @@ For a team-shared, project-scoped config, create `.mcp.json` in the solution roo
 
 ## Next steps
 
-[MCP_CONFIG.md](MCP_CONFIG.md) — every option · [MCP_TOOLS.md](MCP_TOOLS.md) — all 20 tools · [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) — real workflows · [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) — ISV/multi-model · [SETUP_AZURE.md § pipelines](SETUP_AZURE.md#azure-devops-pipelines) — automated index refresh
+[MCP_CONFIG.md](MCP_CONFIG.md) — every option · [MCP_TOOLS.md](MCP_TOOLS.md) — all 22 tools · [USAGE_EXAMPLES.md](USAGE_EXAMPLES.md) — real workflows · [CUSTOM_EXTENSIONS.md](CUSTOM_EXTENSIONS.md) — ISV/multi-model · [SETUP_AZURE.md § pipelines](SETUP_AZURE.md#azure-devops-pipelines) — automated index refresh

@@ -50,7 +50,8 @@ export const LABELS_OVERRIDE_PARAMS: Record<string, string> = {
     '[create] string[] — restrict which language .label.txt files are written (e.g. ["en-US"]). ' +
     'Omitted = every language folder present in the model.',
   defaultComment:
-    '[create] Developer comment for languages without an explicit comment.',
+    '[create] Developer comment for languages without an explicit comment. On update, an existing ' +
+    'comment is replaced only by a comment, defaultComment or description the call states.',
   description:
     '[create] Label description (comment line in .label.txt). Defaults to the VS project name from ' +
     '.rnrproj when omitted, then falls back to labelFileId. Per-translation comment and ' +

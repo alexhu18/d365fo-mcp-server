@@ -361,6 +361,20 @@ describe('compareSysTestDataAccess', () => {
     expect(await compareSysTestDataAccess(PKG)).toBeUndefined();
   });
 
+  it('compares the live settings, not commented-out or reordered copies', async () => {
+    // The runner config keeps the old database in a comment and writes the live
+    // entry value-first: the regex reader saw only the comment, and so reported
+    // a drift (AxDbRain vs AxDB) that the files do not have.
+    serve(doc([
+      '  <!-- <add key="DataAccess.Database" value="AxDbRain" /> -->',
+      '  <add value="AxDB" key="DataAccess.Database" />',
+      setting('DataAccess.SqlUser', 'axdbadmin'),
+      setting('DataAccess.SqlPwd', 'x'.repeat(828)),
+      setting('DataAccess.DbServer', 'D365DEVBOX-1'),
+    ]), AOS);
+    expect(await compareSysTestDataAccess(PKG)).toEqual([]);
+  });
+
   it('ignores a key the AOS config does not carry', async () => {
     serve(RUNNER, doc([
       setting('DataAccess.Database', 'AxDbRain'),

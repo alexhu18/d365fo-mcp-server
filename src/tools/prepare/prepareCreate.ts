@@ -18,7 +18,7 @@ import type { XppServerContext } from '../../types/context.js';
 import { createProvenanceToken } from '../../utils/provenanceStore.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { checkObjectNaming } from '../../utils/objectNamingRules.js';
-import { normalizeObjectName } from '../../utils/objectNaming.js';
+import { COC_BASE_SYMBOL_TYPES, inferExtendedBase, normalizeObjectName } from '../../utils/objectNaming.js';
 import { renderPrepareOpSpec } from '../specs/opSpecs.js';
 import { rankContext, renderRankedContext } from '../../workspace/contextRanker.js';
 import { budgetRankedContext } from './prepareChange.js';
@@ -511,7 +511,16 @@ export async function prepareCreateTool(request: any, context: XppServerContext)
   // prepare at its word, hand-fed a leading "_" to compensate, and got "ConSK__QualityTier"
   // on disk, which cost a create + undo + re-create. It also made the collision check probe
   // a name that never gets written, so a real collision read as "No collision".
-  const finalName = normalizeObjectName(objectName, objectType, modelName);
+  // A {Base}{Token}{Feature}_Extension class: create reads the base from [ExtensionOf];
+  // there is no source yet, so the index stands in for it (see inferExtendedBase).
+  const extendedBase = inferExtendedBase(objectName, modelName, n => {
+    try {
+      return lookupSymbolsNocase(context.symbolIndex.getReadDb(), n, { types: COC_BASE_SYMBOL_TYPES, limit: 1 }).length > 0;
+    } catch {
+      return false;
+    }
+  });
+  const finalName = normalizeObjectName(objectName, objectType, modelName, undefined, { extendedBase });
 
   // For an extension type, the BASE object decides whether the write can work at
   // all — so it is resolved FIRST and its verdict feeds the naming check, which

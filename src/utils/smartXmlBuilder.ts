@@ -10,6 +10,7 @@ import { ensureXppDocComment } from './xppDocGen.js';
 import { decodeXmlEntitiesFromXppSource } from './xmlEscape.js';
 import { type FieldControlMap, controlForField } from './fieldControlTypes.js';
 import { renderAxTableProperties } from './axTablePropertyOrder.js';
+import { DEFAULT_SUBSCRIBER_ACCESS_LEVEL } from './subscriberAccessLevel.js';
 import { axTableFieldElement, baseTypeFromEdtName, normalizeFieldBaseType } from './axFieldTypes.js';
 
 export interface TableFieldSpec {
@@ -182,6 +183,8 @@ export class SmartXmlBuilder {
     // VM-captured golden eval/goldens/L1-table-basic).
     xml += renderAxTableProperties({
       Label: label ? this.escapeXml(label) : undefined,
+      // What Visual Studio writes on a new table; none on TempDB/InMemory.
+      SubscriberAccessLevel: isTempTable ? undefined : { ...DEFAULT_SUBSCRIBER_ACCESS_LEVEL },
       TableGroup: effectiveTableGroup,
       TitleField1: titleCandidates[0]?.name,
       TitleField2: titleCandidates[1]?.name,

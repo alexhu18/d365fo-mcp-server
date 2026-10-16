@@ -207,6 +207,183 @@ describe('find_references — unsearchable targetType, bridge answered with no r
   });
 });
 
+// ─── declarative metadata references ───────────────────────────────────────────
+// Metadata references are stored with a singular, slash-free source path that
+// carries the referencing property. The C# bridge now queries their targets too
+// (Table/X, EdtString/X, …); what it hands back must read as "who uses it", not
+// as a raw path, and the summary must say how much came from metadata.
+
+describe('find_references — metadata references from the bridge', () => {
+  function bridgeWithMetadataRows(): BridgeClient {
+    return {
+      isReady: true,
+      metadataAvailable: true,
+      xrefAvailable: true,
+      findReferences: vi.fn(async () => ({
+        count: 3,
+        references: [
+          { sourcePath: '/Tables/MyFormatTable/Methods/exist', sourceModule: 'MyModel', line: 11, column: 5, referenceType: 'type-reference', callerClass: 'MyFormatTable', callerMethod: 'exist' },
+          { sourcePath: 'Table/MyOutboundStaging/TableFieldString/Format1?ExtendedDataType', sourceModule: 'MyModel', line: 0, column: 0, referenceType: 'type-reference', callerClass: 'MyOutboundStaging' },
+          { sourcePath: 'Form/MyJournalForm/FormDataSourceRoot/MyCountingTrans?Table', sourceModule: 'MyModel', line: 0, column: 0, referenceType: 'type-reference', callerClass: 'MyJournalForm' },
+        ],
+      })),
+    } as unknown as BridgeClient;
+  }
+
+  it('names the referencing object, member and property of a metadata reference', async () => {
+    const text = await runTool({ targetName: 'MyFormatCode', targetType: 'edt' }, bridgeWithMetadataRows());
+    expect(text).toContain('Table MyOutboundStaging › Format1 › ExtendedDataType');
+    expect(text).toContain('Form MyJournalForm › MyCountingTrans › Table');
+    // Code references keep their Class.method reading.
+    expect(text).toContain('MyFormatTable.exist');
+    expect(text).not.toContain('**Table/MyOutboundStaging/TableFieldString');
+  });
+
+  it('splits the summary into X++ code and declarative metadata', async () => {
+    const text = await runTool({ targetName: 'MyFormatCode', targetType: 'edt' }, bridgeWithMetadataRows());
+    expect(text).toContain('From X++ code: 1 · from declarative metadata: 2');
+    expect(text).toContain('X++ code and declarative metadata references');
+  });
+
+  it('scopes a bare name to the type targetType names, not every same-named object', async () => {
+    // Bare, "CustTable" also matched the form, menu item and query named CustTable.
+    for (const [targetType, path] of [['table', '/Tables/CustTable'], ['edt', '/Edts/CustTable'], ['form', '/Forms/CustTable']]) {
+      const bridge = bridgeWithMetadataRows();
+      await runTool({ targetName: 'CustTable', targetType }, bridge);
+      expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(path);
+      expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+    }
+    // Without a type there is nothing to scope to: the bridge expands the bare name.
+    const bridge = bridgeWithMetadataRows();
+    await runTool({ targetName: 'CustTable' }, bridge);
+    expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('CustTable');
+  });
+
+  it('scopes to entities, maps and menu items, which have no container of their own in "view"', async () => {
+    // "/Views/<entity>" matches nothing: an entity is stored under DataEntityViews.
+    for (const [targetType, paths] of [
+      ['data-entity', ['/DataEntityViews/CustCustomerV3Entity']],
+      ['map', ['/Maps/CustCustomerV3Entity']],
+      // A menu item often shares its name with the class or report it runs.
+      ['menu-item', ['/MenuItemDisplays/CustCustomerV3Entity', '/MenuItemActions/CustCustomerV3Entity', '/MenuItemOutputs/CustCustomerV3Entity']],
+    ] as const) {
+      const bridge = bridgeWithMetadataRows();
+      await runTool({ targetName: 'CustCustomerV3Entity', targetType }, bridge);
+      const fn = bridge.findReferences as ReturnType<typeof vi.fn>;
+      expect(fn.mock.calls.map(c => c[0])).toEqual(paths);
+    }
+  });
+
+  it('looks an enum value up as a member of its enum, written "Enum::Value" or "Enum.Value"', async () => {
+    for (const targetName of ['SalesStatus::Invoiced', 'SalesStatus.Invoiced']) {
+      const bridge = bridgeWithMetadataRows();
+      await runTool({ targetName, targetType: 'enum' }, bridge);
+      expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/Enums/SalesStatus/EnumValues/Invoiced');
+      expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+    }
+    // Untyped, an owner the index knows as an enum is queried for the value too.
+    const enumIndex = {
+      getReadDb: () => ({
+        prepare: (sql: string) => ({
+          all: (name: string) => (/FROM symbols/.test(sql) && /NOT IN/.test(sql) && name === 'SalesStatus'
+            ? [{ type: 'enum', model: 'ApplicationSuite' }] : []),
+        }),
+      }),
+    };
+    const bridge = bridgeWithMetadataRows();
+    await findReferencesTool(req({ targetName: 'SalesStatus::Invoiced' }), { symbolIndex: enumIndex, bridge } as any);
+    expect(bridge.findReferences as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('/Enums/SalesStatus/EnumValues/Invoiced');
+  });
+
+  it('queries an entity member under DataEntityViews, although the index calls the entity a view', async () => {
+    const viewIndex = {
+      getReadDb: () => ({
+        prepare: (sql: string) => ({
+          all: (name: string) => (/FROM symbols/.test(sql) && /NOT IN/.test(sql) && name === 'LogisticsPostalAddressBaseEntity'
+            ? [{ type: 'view', model: 'ApplicationSuite' }] : []),
+        }),
+      }),
+    };
+    const bridge = bridgeWithMetadataRows();
+    await findReferencesTool(req({ targetName: 'LogisticsPostalAddressBaseEntity.CountryRegionId', targetType: 'field' }), { symbolIndex: viewIndex, bridge } as any);
+    const fn = bridge.findReferences as ReturnType<typeof vi.fn>;
+    expect(fn.mock.calls.map(c => c[0])).toEqual([
+      '/Views/LogisticsPostalAddressBaseEntity/Fields/CountryRegionId',
+      '/DataEntityViews/LogisticsPostalAddressBaseEntity/Fields/CountryRegionId',
+    ]);
+  });
+
+  it('looks up a table index or field group only when targetType asks for it', async () => {
+    for (const [targetType, path] of [
+      ['index', '/Tables/CustTable/TableIndexs/AccountIdx'],
+      ['field-group', '/Tables/CustTable/TableFieldGroups/AccountIdx'],
+    ] as const) {
+      const bridge = bridgeWithMetadataRows();
+      await runTool({ targetName: 'CustTable.AccountIdx', targetType }, bridge);
+      expect((bridge.findReferences as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0])).toEqual([path]);
+    }
+    // Untyped, a same-named field must not pick up the index or the field group.
+    const bridge = bridgeWithMetadataRows();
+    await runTool({ targetName: 'CustTable.AccountIdx' }, bridge);
+    const sent = (bridge.findReferences as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]).join(' ');
+    expect(sent).not.toMatch(/TableIndexs|TableFieldGroups/);
+  });
+
+  it('asks for the table instead of reporting zero for an owner-less index or field group', async () => {
+    for (const targetType of ['index', 'field-group'] as const) {
+      const bridge = bridgeWithMetadataRows();
+      const text = await runTool({ targetName: 'AccountIdx', targetType }, bridge);
+      expect(bridge.findReferences).not.toHaveBeenCalled();
+      expect(text).toContain('NOT a count of zero');
+      expect(text).toContain('Table.AccountIdx');
+      expect(text).not.toMatch(/Total References Found/);
+    }
+  });
+
+  it('looks up a form data source method as Form.DataSource.method', async () => {
+    const bridge = bridgeWithMetadataRows();
+    await runTool({ targetName: 'VendOpenTrans.VendTransOpen.editMarkTrans', targetType: 'method' }, bridge);
+    expect((bridge.findReferences as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]))
+      .toEqual(['/Forms/VendOpenTrans/DataSources/VendTransOpen/Methods/editMarkTrans']);
+  });
+
+  it('reports the exact totals and shows both code and metadata rows when the bridge sampled', async () => {
+    // The live case: 785 references to a table, 451 of them metadata; the bridge
+    // returns up to 500 rows per shape with the true totals alongside.
+    const code = Array.from({ length: 334 }, (_, i) => ({
+      sourcePath: `/Classes/C${i}/Methods/m`, sourceModule: 'M', line: 1, column: 1, referenceType: 'field-access', callerClass: `C${i}`, callerMethod: 'm',
+    }));
+    const metadata = Array.from({ length: 166 }, (_, i) => ({
+      sourcePath: `Form/F${i}/FormDataSourceRoot/MyCountingTrans?Table`, sourceModule: 'M', line: 0, column: 0, referenceType: 'type-reference', callerClass: `F${i}`,
+    }));
+    const bridge = {
+      isReady: true, metadataAvailable: true, xrefAvailable: true,
+      findReferences: vi.fn(async () => ({ count: 500, total: 785, metadataTotal: 451, references: [...code, ...metadata] })),
+    } as unknown as BridgeClient;
+    const text = await runTool({ targetName: 'MyCountingTrans', targetType: 'table', limit: 20 }, bridge);
+    expect(text).toContain('**Total:** 785 reference(s) found (showing 500)');
+    expect(text).toContain('From X++ code: 334 · from declarative metadata: 451');
+    expect(text).toContain('the totals are exact');
+    // Neither shape crowds the other out of the list.
+    expect(text).toContain('### From declarative metadata (10 of 451)');
+    expect(text).toContain('### From X++ code (10 of 334)');
+    expect(text).toContain('Form F0 › MyCountingTrans › Table');
+  });
+
+  it('says when a lookup hit the bridge row limit, so the total is a floor', async () => {
+    const rows = Array.from({ length: 500 }, (_, i) => ({
+      sourcePath: `/Classes/C${i}/Methods/m`, sourceModule: 'M', line: 1, column: 1, referenceType: 'call', callerClass: `C${i}`, callerMethod: 'm',
+    }));
+    const bridge = {
+      isReady: true, metadataAvailable: true, xrefAvailable: true,
+      findReferences: vi.fn(async () => ({ count: 500, references: rows })),
+    } as unknown as BridgeClient;
+    const text = await runTool({ targetName: '/Tables/Busy' }, bridge);
+    expect(text).toContain('500+ reference(s)');
+    expect(text).toContain('limit of 500 rows');
+  });
+});
+
 // ─── defect 3 (TS half): explicit AOT paths reach the bridge untouched ─────────
 
 describe('find_references — explicit "/Edts/" path routing', () => {

@@ -532,11 +532,16 @@ async function initializeBridge(targetContext: import('./types/context.js').XppS
       }
     }
 
-    // Pass xref connection details for UDE environments
+    // Pass xref connection details: configured (traditional VM) or the XPP config (UDE)
     const xrefServer = await configMgr.getXrefDbServer() ?? undefined;
     const xrefDatabase = await configMgr.getXrefDbName() ?? undefined;
 
+    const { resolveAxDbConfig } = await import('./config/axdbSql.js');
+    let axdb;
+    try { axdb = resolveAxDbConfig(); }
+    catch (error) { console.error(`[AxDB] SQL configuration unavailable: ${error}`); }
     const bridge = await createBridgeClient({
+      axdb,
       packagesPath,
       referencePackagesPath,
       binPath,
@@ -579,6 +584,15 @@ async function main() {
   // stub, or the replacement built after a corrupt-DB recovery.
   onShutdown('symbol index', () => serverState.symbolIndex?.close?.());
   shutdownCoordinator.registerSignalHandlers({ stdio: isStdioMode });
+
+  // An ETW capture keeps its deadline across a restart, and stops with the server
+  // that started it — see src/tools/sdlc/trace/capture.ts.
+  const { isTraceEnabled } = await import('./config/trace.js');
+  if (isTraceEnabled() && process.platform === 'win32') {
+    const { resumeTimer, stopOwnCapture } = await import('./tools/sdlc/trace/capture.js');
+    resumeTimer();
+    onShutdown('ETW capture', () => stopOwnCapture());
+  }
 
   // Start the AosService drive scan now, off the event loop, in both transports.
   // Every path that needs a packages path reads a cache, and whoever fills it
@@ -953,6 +967,8 @@ async function main() {
           { name: 'update_symbol_index',          desc: 'Re-index a file changed outside this server (create/modify refresh it themselves)' },
           { name: 'build_d365fo_project',         desc: 'Compile the model locally; bpCheck/dbSync fold the BP check and the database sync into the same call' },
           { name: 'run_bp_check',                 desc: 'Run Microsoft Best Practices (xppbp.exe) analysis' },
+          { name: 'axdb_sql',                     desc: 'Optional: query AxDB on the dev VM (shown only when SQL is configured)' },
+          { name: 'trace_d365fo',                 desc: 'Optional: ETW trace of X++/SQL time on the dev VM (shown only when tracing is enabled)' },
           { name: 'run_systest_class',            desc: 'Execute unit tests using SysTestConsole.exe' },
         ]},
         { icon: '🧪', category: 'Code Quality & Grounding', tools: [

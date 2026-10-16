@@ -23,6 +23,7 @@ import {
   type FormExtensionControlSpec,
 } from '../../src/utils/formExtensionControlXml';
 import { validateFormExtensionControlShape } from '../../src/utils/formExtensionShapeValidator';
+import { findControlElementOrderViolations } from '../../src/validation/formControlElementOrder';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -878,5 +879,60 @@ describe('a file already damaged by the old writer', () => {
 
     expect(r.kind).toBe('refused');
     expect((r as { message: string }).message).toMatch(/discards/);
+  });
+});
+
+// ─── #1047: the caption element depends on the control type ──────────────────
+//
+// Field report: "Create a button on Purchase Order form to just print Hello
+// World" produced a button with no caption, visible only on hover. add-control
+// wrote the label as <Label> for every type, but AxFormButtonControl has no
+// Label — its caption is <Text> (and a Group's is <Caption>). The deserializer
+// drops the unknown element without a word, so the write read as ✅.
+
+describe('caption element follows the control type (#1047)', () => {
+  const button = (over: Partial<FormExtensionControlSpec> = {}) => spec({
+    controlName: 'HelloWorldButton',
+    parentControl: 'ButtonGroupBaseForm',
+    iType: 'AxFormButtonControl',
+    typeValue: 'Button',
+    dataSource: undefined,
+    dataField: undefined,
+    label: 'Hello World',
+    ...over,
+  });
+
+  it('writes a Button caption as <Text>, never <Label>', () => {
+    const r = inserted(insertFormExtensionControl(FLAT_EXT, button()));
+    expect(r.xml).toContain('<Text>Hello World</Text>');
+    expect(r.xml).not.toContain('<Label>Hello World</Label>');
+    expect(findControlElementOrderViolations(r.xml)).toEqual([]);
+  });
+
+  it('writes a Group caption as <Caption>, ahead of its <DataSource> as shipped forms do', () => {
+    const r = inserted(insertFormExtensionControl(FLAT_EXT, spec({
+      controlName: 'ConNewGroup',
+      parentControl: 'TabHeaderGeneral',
+      iType: 'AxFormGroupControl',
+      typeValue: 'Group',
+      dataField: undefined,
+      label: 'Quality',
+    })));
+    expect(r.xml).not.toContain('<Label>Quality</Label>');
+    expect(r.xml).toMatch(/<Caption>Quality<\/Caption>\s*<DataSource>InventTestGroup<\/DataSource>/);
+    expect(findControlElementOrderViolations(r.xml)).toEqual([]);
+  });
+
+  it('keeps <Label> for a field control', () => {
+    const r = inserted(insertFormExtensionControl(FLAT_EXT, spec({ parentControl: 'Grid', label: 'Blocked' })));
+    expect(r.xml).toContain('<Label>Blocked</Label>');
+  });
+
+  it('refuses to write a data binding a Button cannot carry, and says so', () => {
+    const r = inserted(insertFormExtensionControl(FLAT_EXT, button({ dataSource: 'PurchTable', dataField: 'PurchId' })));
+    expect(r.xml).not.toContain('<DataField>PurchId</DataField>');
+    expect(r.xml).not.toContain('<DataSource>PurchTable</DataSource>');
+    expect(r.notes.join('\n')).toMatch(/dataField "PurchId" was not written/);
+    expect(r.notes.join('\n')).toMatch(/dataSource "PurchTable" was not written/);
   });
 });

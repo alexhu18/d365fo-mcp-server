@@ -62,8 +62,8 @@ The model/project the server writes to. Auto-detected from the IDE when left emp
 | --- | --- | --- | --- | --- |
 | `workspace.modelName` | setup | `D365FO_MODEL_NAME` | — | The model new objects are created in. Leave empty to let the server detect it from the IDE workspace or the .rnrproj file — set it explicitly when one server instance always serves one model. |
 | `workspace.path` | setup | `D365FO_WORKSPACE_PATH` | — | Two-level AOT path of the model being worked on. Used to resolve the package root and the write target when the IDE does not report a workspace. |
-| `workspace.solutionsPath` | setup | `D365FO_SOLUTIONS_PATH` | — | Scanned once at startup so the server can switch model automatically when you open another solution or git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring. The scan resolves the MODEL; it does not pick a project when several .rnrproj under it build that model — get_workspace_info then reports `Project : (not selected)` and names them, and anything that registers a file needs an explicit projectName/projectPath. Picking one meant every write landed in whichever project the scan saw first. |
-| `workspace.projectPath` | advanced | `D365FO_PROJECT_PATH` | — | Forces one specific project instead of auto-detection. Rarely needed outside CI. |
+| `workspace.solutionsPath` | setup | `D365FO_SOLUTIONS_PATH` | — | Scanned once at startup so the server can switch model automatically when you open another solution or git branch. Optional, but it is what makes multi-project workspaces work without reconfiguring. The scan resolves the MODEL; it does not pick a project when several .rnrproj under it build that model — get_workspace_info then reports `Project : (not selected)` and names them, and anything that registers a file needs an explicit projectName/projectPath. Picking one meant every write landed in whichever project the scan saw first. With `workspace.modelName` set, only projects of that model are candidates. It is also the bound on which .rnrproj the server may write: `d365fo_file(action="project")` and the project registration done by create, modify, labels and generate_object all refuse a project that is not under this folder, the IDE's workspace/solution path, `workspace.solutionPath`, or the folder of `workspace.projectPath`. A project activated with `get_workspace_info(projectPath=…)` does not extend the bound — set this to the folder that holds your projects instead. |
+| `workspace.projectPath` | advanced | `D365FO_PROJECT_PATH` | — | Forces one specific project instead of auto-detection. Rarely needed outside CI. Its folder counts as a solution root for project writes (see `workspace.solutionsPath`). |
 | `workspace.solutionPath` | advanced | `D365FO_SOLUTION_PATH` | — | Forces one specific solution instead of auto-detection. Rarely needed outside CI. |
 | — | — | `D365FO_CROSS_MODEL_WRITE_MODELS` | — | Comma-separated models this workspace may write into besides its own. By default any create/modify/label write into another custom model is refused and the extension route in the active model is offered instead — see [Objects owned by another model](CUSTOM_EXTENSIONS.md#objects-owned-by-another-model). Consent lives here, in configuration, because a tool parameter is something the agent can grant itself. Re-read from `.env` before every decision, so an edit applies to the next attempt without a restart. |
 | — | — | `D365FO_ALLOW_CROSS_MODEL_WRITE` | `false` | Set to `true` to allow writes into **any** other custom model — the blanket form of the setting above. |
@@ -74,11 +74,11 @@ How generated objects, extensions and fields are named.
 
 | Key | Asked | Env var | Default | Description |
 | --- | --- | --- | --- | --- |
-| `naming.prefix` | setup | `EXTENSION_PREFIX` | — | Your ISV/customer prefix. Prepended to every generated object, field and method name and enforced by the naming validator, so BP checks pass on the first build. Used as the **fallback**: when the active model's existing objects already show a prefix, that one wins — see [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). |
-| `naming.prefixSource` | advanced | `EXTENSION_PREFIX_SOURCE` | `model` | Whether the effective prefix is learned from the active model's own objects or pinned to the configured `naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns the shared stem, while the objects you write need the full one. See [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). Values: `model` — the model's own objects decide, falling back to naming.prefix; `config` — always naming.prefix, inference off (pre-1.8.2 behaviour). |
+| `naming.prefix` | setup | `EXTENSION_PREFIX` | — | Your ISV/customer prefix. Prepended to every generated object, field and method name and enforced by the naming validator, so BP checks pass on the first build. Used as the **fallback**: when the active model's existing objects already show a prefix, that one wins — see [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). No prefix at all (a suffix convention)? Leave it empty and set `naming.prefixSource` to `none`; empty on its own still falls back to the model name. |
+| `naming.prefixSource` | advanced | `EXTENSION_PREFIX_SOURCE` | `model` | Whether the effective prefix is learned from the active model's own objects or pinned to the configured `naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns the shared stem, while the objects you write need the full one. `none` is for teams that use no prefix (e.g. a suffix convention with `naming.suffix`): new objects, fields and methods keep the name as given, and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). See [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). Values: `model` — the model's own objects decide, falling back to naming.prefix; `config` — always naming.prefix, inference off (pre-1.8.2 behaviour); `none` — no prefix at all — names as given; extensions embed the model name. |
 | `naming.suffix` | advanced | `EXTENSION_SUFFIX` | — | Optional suffix appended to new object names (MyTableZZ with suffix "ZZ"). Most projects use only a prefix — leave empty unless your convention requires one. |
 | `naming.extensionStyle` | advanced | `EXTENSION_NAMING_STYLE` | `prefix` | Whether extension classes/elements embed the prefix (per the Microsoft prefix guideline) or the model name (the Visual Studio default). Use model-name when your model name is long but your prefix is a short abbreviation. Values: `prefix` — CustTable.CrExtension — embeds the extension prefix; `model-name` — CustTable.ContosoRobotics — embeds the model name (VS default). |
-| `naming.extensionClassStyle` | advanced | `EXTENSION_CLASS_NAMING_STYLE` | `inherit` | Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one or the other. Leave on inherit unless your convention names classes differently from elements. Values: `inherit` — follow naming.extensionStyle — the default, behaviour unchanged; `prefix` — CustTableCtso_Extension — embeds the extension prefix; `model-name` — CustTable_ContosoRobotics_Extension — embeds the model name. |
+| `naming.extensionClassStyle` | advanced | `EXTENSION_CLASS_NAMING_STYLE` | `inherit` | Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one or the other. Leave on inherit unless your convention names classes differently from elements. Values: `inherit` — follow naming.extensionStyle — the default, behaviour unchanged; `prefix` — CustTableCtso_Extension — embeds the extension prefix, trailing; `model-name` — CustTable_ContosoRobotics_Extension — embeds the model name; `prefix-leading` — CtsoCustTable_Extension — embeds the extension prefix, leading (e.g. Avanade Development Guidelines). |
 
 ### Metadata index
 
@@ -105,7 +105,7 @@ Transport, timeouts and logging of the MCP server process.
 | Key | Asked | Env var | Default | Description |
 | --- | --- | --- | --- | --- |
 | `server.mode` | advanced | `MCP_SERVER_MODE` | `full` | Which half of the toolset this process exposes. "full" is a single local server; the hybrid deployment splits into an Azure "read-only" instance plus a local "write-only" companion that owns the C# bridge. Values: `full` — all tools — single local server; `read-only` — search/inspect only — Azure-hosted shared index; `write-only` — create/modify/build only — local companion. |
-| `server.toolProfile` | advanced | `MCP_TOOL_PROFILE` | `full` | How many tools this server advertises. "full" publishes all 20. "core" publishes only the plan → discover → write → build → verify loop (15 tools) and leaves out the specialist ones (extension_info, analyze_code, validate_code, security_info, run_systest_class). Worth switching when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool. Values: `full` — all 20 tools; `core` — 15-tool create-and-build loop. |
+| `server.toolProfile` | advanced | `MCP_TOOL_PROFILE` | `full` | How many tools this server advertises. "full" publishes all 22 (axdb_sql and trace_d365fo only once configured). "core" publishes only the plan → discover → write → build → verify loop (17 tools) and leaves out the specialist ones (extension_info, analyze_code, validate_code, security_info, run_systest_class). Worth switching when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool. Values: `full` — all 22 tools; `core` — 17-tool create-and-build loop. |
 | `server.extraTools` | advanced | `MCP_EXTRA_TOOLS` | — | Tool names to publish in addition to the core profile, e.g. security_info,run_systest_class. Ignored when the tool profile is "full". |
 | `server.port` | setup | `PORT` | `8080` | Port for the HTTP transport. Only relevant when clients connect over http://localhost:<port>/mcp/ — an IDE that spawns the server itself uses stdio and ignores this. |
 | `server.host` | advanced | `HOST` | `0.0.0.0` | Interface the HTTP transport binds to. Left unset it follows the API key: 0.0.0.0 once a key (or ALLOW_UNAUTHENTICATED) is configured, which is what a container or App Service needs, and 127.0.0.1 when neither is, so an unauthenticated server stays off the network. Setting it to a public interface without a key is refused at startup. |
@@ -138,8 +138,34 @@ The metadata-provider child process — the only write path to the AOT.
 | `bridge.maxRestarts` | advanced | `BRIDGE_MAX_RESTARTS` | `3` | Circuit breaker: after this many respawns within 60 s the server stops trying. |
 | `bridge.exePath` | advanced | `D365FO_BRIDGE_EXE_PATH` | — | Absolute path to D365MetadataBridge.exe. Leave empty to auto-detect inside the installation — the setup wizard fills this in for an npm install, where the binary is built outside the package so that updating the package does not delete it. |
 | `bridge.logFile` | advanced | `D365FO_BRIDGE_LOG_FILE` | — | Absolute path the C# bridge appends its own diagnostics to. |
+| `bridge.xrefDbServer` | advanced | `D365FO_XREF_DB_SERVER` | — | SQL Server holding the X++ cross-reference database that find_references reads through the bridge. Leave empty to use the XPP config (UDE), or localhost when only the database name is set. Takes precedence over the XPP config. |
+| `bridge.xrefDbName` | advanced | `D365FO_XREF_DB_NAME` | — | Name of the X++ cross-reference database — DYNAMICSXREFDB on a traditional VM, where no XPP config names it and find_references otherwise falls back to a name-based search. Leave empty to use the XPP config (UDE). Takes precedence over the XPP config. |
 | `bridge.fsScanTimeoutMs` | advanced | `D365FO_FS_SCAN_TIMEOUT_MS` | `3000` | Budget for the filesystem scan used when the bridge cannot answer an extension lookup (minimum 500). |
 | `bridge.disableFsFallback` | advanced | `D365FO_DISABLE_FS_FALLBACK` | `false` | Makes extension lookups bridge-only. Turn on to diagnose stale-index issues — results get stricter, not faster. |
+
+### AxDB SQL (optional)
+
+Windows-authenticated SQL access to AxDB on a development VM, for debugging.
+
+| Key | Asked | Env var | Default | Description |
+| --- | --- | --- | --- | --- |
+| `sql.enabled` | advanced | `D365FO_SQL_ENABLED` | `false` | Enable the optional, read-only SQL tool after configuring its server. Blank server always disables SQL. |
+| `sql.server` | setup | `D365FO_SQL_SERVER` | — | Optional server or named instance; enter localhost for a local developer SQL Server. Leaving it empty skips SQL setup. |
+| `sql.database` | setup | `D365FO_SQL_DATABASE` | `AxDB` | Database to query on this server. This is separate from the metadata index and cross-reference database. |
+| `sql.trustServerCertificate` | setup | `D365FO_SQL_TRUST_CERTIFICATE` | `false` | Use for a developer SQL Server with a self-signed certificate. The connection remains encrypted. |
+| `sql.commandTimeoutSeconds` | advanced | `D365FO_SQL_TIMEOUT` | `30` | Maximum time for each SQL command; a batch also has a total time budget. |
+| `sql.maxRows` | advanced | `D365FO_SQL_MAX_ROWS` | `100` | Default returned row limit. Large results are explicitly marked truncated. |
+
+### ETW performance trace (optional)
+
+Capture and analyse an ETW trace of X++ methods and SQL on this D365FO VM.
+
+| Key | Asked | Env var | Default | Description |
+| --- | --- | --- | --- | --- |
+| `trace.enabled` | advanced | `D365FO_TRACE_ENABLED` | `false` | Publish the optional trace_d365fo tool: capture an ETW trace of X++ methods and SQL on this D365FO VM and analyse it, instead of adding timer code. Needs a Windows account allowed to run logman (Administrators or Performance Log Users). |
+| `trace.outputDir` | advanced | `D365FO_TRACE_DIR` | — | Where captures are written. A capture grows by tens of MB per second, so pick a drive with space. Left empty, the folder the agent proposes when it first needs one is remembered for this installation. |
+| `trace.maxSeconds` | advanced | `D365FO_TRACE_MAX_SECONDS` | `120` | A running capture is stopped after this many seconds even if nobody stops it. |
+| `trace.maxSizeMB` | advanced | `D365FO_TRACE_MAX_SIZE_MB` | `4096` | logman stops the capture by itself when the file reaches this size. |
 
 ### Quality gates
 
@@ -234,6 +260,8 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "maxRestarts": 3,
     "exePath": "",
     "logFile": "",
+    "xrefDbServer": "",
+    "xrefDbName": "",
     "fsScanTimeoutMs": 3000,
     "disableFsFallback": false
   },
@@ -244,6 +272,20 @@ Downloading a pre-built index from blob storage instead of building it locally.
   "azure": {
     "blobContainer": "xpp-metadata",
     "blobDatabase": "databases/xpp-metadata-latest.db"
+  },
+  "sql": {
+    "enabled": false,
+    "server": "localhost or localhost\\INSTANCE",
+    "database": "AxDB",
+    "trustServerCertificate": false,
+    "commandTimeoutSeconds": 30,
+    "maxRows": 100
+  },
+  "trace": {
+    "enabled": false,
+    "outputDir": "",
+    "maxSeconds": 120,
+    "maxSizeMB": 4096
   }
 }
 ```

@@ -55,7 +55,7 @@
  * transcript rather than a log nobody opens.
  */
 
-import { resolveObjectPrefix, applyObjectPrefix } from './modelClassifier.js';
+import { resolveObjectPrefix, applyObjectPrefix, isNoPrefixMode } from './modelClassifier.js';
 import { reloadWritePolicy } from './loadEnv.js';
 
 /** An extension of the target object that already exists in the active model. */
@@ -102,6 +102,11 @@ export interface CrossModelWriteCheck {
    * cannot be followed.
    */
   action?: 'modify' | 'create' | 'delete';
+  /**
+   * Wording only — a dry run that previews the write. standDownNotice then says
+   * what WOULD be written instead of reporting a write that never happened.
+   */
+  dryRun?: boolean;
 }
 
 /**
@@ -150,12 +155,13 @@ const PAST_TENSE: Record<NonNullable<CrossModelWriteCheck['action']>, string> = 
 export function standDownNotice(check: CrossModelWriteCheck): string {
   const { objectName, owningModel, activeModel } = check;
   const verb = check.action ?? 'modify';
+  const happened = check.dryRun ? 'would be' : 'was';
   if (!owningModel) return '';
   if (activeModel && (eq(owningModel, activeModel) || eq(check.owningPackage, activeModel))) return '';
 
   if (!activeModel) {
     return (
-      `\n\n⚠️ **Cross-model guard did not run.** "${objectName}" was written into model ` +
+      `\n\n⚠️ **Cross-model guard did not run.** "${objectName}" ${happened} written into model ` +
       `"${owningModel}", and this workspace's write anchor model could not be determined — so ` +
       `nothing verified that "${owningModel}" is where you meant it to go. If it is not, undo this ` +
       `and set the model explicitly (\`modelName\` in the server's config) before writing again.`
@@ -164,7 +170,7 @@ export function standDownNotice(check: CrossModelWriteCheck): string {
 
   if (crossModelWriteAllowedByConfig(owningModel)) {
     return (
-      `\n\n⚠️ **Cross-model write permitted by configuration.** "${objectName}" was ${PAST_TENSE[verb]} ` +
+      `\n\n⚠️ **Cross-model write permitted by configuration.** "${objectName}" ${happened} ${PAST_TENSE[verb]} ` +
       `in model "${owningModel}", not in "${activeModel}" which this workspace targets. ` +
       `D365FO_ALLOW_CROSS_MODEL_WRITE / D365FO_CROSS_MODEL_WRITE_MODELS is what allowed it. ` +
       `The change will not appear in this workspace's project or version control, and every model ` +
@@ -236,9 +242,10 @@ export function suggestedExtensionName(
 ): string | null {
   if (!EXTENSION_TYPE_OF[baseType]) return null;
   const prefix = resolveObjectPrefix(activeModel);
-  if (!prefix) return null;
+  // naming.prefixSource=none still names extensions — after the model.
+  if (!prefix && !isNoPrefixMode()) return null;
   return baseType === 'class'
-    ? applyObjectPrefix(`${baseObject}_Extension`, prefix, activeModel)
+    ? applyObjectPrefix(`${baseObject}_Extension`, prefix, activeModel, { knownBase: true })
     : applyObjectPrefix(`${baseObject}.Extension`, prefix, activeModel);
 }
 

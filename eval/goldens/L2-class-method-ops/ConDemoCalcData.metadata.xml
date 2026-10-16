@@ -64,6 +64,9 @@ public class ConDemoCalcData extends common
 		</Methods>
 	</SourceCode>
 	<Label>@SYS13887</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>ItemName</TitleField1>
 	<TitleField2>Qty</TitleField2>

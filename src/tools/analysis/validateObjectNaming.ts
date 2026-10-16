@@ -56,7 +56,7 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
     const {
       errors, warnings, suggestions, exactConflict, similarSymbols,
       isExtension, prefix, modelName, modelTokenPhrase, extensionInfix,
-      useModelName, namingStyle, useModelNameForClass, classNamingStyle,
+      useModelName, namingStyle, useModelNameForClass, usePrefixLeadingForClass, classNamingStyle,
     } = check;
     const name = args.proposedName;
     const reinterpreted = check.reinterpretedNote ? { note: check.reinterpretedNote } : undefined;
@@ -83,13 +83,16 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       // the two are the same unless EXTENSION_CLASS_NAMING_STYLE says otherwise.
       const isClassExt = args.objectType === 'class-extension';
       const appliedUseModelName = isClassExt ? useModelNameForClass : useModelName;
+      const appliedUsePrefixLeading = isClassExt && usePrefixLeadingForClass;
       const appliedStyle = isClassExt ? classNamingStyle : namingStyle;
       const appliedVar = isClassExt && classNamingStyle !== namingStyle
         ? 'EXTENSION_CLASS_NAMING_STYLE'
         : 'EXTENSION_NAMING_STYLE';
       output += appliedUseModelName
         ? `Extension Style: model-name (token = ${modelTokenPhrase})\n`
-        : `Extension Style: prefix (token = "${extensionInfix}")\n`;
+        : appliedUsePrefixLeading
+          ? `Extension Style: prefix-leading (token = "${extensionInfix}")\n`
+          : `Extension Style: prefix (token = "${extensionInfix}")\n`;
       if (classNamingStyle !== namingStyle) {
         output += `  ℹ Element extensions use "${namingStyle}", extension classes use "${classNamingStyle}" (EXTENSION_CLASS_NAMING_STYLE).\n`;
       }

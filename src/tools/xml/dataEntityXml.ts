@@ -145,6 +145,45 @@ export function isYes(value: unknown): boolean {
   return false;
 }
 
+/** Every `properties` key buildAxDataEntityXml reads. Anything else is dropped. */
+const KNOWN_ENTITY_PROPERTIES: ReadonlySet<string> = new Set([
+  'label', 'publicEntityName', 'publicCollectionName', 'entityCategory', 'primaryTable', 'fields',
+  'allowRowVersionChangeTracking', 'changeTrackingEnabled', 'isPublic', 'declaration', 'methods',
+  'fieldGroups', 'standardStructure', 'dataManagementEnabled', 'dataManagementStagingTable',
+  'primaryKey', 'entityKeyName', 'primaryKeyField', 'primaryKeyFields', 'dynamicFields',
+  'isReadOnly', 'tags', 'configurationKey', 'primaryCompanyContext', 'surrogateKey',
+  // Read one level up, where XmlTemplateGenerator splits it into declaration + methods.
+  'sourceCode',
+]);
+
+/**
+ * `properties` keys the generator does not read. A create used to answer ✅ for a
+ * `properties.someTypo` that changed nothing; the caller lists them in the reply.
+ */
+export function findIgnoredEntityProperties(properties?: Record<string, any>): string[] {
+  return Object.keys(properties ?? {}).filter(k => !KNOWN_ENTITY_PROPERTIES.has(k) && properties![k] !== undefined);
+}
+
+/**
+ * The staging table an entity with dataManagementEnabled=true points at. This
+ * builder writes the REFERENCE only; nothing creates the table, so the next full
+ * build fails with a missing-table error. Empty when data management is off.
+ */
+export function stagingTableNote(entityName: string, properties?: Record<string, any>): string {
+  if (!isYes(properties?.dataManagementEnabled)) return '';
+  const staging = properties?.dataManagementStagingTable || `${entityName}Staging`;
+  return (
+    `\n⚠️ dataManagementEnabled=true wrote <DataManagementStagingTable>${staging}</DataManagementStagingTable>, ` +
+    `but this create does NOT create that table — the build fails ("table '${staging}' does not exist") ` +
+    `until it exists. Create it as its own table: TableGroup=Staging, SaveDataPerCompany=No, ` +
+    `DeveloperDocumentation=@DMF:StagingDeveloperDocumentation, the DMF fields DefinitionGroup / ` +
+    `ExecutionId / IsSelected (DMFIsSelected) / TransferStatus (DMFTransferStatus), one field per ` +
+    `entity field with the same EDT/enum type, an alternate-key index StagingIdx on ` +
+    `DefinitionGroup, ExecutionId and the entity's key fields, and a DataEntity relation back to '${entityName}'. ` +
+    `Or omit dataManagementEnabled and enable it later.`
+  );
+}
+
 function buildFieldGroupsXml(
   groups: Array<{ name: string; autoPopulate?: boolean; fields?: string[] }>,
 ): string {
@@ -197,7 +236,7 @@ export function buildAxDataEntityXml(entityName: string, properties?: Record<str
   const entityCategory = assertKnownEnumValue(
     `Data entity '${entityName}': entityCategory`, properties?.entityCategory, ENTITY_CATEGORIES, 'Transaction');
   const primaryTable: string | undefined = properties?.primaryTable;
-  const fields: Array<{ name: string; dataField?: string }> | undefined =
+  let fields: Array<{ name: string; dataField?: string }> | undefined =
     Array.isArray(properties?.fields) ? properties.fields : undefined;
 
   // ── Opt-in additions. Every one of these must be absent from the output when
@@ -241,18 +280,30 @@ export function buildAxDataEntityXml(entityName: string, properties?: Record<str
   const stateMachinesXml = standardStructure ? '\t<StateMachines />\n' : '';
 
   // Omitted unless opted in — same NoYes-default rule as IsPublic above.
-  const dataManagementXml = properties?.dataManagementEnabled === true
+  const dataManagementXml = isYes(properties?.dataManagementEnabled)
     ? `\t<DataManagementEnabled>Yes</DataManagementEnabled>\n` +
       `\t<DataManagementStagingTable>${properties?.dataManagementStagingTable || `${entityName}Staging`}</DataManagementStagingTable>\n`
     : '';
+
+  // Opt-in properties, absent unless passed; positions follow ENTITY_TOP_LEVEL_ORDER (dataEntityViewEdit.ts).
+  const optText = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() ? escapeXml(v.trim()) : undefined;
+  const configKey = optText(properties?.configurationKey);
+  const configKeyXml = configKey ? `\t<ConfigurationKey>${configKey}</ConfigurationKey>\n` : '';
+  const tags = optText(properties?.tags);
+  const tagsXml = tags ? `\t<Tags>${tags}</Tags>\n` : '';
+  const readOnlyXml = isYes(properties?.isReadOnly) ? '\t<IsReadOnly>Yes</IsReadOnly>\n' : '';
+  const companyContext = optText(properties?.primaryCompanyContext);
+  const companyContextXml = companyContext
+    ? `\t<PrimaryCompanyContext>${companyContext}</PrimaryCompanyContext>\n` : '';
 
   if (!primaryTable || !fields || fields.length === 0) {
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxDataEntityView xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 \t<Name>${entityName}</Name>
-${sourceCodeXml}\t<Label>${escapeXml(label)}</Label>
-${changeTrackingXml}${dataManagementXml}\t<EntityCategory>${entityCategory}</EntityCategory>
-${isPublicXml}${publicNamesXml}${deleteActionsXml}${fieldGroupsXml}\t<Fields />
+${sourceCodeXml}${configKeyXml}\t<Label>${escapeXml(label)}</Label>
+${tagsXml}${changeTrackingXml}${dataManagementXml}\t<EntityCategory>${entityCategory}</EntityCategory>
+${isPublicXml}${readOnlyXml}${companyContextXml}${publicNamesXml}${deleteActionsXml}${fieldGroupsXml}\t<Fields />
 \t<Keys />
 \t<Mappings />
 \t<Ranges />
@@ -266,8 +317,14 @@ ${stateMachinesXml}\t<ViewMetadata />
   // in both <PrimaryKey> and <AxDataEntityViewKey><Name>), and the key may span
   // several fields for a composite business key.
   const keyName: string = properties?.primaryKey || properties?.entityKeyName || 'EntityKey';
-  const keyFields: string[] =
-    Array.isArray(properties?.primaryKeyFields) && properties.primaryKeyFields.length > 0
+  // surrogateKey: a SourceKey field (the shipped name) bound to the table's RecId is the sole key. Wins over primaryKeyField(s).
+  const surrogate = isYes(properties?.surrogateKey);
+  if (surrogate && !fields.some(f => f.name === 'SourceKey')) {
+    fields = [...fields, { name: 'SourceKey', dataField: 'RecId' }];
+  }
+  const keyFields: string[] = surrogate
+    ? ['SourceKey']
+    : Array.isArray(properties?.primaryKeyFields) && properties.primaryKeyFields.length > 0
       ? properties.primaryKeyFields.map((f: any) => String(f))
       : [properties?.primaryKeyField || fields[0].name];
 
@@ -295,9 +352,9 @@ ${stateMachinesXml}\t<ViewMetadata />
   return `<?xml version="1.0" encoding="utf-8"?>
 <AxDataEntityView xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 \t<Name>${entityName}</Name>
-${sourceCodeXml}\t<Label>${escapeXml(label)}</Label>
-${changeTrackingXml}${dataManagementXml}\t<EntityCategory>${entityCategory}</EntityCategory>
-${isPublicXml}\t<PrimaryKey>${keyName}</PrimaryKey>
+${sourceCodeXml}${configKeyXml}\t<Label>${escapeXml(label)}</Label>
+${tagsXml}${changeTrackingXml}${dataManagementXml}\t<EntityCategory>${entityCategory}</EntityCategory>
+${isPublicXml}${readOnlyXml}${companyContextXml}\t<PrimaryKey>${keyName}</PrimaryKey>
 ${publicNamesXml}${deleteActionsXml}${fieldGroupsXml}\t<Fields>
 ${entityFieldsXml}
 \t</Fields>

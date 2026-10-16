@@ -31,6 +31,9 @@ public class ConDemoAgentNote extends common
 		<Methods />
 	</SourceCode>
 	<Label>@SYS13887</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>Subject</TitleField1>
 	<TitleField2>NoteId</TitleField2>

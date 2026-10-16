@@ -71,6 +71,7 @@
   <!-- NuGet packages -->
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
+    <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="161.8901.0" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
@@ -139,6 +140,76 @@
     <Task>
       <Code Type="Fragment" Language="cs">
         Version = System.Diagnostics.FileVersionInfo.GetVersionInfo(FilePath).FileVersion ?? "";
+      </Code>
+    </Task>
+  </UsingTask>
+
+  <!--
+    Record WHICH sources this binary was compiled from, next to the binary (#1115).
+
+    An update can move the bridge sources and leave the built exe in place: `npm
+    install -g` replaces the package but not the build in the data directory,
+    and `git pull` never touches bin/Release. The server then runs new
+    TypeScript against an old bridge, and nothing says so. `update` and `doctor`
+    compare this stamp with the sources on disk (src/cli/bridgeSources.ts).
+
+    Written by the build itself, so every way of building leaves one: setup,
+    update, `npm run bridge:build` or a hand-run `dotnet build`, with or without
+    `-o`. The hash is the one scripts/bridgeAttest.mjs computes (same files,
+    same order, CRLF normalised). It runs only after a successful build: a
+    failed build keeps the previous binary and so, correctly, its stamp.
+  -->
+  <Target Name="WriteBridgeSourceStamp" AfterTargets="Build">
+    <WriteBridgeSourceStamp ProjectDir="$(MSBuildProjectDirectory)"
+                            RepoRoot="$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\..'))"
+                            OutputFile="$(OutDir)D365MetadataBridge.sources.json" />
+    <ItemGroup>
+      <FileWrites Include="$(OutDir)D365MetadataBridge.sources.json" />
+    </ItemGroup>
+  </Target>
+
+  <UsingTask TaskName="WriteBridgeSourceStamp" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <ProjectDir ParameterType="System.String" Required="true" />
+      <RepoRoot ParameterType="System.String" Required="true" />
+      <OutputFile ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs">
+        <![CDATA[
+        var files = new System.Collections.Generic.List<string>();
+        var pending = new System.Collections.Generic.Stack<string>();
+        pending.Push(System.IO.Path.GetFullPath(ProjectDir).TrimEnd('\\', '/'));
+        while (pending.Count > 0)
+        {
+            var dir = pending.Pop();
+            foreach (var sub in System.IO.Directory.GetDirectories(dir))
+            {
+                var name = System.IO.Path.GetFileName(sub);
+                if (name != "obj" && name != "bin") pending.Push(sub);
+            }
+            foreach (var file in System.IO.Directory.GetFiles(dir))
+                if (file.EndsWith(".cs", System.StringComparison.Ordinal) || file.EndsWith(".csproj", System.StringComparison.Ordinal)) files.Add(file);
+        }
+        files.Sort(System.StringComparer.Ordinal);
+        var root = System.IO.Path.GetFullPath(RepoRoot).TrimEnd('\\', '/');
+        var manifest = new System.Text.StringBuilder();
+        using (var sha = System.Security.Cryptography.SHA256.Create())
+        {
+            foreach (var file in files)
+            {
+                var rel = file.Substring(root.Length).TrimStart('\\', '/').Replace('\\', '/');
+                var content = new System.Text.UTF8Encoding(false).GetString(System.IO.File.ReadAllBytes(file)).Replace("\r\n", "\n");
+                var fileHash = System.BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(content))).Replace("-", "").ToLowerInvariant();
+                manifest.Append(rel).Append(':').Append(fileHash).Append('\n');
+            }
+            var hash = System.BitConverter.ToString(sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(manifest.ToString()))).Replace("-", "").ToLowerInvariant();
+            System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(OutputFile)));
+            System.IO.File.WriteAllText(OutputFile,
+                "{\n  \"sourceHash\": \"" + hash + "\",\n  \"sourceFileCount\": " + files.Count + ",\n  \"builtAt\": \"" + System.DateTime.UtcNow.ToString("o") + "\"\n}\n");
+        }
+        ]]>
       </Code>
     </Task>
   </UsingTask>

@@ -5,6 +5,8 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     setupFiles: ['./tests/setup.ts'],
+    // Fails the run if a test deletes files directly in os.tmpdir() — see the file.
+    globalSetup: ['./tests/tmpdirGuard.globalSetup.ts'],
     // Integration tests (*.integration.test.ts) are run separately via
     // vitest.integration.config.ts (npm run test:integration) — keep them out
     // of the default unit run so the two tiers stay distinct.

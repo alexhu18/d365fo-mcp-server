@@ -27,6 +27,11 @@ import * as path from 'path';
 const mockResolveDbPathLocally = vi.fn(async (_p: string): Promise<string | null> => null);
 vi.mock('../../src/utils/metadataResolver', () => ({
   resolveDbPathLocally: (p: string) => mockResolveDbPathLocally(p),
+  // The real remap: the part after PackagesLocalDirectory, under the configured root.
+  remapDbPathLocally: async (p: string) => {
+    const m = p.replace(/\\/g, '/').match(/PackagesLocalDirectory\/(.+)$/i);
+    return m && packagesRoot.value ? path.join(packagesRoot.value, ...m[1].split('/')) : null;
+  },
 }));
 
 /** An existing directory stands in for a reachable PackagesLocalDirectory. */
@@ -71,8 +76,20 @@ describe('indexedPathIsMissing', () => {
     packagesRoot.value = REACHABLE_ROOT;
   });
 
-  it('reports a PackagesLocalDirectory path with no file at either location', async () => {
-    expect(await indexedPathIsMissing(GHOST)).toBe(true);
+  it('reports a foreign PackagesLocalDirectory path whose model folder is here without the file', async () => {
+    // GHOST's own root (Q:) is not on this machine, so the remap decides: the model
+    // folder is here, the file is not — deleted, not "not installed".
+    realFs.mkdirSync(path.join(REACHABLE_ROOT, 'GhostModel', 'GhostModel', 'AxEnum'), { recursive: true });
+    try {
+      expect(await indexedPathIsMissing(GHOST)).toBe(true);
+    } finally {
+      realFs.rmSync(path.join(REACHABLE_ROOT, 'GhostModel'), { recursive: true, force: true });
+    }
+  });
+
+  it('does not report a foreign path whose package is simply not installed here', async () => {
+    // The shipped index records every standard package; a machine installs a subset.
+    expect(await indexedPathIsMissing(GHOST)).toBe(false);
   });
 
   it('says nothing when the packages root itself is unreachable', async () => {
@@ -93,11 +110,10 @@ describe('indexedPathIsMissing', () => {
     expect(await indexedPathIsMissing(GHOST)).toBe(false);
   });
 
-  it('never judges a path outside PackagesLocalDirectory', async () => {
+  it('does not flag a build-agent path outside PackagesLocalDirectory', async () => {
     // Unreachable is not deleted — calling a build-agent row stale would tell the
     // agent to re-create objects that exist perfectly well.
     expect(await indexedPathIsMissing(BUILD_AGENT)).toBe(false);
-    expect(mockResolveDbPathLocally).not.toHaveBeenCalled();
   });
 
   it('says nothing for a row with no path at all', async () => {
@@ -129,11 +145,14 @@ describe('resolveIndexedObject — sourceFileMissing', () => {
 
   it('flags a row whose file is gone', async () => {
     mockLookupSymbolNocase.mockReturnValue({ name: 'ConSK_QualityTier', model: 'ContosoFinanceSK', file_path: GHOST });
-
-    const ref = await resolveIndexedObject({}, 'ConSK_QualityTier', ['enum']);
-
-    expect(ref?.sourceFileMissing).toBe(true);
-    expect(ref?.localPath).toBeNull();
+    realFs.mkdirSync(path.join(REACHABLE_ROOT, 'GhostModel', 'GhostModel', 'AxEnum'), { recursive: true });
+    try {
+      const ref = await resolveIndexedObject({}, 'ConSK_QualityTier', ['enum']);
+      expect(ref?.sourceFileMissing).toBe(true);
+      expect(ref?.localPath).toBeNull();
+    } finally {
+      realFs.rmSync(path.join(REACHABLE_ROOT, 'GhostModel'), { recursive: true, force: true });
+    }
   });
 
   it('does not flag a row that resolves to a readable file', async () => {

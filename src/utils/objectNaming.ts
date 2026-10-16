@@ -21,6 +21,8 @@ import {
   getObjectSuffix,
   getExtensionNamingStyle,
   getExtensionClassNamingStyle,
+  endsWithInfix,
+  inferBaseBeforeToken,
 } from './modelClassifier.js';
 import { normalizeModelToken } from './modelToken.js';
 
@@ -35,6 +37,33 @@ export const DOT_NOTATION_EXTENSION_TYPES: ReadonlySet<string> = new Set([
   'menu-item-output-extension', 'menu-extension',
   'security-duty-extension', 'security-role-extension',
 ]);
+
+/**
+ * Index types a CoC class can extend. Scopes inferExtendedBase's lookups, so a
+ * candidate also spelled by thousands of method/field rows stays a cheap probe.
+ */
+export const COC_BASE_SYMBOL_TYPES: readonly string[] = ['class', 'table', 'form', 'view', 'query', 'data-entity', 'map'];
+
+/**
+ * The base a `{Base}{Token}{Feature}_Extension` class name extends, for a caller
+ * with no `[ExtensionOf]` to read it from — prepare and validate_object_naming
+ * predict names before any source exists. The writer reads the base from the
+ * attribute; these read it from the index, so all three name the same class.
+ * Undefined for any other shape, or when no known object precedes the token.
+ */
+export function inferExtendedBase(
+  objectName: string,
+  modelName: string | undefined,
+  isKnownObject: (name: string) => boolean,
+): string | undefined {
+  // A dotted name is an element extension (CustTable.MY_Extension), never a class.
+  if (!objectName.endsWith('_Extension') || objectName.includes('.')) return undefined;
+  const stem = objectName.slice(0, -'_Extension'.length);
+  const prefix = resolveObjectPrefix(modelName ?? '');
+  const infix = prefix ? deriveExtensionInfix(prefix, modelName) : '';
+  const modelToken = modelName ? normalizeModelToken(modelName) : '';
+  return inferBaseBeforeToken(stem, [infix, modelToken, prefix], isKnownObject);
+}
 
 export function isExtensionObjectType(objectType: string): boolean {
   return objectType === 'class-extension' || DOT_NOTATION_EXTENSION_TYPES.has(objectType);
@@ -56,7 +85,9 @@ function stripElementStyleExtensionWord(name: string, tokens: readonly string[])
   // Infix first: the token that would be re-applied is the one to take off, and
   // for most models these are all the same string anyway.
   for (const token of tokens) {
-    if (token && base.toLowerCase().endsWith(token.toLowerCase())) {
+    // As its own word only: "SalesTableExtension" under infix "Le" is the base
+    // SalesTable, not SalesTab.
+    if (token && endsWithInfix(base, token)) {
       base = base.slice(0, -token.length);
       break;
     }
@@ -78,6 +109,7 @@ export function normalizeObjectName(
   objectType: string,
   modelName: string | undefined,
   onNote?: (note: string) => void,
+  options?: { knownBase?: boolean; extendedBase?: string },
 ): string {
   const objectPrefix = resolveObjectPrefix(modelName ?? '');
   // Elements and classes carry their own style: a convention may spell one with the
@@ -85,6 +117,9 @@ export function normalizeObjectName(
   const elementNamingStyle = getExtensionNamingStyle();
   const classNamingStyle = getExtensionClassNamingStyle();
   let effective = objectName;
+  // Whether the text before "_Extension" is known to be the base class itself —
+  // see ApplyObjectPrefixOptions.knownBase.
+  let knownBase = options?.knownBase === true;
 
   // Cases A and B below strip a model-name token off a name that already carries
   // one, so they have to compare against the spelling a NAME can hold — the token,
@@ -119,7 +154,9 @@ export function normalizeObjectName(
     modelDiffersFromPrefix
   ) {
     const baseName = effective.slice(0, -'_Extension'.length);
-    if (baseName.toLowerCase().endsWith(modelToken.toLowerCase())) {
+    // As its own word only — a base whose last letters spell a short model
+    // name (SalesTax under model "Tax") is not carrying the model token.
+    if (endsWithInfix(baseName, modelToken)) {
       // Trim the separator the token was sitting behind. Without it the stripped stem
       // keeps the separator and the infix lands one character late:
       // CustTable_ContosoRobotics_Extension → CustTable_ → CustTable_Ctso_Extension,
@@ -143,13 +180,16 @@ export function normalizeObjectName(
       [deriveExtensionInfix(objectPrefix, modelName), objectPrefix, modelToken],
     );
     const hadExtensionWord = base !== effective;
+    // A bare base name states the base outright; one that carried an element-style
+    // "Extension" word was an extension name, and may already hold the infix.
+    if (!hadExtensionWord) knownBase = true;
     effective = `${base}_Extension`;
     onNote?.(hadExtensionWord
       ? `Element-style extension name rewritten to the class form: ${objectName} → ${effective}`
       : `Bare class-extension name auto-converted to _Extension form: ${objectName} → ${effective}`);
   }
 
-  let finalName = applyObjectPrefix(effective, objectPrefix, modelName);
+  let finalName = applyObjectPrefix(effective, objectPrefix, modelName, { knownBase, extendedBase: options?.extendedBase });
 
   // EXTENSION_SUFFIX applies to NEW objects only — never to extensions. The
   // model-name style's "Base.ModelName" form has no "Extension" word, so

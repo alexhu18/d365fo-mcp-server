@@ -20,12 +20,22 @@
  * Collections (<DeleteActions>, <FieldGroups>, <Fields>, …) follow both.
  */
 
+import {
+  renderSubscriberAccessLevel,
+  setSubscriberAccessLevel,
+  type SubscriberAccessLevel,
+} from './subscriberAccessLevel.js';
+
 /** Block 1 — properties the serialiser always writes, in order. */
 const AX_TABLE_MANDATORY_PROPERTIES = [
   'ConfigurationKey',
   'DeveloperDocumentation',
   'FormRef',
   'Label',
+  // An AccessGrant with child elements, not a scalar (subscriberAccessLevel.ts).
+  // Written by VS after Label and before TableGroup — of 3,665 shipped tables
+  // that carry one, none places it elsewhere in the block.
+  'SubscriberAccessLevel',
   'TableGroup',
   'TitleField1',
   'TitleField2',
@@ -110,7 +120,9 @@ export function axTableElementRank(name: string): number {
  * @param indent line prefix (default one tab, matching AxTable XML)
  */
 export function renderAxTableProperties(
-  props: Record<string, string | number | undefined | null>,
+  props: Record<string, string | number | SubscriberAccessLevel | undefined | null> & {
+    SubscriberAccessLevel?: SubscriberAccessLevel;
+  },
   indent = '\t',
 ): string {
   const names = Object.keys(props)
@@ -120,7 +132,27 @@ export function renderAxTableProperties(
       const rb = axTableElementRank(b);
       return ra !== rb ? ra - rb : a.localeCompare(b);
     });
-  return names.map(n => `${indent}<${n}>${props[n]}</${n}>\n`).join('');
+  return names
+    .map(n => {
+      const value = props[n];
+      if (typeof value === 'object' && value !== null) {
+        const element = renderSubscriberAccessLevel(value, indent);
+        return element ? `${element}\n` : '';
+      }
+      return `${indent}<${n}>${value}</${n}>\n`;
+    })
+    .join('');
+}
+
+/**
+ * Set (or, with an empty level, remove) the table's SubscriberAccessLevel in
+ * canonical position. It has child elements, so it cannot go through
+ * upsertAxTableProperty. Null when the document is not an AxTable.
+ */
+export function upsertAxTableSubscriberAccessLevel(xml: string, level: SubscriberAccessLevel): string | null {
+  // Placed after its predecessors, not before the first known successor: real
+  // tables put elements this order list does not know between it and TableGroup.
+  return setSubscriberAccessLevel(xml, level);
 }
 
 /**
@@ -139,6 +171,8 @@ export function upsertAxTableProperty(
 ): string | null {
   if (!/<AxTable[\s>]/.test(xml)) return null;
   if (AX_TABLE_NON_EXISTENT_PROPERTIES[property]) return null;
+  // Child elements, not a scalar — see upsertAxTableSubscriberAccessLevel.
+  if (property === 'SubscriberAccessLevel') return null;
   if (axTableElementRank(property) === Number.MAX_SAFE_INTEGER) return null;
 
   const existing = new RegExp(`([ \\t]*)<${property}\\s*/>|([ \\t]*)<${property}>[\\s\\S]*?</${property}>`);

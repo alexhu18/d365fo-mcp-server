@@ -159,6 +159,21 @@ export async function readViewMetadata(
  * Returns null when the path cannot be remapped or the remapped file does not exist.
  */
 export async function resolveDbPathLocally(dbFilePath: string): Promise<string | null> {
+  const localPath = await remapDbPathLocally(dbFilePath);
+  if (!localPath) return null;
+  try {
+    await fs.access(localPath);
+    return localPath;
+  } catch {
+    return null; // File does not exist locally
+  }
+}
+
+/**
+ * Where a DB path would live under the local packages root — without checking that
+ * the file is there. Null when the path has no PackagesLocalDirectory segment.
+ */
+export async function remapDbPathLocally(dbFilePath: string): Promise<string | null> {
   // Normalise separators so the regex matches both Linux and Windows DB paths
   const normalised = dbFilePath.replace(/\\/g, '/');
 
@@ -171,16 +186,10 @@ export async function resolveDbPathLocally(dbFilePath: string): Promise<string |
   await configManager.ensureLoaded();
   const localPackagePath =
     configManager.getPackagePath() || fallbackPackagePath();
+  if (!localPackagePath) return null;
 
   // Convert forward slashes back to the OS separator
-  const localPath = path.join(localPackagePath, ...relativePart.split('/'));
-
-  try {
-    await fs.access(localPath);
-    return localPath;
-  } catch {
-    return null; // File does not exist locally
-  }
+  return path.join(localPackagePath, ...relativePart.split('/'));
 }
 
 /**

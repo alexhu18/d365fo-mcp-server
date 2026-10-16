@@ -36,6 +36,9 @@ public class ConDemoGatedSetting extends common
 	</SourceCode>
 	<ConfigurationKey>ConDemoModuleKey</ConfigurationKey>
 	<Label>@TaxTransactionInquiry:HeaderNote</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>SettingKey</TitleField1>
 	<TitleField2>SettingValue</TitleField2>

@@ -19,8 +19,10 @@
 import * as fs from 'fs';
 import { promises as fsp } from 'fs';
 import { lookupSymbolNocase } from './symbolLookup.js';
-import { resolveDbPathLocally } from './metadataResolver.js';
+import * as path from 'path';
+import { resolveDbPathLocally, remapDbPathLocally } from './metadataResolver.js';
 import { getConfigManager, fallbackPackagePath } from './configManager.js';
+import { isAotSourcePath } from './packagesRoot.js';
 import { bridgeStartupState, type BridgeReadinessSource } from '../bridge/bridgeReadiness.js';
 
 export interface IndexedObjectRef {
@@ -32,12 +34,10 @@ export interface IndexedObjectRef {
   /** Readable path on this machine (indexed or remapped), null when unreachable. */
   localPath: string | null;
   /**
-   * The index records a PackagesLocalDirectory path whose file is gone from BOTH
-   * the recorded location and the local remap — the row outlived the object.
-   *
-   * Only set for PackagesLocalDirectory paths: a foreign build-agent path that
-   * simply does not remap here is unreachable, not deleted, and must not be
-   * reported as stale.
+   * The indexed file is gone from BOTH the recorded location and the local remap,
+   * and this machine can tell that means deleted — see isStaleIndexedPath. A
+   * foreign build-agent path that simply is not here is unreachable, not deleted,
+   * and must not be reported as stale.
    */
   sourceFileMissing: boolean;
 }
@@ -73,50 +73,167 @@ export async function resolveIndexedObject(
 /** Resolve an indexed file path to something readable here, or null. */
 async function resolveLocalPath(indexedPath: string | null): Promise<string | null> {
   if (!indexedPath) return null;
+  if (!isAbsoluteAnyHost(slashed(indexedPath))) {
+    // Package-relative row (`Pkg/Model/AxTable/X.xml`): it names no root, so try the
+    // local metadata roots — never the process cwd, which is the user's home.
+    for (const root of await localMetadataRoots()) {
+      const candidate = path.join(root, ...slashed(indexedPath).split('/'));
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  }
   try {
     if (fs.existsSync(indexedPath)) return indexedPath;
   } catch { /* ignore */ }
   return resolveDbPathLocally(indexedPath);
 }
 
+/** Forward-slash form of an indexed path, whichever host wrote it. */
+function slashed(p: string): string {
+  return p.trim().replace(/\\/g, '/');
+}
+
 /**
- * Can this machine observe the absence of a PackagesLocalDirectory file at all?
- *
- * "No file at either location" means the object was deleted only if the packages
- * root is actually there to be looked at. An unconfigured, mistyped or
- * momentarily unreachable root (an offline share, a drive not yet mapped) makes
- * EVERY object's file unreadable — and the stale-row note that follows tells the
- * agent to treat the object as not existing and create it, without re-checking.
- * That is a duplicate of something like CustTable on a bad config day, so the
- * root has to be verified before the row is called a ghost.
+ * Absolute on ANY host. `path.isAbsolute` on Linux calls `K:\AosService\…` relative,
+ * and the hosted (Linux) server reads indexes built on Windows.
  */
-async function packagesRootReachable(): Promise<boolean> {
+function isAbsoluteAnyHost(slashedPath: string): boolean {
+  return slashedPath.startsWith('/') || /^[a-zA-Z]:\//.test(slashedPath);
+}
+
+/** Parent of a slashed path, or '' at the top. Host-independent, unlike path.dirname. */
+function parentOf(slashedPath: string): string {
+  const i = slashedPath.lastIndexOf('/');
+  return i > 0 ? slashedPath.slice(0, i) : '';
+}
+
+/**
+ * `<root>/<Package>/<Model>/Ax<Type>/<Name>.xml` → `<root>`, or null when the path
+ * does not have the AOT shape (or the root would be a bare drive / filesystem root,
+ * which says nothing about where the index was built).
+ */
+function metadataRootOf(slashedPath: string): string | null {
+  const segs = slashedPath.split('/');
+  if (segs.length < 5 || !/^Ax\w+$/i.test(segs[segs.length - 2])) return null;
+  const root = segs.slice(0, -4).join('/');
+  if (!root || /^[a-zA-Z]:$/.test(root)) return null;
+  return root;
+}
+
+/** Package-relative AOT shape: exactly `<Package>/<Model>/Ax<Type>/<Name>.xml`. */
+function isPackageRelativeAotPath(slashedPath: string): boolean {
+  const segs = slashedPath.split('/');
+  return segs.length === 4 && segs.every(Boolean) && /^Ax\w+$/i.test(segs[2]);
+}
+
+/**
+ * The metadata roots configured or detected on this machine: the packages root and,
+ * on UDE, the custom and Microsoft roots. Only ones that exist are returned.
+ */
+async function localMetadataRoots(): Promise<string[]> {
+  const roots: string[] = [];
   try {
-    const configManager = getConfigManager();
-    await configManager.ensureLoaded();
-    const root = configManager.getPackagePath() || fallbackPackagePath();
-    if (!root) return false;
-    await fsp.access(root);
-    return true;
-  } catch {
-    return false;
-  }
+    const cm = getConfigManager() as ReturnType<typeof getConfigManager> & {
+      getCustomPackagesPath?: () => Promise<string | null>;
+      getMicrosoftPackagesPath?: () => Promise<string | null>;
+    };
+    await cm.ensureLoaded();
+    const candidates = [
+      cm.getPackagePath() || fallbackPackagePath(),
+      await cm.getCustomPackagesPath?.().catch(() => null),
+      await cm.getMicrosoftPackagesPath?.().catch(() => null),
+    ];
+    for (const r of candidates) {
+      if (r && !roots.includes(r) && fs.existsSync(r)) roots.push(r);
+    }
+  } catch { /* config unavailable — no roots */ }
+  return roots;
+}
+
+/**
+ * Was the index built from THIS root? A root that is here and holds packages is
+ * where the indexer read the file from, so a file missing under it was deleted.
+ *
+ * "Holds packages", not just "exists": UDE boxes routinely carry an EMPTY
+ * C:\AosService\PackagesLocalDirectory stub, and an index built on a C: VM must not
+ * be judged against it. Cached briefly — search judges a page of rows at once.
+ */
+const ROOT_VERDICT_TTL_MS = 30_000;
+const rootVerdicts = new Map<string, { at: number; populated: boolean }>();
+function rootIsPopulatedHere(root: string): boolean {
+  const now = Date.now();
+  const cached = rootVerdicts.get(root);
+  if (cached && now - cached.at < ROOT_VERDICT_TTL_MS) return cached.populated;
+  let populated = false;
+  try {
+    populated = fs.readdirSync(root).length > 0;
+  } catch { /* not here */ }
+  rootVerdicts.set(root, { at: now, populated });
+  return populated;
+}
+
+/** Test seam — forget cached root verdicts. */
+export function resetStaleRootCache(): void {
+  rootVerdicts.clear();
+}
+
+/**
+ * The lenient test for a path whose root is NOT here: the object's own folder
+ * (Ax<Type>) or its model folder exists, yet the file does not. A missing model
+ * folder under a foreign root is indistinguishable from "package not installed".
+ */
+function objectFolderPresent(slashedPath: string): boolean {
+  const typeFolder = parentOf(slashedPath);
+  const modelFolder = parentOf(typeFolder);
+  return (!!typeFolder && fs.existsSync(typeFolder)) || (!!modelFolder && fs.existsSync(modelFolder));
 }
 
 /**
  * The one rule for "this index row outlived its file", shared by the ref-carrying
- * readers and the raw-path ones so the two can never drift apart.
+ * readers, the raw-path ones, search row marking and the bridge-less table reader,
+ * so none of them can answer differently about one row.
  *
- * Only a PackagesLocalDirectory path can be judged: a foreign build-agent path
- * that does not remap here is unreachable, not deleted.
+ * Called only once no file was found at the recorded path or its local remap.
+ * Whether that absence means "deleted" depends on where the index was built:
+ *
+ * - BUILT HERE — the recorded path's metadata root (the folder holding the package
+ *   folders: a PackagesLocalDirectory, a UDE custom root, a repo) exists on this
+ *   machine and holds packages. The indexer read the file from there, so it was
+ *   deleted: a rolled-back object, a removed model, a whole package dropped by a
+ *   branch switch, a dangling model symlink.
+ * - BUILT ELSEWHERE — a CI agent (`/home/vsts/...`, `C:\home\vsts\...`) or an old
+ *   UDE version folder. The shipped index records those for every standard object,
+ *   so absence proves nothing by itself; only the object's own (Ax<Type>) or model
+ *   folder being present at the recorded path or the local remap does. A missing
+ *   package there is "not installed" as often as "deleted", and calling every such
+ *   row a ghost made the bridge-less reader answer "not found" for CustTable.
+ * - Package-relative rows (`Pkg/Model/AxTable/X.xml`) name no root; they get the
+ *   lenient test against each local metadata root.
+ * - An unreachable or unconfigured packages root makes no folder visible, so it
+ *   can never turn every row into a ghost on a bad config day.
+ * - A path to the extracted-metadata JSON cache is not the AOT source and proves
+ *   nothing either way (see isAotSourcePath).
  */
 async function isStaleIndexedPath(
   indexedPath: string | null | undefined,
   localPath: string | null,
 ): Promise<boolean> {
   if (localPath !== null) return false;
-  if (!indexedPath || !/PackagesLocalDirectory/i.test(indexedPath)) return false;
-  return packagesRootReachable();
+  if (!isAotSourcePath(indexedPath)) return false;
+  const recorded = slashed(indexedPath);
+
+  if (!isAbsoluteAnyHost(recorded)) {
+    if (!isPackageRelativeAotPath(recorded)) return false;
+    const roots = await localMetadataRoots();
+    return roots.some(r => objectFolderPresent(`${slashed(r).replace(/\/+$/, '')}/${recorded}`));
+  }
+
+  const root = metadataRootOf(recorded);
+  if (root && rootIsPopulatedHere(root)) return true;
+
+  if (objectFolderPresent(recorded)) return true;
+  const remapped = await remapDbPathLocally(indexedPath);
+  return !!remapped && objectFolderPresent(slashed(remapped));
 }
 
 /**
@@ -177,8 +294,9 @@ export function indexedSourceNote(source: string, ref?: IndexedObjectRef | null)
  * a ghost, and only then started the real work.
  *
  * The bridge disagreeing with the cache is the tell, and it is available right here:
- * bridge silent + PackagesLocalDirectory path + no file at either the recorded or
- * the remapped location means the row outlived the object.
+ * bridge silent + no file at either the recorded or the remapped location + a
+ * place where its absence is observable (see isStaleIndexedPath) means the row
+ * outlived the object.
  */
 export function staleIndexNote(ref: IndexedObjectRef): string {
   if (!ref.sourceFileMissing) return '';
@@ -193,7 +311,7 @@ export function staleIndexNote(ref: IndexedObjectRef): string {
  * `isStaleIndexedPath`, so the two can never answer differently about one row.
  */
 export async function indexedPathIsMissing(indexedPath: string | null | undefined): Promise<boolean> {
-  if (!indexedPath || !/PackagesLocalDirectory/i.test(indexedPath)) return false;
+  if (!indexedPath) return false;
   return isStaleIndexedPath(indexedPath, await resolveLocalPath(indexedPath));
 }
 
@@ -202,17 +320,17 @@ export async function indexedPathIsMissing(indexedPath: string | null | undefine
  *
  * `renderStaleIndexNote` answers "you asked for this object and the cache answered
  * for it", so it can end in "treat it as NOT EXISTING and create it". A search
- * result set cannot say that. `indexedPathIsMissing` fires for any
- * PackagesLocalDirectory path with no file here, and the shipped symbol index covers
- * every standard package while a given machine installs a subset — so on a partial
- * install these rows are mostly "that package is not installed", not "deleted". Both
+ * result set cannot say that. `indexedPathIsMissing` fires when the root the index
+ * was built from is here without the file, or when the object's folder is here
+ * without it — and a package uninstalled since the index was built looks exactly
+ * like one deleted. Both
  * causes matter to the caller and neither justifies hiding the row (that would answer
  * "no such object" for most of D365FO, in the tool every other workflow starts from),
  * so name them and let the caller decide.
  */
 export function renderStaleSearchRowsNote(count: number): string {
   return `\n⚠️ ${count} result${count === 1 ? '' : 's'} marked STALE: the symbol index records a ` +
-    `PackagesLocalDirectory path with no file there or at its local remap, so ${count === 1 ? 'it is' : 'they are'} ` +
+    `path with no file there or at its local remap, so ${count === 1 ? 'it is' : 'they are'} ` +
     `an index row without an object on this machine — either deleted without the index being rebuilt ` +
     `(a workspace reset, a rolled-back run), or belonging to a package this machine does not have ` +
     `installed. ${count === 1 ? 'It is' : 'They are'} listed last and ${count === 1 ? 'is' : 'are'} NOT ` +

@@ -201,11 +201,11 @@ describe('get_workspace_info flags a naming style it does not recognise', () => 
     const out = String((await getWorkspaceInfoTool(req('get_workspace_info', {}), buildContext())).content[0].text);
 
     expect(out).toContain('EXTENSION_NAMING_STYLE="modelname" is not a known value (prefix | model-name) — treated as "prefix"');
-    expect(out).toContain('EXTENSION_CLASS_NAMING_STYLE="prefx" is not a known value (inherit | prefix | model-name) — treated as "inherit", i.e. "prefix"');
+    expect(out).toContain('EXTENSION_CLASS_NAMING_STYLE="prefx" is not a known value (inherit | prefix | model-name | prefix-leading) — treated as "inherit", i.e. "prefix"');
   });
 
   it('stays quiet for every valid value, in any case', async () => {
-    for (const [el, cl] of [['model-name', 'inherit'], ['Prefix', 'MODEL-NAME'], ['prefix', 'prefix']]) {
+    for (const [el, cl] of [['model-name', 'inherit'], ['Prefix', 'MODEL-NAME'], ['prefix', 'prefix'], ['prefix', 'Prefix-Leading']]) {
       process.env.EXTENSION_NAMING_STYLE = el;
       process.env.EXTENSION_CLASS_NAMING_STYLE = cl;
       const out = String((await getWorkspaceInfoTool(req('get_workspace_info', {}), buildContext())).content[0].text);

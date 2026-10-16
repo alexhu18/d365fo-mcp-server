@@ -432,6 +432,8 @@ namespace D365MetadataBridge.Services
                 PrimaryIndex = Safe(() => table.PrimaryIndex),
                 Extends = Safe(() => table.Extends),
                 SaveDataPerCompany = Safe(() => table.SaveDataPerCompany.ToString()),
+                SubscriberAccessLevel = Safe(() => AccessGrantText.Describe(table.SubscriberAccessLevel)),
+                AllowRowVersionChangeTracking = Safe(() => table.AllowRowVersionChangeTracking.ToString()),
                 SupportInheritance = Safe(() => table.SupportInheritance.ToString()),
                 InstanceRelationType = Safe(() => table.InstanceRelationType),
             };

@@ -6,14 +6,15 @@
  * FALLBACK: Only for newly created tables not yet indexed, uses disk scan.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { findD365FileOnDisk } from '../../utils/objectFileLookup.js';
 import { tryBridgeTable } from '../../bridge/bridgeAdapter.js';
-import { bridgeUnavailableNote } from '../../utils/indexedXmlLookup.js';
+import { bridgeUnavailableNote, indexedPathIsMissing } from '../../utils/indexedXmlLookup.js';
+import { canonicalSymbolName } from '../../utils/symbolLookup.js';
+import { indexedEdtStringSize, INDEXED_SIZE_CAVEAT } from './edtInfo.js';
 import { pageFields, fieldsHeading, fieldsFooter, TABLE_FIELD_PAGE_SIZE } from '../../utils/payloadBudget.js';
 
 const TableInfoArgsSchema = z.object({
@@ -73,7 +74,7 @@ export async function tableInfoTool(request: CallToolRequest, context: XppServer
 
     // 2. DB index fallback — serves offline / write-only / build-agent scenarios.
     const { symbolIndex } = context;
-    const dbResponse = buildTableResponseFromDb(
+    const dbResponse = await buildTableResponseFromDb(
       symbolIndex, args.tableName, args.methodOffset, args.fieldsOffset, args.fieldFilter,
     );
     if (dbResponse) {
@@ -134,6 +135,22 @@ export async function tableInfoTool(request: CallToolRequest, context: XppServer
 }
 
 /**
+ * The length of an indexed field, rendered as a suffix, or '' when the index cannot say.
+ *
+ * A field row stores its EDT, not its length, so without the bridge "how long is
+ * DirPartyTable.Name" used to come back as a bare type name and the length was a guess. The
+ * length lives on the EDT chain in `edt_metadata`. A field typed with a primitive or an enum
+ * finds no EDT row there and gets no suffix.
+ */
+function indexedFieldSize(db: any, edtName: string): string {
+  const size = indexedEdtStringSize(db, edtName);
+  if (!size) return '';
+  const shown = size.value === '-1' ? '-1 (memo, unlimited)' : size.value;
+  const from = size.declaredBy.toLowerCase() === edtName.toLowerCase() ? '' : `, inherited from ${size.declaredBy}`;
+  return ` (String Size ${shown}${from})`;
+}
+
+/**
  * Serve table info entirely from the pre-indexed symbol database.
  * Returns null when the table is not present in the index; caller then falls through
  * to disk parsing.
@@ -144,36 +161,45 @@ export async function tableInfoTool(request: CallToolRequest, context: XppServer
  * resolving here as if it still existed ("Served from symbol index"), and
  * generate_object(scaffold) trusted that phantom hit to bind a new form's
  * datasource, producing a form that references a table with no file on disk —
- * 4 build errors ("Table '<Name>' does not exist"). Guard against a stale row by
- * checking the indexed filePath actually still exists before trusting the hit;
+ * 4 build errors ("Table '<Name>' does not exist"). Guard against a stale row with
+ * the shared rule (indexedPathIsMissing) before trusting the hit;
  * a stale entry is treated the same as "not found" so the caller's disk-scan
  * fallback (or the final not-found error, which now hints at re-indexing) applies.
  */
-function buildTableResponseFromDb(
+async function buildTableResponseFromDb(
   symbolIndex: any,
   tableName: string,
   methodOffset: number,
   fieldsOffset = 0,
   fieldFilter?: string,
-): { content: { type: 'text'; text: string }[] } | null {
-  const tableSym = symbolIndex.getSymbolByName?.(tableName, 'table');
+): Promise<{ content: { type: 'text'; text: string }[] } | null> {
+  let tableSym = symbolIndex.getSymbolByName?.(tableName, 'table');
+  const rdb = symbolIndex.getReadDb();
+  if (!tableSym) {
+    // `custtable` must find CustTable — the lookup above is BINARY.
+    const canonical = canonicalSymbolName(rdb, tableName, ['table']);
+    if (canonical && canonical !== tableName) tableSym = symbolIndex.getSymbolByName?.(canonical, 'table');
+  }
   if (!tableSym) return null;
-  if (tableSym.filePath && !fs.existsSync(tableSym.filePath)) {
+  // Only a file deleted from THIS machine makes the row stale. A path that simply
+  // is not here (the shipped index records build-agent paths) is not evidence of
+  // anything — rejecting it made every standard table "not found" without the bridge.
+  // Same rule as every other index reader and search's stale-row marking.
+  if (tableSym.filePath && await indexedPathIsMissing(tableSym.filePath)) {
     console.error(
-      `[tableInfo] Stale symbol-index entry for table '${tableName}' — indexed file ` +
+      `[tableInfo] Stale symbol-index entry for table '${tableSym.name}' — indexed file ` +
       `'${tableSym.filePath}' no longer exists on disk (likely rolled back/deleted since ` +
       `the index was built). Treating as not-found; run update_symbol_index to refresh.`,
     );
     return null;
   }
 
-  const rdb = symbolIndex.getReadDb();
   const fields = rdb.prepare(
     `SELECT name, signature FROM symbols WHERE parent_name = ? AND type = 'field' ORDER BY name`
-  ).all(tableName) as Array<{ name: string; signature: string | null }>;
+  ).all(tableSym.name) as Array<{ name: string; signature: string | null }>;
   const methods = rdb.prepare(
     `SELECT name, signature FROM symbols WHERE parent_name = ? AND type = 'method' ORDER BY name`
-  ).all(tableName) as Array<{ name: string; signature: string | null }>;
+  ).all(tableSym.name) as Array<{ name: string; signature: string | null }>;
 
   const METHOD_PAGE = 25;
   const totalMethods = methods.length;
@@ -184,10 +210,14 @@ function buildTableResponseFromDb(
   if (tableSym.model) out += `**Model:** ${tableSym.model}\n`;
   const fieldPage = pageFields(fields, fieldsOffset, fieldFilter);
   out += `\n## ${fieldsHeading(fieldPage)}\n\n`;
+  let sizesShown = false;
   for (const f of fieldPage.visible) {
-    out += `- **${f.name}**${f.signature ? `: ${f.signature}` : ''}\n`;
+    const size = f.signature ? indexedFieldSize(rdb, f.signature) : '';
+    if (size) sizesShown = true;
+    out += `- **${f.name}**${f.signature ? `: ${f.signature}${size}` : ''}\n`;
   }
   out += fieldsFooter(fieldPage);
+  if (sizesShown) out += `\n> ℹ️ ${INDEXED_SIZE_CAVEAT}\n`;
   out += `\n## Methods (${totalMethods} total${totalMethods > METHOD_PAGE ? `, showing ${methodOffset + 1}–${Math.min(methodOffset + METHOD_PAGE, totalMethods)}` : ''})\n\n`;
   for (const m of paged) {
     out += `- \`${m.signature || m.name}\`\n`;

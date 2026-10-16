@@ -35,7 +35,16 @@ import {
   AX_TABLE_ELEMENT_ORDER,
   AX_TABLE_NON_EXISTENT_PROPERTIES,
   upsertAxTableProperty,
+  upsertAxTableSubscriberAccessLevel,
 } from '../../utils/axTablePropertyOrder.js';
+import {
+  DEFAULT_SUBSCRIBER_ACCESS_LEVEL,
+  describeSubscriberAccessLevel,
+  isTempAxTable,
+  parseSubscriberAccessLevel,
+  readSubscriberAccessLevel,
+  sameSubscriberAccessLevel,
+} from '../../utils/subscriberAccessLevel.js';
 
 /** Keys of `properties` that are handled by their own bridge parameter, not as elements. */
 const STRUCTURAL_TABLE_KEYS = new Set(
@@ -254,12 +263,16 @@ export function reconcileTableCreateProperties(
   properties: Record<string, unknown> | undefined,
 ): TableCreateReconcileResult {
   const result: TableCreateReconcileResult = { xml, patched: [], unhonoured: [], droppedCollections: [] };
-  if (!properties || !/<AxTable[\s>]/.test(xml)) return result;
+  if (!/<AxTable[\s>]/.test(xml)) return result;
+
+  reconcileSubscriberAccessLevel(result, properties);
+  if (!properties) return result;
 
   result.droppedCollections = findDroppedTableCollections(xml, properties);
 
   for (const [key, rawValue] of Object.entries(properties)) {
     if (rawValue === undefined || rawValue === null) continue;
+    if (key.toLowerCase() === 'subscriberaccesslevel') continue; // reconciled above
     if (!['string', 'number', 'boolean'].includes(typeof rawValue)) continue;
     if (STRUCTURAL_TABLE_KEYS.has(key.toLowerCase())) continue;
     if (String(rawValue).length === 0) continue;
@@ -324,6 +337,47 @@ export function reconcileTableCreateProperties(
 }
 
 /**
+ * SubscriberAccessLevel on a new table (issue #1073). The bridge's create writes
+ * none and its property setter has no case for it, so this is where it lands
+ * for every writer: the caller's value when one was passed, otherwise Visual
+ * Studio's Read=Allow on a regular table that has none. Only a requested value
+ * is reported; the default is what VS does without a word, too.
+ */
+function reconcileSubscriberAccessLevel(
+  result: TableCreateReconcileResult,
+  properties: Record<string, unknown> | undefined,
+): void {
+  const key = properties && Object.keys(properties).find(k => k.toLowerCase() === 'subscriberaccesslevel');
+  const raw = key ? properties![key] : undefined;
+  const current = readSubscriberAccessLevel(result.xml);
+
+  if (raw === undefined || raw === null) {
+    if (Object.keys(current).length > 0 || isTempAxTable(result.xml)) return;
+    result.xml = upsertAxTableSubscriberAccessLevel(result.xml, DEFAULT_SUBSCRIBER_ACCESS_LEVEL) ?? result.xml;
+    return;
+  }
+
+  const shown = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  const parsed = parseSubscriberAccessLevel(raw);
+  if (!parsed.ok) {
+    result.unhonoured.push({ name: key!, value: shown, detail: parsed.error });
+    return;
+  }
+  if (sameSubscriberAccessLevel(current, parsed.level)) return;
+  const patched = upsertAxTableSubscriberAccessLevel(result.xml, parsed.level);
+  if (patched) {
+    result.xml = patched;
+    result.patched.push({ name: key!, element: 'SubscriberAccessLevel', value: describeSubscriberAccessLevel(parsed.level) });
+  } else {
+    result.unhonoured.push({
+      name: key!,
+      value: shown,
+      detail: 'The AxTable property block has no element to place <SubscriberAccessLevel> before, so it was NOT written.',
+    });
+  }
+}
+
+/**
  * Caller-facing report for a reconciled table create. Empty string when the writer
  * honoured everything — silence here means "nothing was dropped", which is exactly
  * the guarantee that was missing.
@@ -344,7 +398,9 @@ export function renderTableCreateHonestyReport(result: TableCreateReconcileResul
   if (result.patched.length > 0) {
     parts.push(
       `\n🔧 Written after the create (the metadata writer dropped ${result.patched.length === 1 ? 'it' : 'them'}): ` +
-        result.patched.map(p => `<${p.element}>${p.value}</${p.element}>`).join(', ') +
+        result.patched
+          .map(p => (p.element === 'SubscriberAccessLevel' ? `<SubscriberAccessLevel> (${p.value})` : `<${p.element}>${p.value}</${p.element}>`))
+          .join(', ') +
         `\n   The C# bridge's SetAxTableProperty() does not know ${result.patched.map(p => p.element).join('/')}; ` +
         `the value was written into the AxTable XML in canonical element order instead.`,
     );

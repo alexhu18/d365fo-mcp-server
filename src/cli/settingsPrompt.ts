@@ -9,7 +9,7 @@
 import { c } from '../utils/terminalUi.js';
 import { multiselect, type Option } from '@clack/prompts';
 import type { Setting, SectionId } from '../config/settings.js';
-import { SECTIONS, settingsInSection } from '../config/settings.js';
+import { SECTIONS, settingByPath, settingsInSection } from '../config/settings.js';
 import { initialText, readSetting, readSettingOrDefault, writeSetting, type SettingsStore } from './settingsStore.js';
 import { askConfirm, askSelect, askText, ensure, p } from './ui.js';
 
@@ -71,7 +71,11 @@ export async function askSetting(
 
   switch (setting.type) {
     case 'boolean': {
-      const value = await askConfirm(message(setting), readSettingOrDefault(store, setting) === true);
+      // Stored answer, then the caller's suggestion ('true' / 'false'), then the default.
+      const initial = readSetting(store, setting) === undefined && opts?.initial !== undefined
+        ? opts.initial === 'true'
+        : readSettingOrDefault(store, setting) === true;
+      const value = await askConfirm(message(setting), initial);
       writeSetting(store, setting, value);
       return value;
     }
@@ -121,13 +125,15 @@ export async function askSetting(
     }
     default: {
       // A stored answer always wins; the caller's suggestion only fills an
-      // empty field, so re-running setup never overwrites a deliberate value
-      // with something merely detected.
+      // unset field, so re-running setup never overwrites a deliberate value
+      // with something merely detected. A detected value does beat the
+      // documented default (as for enums): it describes this machine.
       const raw = await askText({
         message: message(setting, required ? '' : c.dim('(Enter to skip)')),
-        initialValue: initialText(store, setting) || opts?.initial || '',
+        initialValue: (readSetting(store, setting) === undefined ? opts?.initial : undefined) || initialText(store, setting),
         placeholder: setting.placeholder,
         required,
+        validate: setting.validate,
       });
       writeSetting(store, setting, raw || undefined);
       return raw || undefined;
@@ -140,6 +146,21 @@ export async function askSettings(store: SettingsStore, settings: Setting[]): Pr
   for (const setting of settings) {
     await askSetting(store, setting);
   }
+}
+
+/**
+ * The naming questions. naming.prefix is optional (#1085), and an empty one is
+ * ambiguous — "infer it / use the model name" or "we use no prefix" — so only
+ * then is the user asked which they mean (naming.prefixSource, whose `none`
+ * choice is the suffix-convention answer).
+ */
+export async function askNaming(store: SettingsStore): Promise<void> {
+  await askSettings(store, settingsInSection('naming', 'basic'));
+  const prefix = String(readSetting(store, settingByPath('naming.prefix')!) ?? '').trim();
+  const source = String(readSetting(store, settingByPath('naming.prefixSource')!) ?? '').trim().toLowerCase();
+  // Also when a prefix was just entered over an earlier `none`: left as it is, that
+  // choice would silently ignore the prefix the user has just typed.
+  if (!prefix || source === 'none') await askSetting(store, settingByPath('naming.prefixSource')!);
 }
 
 /**

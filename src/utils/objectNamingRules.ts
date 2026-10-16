@@ -18,9 +18,14 @@ import {
   getObjectSuffix,
   getExtensionNamingStyle,
   getExtensionClassNamingStyle,
+  prefixLeadingBaseOf,
+  prefixLeadingClassName,
+  endsWithInfix,
   deriveExtensionInfix,
+  inferBaseBeforeToken,
+  isNoPrefixMode,
 } from './modelClassifier.js';
-import { normalizeObjectName } from './objectNaming.js';
+import { COC_BASE_SYMBOL_TYPES, normalizeObjectName } from './objectNaming.js';
 import {
   matchPrefixCandidate,
   modelWritesLandIn,
@@ -133,6 +138,7 @@ export interface ObjectNamingCheck {
   useModelName: boolean;
   namingStyle: string;
   useModelNameForClass: boolean;
+  usePrefixLeadingForClass: boolean;
   classNamingStyle: string;
   errors: string[];
   warnings: string[];
@@ -221,6 +227,7 @@ export async function checkObjectNaming(
     // class-extension branch below asks this one, the element branch asks the above.
     const classNamingStyle = getExtensionClassNamingStyle();
     const useModelNameForClass = classNamingStyle === 'model-name' && !!modelName;
+    const usePrefixLeadingForClass = classNamingStyle === 'prefix-leading';
     // The spelling of the model name that may appear INSIDE an object name — what the
     // write path embeds (applyObjectPrefix → normalizeModelToken, #892). Comparing the
     // raw name instead flagged the very name d365fo_file(create) writes and recommended
@@ -242,7 +249,8 @@ export async function checkObjectNaming(
     // suggested name and every startsWith() check below wrong.
     const resolution = resolveEffectivePrefix(modelName);
     const explicitPrefix = args.modelPrefix?.trim() || '';
-    const prefix = explicitPrefix || resolution.prefix || detectModelPrefix(db, name);
+    // naming.prefixSource=none is a decision, not a gap: no guess off the index either.
+    const prefix = explicitPrefix || resolution.prefix || (isNoPrefixMode() ? '' : detectModelPrefix(db, name));
 
     // An explicitly passed prefix is the caller's decision and the only candidate;
     // otherwise every token that could rightfully prefix a name in this workspace
@@ -283,13 +291,35 @@ export async function checkObjectNaming(
       // about under the prefix style must still yield the base the writer derives from
       // it (objectNaming.ts case B), or check and writer name different targets. A name
       // ending in "_Extension" is a class, so the class style decides which goes first.
-      const candidates = useModelNameForClass ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
-      const derived = args.baseObjectName;
-      for (const token of candidates) {
-        if (!token || !derived.toLowerCase().endsWith(token.toLowerCase())) continue;
-        const stripped = derived.slice(0, derived.length - token.length).replace(/_+$/, '');
-        if (stripped) args.baseObjectName = stripped;
-        break;
+      if (usePrefixLeadingForClass) {
+        // Prefix-leading names carry the token at the START, not the end — the
+        // opposite of what the trailing-strip loop below looks for. The writer's own
+        // derivation, so a leading token is only taken off at a word boundary
+        // (ContactPerson is not Con|tactPerson) and a stale trailing one from the
+        // 'prefix' style is taken off exactly as the writer would.
+        args.baseObjectName = prefixLeadingBaseOf(args.baseObjectName, extensionInfix);
+      } else {
+        const candidates = useModelNameForClass ? [modelToken, extensionInfix] : [extensionInfix, modelToken];
+        const derived = args.baseObjectName;
+        for (const token of candidates) {
+          // As its own word only, exactly as the writer reads it: SalesTable_Extension
+          // under infix "Le" is base SalesTable missing its infix, not SalesTab + "le".
+          if (!token || !endsWithInfix(derived, token)) continue;
+          const stripped = derived.slice(0, derived.length - token.length).replace(/_+$/, '');
+          if (stripped) args.baseObjectName = stripped;
+          break;
+        }
+        // {Base}{Token}{Feature}: the token sits mid-stem, so neither end says where
+        // the base stops. The index does — the same base the writer reads from
+        // [ExtensionOf], so check and writer name the same class. The raw prefix is
+        // tried too, as inferExtendedBase and applyObjectPrefix do: where a model's
+        // learned infix differs from it, a name carrying the prefix is still prefixed.
+        if (args.baseObjectName === derived) {
+          const inferred = inferBaseBeforeToken(derived, [...candidates, prefix.replace(/_+$/, '')], n => {
+            try { return lookupSymbolNocase(db, n, COC_BASE_SYMBOL_TYPES) != null; } catch { return false; }
+          });
+          if (inferred) args.baseObjectName = inferred;
+        }
       }
     }
 
@@ -308,13 +338,43 @@ export async function checkObjectNaming(
         );
       } else {
         if (args.objectType === 'class-extension') {
-          // prefix style → {Base}{Prefix}_Extension; model-name style → {Base}_{ModelToken}_Extension
+          // prefix style → {Base}{Prefix}_Extension; model-name style → {Base}_{ModelToken}_Extension;
+          // prefix-leading style → {Prefix}{Base}_Extension
           const expectedPattern = useModelNameForClass
             ? `${baseObjectName}_${modelToken}_Extension`
-            : `${baseObjectName}${extensionInfix}_Extension`;
+            : usePrefixLeadingForClass
+              ? prefixLeadingClassName(baseObjectName, extensionInfix)
+              : `${baseObjectName}${extensionInfix}_Extension`;
           const expectedToken = useModelNameForClass ? modelToken : extensionInfix;
 
-          if (!name.startsWith(baseObjectName)) {
+          if (usePrefixLeadingForClass) {
+            // The token leads here, so the structural checks run in the opposite
+            // order from the other two styles: base name immediately before
+            // "_Extension", token in front of that.
+            // Case-insensitive: the writer upper-cases a camelCase base's first letter
+            // (CtsoWhsWorkExecute_Extension for whsWorkExecute), and X++ names are
+            // case-insensitive anyway.
+            const expectedSuffix = `${baseObjectName}_Extension`;
+            if (!name.toLowerCase().endsWith(expectedSuffix.toLowerCase())) {
+              errors.push(
+                name.endsWith('_Extension')
+                  ? `Class extension names must have the base class name immediately before '_Extension'.\n  Expected format: ${expectedPattern}`
+                  : `Class extension names must end with '_Extension'.\n  Expected format: ${expectedPattern}`,
+              );
+              if (expectedToken) suggestions.push(`Correct name: ${expectedPattern}`);
+            } else {
+              const lead = name.slice(0, name.length - expectedSuffix.length);
+              if (
+                expectedToken &&
+                lead.toLowerCase() !== expectedToken.toLowerCase() &&
+                !lead.toLowerCase().includes(expectedToken.toLowerCase())
+              ) {
+                warnings.push(
+                  `Extension name does not lead with the extension infix "${extensionInfix}" (EXTENSION_CLASS_NAMING_STYLE=prefix-leading).\n  Current: ${name}\n  Recommended: ${expectedPattern}`,
+                );
+              }
+            }
+          } else if (!name.startsWith(baseObjectName)) {
             errors.push(
               `Class extension names must start with the base class name.\n  Expected format: ${expectedPattern}`,
             );
@@ -359,8 +419,9 @@ export async function checkObjectNaming(
           // detectModelPrefix is a guess off the symbol index that resolveObjectPrefix
           // would not make. Skipped once an error stands, so a rejected name is not
           // also told what it would have been written as.
-          if (!explicitPrefix && resolution.prefix && errors.length === 0) {
-            const wouldWrite = normalizeObjectName(name, 'class-extension', modelName || undefined);
+          if (!explicitPrefix && (resolution.prefix || isNoPrefixMode()) && errors.length === 0) {
+            // The base is known here, as it is to the writer from [ExtensionOf].
+            const wouldWrite = normalizeObjectName(name, 'class-extension', modelName || undefined, undefined, { extendedBase: baseObjectName });
             if (wouldWrite !== name) {
               warnings.push(
                 `The write path will not use this name as given.
@@ -489,8 +550,15 @@ export async function checkObjectNaming(
 
       // Underscores are allowed only as a prefix separator: {Prefix}_{Rest}
       // (e.g. valid "MY_VendPaymTermsMaintain", invalid "MYVendPaymTerms_Helper").
-      if (name.includes('_')) {
-        const underscoreIdx = name.indexOf('_');
+      // A configured suffix may carry its own separator (EXTENSION_SUFFIX="_ABC" →
+      // CustomerSettings_ABC); that underscore is the suffix's, not a stray one.
+      const suffixToken = getObjectSuffix();
+      const nameWithoutSuffix =
+        suffixToken && name.toLowerCase().endsWith(suffixToken.toLowerCase()) && name.length > suffixToken.length
+          ? name.slice(0, name.length - suffixToken.length)
+          : name;
+      if (nameWithoutSuffix.includes('_')) {
+        const underscoreIdx = nameWithoutSuffix.indexOf('_');
         const beforeUnderscore = name.slice(0, underscoreIdx);
         // Matched against every candidate prefix, not just the winning one: while
         // the model's own naming and EXTENSION_PREFIX disagree, "Other_MyObject"
@@ -500,10 +568,14 @@ export async function checkObjectNaming(
         separator = matchPrefixCandidate(beforeUnderscore, candidates);
         if (!separator) {
           errors.push(
-            `Non-extension objects must not contain underscores. ` +
-              `The only allowed underscore is as a prefix separator: ` +
-              `${prefix ? prefix + '_MyObject' : 'Prefix_MyObject'}. ` +
-              `For extension classes use: VendTable${prefix || 'Prefix'}_Extension.`,
+            isNoPrefixMode()
+              ? `Non-extension objects must not contain underscores. With naming.prefixSource=none the only ` +
+                `allowed one belongs to a configured suffix (naming.suffix="_ABC" → MyObject_ABC). ` +
+                `For extension classes use: VendTable_${modelToken || 'ModelName'}_Extension.`
+              : `Non-extension objects must not contain underscores. ` +
+                `The only allowed underscore is as a prefix separator: ` +
+                `${prefix ? prefix + '_MyObject' : 'Prefix_MyObject'}. ` +
+                `For extension classes use: VendTable${prefix || 'Prefix'}_Extension.`,
           );
         }
       }
@@ -533,8 +605,11 @@ export async function checkObjectNaming(
         }
       }
 
+      // The role suffixes below sit before a configured EXTENSION_SUFFIX, which the
+      // writer appends last (CustomerExportEntity_ABC is an entity name, not one
+      // missing "Entity").
       if (args.objectType === 'security-privilege') {
-        if (!/(View|Maintain|Delete|Admin|Invoke|Approve|FullControl)$/.test(name)) {
+        if (!/(View|Maintain|Delete|Admin|Invoke|Approve|FullControl)$/.test(nameWithoutSuffix)) {
           warnings.push(
             `Security privileges typically end with an action suffix: View, Maintain, Delete, Admin, Invoke, Approve, or FullControl.\n  Examples: ${name}View, ${name}Maintain`,
           );
@@ -543,7 +618,7 @@ export async function checkObjectNaming(
 
       if (args.objectType === 'security-duty') {
         if (
-          !/(Maintain|View|Inquire|Admin|Approve|Process)$/.test(name) &&
+          !/(Maintain|View|Inquire|Admin|Approve|Process)$/.test(nameWithoutSuffix) &&
           !(name.toLowerCase().includes('maintain') || name.toLowerCase().includes('view'))
         ) {
           warnings.push(`Security duties typically end with: Maintain, View, Inquire, Admin, Approve, or Process.`);
@@ -551,7 +626,7 @@ export async function checkObjectNaming(
       }
 
       if (args.objectType === 'data-entity') {
-        if (!name.endsWith('Entity')) {
+        if (!nameWithoutSuffix.endsWith('Entity')) {
           warnings.push(`Data entity names typically end with 'Entity'. Recommendation: ${name}Entity`);
           suggestions.push(`Data entity name: ${name}Entity`);
         }
@@ -561,7 +636,7 @@ export async function checkObjectNaming(
         // The AxReport name itself carries no suffix; what matters is that the
         // companion classes follow the role-suffix convention, so hand the full
         // roster to the caller in one place.
-        if (/(DP|Contract|Controller|UIBuilder|Tmp)$/.test(name)) {
+        if (/(DP|Contract|Controller|UIBuilder|Tmp)$/.test(nameWithoutSuffix)) {
           warnings.push(
             `"${name}" ends with a report COMPANION-class suffix — the AxReport itself is normally the bare document name ` +
             `(the suffixed names belong to its classes/table).`,
@@ -621,6 +696,7 @@ export async function checkObjectNaming(
     useModelName,
     namingStyle,
     useModelNameForClass,
+    usePrefixLeadingForClass,
     classNamingStyle,
     errors,
     warnings,

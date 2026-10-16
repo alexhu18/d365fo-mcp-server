@@ -11,7 +11,7 @@
  * object", about an operation that never touched the bridge).
  */
 
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
@@ -51,8 +51,13 @@ beforeEach(async () => {
   await seed();
 });
 
-afterAll(async () => {
-  await fs.rm(path.dirname(dir), { recursive: true, force: true }).catch(() => {});
+// `dir` IS the mkdtemp folder, so this removes exactly it. The previous
+// afterAll removed `path.dirname(dir)` — that is os.tmpdir() itself — and
+// deleted every file in %TEMP% on each run, with the errors on locked files
+// swallowed by a .catch. tests/tmpdirGuard.globalSetup.ts now fails the run
+// if any test does that again.
+afterEach(async () => {
+  await fs.rm(dir, { recursive: true, force: true });
 });
 
 describe('the ops are actually REACHABLE from the tool surface', () => {

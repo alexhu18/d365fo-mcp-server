@@ -51,7 +51,7 @@ const LabelsArgsSchema = z
       'Which label operation to run: ' +
       'search (full-text query, read), info (translations for a label ID or list of label files, read), ' +
       'create (add a NEW label to an AxLabelFile, write), update (overwrite the text of an EXISTING label, ' +
-      'e.g. fix a wrong translation, write), rename (rename a label ID across .label.txt + X++ + XML, write).',
+      'e.g. fix a wrong translation; languages without a supplied translation keep their text, write), rename (rename a label ID across .label.txt + X++ + XML, write).',
     ),
   })
   .passthrough();

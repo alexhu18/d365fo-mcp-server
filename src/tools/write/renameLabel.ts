@@ -23,6 +23,9 @@ import { defaultPackagesRoot } from '../../utils/packagesRoot.js';
 import { PackageResolver } from '../../utils/packageResolver.js';
 import { detectEol } from '../../utils/eolUtils.js';
 import { isExtensionLabelFile } from '../../metadata/labelParser.js';
+import { crossModelWriteRefusal, standDownNotice } from '../../utils/crossModelWriteGuard.js';
+import { resolveAnchorModel } from './writeAnchorGuard.js';
+import { assertWritePathAllowed, isFileUnderRoot } from '../../utils/pathContainment.js';
 
 const UTF8_BOM = '\uFEFF';
 
@@ -90,32 +93,55 @@ function escapeRegex(s: string): string {
 }
 
 /**
+ * The label ID a .label.txt line declares, or null for a comment (" ;…"), blank
+ * or malformed line. The one reading of a line that the existence check, the
+ * collision check and the rewrite share: when the checks searched the raw text
+ * for "\n<id>=" or "<BOM><id>=", a label on the first line of a file without a
+ * BOM was invisible to them but not to the rewrite, and renaming onto it left
+ * two declarations of the same ID.
+ */
+function labelIdOfLine(line: string): string | null {
+  if (line.startsWith(' ;') || line.startsWith('\t;')) return null;
+  const eqIdx = line.indexOf('=');
+  if (eqIdx <= 0) return null;
+  const id = line.substring(0, eqIdx).trim();
+  return id && !/\s/.test(id) ? id : null;
+}
+
+/** Lines of a .label.txt, without its BOM and line endings. */
+function labelLines(content: string): string[] {
+  return stripBom(content).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+}
+
+/** Whether a .label.txt declares `labelId`. */
+function declaresLabel(content: string, labelId: string): boolean {
+  return labelLines(content).some(line => labelIdOfLine(line) === labelId);
+}
+
+/**
  * Rename a label entry inside a single .label.txt file.
  * Returns the new file content, or null if the label was not found.
  */
 function renameLabelInTxt(content: string, oldId: string, newId: string): string | null {
   // Preserve the original line-ending style — D365FO .label.txt files are CRLF
   // in TFVC/Git, and silently rewriting them as LF makes every line look modified.
+  // The BOM stays as it was for the same reason: adding one to a file that had
+  // none shows up as a change to its first line.
   const eol = detectEol(content);
-  const lines = stripBom(content).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
   let found = false;
   const out: string[] = [];
 
-  for (const line of lines) {
-    const eqIdx = line.indexOf('=');
-    if (eqIdx > 0) {
-      const id = line.substring(0, eqIdx).trim();
-      if (id === oldId) {
-        found = true;
-        out.push(newId + line.substring(eqIdx)); // replace only the ID part
-        continue;
-      }
+  for (const line of labelLines(content)) {
+    if (labelIdOfLine(line) === oldId) {
+      found = true;
+      out.push(newId + line.substring(line.indexOf('='))); // replace only the ID part
+      continue;
     }
     out.push(line);
   }
 
   if (!found) return null;
-  return UTF8_BOM + out.join(eol);
+  return (content.startsWith(UTF8_BOM) ? UTF8_BOM : '') + out.join(eol);
 }
 
 /**
@@ -159,6 +185,39 @@ async function collectFiles(dir: string, extensions: string[]): Promise<string[]
     }
   }
   return results;
+}
+
+/**
+ * Why each of `files` — reference rewrites outside the label's own model
+ * directory — may not be written, or [] when all of them may. A file must lie
+ * under a configured package root in the AOT layout, and its model must pass
+ * the cross-model guard, exactly as a d365fo_file write into it would.
+ */
+async function refuseReferenceWritesOutsideModel(
+  files: string[],
+  labelRef: string,
+  configManager: ReturnType<typeof getConfigManager>,
+): Promise<string[]> {
+  if (files.length === 0) return [];
+  const activeModel = await resolveAnchorModel(configManager);
+  const refusals: string[] = [];
+  for (const file of files) {
+    const contained = await assertWritePathAllowed(file);
+    if (!contained.ok) {
+      refusals.push(`${file} — outside the configured package roots or not an AOT object file`);
+      continue;
+    }
+    const refusal = crossModelWriteRefusal({
+      objectName: labelRef,
+      objectType: 'label',
+      owningModel: contained.modelSegment,
+      owningPackage: contained.packageSegment,
+      activeModel,
+      action: 'modify',
+    });
+    if (refusal) refusals.push(`${file} — in model "${contained.modelSegment}", this workspace targets "${activeModel}"`);
+  }
+  return refusals;
 }
 
 export async function renameLabelTool(request: CallToolRequest, context: XppServerContext) {
@@ -220,6 +279,26 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       resolvedPackageName = model;
     }
 
+    // Cross-model guard, as labels(create) applies it: the rename rewrites the
+    // owning model's label file, and another model's label file is that model's
+    // code. Checked for a dry run too — previewing a rename the real call would
+    // refuse only plans work that cannot be done.
+    const crossModelCheck = {
+      objectName: `@${labelFileId}:${oldLabelId}`,
+      objectType: 'label',
+      owningModel: model,
+      owningPackage: resolvedPackageName,
+      activeModel: await resolveAnchorModel(configManager),
+      toolSwitchedModel: configManager.getToolProjectSwitch()?.forcedModel ?? null,
+      action: 'modify' as const,
+      dryRun,
+    };
+    const crossModelRefusal = crossModelWriteRefusal(crossModelCheck);
+    if (crossModelRefusal) {
+      return { content: [{ type: 'text', text: crossModelRefusal }], isError: true };
+    }
+    const crossModelNotice = standDownNotice(crossModelCheck);
+
     const modelDir = path.join(resolvedPackagePath, resolvedPackageName, model);
     const labelResourcesDir = path.join(modelDir, 'AxLabelFile', 'LabelResources');
 
@@ -243,7 +322,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       const txtPath = path.join(labelResourcesDir, lang, `${labelFileId}.${lang}.label.txt`);
       try {
         const content = await fs.readFile(txtPath, 'utf-8');
-        if (content.includes(`\n${oldLabelId}=`) || content.includes(`${UTF8_BOM}${oldLabelId}=`)) {
+        if (declaresLabel(content, oldLabelId)) {
           foundInAny = true;
           break;
         }
@@ -268,7 +347,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       const txtPath = path.join(labelResourcesDir, lang, `${labelFileId}.${lang}.label.txt`);
       try {
         const content = await fs.readFile(txtPath, 'utf-8');
-        if (content.includes(`\n${newLabelId}=`) || content.includes(`${UTF8_BOM}${newLabelId}=`)) {
+        if (declaresLabel(content, newLabelId)) {
           return {
             content: [{
               type: 'text',
@@ -282,21 +361,28 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       } catch { /* skip */ }
     }
 
-    // Collect all files to scan for references
+    // Collect all files to scan for references. A file reachable from both the
+    // model directory and a searchPath is one file: rewritten (and counted) once.
     const scanRoots = [modelDir, ...(args.searchPaths ?? [])];
-    const allXppFiles = (
-      await Promise.all(scanRoots.map(d => collectFiles(d, ['.xpp'])))
-    ).flat();
-    const allXmlFiles = (
-      await Promise.all(scanRoots.map(d => collectFiles(d, ['.xml'])))
-    ).flat();
+    const uniqueFiles = (files: string[]) => [...new Map(files.map(f => [path.resolve(f).toLowerCase(), f])).values()];
+    const allXppFiles = uniqueFiles(
+      (await Promise.all(scanRoots.map(d => collectFiles(d, ['.xpp'])))).flat(),
+    );
+    const allXmlFiles = uniqueFiles(
+      (await Promise.all(scanRoots.map(d => collectFiles(d, ['.xml'])))).flat(),
+    );
 
-    // Phase: rename in .label.txt files
+    // Everything is computed before anything is written: a reference rewrite the
+    // guard below refuses must stop the whole rename, or the label would be
+    // renamed with some of its references left pointing at the old ID.
     type FileChange = { file: string; replacements: number };
+    type PendingWrite = { file: string; content: string };
     const labelTxtChanges: FileChange[] = [];
     const xppChanges: FileChange[] = [];
     const xmlChanges: FileChange[] = [];
+    const pendingWrites: PendingWrite[] = [];
 
+    // Phase: rename in .label.txt files
     for (const lang of existingLanguages) {
       const txtPath = path.join(labelResourcesDir, lang, `${labelFileId}.${lang}.label.txt`);
       let content: string;
@@ -308,9 +394,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       if (newContent === null) continue;
 
       labelTxtChanges.push({ file: txtPath, replacements: 1 });
-      if (!dryRun) {
-        await writeFileAtomic(txtPath, newContent);
-      }
+      pendingWrites.push({ file: txtPath, content: newContent });
     }
 
     // Phase: replace @LabelFileId:OldId references in .xpp files
@@ -324,9 +408,7 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       if (count === 0) continue;
 
       xppChanges.push({ file: xppFile, replacements: count });
-      if (!dryRun) {
-        await writeFileAtomic(xppFile, newContent);
-      }
+      pendingWrites.push({ file: xppFile, content: newContent });
     }
 
     // Phase: replace references in XML metadata files
@@ -343,9 +425,39 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
       if (count === 0) continue;
 
       xmlChanges.push({ file: xmlFile, replacements: count });
-      if (!dryRun) {
-        await writeFileAtomic(xmlFile, newContent);
-      }
+      pendingWrites.push({ file: xmlFile, content: newContent });
+    }
+
+    // searchPaths is the caller's to choose, so a reference found through it can
+    // sit in any model — or outside every package root. The label-file check
+    // above says nothing about those files: without this, renaming a label of the
+    // workspace's own model with searchPaths pointed at another model rewrote
+    // that model's objects. Each file outside the model directory must pass the
+    // same containment and cross-model checks a d365fo_file write does.
+    const outsideRefusals = await refuseReferenceWritesOutsideModel(
+      pendingWrites.map(w => w.file).filter(f => !isFileUnderRoot(f, modelDir)),
+      `@${labelFileId}:${oldLabelId}`,
+      configManager,
+    );
+    if (outsideRefusals.length > 0) {
+      return {
+        content: [{
+          type: 'text',
+          text:
+            `⛔ Refusing to rename "@${labelFileId}:${oldLabelId}" — ${outsideRefusals.length} of the references ` +
+            `found through searchPaths are in files this workspace may not write. Nothing was ${dryRun ? 'previewed' : 'written'}: ` +
+            `a partial rename leaves references to an ID that no longer exists.\n\n` +
+            outsideRefusals.slice(0, 10).map(r => `  • ${r}`).join('\n') +
+            (outsideRefusals.length > 10 ? `\n  • … and ${outsideRefusals.length - 10} more` : '') +
+            `\n\nDrop those directories from searchPaths. References in another model are that model's code — ` +
+            `they change when its owner renames them, not from this workspace.`,
+        }],
+        isError: true,
+      };
+    }
+
+    if (!dryRun) {
+      for (const w of pendingWrites) await writeFileAtomic(w.file, w.content);
     }
 
     // Update SQLite index
@@ -415,6 +527,8 @@ export async function renameLabelTool(request: CallToolRequest, context: XppServ
     if (dryRun && totalFiles > 0) {
       lines.push(`💡 Remove dryRun=true to apply the rename.`);
     }
+
+    if (crossModelNotice) lines.push(crossModelNotice.trim());
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   } catch (err: any) {

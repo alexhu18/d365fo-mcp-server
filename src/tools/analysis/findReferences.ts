@@ -12,11 +12,11 @@ import { tryBridgeReferences } from '../../bridge/bridgeAdapter.js';
 import * as fs from 'fs';
 import { readIndexedMethodSources } from '../../utils/indexedMethodSource.js';
 
-const FindReferencesArgsSchema = z.object({
+export const FindReferencesArgsSchema = z.object({
   // "name" is accepted as an alias for "targetName"
   targetName: z.string().optional().describe('Name of the target. For a precise, type-scoped method where-used, qualify it as "Owner.method" (e.g. "SalesTable.initFromSalesQuotationTable") or pass an AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"). A bare method name matches that name on every type. For a label, pass the label id ("@WAX2194" or "@LabelFile:LabelId").'),
   name: z.string().optional().describe('Alias for targetName.'),
-  targetType: z.enum(['method', 'class', 'table', 'field', 'enum', 'edt', 'form', 'query', 'view', 'report', 'label', 'all']).optional().describe('Type of the target to search for'),
+  targetType: z.enum(['method', 'class', 'table', 'field', 'enum', 'edt', 'form', 'query', 'view', 'data-entity', 'map', 'report', 'menu-item', 'index', 'field-group', 'label', 'all']).optional().describe('Type of the target to search for. For an enum value pass "Enum::Value" (or "Enum.Value") with targetType "enum"; for a table index or field group, "Table.Name" with targetType "index" or "field-group"; for a form data source method, "Form.DataSource.method".'),
   ownerName: z.string().optional().describe('Declaring table/class/form that owns the method, when targetName is just the bare method name. Used to scope the where-used to a single type (matches Visual Studio xref).'),
   scope: z.enum(['all', 'workspace', 'standard', 'custom']).optional().default('all').describe('Search scope'),
   limit: z.number().optional().default(50).describe('Maximum results to return'),
@@ -41,6 +41,31 @@ const TYPE_TO_XREF_CONTAINER: Record<string, string> = {
 };
 
 /**
+ * The xref container a `targetType` names. A bare name reaches the bridge as a
+ * bare name, which it expands across EVERY container — so a where-used on the
+ * table CustTable also counted the form, the menu item and the query named
+ * CustTable (963 extra references on a live database). A targetType that names
+ * a type scopes the lookup to it: "/Tables/CustTable", whose metadata twin the
+ * bridge adds itself.
+ */
+const TARGET_TYPE_TO_XREF_CONTAINER: Record<string, string[]> = {
+  table: ['Tables'],
+  class: ['Classes'],
+  enum: ['Enums'],
+  edt: ['Edts'],
+  form: ['Forms'],
+  query: ['Queries'],
+  view: ['Views'],
+  // An entity is not a view to the xref DB: "/Views/<entity>" matches nothing.
+  'data-entity': ['DataEntityViews'],
+  map: ['Maps'],
+  report: ['Reports'],
+  // A menu item very often shares its name with the controller class or the report
+  // it runs; without this there is no way to leave those out.
+  'menu-item': ['MenuItemDisplays', 'MenuItemActions', 'MenuItemOutputs'],
+};
+
+/**
  * Detect and normalize a label where-used target. Labels live in the xref DB
  * under "/Labels/@<ref>", where <ref> is either the old concatenated form
  * ("@WAX2194") or the newer "@LabelFile:LabelId" form
@@ -56,18 +81,90 @@ export function resolveLabelTarget(targetName: string, targetType?: string): str
   return null;
 }
 
+function isEnumName(db: any, name: string): boolean {
+  return detectObjectTypeInDb(db, name).some(t => t.type === 'enum');
+}
+
 /**
  * Resolve which xref containers an owner name exists as (Tables/Classes/…).
  * Usually one; returns several only when a name collides across object types.
  */
+
 function resolveXrefContainers(db: any, ownerName: string): string[] {
   const types = detectObjectTypeInDb(db, ownerName);
   const containers = new Set<string>();
   for (const { type } of types) {
     const container = TYPE_TO_XREF_CONTAINER[type];
     if (container) containers.add(container);
+    // The index records a data entity as a 'view' (the kind is in its signature),
+    // but the xref DB keeps entities under DataEntityViews. Only the path that
+    // exists matches, so query both.
+    if (type === 'view') containers.add('DataEntityViews');
   }
   return [...containers];
+}
+
+/**
+ * [ExtensionOf] classes of `ownerName` that declare `memberName`.
+ *
+ * A method added to a table or class by an extension class is stored in
+ * DYNAMICSXREFDB under the EXTENSION class — "/Classes/<Ext>/Methods/<m>" — and
+ * only there: "/Tables/<Owner>/Methods/<m>" does not exist. So "Owner.m" has to
+ * look there too, or a method every caller reaches as Owner.m reports 0. The
+ * index already records each class extension, its base and its methods.
+ */
+function extensionClassesDeclaring(db: any, ownerName: string, memberName: string): string[] {
+  let rows: Array<{ extension_name?: string; added_methods?: string | null }> = [];
+  try {
+    rows = db.prepare(
+      `SELECT extension_name, added_methods FROM extension_metadata
+       WHERE base_object_name = ? COLLATE NOCASE AND extension_type = 'class-extension'`,
+    ).all(ownerName);
+  } catch {
+    return []; // extension_metadata not built
+  }
+  const wanted = memberName.toLowerCase();
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (!row?.extension_name || !row.added_methods) continue;
+    let methods: unknown;
+    try { methods = JSON.parse(row.added_methods); } catch { continue; }
+    if (Array.isArray(methods) && methods.some(m => typeof m === 'string' && m.toLowerCase() === wanted)) {
+      out.add(row.extension_name);
+    }
+  }
+  return [...out];
+}
+
+/** Past this many declaring types a bare method name stays a bare-name lookup. */
+const MAX_DECLARING_TYPES = 25;
+
+/**
+ * Every type that declares a method called `methodName`, as xref paths — or
+ * null when there are none or too many to query one by one.
+ *
+ * A bare method name reached the bridge as a bare name, which it expands to
+ * TYPE paths ("/Tables/<name>", …): for a method that matches nothing, and the
+ * caller fell back to the name-based search. Resolving the declaring types from
+ * the index queries the paths the calls are actually recorded under, extension
+ * classes included (their methods are indexed with the extension as parent).
+ */
+function declaringMethodPaths(db: any, methodName: string): string[] | null {
+  let rows: Array<{ parent_name?: string }> = [];
+  try {
+    rows = db.prepare(
+      `SELECT DISTINCT parent_name FROM symbols
+       WHERE type = 'method' AND name = ? AND parent_name IS NOT NULL
+       LIMIT ${MAX_DECLARING_TYPES + 1}`,
+    ).all(methodName);
+  } catch {
+    return null;
+  }
+  const parents = rows.map(r => r?.parent_name).filter((p): p is string => !!p);
+  if (parents.length === 0 || parents.length > MAX_DECLARING_TYPES) return null;
+  const paths = parents.flatMap(parent =>
+    resolveXrefContainers(db, parent).map(c => `/${c}/${parent}/Methods/${methodName}`));
+  return paths.length > 0 ? paths : null;
 }
 
 /**
@@ -134,7 +231,9 @@ function describeUnsearchableType(
   //
   // It is authoritative for these five types specifically BECAUSE of the container
   // fix in this change: a bare name now expands to /Edts/, /Forms/, /Queries/,
-  // /Views/ and /Reports/, so the query reaches the rows that exist instead of
+  // /Views/ and /Reports/ — and to the metadata shape of each (EdtString/, Form/,
+  // QuerySimple/, View/, Report/ …, where table fields, data sources and control
+  // bindings are recorded) — so the query reaches the rows that exist instead of
   // matching nothing by construction. Calling that "inconclusive" would put back
   // the defect this function was written to remove, one layer down — and the text
   // did worse than hedge, telling the reader to "re-run once the xref bridge is
@@ -160,6 +259,7 @@ function describeUnsearchableType(
   const suggestion = targetName.startsWith('/') ? null : ({
     edt: `/Edts/${targetName}`, report: `/Reports/${targetName}`,
     form: `/Forms/${targetName}`, query: `/Queries/${targetName}`, view: `/Views/${targetName}`,
+    'data-entity': `/DataEntityViews/${targetName}`, map: `/Maps/${targetName}`,
   } as Record<string, string>)[targetType];
 
   let out = `# References to \`${targetName}\`\n\n`;
@@ -172,7 +272,7 @@ function describeUnsearchableType(
   out += `mostly from declarative metadata that is not in the text index at all. Running it would `;
   out += `have produced a number with no relationship to the real answer.\n\n`;
   out += `**What to do:**\n`;
-  out += `- Re-run once the xref bridge is available (full server mode with a UDE/local xref DB)\n`;
+  out += `- Re-run once the xref bridge is available (full server mode; on UDE the XPP config names the xref DB, on a traditional VM set \`bridge.xrefDbName\`, usually DYNAMICSXREFDB)\n`;
   if (suggestion) {
     out += `- Or pass the explicit AOT path as \`targetName\`: \`${suggestion}\`\n`;
   }
@@ -229,7 +329,8 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
 
     // Target shape: AOT path ("/Tables/SalesTable/Methods/initFromSalesQuotationTable"),
     // owner-qualified ("SalesTable.initFromSalesQuotationTable"), or bare name.
-    const cleanTargetName = targetName.replace(/\(.*$/, '').trim(); // strip trailing parens
+    // Strip trailing parens; "Enum::Value" is the X++ spelling of an enum value's Owner.member.
+    const cleanTargetName = targetName.replace(/\(.*$/, '').trim().replace('::', '.');
     const isAotPath = cleanTargetName.startsWith('/');
 
     let owner: string | null = ownerName?.trim() || null;
@@ -238,6 +339,19 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
       const dot = cleanTargetName.lastIndexOf('.');
       owner = owner ?? (cleanTargetName.slice(0, dot).trim() || null);
       memberName = cleanTargetName.slice(dot + 1).trim();
+    }
+
+    // An index or field group is a member of its table. Sent as a bare name, the bridge
+    // expands it to "/Tables/<name>", "/Classes/<name>", … and matches nothing, which the
+    // unsearchable-type answer then reported as an authoritative zero.
+    if ((targetType === 'index' || targetType === 'field-group') && !owner && !isAotPath) {
+      const what = targetType === 'index' ? 'a table index' : 'a field group';
+      return { content: [{ type: 'text', text:
+        `# References to \`${cleanTargetName}\`\n\n` +
+        `**Target Type:** ${targetType}\n` +
+        `**Result:** not searched — this is NOT a count of zero\n\n` +
+        `${what[0].toUpperCase()}${what.slice(1)} is looked up under its table. Pass \`Table.${cleanTargetName}\` ` +
+        `as targetName (e.g. \`CustTable.AccountIdx\`) or set \`ownerName\`.\n` }] };
     }
 
     // parentObjectName powers the cross-type ("you used a form name as a class") hint
@@ -256,15 +370,66 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
     // is known, resolve its container type and build "/<Container>/<Owner>/<Methods|Fields>/<member>".
     let bridgeTargets: string[] = [cleanTargetName];
     let memberScoped = false;
+    // The enum of an "Enum::Value" target, for the name-based fallback below.
+    let enumValueOwner: string | null = null;
+    const typeContainers = targetType ? TARGET_TYPE_TO_XREF_CONTAINER[targetType] : undefined;
     if (isAotPath) {
-      memberScoped = cleanTargetName.includes('/Methods/') || cleanTargetName.includes('/Fields/');
-    } else if (owner && memberSegments.length > 0) {
-      const containers = resolveXrefContainers(symbolIndex.getReadDb(), owner);
-      bridgeTargets = containers.length > 0
-        ? containers.flatMap(c => memberSegments.map(seg => `/${c}/${owner}/${seg}/${memberName}`))
-        // Owner not indexed — hand the qualified name to the bridge to resolve across container types.
-        : [`${owner}.${memberName}`];
+      memberScoped = /\/(Methods|Fields|EnumValues|TableIndexs|TableFieldGroups)\//.test(cleanTargetName);
+    } else if (owner && targetType === 'enum') {
+      // "Enum.Value": an enum's members are its values, "/Enums/<E>/EnumValues/<v>".
+      bridgeTargets = [`/Enums/${owner}/EnumValues/${memberName}`];
       memberScoped = true;
+      enumValueOwner = owner;
+    } else if (owner && (targetType === 'index' || targetType === 'field-group')) {
+      // Only when asked for: an index or field group very often has the name of a field of
+      // the same table (1,751 tables have such a field group on a live database, 886 such an
+      // index), so an untyped "Table.Name" must stay the field. X++ spells the segments
+      // "TableIndexs" and "TableFieldGroups".
+      const db = symbolIndex.getReadDb();
+      const segment = targetType === 'index' ? 'TableIndexs' : 'TableFieldGroups';
+      const allowed = targetType === 'index' ? ['Tables', 'Maps'] : ['Tables', 'Views', 'DataEntityViews', 'Maps'];
+      const containers = resolveXrefContainers(db, owner).filter(c => allowed.includes(c));
+      bridgeTargets = (containers.length > 0 ? containers : ['Tables'])
+        .map(c => `/${c}/${owner}/${segment}/${memberName}`);
+      memberScoped = true;
+    } else if (owner && wantsMethod && /^[^.]+\.[^.]+$/.test(owner)) {
+      // "Form.DataSource.method": the data source's own method, stored under the data
+      // source by its name (not its table's).
+      const [form, dataSource] = owner.split('.');
+      bridgeTargets = [`/Forms/${form}/DataSources/${dataSource}/Methods/${memberName}`];
+      memberScoped = true;
+    } else if (owner && memberSegments.length > 0) {
+      const db = symbolIndex.getReadDb();
+      const paths = resolveXrefContainers(db, owner)
+        .flatMap(c => memberSegments.map(seg => `/${c}/${owner}/${seg}/${memberName}`));
+      // Untyped "Owner.member" on an enum can only be one of its values.
+      if (targetType !== 'method' && targetType !== 'field' && isEnumName(db, owner)) {
+        paths.push(`/Enums/${owner}/EnumValues/${memberName}`);
+        enumValueOwner = owner;
+      }
+      // Owner not indexed — hand the qualified name to the bridge to resolve across container types.
+      bridgeTargets = paths.length > 0 ? paths : [`${owner}.${memberName}`];
+      // A method an [ExtensionOf] class adds to the owner lives under that class.
+      if (wantsMethod) {
+        for (const ext of extensionClassesDeclaring(db, owner, memberName)) {
+          bridgeTargets.push(`/Classes/${ext}/Methods/${memberName}`);
+        }
+      }
+      memberScoped = true;
+    } else if (typeContainers && !cleanTargetName.includes('/')) {
+      bridgeTargets = typeContainers.map(c => `/${c}/${cleanTargetName}`);
+    } else if (wantsMethod && targetType !== 'all') {
+      // A bare method name, when it is not also a type name (then it stays a type
+      // lookup): query the types that declare it, extension classes included.
+      const db = symbolIndex.getReadDb();
+      // Any object type counts, not only the ones that own members: an EDT or enum
+      // named like some method must stay a type lookup.
+      const isTypeName = targetType !== 'method' && detectObjectTypeInDb(db, memberName).length > 0;
+      const paths = isTypeName ? null : declaringMethodPaths(db, memberName);
+      if (paths) {
+        bridgeTargets = paths;
+        memberScoped = true;
+      }
     }
 
     // Try C# bridge first (DYNAMICSXREFDB — live cross-references)
@@ -319,7 +484,10 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
 
     // 5. Search for enum references
     if (!targetType || targetType === 'enum' || targetType === 'all') {
-      const enumRefs = findEnumReferences(symbolIndex, ftsName, scope, limit);
+      // An enum value is written "Enum::Value" in code: search the enum, keep that value.
+      const enumRefs = enumValueOwner
+        ? findEnumReferences(symbolIndex, enumValueOwner, scope, limit, memberName)
+        : findEnumReferences(symbolIndex, ftsName, scope, limit);
       references.push(...enumRefs);
     }
 
@@ -328,7 +496,18 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
     // declaring type's own source — one indexed lookup and up to three files.
     const intraTypeRefs = wantsMethod
       ? scanDeclaringTypeSource(symbolIndex, ftsName, limit).filter(
-          r => !references.some(existing => existing.file === r.file && existing.context === r.context),
+          // Same call site already reported from the index. The two paths cut
+          // different windows around it (±1 line here, ±2 there), so equal
+          // contexts never matched and every call both found was listed twice.
+          // Compared by the call line, not the whole window: a call on the first
+          // line of a method body takes its leading line from the FILE here but
+          // has none in the indexed body, so the window is not a substring there.
+          r => {
+            const callLine = r.context.split('\n').find(l => callOf(ftsName).test(l))?.trim();
+            return !references.some(
+              existing => existing.file === r.file && (existing.context.includes(r.context) || (!!callLine && existing.context.includes(callLine))),
+            );
+          },
         )
       : [];
     references.push(...intraTypeRefs);
@@ -358,6 +537,16 @@ export async function findReferencesTool(request: CallToolRequest, context: XppS
           `so a same-named method on an unrelated type is counted as a hit. Only the xref bridge ` +
           `can scope a member to its declaring type.\n`
         : `> ℹ️ This counts every method named \`${ftsName}\` regardless of owner. For a type-scoped where-used, pass \`ownerName\` or qualify as \`Owner.${ftsName}\`.\n`;
+    }
+    // A table is referenced from metadata as much as from code, and this scan
+    // sees only code — the same reason an EDT gets "inconclusive" above. A table
+    // still has code references worth counting, so say what the number leaves out.
+    const tableTarget = targetType === 'table' ||
+      (!targetType && !isAotPath && resolveXrefContainers(symbolIndex.getReadDb(), ftsName).includes('Tables'));
+    if (tableTarget) {
+      output += `> ⚠️ For a table this counts X++ code only. Its declarative references — form data sources, ` +
+        `relations, data entity mappings, fields bound on forms — are recorded only in the cross-reference ` +
+        `database, and ${bridgeFallbackReason(bridgeOutcome.status)}.\n`;
     }
     output += `\n`;
 
@@ -560,14 +749,16 @@ function scanDeclaringTypeSource(symbolIndex: any, methodName: string, limit: nu
         texts = [...bodies.values()].map(m => m.source);
       }
 
+      const call = callOf(methodName);
+      const qualifiedCall = new RegExp(`::\\s*${escapeRegExp(methodName)}\\s*\\(`, 'i');
       for (const text of texts) {
         if (found.length >= limit) break;
         const lines = text.split('\n');
         for (let i = 0; i < lines.length && found.length < limit; i++) {
           // `this.m(` and `Type::m(` are calls; `m(` alone would match the
           // declaration and every same-named member in the file.
-          if (!/\bthis\.(\w+)\(/.test(lines[i]) && !new RegExp(`::${methodName}\\s*\\(`).test(lines[i])) continue;
-          if (!lines[i].includes(methodName + '(')) continue;
+          if (!/\bthis\s*\.\s*\w+\s*\(/.test(lines[i]) && !qualifiedCall.test(lines[i])) continue;
+          if (!call.test(lines[i])) continue;
           found.push({
             file: owner.file_path,
             model: '',
@@ -595,7 +786,9 @@ function findMethodReferences(symbolIndex: any, methodName: string, _scope: stri
     // method whose FIRST TEN LINES mention the name, but once it has, the call
     // being reported is often further down — and extracting context from the
     // preview then returned nothing, dropping a row FTS had correctly matched.
-    const context = extractMethodCallContext(bodyOf(row), methodName);
+    // In the method's own body the first "name(" is its declaration, not a call.
+    const isDeclaringMethod = typeof row.name === 'string' && row.name.toLowerCase() === methodName.toLowerCase();
+    const context = extractMethodCallContext(bodyOf(row), methodName, isDeclaringMethod);
     if (context) {
       references.push({
         file: row.file_path,
@@ -740,14 +933,14 @@ function findFieldReferences(symbolIndex: any, fieldName: string, _scope: string
   return references;
 }
 
-function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, limit: number): Reference[] {
+function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, limit: number, value?: string): Reference[] {
   const references: Reference[] = [];
   const rdb = symbolIndex.getReadDb();
 
   const rows = ftsMethodSearch(rdb, enumName, limit);
 
   for (const row of rows) {
-    const context = extractEnumReferenceContext(bodyOf(row), enumName);
+    const context = extractEnumReferenceContext(bodyOf(row), enumName, value);
     if (context) {
       references.push({
         file: row.file_path,
@@ -762,12 +955,48 @@ function findEnumReferences(symbolIndex: any, enumName: string, _scope: string, 
   return references;
 }
 
-function extractMethodCallContext(source: string, methodName: string): string | null {
+/** A symbol name as a literal regex fragment. */
+function escapeRegExp(name: string): string {
+  return name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * "name(" the way X++ may write it: identifiers are case-insensitive and a
+ * space may stand before the parenthesis, so "validatewrite()" and
+ * "validateWrite ()" call validateWrite just as much. An exact
+ * includes("validateWrite(") dropped them — after the case-insensitive FTS
+ * lookup had already matched the method — and it also matched the tail of a
+ * longer name ("myValidateWrite(").
+ */
+function callOf(name: string): RegExp {
+  return new RegExp(`(?<![\\w$])${escapeRegExp(name)}\\s*\\(`, 'i');
+}
+
+/** Leading words that make a "name(" line a statement, not a declaration. */
+const STATEMENT_START = /^\s*(?:return|if|while|for|switch|case|throw|else|print|info|warning|error|next|super)\b/i;
+
+/**
+ * Whether a line declares `methodName` — "public static void name(", "display Name name(" —
+ * rather than calling it. Only the declaring method's own body is checked, so a
+ * same-named call elsewhere is never dropped by this.
+ */
+function isMethodDeclarationLine(line: string, methodName: string): boolean {
+  const declaration = new RegExp(`^\\s*(?:[A-Za-z_][\\w.<>\\[\\]]*\\s+)+${escapeRegExp(methodName)}\\s*\\(`, 'i');
+  // No "=" test: an assignment ("real t = calcTotal(") cannot match the anchored
+  // type-and-modifier prefix anyway, while a default parameter value
+  // ("void foo(int _x = 5)") is still a declaration.
+  return declaration.test(line) && !STATEMENT_START.test(line);
+}
+
+function extractMethodCallContext(source: string, methodName: string, skipDeclaration = false): string | null {
   if (!source) return null;
 
+  const call = callOf(methodName);
   const lines = source.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(methodName + '(')) {
+    if (call.test(lines[i])) {
+      // The declaration counted as a call of the method to itself.
+      if (skipDeclaration && isMethodDeclarationLine(lines[i], methodName)) continue;
       // Return 2 lines before and after
       const start = Math.max(0, i - 2);
       const end = Math.min(lines.length, i + 3);
@@ -781,11 +1010,11 @@ function extractMethodCallContext(source: string, methodName: string): string | 
 function extractInstantiationContext(source: string, className: string): string | null {
   if (!source) return null;
 
-  const pattern = `new ${className}(`;
+  const pattern = new RegExp(`\\bnew\\s+${escapeRegExp(className)}\\s*\\(`, 'i');
   const lines = source.split('\n');
-  
+
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(pattern)) {
+    if (pattern.test(lines[i])) {
       const start = Math.max(0, i - 1);
       const end = Math.min(lines.length, i + 2);
       return lines.slice(start, end).join('\n').trim();
@@ -825,12 +1054,15 @@ function extractFieldAccessContext(source: string, fieldName: string): string | 
   return null;
 }
 
-function extractEnumReferenceContext(source: string, enumName: string): string | null {
+function extractEnumReferenceContext(source: string, enumName: string, value?: string): string | null {
   if (!source) return null;
 
+  // With a value, only "Enum::Value" itself — not "Enum::ValueOther" or another value.
+  const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const valueRef = value ? new RegExp(`\\b${escapeRe(enumName)}::${escapeRe(value)}\\b`, 'i') : null;
   const lines = source.split('\n');
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(enumName + '::')) {
+    if (valueRef ? valueRef.test(lines[i]) : lines[i].includes(enumName + '::')) {
       const start = Math.max(0, i - 1);
       const end = Math.min(lines.length, i + 2);
       return lines.slice(start, end).join('\n').trim();

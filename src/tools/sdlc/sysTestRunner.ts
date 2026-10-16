@@ -6,6 +6,7 @@ import os from 'os';
 import fs from 'fs/promises';
 import { getConfigManager } from '../../utils/configManager.js';
 import { defaultPackagesRoot } from '../../utils/packagesRoot.js';
+import { readAppSetting } from '../../utils/appSettings.js';
 import { withOperationLock } from '../../utils/operationLocks.js';
 import { wasCreatedThisSession } from '../../workspace/createdArtifactLedger.js';
 
@@ -32,11 +33,7 @@ const DATA_ACCESS_KEYS = [
   'DataAccess.DbServer',
 ] as const;
 
-/** One `<add key="…" value="…"/>` out of a .config document. */
-export function readAppSetting(xml: string, key: string): string | undefined {
-  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`<add\\s+key="${escaped}"\\s+value="([^"]*)"`, 'i').exec(xml)?.[1];
-}
+export { readAppSetting };
 
 export interface DataAccessDrift {
   key: string;

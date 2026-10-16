@@ -16,7 +16,7 @@
  * came from, what lost, and whether the two disagree at all.
  */
 
-import { resolveObjectPrefix } from './modelClassifier.js';
+import { isNoPrefixMode, resolveObjectPrefix } from './modelClassifier.js';
 import { getInferredModelPrefix, type InferredModelPrefix } from './modelPrefixInference.js';
 import { crossModelWriteAllowedByConfig } from './crossModelWriteGuard.js';
 
@@ -97,7 +97,9 @@ export function resolveEffectivePrefix(modelName: string | null): EffectivePrefi
   // objects' count, and there were none to agree). A line that contradicts
   // itself in the section built to make the prefix checkable is worse than a
   // vaguer one, so each origin states the evidence it actually has.
-  const source = inferred?.regular
+  const source = isNoPrefixMode()
+    ? 'none — naming.prefixSource=none (new objects keep the name as given)'
+    : inferred?.regular
     ? inferred.coverage > 0
       ? `inferred from ${inferred.coverage}/${inferred.sampleSize} objects of model "${modelName}"`
       : `inferred from the extension elements of model "${modelName}"`
@@ -119,6 +121,9 @@ export function resolveEffectivePrefix(modelName: string | null): EffectivePrefi
  */
 export function prefixCandidates(resolution: EffectivePrefix): PrefixCandidate[] {
   const out: PrefixCandidate[] = [];
+  // No prefix by choice: neither the model's stem nor a leftover EXTENSION_PREFIX
+  // is a token a name may "carry".
+  if (isNoPrefixMode()) return out;
   const add = (token: string | null | undefined, label: string, effective: boolean) => {
     const t = bare(token?.trim() ?? '');
     if (!t || out.some(c => c.token.toLowerCase() === t.toLowerCase())) return;

@@ -16,7 +16,7 @@
  * its request/extra args, so a direct call returns the exact wire payload.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createXppMcpServer } from '../../src/server/mcpServer';
 
 // ~4 chars/token is the usual rough conversion for English+JSON; only used for
@@ -184,7 +184,35 @@ const CHARS_PER_TOKEN = 4;
 // src/Metadata the server could read and not write, so every <ModuleReferences>
 // entry — a mandatory step before code that names a type from another model —
 // was a hand-edited XML carve-out. Parameters stay in the op-spec registry.
+//
+// Then find_references published the targetTypes #1064 had taught its handler
+// (data-entity, map, menu-item: +32 chars) and paid for them inside its own
+// schema: targetType's description repeated the label rule the tool description
+// already states, the tool description closed on "Essential for impact analysis
+// before refactoring", and targetType advertised `default: 'all'` — untrue, since
+// an omitted targetType takes the untyped path, which is NOT 'all' (a bare method
+// name is resolved to its declaring types, and with 'all' it is not).
+// Measured payload after: 45_015. The ceiling stays where it is on purpose: the
+// 85 chars under it are what the index/field-group targetTypes need next.
+// They took 63 of them (#1067): the two enum values and the "Table.Name" form in
+// targetType's description. Measured payload after: 45_078.
+//
+// d365fo_file's undo line gained "outside git, only if created this session": it
+// said "untracked → deleted", and on a TFVC workspace — every file untracked as far
+// as git can see — an agent read that as "undo deletes any file it is pointed at"
+// and would not use undo at all. Paid for in the same description ("returns the
+// contract for the one you picked" → "returns its contract"), so the ceiling holds.
 const TOTAL_BUDGET = 45_100;
+// axdb_sql is published only once SQL is configured, so TOTAL_BUDGET above —
+// the payload every default install sends — does not carry it. A configured
+// install does: measured 324 chars for the tool (its schema, description and
+// annotations), 45,078 -> 45,402. That is an allowance for an opt-in surface,
+// not headroom for the default one: it is asserted separately below.
+const SQL_CONFIGURED_ALLOWANCE = 330;
+// trace_d365fo likewise: published only once trace.enabled is true, so it is an
+// allowance for an opt-in surface asserted on its own, not part of TOTAL_BUDGET.
+// Measured 381 chars for the tool (schema, description, annotations).
+const TRACE_ENABLED_ALLOWANCE = 400;
 const LARGEST_TOOL_BUDGET = 5_780;
 
 async function getTools(): Promise<Array<{ name: string }>> {
@@ -197,6 +225,34 @@ async function getTools(): Promise<Array<{ name: string }>> {
 }
 
 describe('tool schema token budget', () => {
+  it('adds no more than the SQL allowance once AxDB SQL is configured', async () => {
+    vi.stubEnv('D365FO_SQL_ENABLED', 'true');
+    vi.stubEnv('D365FO_SQL_SERVER', 'localhost');
+    try {
+      const tools = await getTools();
+      expect(tools.map(t => t.name)).toContain('axdb_sql');
+      expect(tools.length).toBe(21);
+      expect(JSON.stringify(tools).length).toBeLessThan(TOTAL_BUDGET + SQL_CONFIGURED_ALLOWANCE);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('adds no more than the trace allowance once tracing is enabled', async () => {
+    vi.stubEnv('D365FO_TRACE_ENABLED', 'true');
+    try {
+      const tools = await getTools();
+      expect(tools.map(t => t.name)).toContain('trace_d365fo');
+      expect(tools.length).toBe(21);
+      const traceChars = JSON.stringify(tools.find(t => t.name === 'trace_d365fo')).length;
+      // eslint-disable-next-line no-console
+      console.error(`[tool-budget] trace_d365fo ${traceChars} chars`);
+      expect(JSON.stringify(tools).length).toBeLessThan(TOTAL_BUDGET + TRACE_ENABLED_ALLOWANCE);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('total ListTools payload stays within the token budget', async () => {
     const tools = await getTools();
     const chars = JSON.stringify(tools).length;
@@ -232,6 +288,14 @@ describe('tool schema token budget', () => {
     const tools = await getTools();
     const byName = new Map(tools.map(t => [t.name, t]));
 
+    // Action "project" (create/delete/add-object/remove-object — the .rnrproj and
+    // .sln entry were the last hand-written files in the flow) cost ~117 serialized
+    // chars and was paid for inside d365fo_file's own schema, not with a cap raise:
+    // the opening line re-listed the actions its bullets list, create named its file
+    // encoding, delete and the Windows note restated what the bullets already say,
+    // objectType said [delete] takes the enum it is published with, and properties
+    // restated the op-spec paragraph. d365fo_file 5,715 -> 5,705; payload 45,093.
+    //
     // d365fo_file's cap moved 5,700 -> 5,780 when objectType "model-descriptor"
     // and operations add-/remove-module-reference were published (5,640 -> 5,707
     // serialized chars: 19 for the objectType, 48 for the two operations). That

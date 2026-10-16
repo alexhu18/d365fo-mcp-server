@@ -21,9 +21,11 @@
 import { describe, it, expect } from 'vitest';
 import { prepareTool } from '../../src/server/toolSchemas/prepare';
 import { validateCodeTool } from '../../src/server/toolSchemas/validateCode';
+import { findReferencesTool } from '../../src/server/toolSchemas/findReferences';
 import { prepareCreateArgsSchema } from '../../src/tools/prepare/prepareCreate';
 import { prepareChangeArgsSchema } from '../../src/tools/prepare/prepareChange';
 import { validateXppArgsSchema } from '../../src/tools/analysis/validateXpp';
+import { FindReferencesArgsSchema } from '../../src/tools/analysis/findReferences';
 
 /** The string values of a zod enum field, however it is wrapped (optional/default). */
 function zodEnumValues(field: unknown): string[] {
@@ -68,6 +70,15 @@ describe('published tool schema vs handler schema', () => {
   it('validate_code publishes exactly the codeTypes its handler accepts', () => {
     expect(publishedEnum(validateCodeTool, 'codeType').sort())
       .toEqual(zodEnumValues(validateXppArgsSchema.shape.codeType).sort());
+  });
+
+  // #1064 taught the handler targetTypes data-entity, map and menu-item and the
+  // tests passed, because they call the handler directly; the tool list kept
+  // offering the old twelve, so no agent could ask for an entity's where-used
+  // scoped away from the view-shaped path that matches nothing.
+  it('find_references publishes exactly the targetTypes its handler accepts', () => {
+    expect(publishedEnum(findReferencesTool, 'targetType').sort())
+      .toEqual(zodEnumValues(FindReferencesArgsSchema.shape.targetType).sort());
   });
 
   it('specifically: the extension types #983 added are reachable from the tool list', () => {

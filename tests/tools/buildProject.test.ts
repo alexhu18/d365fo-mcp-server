@@ -634,6 +634,7 @@ describe('build_d365fo_project', () => {
     expect(closeCallback).toBeDefined();
 
     readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return writeFileMock.mock.calls.filter((c: any[]) => c[0].includes('d365build_state')).at(-1)?.[1];
       if (p.endsWith('.xppc.err')) return "Compile Error: Class Method dynamics://MyModel/MyClass/myMethod: [(28,27),(28,28)]: ';' expected.";
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
@@ -666,6 +667,7 @@ describe('build_d365fo_project', () => {
     expect(closeCallback).toBeDefined();
 
     readFileMock.mockImplementation(async (p: string) => {
+      if (p.includes('d365build_state')) return writeFileMock.mock.calls.filter((c: any[]) => c[0].includes('d365build_state')).at(-1)?.[1];
       if (p.endsWith('.xppc.err')) return 'Compile Warning: MyClass: potential issue.';
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
     });
@@ -679,6 +681,46 @@ describe('build_d365fo_project', () => {
     const state = JSON.parse(lastStateWrite![1]);
     expect(state.status).toBe('succeeded');
     expect(state.exitCode).toBe(0);
+  });
+
+  // Issue #1048 asked whether a build could pass while its log reports errors
+  // other than "Compile Error:" — the verdict regex knows only that prefix.
+  // Probed on the VM (2026-09-29, fm-mcp sandbox): every other error kind came
+  // with a NON-ZERO exit code, so the exit code fails the build and the regex
+  // gap never decides. The rows below are the real log lines and exit codes.
+  // (Incremental builds reported neither the pattern nor the relation error at
+  // all — exit 0, empty log — which is what incrementalScopeCaveat warns about.)
+  it.each([
+    [1, "Compile Fatal Error: Class dynamics://Class/Probe1048ClassB: The element must be named 'Probe1048ClassA' instead of 'Probe1048ClassB' to be consistent with its file name.\nErrors: 1"],
+    [1, "Metadata Error: AxTable/Probe1048RelTable/Relations/NoSuchTable/RelatedTable: Table 'NoSuchTableProbe1048' does not exist.\nErrors: 1"],
+    [2, "FormPatternValidation Error: AxForm/Probe1048Form/Design: Control 'AxForm/Probe1048Form/Design' is missing child 'Dialog Content Group' required by pattern 'Drop Dialog'.\nErrors: 2"],
+  ])('fails a build whose xppc exits %i with a non-"Compile Error:" error line, as xppc really does', async (exitCode, log) => {
+    let closeCallback: ((code: number | null) => void) | undefined;
+    const child = {
+      pid: 42,
+      unref: vi.fn(),
+      on: vi.fn().mockImplementation((event: string, cb: any) => {
+        if (event === 'close') closeCallback = cb;
+      }),
+    };
+    spawnMock.mockReturnValue(child);
+    allowPaths([XPPC, PKG]);
+    cfgGetModelName.mockReturnValue(MODEL_NAME);
+
+    await buildProjectTool({ modelName: MODEL_NAME, wait: false }, {});
+    readFileMock.mockImplementation(async (p: string) => {
+      // The close handler finishes only a build it still owns: serve the state it wrote.
+      if (p.includes('d365build_state')) return writeFileMock.mock.calls.filter((c: any[]) => c[0].includes('d365build_state')).at(-1)?.[1];
+      if (p.endsWith('.xppc.err')) return log;
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    });
+    await closeCallback!(exitCode);
+
+    const state = JSON.parse(writeFileMock.mock.calls
+      .filter((c: any[]) => c[0].includes('d365build_state'))
+      .at(-1)![1]);
+    expect(state.status).toBe('failed');
+    expect(state.exitCode).toBe(exitCode);
   });
 
   it('buildJobKey is case-insensitive: MYMODEL and mymodel resolve same state file path', async () => {

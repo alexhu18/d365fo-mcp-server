@@ -8,7 +8,7 @@
  * cover the helper and the "database has it, nothing else can reach it" path.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import {
   readIndexedMethodSource,
   readIndexedMethodSources,

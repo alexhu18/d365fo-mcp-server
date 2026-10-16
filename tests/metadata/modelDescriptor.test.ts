@@ -10,7 +10,6 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   parseModuleReferences,
-  readModuleReferences,
   packagesRootFromPath,
   buildModelVisibility,
 } from '../../src/metadata/modelDescriptor';
@@ -49,18 +48,6 @@ describe('parseModuleReferences', () => {
 
   it('returns an empty list for a descriptor with no references', () => {
     expect(parseModuleReferences('<AxModelInfo />')).toEqual([]);
-  });
-});
-
-describe('readModuleReferences', () => {
-  it('reads a model whose package shares its name', async () => {
-    expect(await readModuleReferences(root, 'Contoso')).toEqual(['ApplicationSuite', 'Ledger']);
-  });
-
-  // Null is "unknown", never "references nothing" — callers must not treat a
-  // missing descriptor as an empty reference set.
-  it('returns null when there is no descriptor', async () => {
-    expect(await readModuleReferences(root, 'NoSuchModel')).toBeNull();
   });
 });
 

@@ -16,6 +16,9 @@
  * inputs, not configuration.
  */
 
+import { SQL_SETTINGS } from './sqlSettings.js';
+import { TRACE_SETTINGS } from './traceSettings.js';
+
 export type SettingType = 'string' | 'path' | 'boolean' | 'int' | 'list' | 'enum';
 
 /**
@@ -32,6 +35,8 @@ export type SectionId =
   | 'index'
   | 'server'
   | 'bridge'
+  | 'sql'
+  | 'trace'
   | 'behavior'
   | 'azure';
 
@@ -76,6 +81,8 @@ export interface Setting {
   placeholder?: string;
   /** Wizard refuses an empty answer. */
   required?: boolean;
+  /** Optional text validation in the interactive configuration prompts. */
+  validate?: (value: string) => string | undefined;
 }
 
 export interface Section {
@@ -114,6 +121,16 @@ export const SECTIONS: Section[] = [
     id: 'bridge',
     title: 'C# bridge',
     description: 'The metadata-provider child process — the only write path to the AOT.',
+  },
+  {
+    id: 'sql',
+    title: 'AxDB SQL (optional)',
+    description: 'Windows-authenticated SQL access to AxDB on a development VM, for debugging.',
+  },
+  {
+    id: 'trace',
+    title: 'ETW performance trace (optional)',
+    description: 'Capture and analyse an ETW trace of X++ methods and SQL on this D365FO VM.',
   },
   {
     id: 'behavior',
@@ -254,7 +271,12 @@ export const SETTINGS: Setting[] = [
       'The scan resolves the MODEL; it does not pick a project when several .rnrproj under it build that model — ' +
       'get_workspace_info then reports `Project : (not selected)` and names them, and anything that registers a ' +
       'file needs an explicit projectName/projectPath. Picking one meant every write landed in whichever project ' +
-      'the scan saw first.',
+      'the scan saw first. With `workspace.modelName` set, only projects of that model are candidates. It is also ' +
+      'the bound on which .rnrproj the server may write: `d365fo_file(action="project")` and the project ' +
+      'registration done by create, modify, labels and generate_object all refuse a project that is not under ' +
+      'this folder, the IDE\'s workspace/solution path, `workspace.solutionPath`, or the folder of ' +
+      '`workspace.projectPath`. A project activated with `get_workspace_info(projectPath=…)` does not extend the ' +
+      'bound — set this to the folder that holds your projects instead.',
     placeholder: 'K:\\repos\\MySolution\\projects',
   },
   {
@@ -264,7 +286,9 @@ export const SETTINGS: Setting[] = [
     tier: 'advanced',
     type: 'path',
     label: 'Pinned .rnrproj file',
-    description: 'Forces one specific project instead of auto-detection. Rarely needed outside CI.',
+    description:
+      'Forces one specific project instead of auto-detection. Rarely needed outside CI. Its folder counts as a ' +
+      'solution root for project writes (see `workspace.solutionsPath`).',
   },
   {
     path: 'workspace.solutionPath',
@@ -311,9 +335,10 @@ export const SETTINGS: Setting[] = [
       'Your ISV/customer prefix. Prepended to every generated object, field and method name and enforced by the ' +
       'naming validator, so BP checks pass on the first build. Used as the **fallback**: when the active model\'s ' +
       'existing objects already show a prefix, that one wins — see ' +
-      '[Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from).',
+      '[Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). ' +
+      'No prefix at all (a suffix convention)? Leave it empty and set `naming.prefixSource` to `none`; empty ' +
+      'on its own still falls back to the model name.',
     placeholder: 'ISV_',
-    required: true,
   },
   {
     path: 'naming.prefixSource',
@@ -325,12 +350,15 @@ export const SETTINGS: Setting[] = [
     description:
       'Whether the effective prefix is learned from the active model\'s own objects or pinned to the configured ' +
       '`naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns ' +
-      'the shared stem, while the objects you write need the full one. See ' +
+      'the shared stem, while the objects you write need the full one. `none` is for teams that use no prefix ' +
+      '(e.g. a suffix convention with `naming.suffix`): new objects, fields and methods keep the name as given, ' +
+      'and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). See ' +
       '[Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from).',
     default: 'model',
     choices: [
       { value: 'model', hint: 'the model\'s own objects decide, falling back to naming.prefix' },
       { value: 'config', hint: 'always naming.prefix, inference off (pre-1.8.2 behaviour)' },
+      { value: 'none', hint: 'no prefix at all — names as given; extensions embed the model name' },
     ],
   },
   {
@@ -375,8 +403,9 @@ export const SETTINGS: Setting[] = [
     default: 'inherit',
     choices: [
       { value: 'inherit', hint: 'follow naming.extensionStyle — the default, behaviour unchanged' },
-      { value: 'prefix', hint: 'CustTableCtso_Extension — embeds the extension prefix' },
+      { value: 'prefix', hint: 'CustTableCtso_Extension — embeds the extension prefix, trailing' },
       { value: 'model-name', hint: 'CustTable_ContosoRobotics_Extension — embeds the model name' },
+      { value: 'prefix-leading', hint: 'CtsoCustTable_Extension — embeds the extension prefix, leading (e.g. Avanade Development Guidelines)' },
     ],
   },
 
@@ -532,15 +561,15 @@ export const SETTINGS: Setting[] = [
     type: 'enum',
     label: 'Tool profile',
     description:
-      'How many tools this server advertises. "full" publishes all 20. "core" publishes only the plan → discover → ' +
-      'write → build → verify loop (15 tools) and leaves out the specialist ones (extension_info, analyze_code, ' +
+      'How many tools this server advertises. "full" publishes all 22 (axdb_sql and trace_d365fo only once configured). "core" publishes only the plan → discover → ' +
+      'write → build → verify loop (17 tools) and leaves out the specialist ones (extension_info, analyze_code, ' +
       'validate_code, security_info, run_systest_class). Worth switching ' +
       'when the workspace runs several MCP servers at once: hosts stop sending the tool catalogue inline past a ' +
       'limit (VS Code: ~100 tools) and make the model search for tools first, which costs a round trip per tool.',
     default: 'full',
     choices: [
-      { value: 'full', hint: 'all 20 tools' },
-      { value: 'core', hint: '15-tool create-and-build loop' },
+      { value: 'full', hint: 'all 22 tools' },
+      { value: 'core', hint: '17-tool create-and-build loop' },
     ],
   },
   {
@@ -842,6 +871,30 @@ export const SETTINGS: Setting[] = [
     description: 'Absolute path the C# bridge appends its own diagnostics to.',
   },
   {
+    path: 'bridge.xrefDbServer',
+    env: 'D365FO_XREF_DB_SERVER',
+    section: 'bridge',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Cross-reference database server',
+    description:
+      'SQL Server holding the X++ cross-reference database that find_references reads through the bridge. ' +
+      'Leave empty to use the XPP config (UDE), or localhost when only the database name is set. ' +
+      'Takes precedence over the XPP config.',
+  },
+  {
+    path: 'bridge.xrefDbName',
+    env: 'D365FO_XREF_DB_NAME',
+    section: 'bridge',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Cross-reference database name',
+    description:
+      'Name of the X++ cross-reference database — DYNAMICSXREFDB on a traditional VM, where no XPP config ' +
+      'names it and find_references otherwise falls back to a name-based search. Leave empty to use the ' +
+      'XPP config (UDE). Takes precedence over the XPP config.',
+  },
+  {
     path: 'bridge.fsScanTimeoutMs',
     env: 'D365FO_FS_SCAN_TIMEOUT_MS',
     section: 'bridge',
@@ -948,6 +1001,10 @@ export const SETTINGS: Setting[] = [
       'Set the SAME random string on both halves of a hybrid deployment (and on every scaled-out App Service ' +
       'instance) so tokens issued by one process validate in another. Without it, tokens are memory-local.',
   },
+  // ── sql ──────────────────────────────────────────────────────────────────
+  ...SQL_SETTINGS,
+  // ── trace ────────────────────────────────────────────────────────────────
+  ...TRACE_SETTINGS,
 ];
 
 const BY_PATH = new Map(SETTINGS.flatMap(s => (s.path ? [[s.path, s] as const] : [])));
@@ -970,6 +1027,9 @@ export function serializeValue(setting: Setting, value: unknown): string | null 
   if (value === undefined || value === null) return null;
   switch (setting.type) {
     case 'boolean':
+      // A hand-edited `"enabled": "false"` is a non-empty string, so truthiness read it as
+      // true — and switched on what the user had written off. Text reads as parseValue reads it.
+      if (typeof value === 'string') return parseValue(setting, value) ? 'true' : 'false';
       return value ? 'true' : 'false';
     case 'int':
       return String(value);

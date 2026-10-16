@@ -15,8 +15,11 @@
  *     needs (issue #825). 'core' publishes only the plan → discover → write →
  *     build → verify loop; MCP_EXTRA_TOOLS adds individual tools back.
  *
- * isToolEnabled() is the single predicate combining both, shared by the
- * ListTools filter and the runtime call gate so they cannot drift apart.
+ * isToolEnabled() is the predicate combining both for the ListTools filter. The
+ * runtime call gate in toolHandler checks the same two parts one at a time, so
+ * a refusal can name its reason. The one difference is axdb_sql: unpublished
+ * while SQL is unconfigured, it still reaches its own handler, which answers
+ * SQL_DISABLED with the way to configure it.
  */
 
 /**
@@ -29,7 +32,12 @@
  * IMetadataProvider without SQLite, so Copilot can verify objects it just
  * created without an Azure re-deploy.
  */
+import { isAxDbConfigured } from '../config/axdbSql.js';
+import { isTraceEnabled } from '../config/trace.js';
+
 export const LOCAL_TOOLS = new Set([
+  'axdb_sql',
+  'trace_d365fo',
   'verify_d365fo_project',
   'update_symbol_index',
   'build_d365fo_project',
@@ -190,6 +198,8 @@ export const CORE_TOOLS = new Set([
   'build_d365fo_project',
   'run_bp_check',
   'verify_d365fo_project',
+  'axdb_sql',
+  'trace_d365fo',
 ]);
 
 /**
@@ -232,9 +242,9 @@ export function isToolInProfile(
 }
 
 /**
- * Single source of truth for whether a tool is published AND callable: locality
- * first, then breadth. Used by the ListTools filter (mcpServer) and the runtime
- * call gate (toolHandler).
+ * Whether a tool is published: locality first, then breadth, and axdb_sql only
+ * once SQL is configured. Used by the ListTools filter (mcpServer); the runtime
+ * call gate (toolHandler) applies the locality and breadth parts itself.
  */
 export function isToolEnabled(
   toolName: string,
@@ -242,5 +252,7 @@ export function isToolEnabled(
   profile: ToolProfile = TOOL_PROFILE,
   extras: ReadonlySet<string> = EXTRA_TOOLS,
 ): boolean {
-  return isToolAllowedInMode(mode, toolName) && isToolInProfile(profile, toolName, extras);
+  // axdb_sql and trace_d365fo are published only once configured: an install without them pays nothing.
+  return (toolName !== 'axdb_sql' || isAxDbConfigured()) && (toolName !== 'trace_d365fo' || isTraceEnabled())
+    && isToolAllowedInMode(mode, toolName) && isToolInProfile(profile, toolName, extras);
 }

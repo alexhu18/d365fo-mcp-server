@@ -373,7 +373,10 @@ export function clearInferredModelPrefixes(): void {
  * wants the configured EXTENSION_PREFIX to be authoritative, as it was before.
  */
 function inferenceDisabled(): boolean {
-  return process.env.EXTENSION_PREFIX_SOURCE?.trim().toLowerCase() === 'config';
+  const source = process.env.EXTENSION_PREFIX_SOURCE?.trim().toLowerCase();
+  // 'none' (no prefix at all) has nothing to learn either: a model whose objects
+  // share a stem must not bring a prefix back.
+  return source === 'config' || source === 'none';
 }
 
 /**

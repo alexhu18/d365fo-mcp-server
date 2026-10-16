@@ -55,12 +55,38 @@ import type {
   BridgeApiUsageCallersResult,
 } from './bridgeTypes.js';
 import { packagesRoots } from '../utils/packagesRoot.js';
+import type { AxDbConfig } from '../config/axdbSql.js';
+import type { AxDbMethod } from './bridgeTypes.js';
 
 // Re-export types for convenience
 export type { BridgeReadyPayload, BridgeInfoPayload } from './bridgeTypes.js';
 export * from './bridgeTypes.js';
 
 const BRIDGE_EXE_NAME = 'D365MetadataBridge.exe';
+
+/** Where a built bridge is looked for inside this installation, in order. */
+export function bridgeExeCandidates(): string[] {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return [
+    // Development: built in-tree
+    path.resolve(here, '../../bridge/D365MetadataBridge/bin/Release', BRIDGE_EXE_NAME),
+    // Production: alongside the server
+    path.resolve(here, './', BRIDGE_EXE_NAME),
+    path.resolve(here, BRIDGE_EXE_NAME),
+  ];
+}
+
+/**
+ * The bridge binary the server would start, found without starting it: the
+ * configured path when one is set (and exists — a configured path is never
+ * second-guessed), otherwise the first built candidate. For callers that only
+ * need the binary, such as the trace analysis (`--analyze-trace`), which touches
+ * no D365FO assembly and so works even when the long-running bridge did not start.
+ */
+export function locateBridgeExe(configured = process.env.D365FO_BRIDGE_EXE_PATH?.trim()): string | undefined {
+  if (configured) return fs.existsSync(configured) ? configured : undefined;
+  return bridgeExeCandidates().find(c => fs.existsSync(c));
+}
 
 /** Parse a positive-integer env var with a fallback (ignores invalid/non-positive values). */
 function envInt(name: string, fallback: number): number {
@@ -152,6 +178,7 @@ async function settledWithin(promise: Promise<unknown>, ms: number): Promise<boo
 }
 
 export interface BridgeClientOptions {
+  axdb?: AxDbConfig;
   /** Path to the D365MetadataBridge.exe (auto-detected if omitted) */
   bridgeExePath?: string;
   /** e.g. K:\AosService\PackagesLocalDirectory — the volume varies by VM image */
@@ -214,6 +241,8 @@ export class BridgeClient extends EventEmitter {
 
   public readonly options: BridgeClientOptions;
 
+  private startedExePath: string | undefined;
+
   constructor(options: BridgeClientOptions) {
     super();
     this.options = options;
@@ -221,6 +250,9 @@ export class BridgeClient extends EventEmitter {
 
   /** Whether the bridge process is running and the metadata provider initialized */
   get isReady(): boolean { return this._isReady && !this._disposed; }
+  get axdbSqlAvailable(): boolean { return this.readyPayload?.axdbSqlAvailable ?? false; }
+  /** The binary this client started, for one-shot modes such as --analyze-trace; undefined before the first start. */
+  get exePath(): string | undefined { return this.startedExePath; }
 
   /** Whether the MS metadata API is available (set after ready) */
   get metadataAvailable(): boolean { return this.readyPayload?.metadataAvailable ?? false; }
@@ -250,6 +282,7 @@ export class BridgeClient extends EventEmitter {
   /** Spawn the child process and wait for its "ready" message. Used by initialize() and restart(). */
   private async spawnAndWaitReady(): Promise<BridgeReadyPayload> {
     const exePath = this.resolveBridgeExe();
+    this.startedExePath = exePath;
     const args = [
       '--packages-path', this.options.packagesPath,
     ];
@@ -267,6 +300,13 @@ export class BridgeClient extends EventEmitter {
     }
     if (this.options.logFile) {
       args.push('--log-file', this.options.logFile);
+    }
+
+    const sql = this.options.axdb;
+    if (sql) {
+      args.push('--axdb-server', sql.server, '--axdb-database', sql.database,
+        '--axdb-timeout', String(sql.commandTimeoutSeconds), '--axdb-max-rows', String(sql.maxRows));
+      if (sql.trustServerCertificate) args.push('--axdb-trust-certificate');
     }
 
     console.error(`[BridgeClient] Spawning: ${exePath} ${args.join(' ')}`);
@@ -424,6 +464,12 @@ export class BridgeClient extends EventEmitter {
         await this.ensureHealthy();
       }
     }
+  }
+
+  /** Live SQL is never replayed, including reads. Server SQL budget is at most 45s. */
+  async callAxDb(method: AxDbMethod, params: Record<string, unknown>): Promise<unknown> {
+    if (this.restartPromise) await this.restartPromise;
+    return this.callOnce(method, params, 50_000);
   }
 
   /** Single-shot RPC send with no retry. */
@@ -1002,15 +1048,8 @@ export class BridgeClient extends EventEmitter {
       return configured;
     }
 
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-    const candidates = [
-      // Development: built in-tree
-      path.resolve(__dirname, '../../bridge/D365MetadataBridge/bin/Release', BRIDGE_EXE_NAME),
-      // Production: alongside the server
-      path.resolve(__dirname, './', BRIDGE_EXE_NAME),
-      path.resolve(__dirname, BRIDGE_EXE_NAME),
-    ];
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    const candidates = bridgeExeCandidates();
 
     for (const candidate of candidates) {
       if (fs.existsSync(candidate)) {
@@ -1020,7 +1059,11 @@ export class BridgeClient extends EventEmitter {
 
     throw new Error(
       `Bridge executable not found. Searched:\n${candidates.map(c => `  - ${c}`).join('\n')}\n` +
-      `Build it with: cd bridge/D365MetadataBridge && dotnet build -c Release`
+      // Absolute, so it runs from any directory; one invocation, because Windows
+      // PowerShell 5.1 rejects `&&`. An npm install needs `-o` outside the
+      // package, which only the CLI knows — `doctor` prints that form.
+      `Build it with: dotnet build "${path.resolve(__dirname, '../../bridge/D365MetadataBridge/D365MetadataBridge.csproj')}" -c Release\n` +
+      '  (npm install: run `d365fo-mcp doctor` for the command that builds outside the package.)'
     );
   }
 
@@ -1042,6 +1085,7 @@ export class BridgeClient extends EventEmitter {
  * This is a non-throwing factory — safe to call during server startup.
  */
 export async function createBridgeClient(options: {
+  axdb?: AxDbConfig;
   packagesPath?: string;
   referencePackagesPath?: string;
   binPath?: string;

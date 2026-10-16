@@ -37,6 +37,7 @@
  */
 
 import { escapeXml, decodeXmlEntitiesFromXppSource } from '../../utils/xmlEscape.js';
+import { extensionClassBaseOf } from '../../utils/modelClassifier.js';
 import { readMethodCall } from '../../utils/methodBodyHint.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../../utils/xppDocGen.js';
 import { xppMethodSourceForXml, reindentXppSource } from '../../utils/xppFormat.js';
@@ -508,7 +509,10 @@ ${methodsXml}\t</SourceCode>
     sourceCode?: string,
     properties?: Record<string, any>
   ): string {
-    const baseClass = properties?.baseClass || extensionName.replace(/_[^_]+_Extension$/, '');
+    // Derived from the name only when the caller did not state it — through the one
+    // helper that reads all three class styles. The old `/_[^_]+_Extension$/` only
+    // fit the model-name shape: CustTableCtso_Extension "extended" itself.
+    const baseClass = properties?.baseClass || extensionClassBaseOf(extensionName, properties?.modelName);
 
     const defaultSource = sourceCode ||
       `[ExtensionOf(classStr(${baseClass}))]\nfinal class ${extensionName}\n{\n    // ⚠️  ALWAYS call next <methodName>() — verify exact signature with:\n    //     ${readMethodCall('class', baseClass, '<methodName>')}\n    //\n    // Template for wrapping a method:\n    //   public ReturnType methodName(ParamType _param)\n    //   {\n    //       ReturnType result = next methodName(_param);\n    //       return result;\n    //   }\n}`;

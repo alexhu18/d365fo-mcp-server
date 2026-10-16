@@ -9,8 +9,9 @@ import { z } from 'zod';
 import { readMethodCall } from '../../utils/methodBodyHint.js';
 import {
   resolveObjectPrefix, applyObjectPrefix, deriveExtensionInfix, getObjectSuffix, applyObjectSuffix,
-  getExtensionClassNamingStyle,
+  getExtensionClassNamingStyle, isNoPrefixMode,
 } from '../../utils/modelClassifier.js';
+import { normalizeModelToken } from '../../utils/modelToken.js';
 import { normalizeObjectName } from '../../utils/objectNaming.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { enforceGrounding } from '../../utils/provenanceStore.js';
@@ -451,6 +452,14 @@ function formControlExtensionTemplate(formName: string, className: string, contr
 [ExtensionOf(formControlStr(${formName}, ${ctrlName}))]
 final class ${className}
 {
+    // Button / CommandButton control: wrap clicked() instead — modified, validate and lookup
+    // are for value-bearing controls and never run on a click:
+    //   public void clicked()
+    //   {
+    //       next clicked();
+    //       // TODO: Add logic that runs when the button is clicked
+    //   }
+
     /// <summary>
     /// Fires when the control value is changed by the user.
     /// </summary>
@@ -1263,8 +1272,8 @@ function reportCustomDesignTemplate(
   baseController: string,
   documentType: string,
   designName: string,
+  customReport = `${prefix}${standardReport}`,
 ): string {
-  const customReport = `${prefix}${standardReport}`;
   return `
 // ── 1. Controller — runs YOUR copy of the report ────────────────────────
 /// <summary>
@@ -2728,7 +2737,12 @@ export async function codeGenTool(request: CallToolRequest) {
     const resolvedModelName = args.modelName || getConfigManager().getModelName() || '';
     const prefix = resolveObjectPrefix(resolvedModelName);
     // Extension infix: PascalCase form without underscore (e.g. "XY" → "Xy" when env has "XY_")
-    const extensionInfix = deriveExtensionInfix(prefix);
+    // With no prefix by choice (naming.prefixSource=none) the model name is the token
+    // these patterns embed, as it is in the extension names the writer produces.
+    const extensionInfix =
+      deriveExtensionInfix(prefix) ||
+      (isNoPrefixMode() && resolvedModelName ? normalizeModelToken(resolvedModelName) : '');
+    const noPrefixNote = '📌 **Naming:** no prefix (naming.prefixSource=none) — ';
     // The name d365fo_file(action="create") WILL write for an extension class, from the
     // writer's own function. Assembled here by hand it disagreed with the writer in every
     // style: the writer puts the token right before "_Extension", so the old
@@ -2738,7 +2752,7 @@ export async function codeGenTool(request: CallToolRequest) {
     // data-source extension classes, 12 carry the token after "DS" and none before it;
     // 3 of 596 form extension classes use "{Infix}Form_Extension".
     const extensionClassName = (stem: string) =>
-      normalizeObjectName(`${stem}_Extension`, 'class-extension', resolvedModelName || undefined);
+      normalizeObjectName(`${stem}_Extension`, 'class-extension', resolvedModelName || undefined, undefined, { knownBase: true });
     const classStyleLine =
       `  Style: ${getExtensionClassNamingStyle()} (EXTENSION_CLASS_NAMING_STYLE) — the name d365fo_file(action="create") writes.`;
 
@@ -2857,15 +2871,18 @@ export async function codeGenTool(request: CallToolRequest) {
         const baseController = args.baseName?.trim() || `${standardReport}Controller`;
         const documentType = args.documentType?.trim() || 'SalesOrderConfirmation';
         const designName = args.designName?.trim() || 'Report';
+        // The copy is a NEW object: under naming.prefixSource=none the model token
+        // trails it (SalesInvoiceABC), so the model name is never a leading prefix.
+        const customReport = isNoPrefixMode() ? `${standardReport}${extensionInfix}` : `${extensionInfix}${standardReport}`;
         code = reportCustomDesignTemplate(
-          standardReport, extensionInfix, baseController, documentType, designName);
-        displayName = `${extensionInfix}${standardReport}`;
+          standardReport, extensionInfix, baseController, documentType, designName, customReport);
+        displayName = customReport;
         namingNote =
-          `📌 **Generated:** \`${extensionInfix}${standardReport}Controller extends ${baseController}\` ` +
-          `+ \`${extensionInfix}${standardReport}PrintMgmtHandler\`` +
+          `📌 **Generated:** \`${customReport}Controller extends ${baseController}\` ` +
+          `+ \`${customReport}PrintMgmtHandler\`` +
           (extensionInfix ? '' : ' — ⚠️ no prefix resolved; set `EXTENSION_PREFIX` or pass `modelName`.') +
           `\n\n**Do this first:** duplicate the standard \`${standardReport}\` report into your model and ` +
-          `rename the copy \`${extensionInfix}${standardReport}\`. Neither class compiles until it exists.\n\n` +
+          `rename the copy \`${customReport}\`. Neither class compiles until it exists.\n\n` +
           `⚠️ **Verify two names against the real objects** — both are compile-time checked: the base ` +
           `controller (\`${baseController}\`) and the DESIGN inside the report (\`${designName}\`). ` +
           `Read the design from the AxReport, not from habit: shipped reports do use "Report", but it is a ` +
@@ -2876,7 +2893,7 @@ export async function codeGenTool(request: CallToolRequest) {
 
       } else if (args.pattern === 'report-menu-redirect') {
         const controllerClass = args.name;
-        const customReport = args.baseName?.trim() || `${extensionInfix}Report`;
+        const customReport = args.baseName?.trim() || (isNoPrefixMode() ? `Report${extensionInfix}` : `${extensionInfix}Report`);
         const designName = args.designName?.trim() || 'Report';
         code = reportMenuRedirectTemplate(controllerClass, extensionInfix, customReport, designName);
         displayName = controllerClass;
@@ -3019,8 +3036,11 @@ export async function codeGenTool(request: CallToolRequest) {
       namingNote = prefix
         ? `📌 **Naming (MS guidelines):** Object prefix: \`${prefix}\` → generates \`${finalName}DataContract\`, \`${finalName}Controller\`, \`${finalName}Service\`\n` +
           `   Service method: \`${serviceMethod}(${finalName}DataContract _contract)\``
-        : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\`.\n` +
-          `   Service method: \`${serviceMethod}(${finalName}DataContract _contract)\``;
+        : isNoPrefixMode()
+          ? `${noPrefixNote}generates \`${finalName}DataContract\`, \`${finalName}Controller\`, \`${finalName}Service\`\n` +
+            `   Service method: \`${serviceMethod}(${finalName}DataContract _contract)\``
+          : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\`.\n` +
+            `   Service method: \`${serviceMethod}(${finalName}DataContract _contract)\``;
     } else {
       // New element pattern — apply prefix to the name
       const newTemplate = newElementTemplates[args.pattern];
@@ -3037,6 +3057,8 @@ export async function codeGenTool(request: CallToolRequest) {
       displayName = finalName;
       namingNote = prefix
         ? `📌 **Naming (MS guidelines):** Object name with prefix: \`${finalName}\``
+        : isNoPrefixMode()
+        ? `${noPrefixNote}object name as given: \`${finalName}\``
         : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` to auto-prefix new objects.`;
     }
 

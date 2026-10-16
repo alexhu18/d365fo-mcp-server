@@ -32,6 +32,7 @@ import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../utils
 import { parseXppDeclaration, parseXppClassHeader } from '../metadata/xppDeclaration.js';
 import { rankCustomFirst, isExactNameMatch } from '../utils/exactMatchRanking.js';
 import { COMPACT_METHODS_HINT, fullBodyHint } from '../utils/methodBodyHint.js';
+import { subscriberAccessLevelValue } from '../utils/subscriberAccessLevel.js';
 import {
   pageFields, fieldsHeading, fieldsFooter,
   createControlBudget, chargeControl, chargeSkippedSubtree, controlsFooter,
@@ -184,6 +185,8 @@ function formatTable(
   if (t.cacheLookup) out += `**CacheLookup:** ${t.cacheLookup}\n`;
   if (t.clusteredIndex) out += `**ClusteredIndex:** ${t.clusteredIndex}\n`;
   if (t.primaryIndex) out += `**PrimaryIndex:** ${t.primaryIndex}\n`;
+  if (t.subscriberAccessLevel) out += `**SubscriberAccessLevel:** ${t.subscriberAccessLevel}\n`;
+  if (t.allowRowVersionChangeTracking === 'Yes') out += `**AllowRowVersionChangeTracking:** Yes\n`;
   out += `_Source: C# bridge (IMetadataProvider)_\n\n`;
 
   // Fields — paged like methods below. A Microsoft table can carry 400+ fields,
@@ -664,11 +667,24 @@ export async function tryBridgeReferences(
   // transient failure as an authoritative "0 references".
   const merged: BridgeReferenceInfo[] = [];
   let errored = false;
+  // The bridge returns at most XREF_ROW_CAP rows per target shape and candidate,
+  // with the exact totals alongside; an older bridge returns only the rows.
+  let capped = false;
+  let exact = true;
+  let exactTotal = 0;
+  let exactMetadata = 0;
   for (const t of targets) {
     try {
       const r = await bridge.findReferences(t);
       if (r?.error) errored = true;
       if (r?.references?.length) merged.push(...r.references);
+      if (typeof r?.total === 'number') {
+        exactTotal += r.total;
+        exactMetadata += r.metadataTotal ?? 0;
+      } else {
+        exact = false;
+        if ((r?.references?.length ?? 0) >= XREF_ROW_CAP) capped = true;
+      }
     } catch (e) {
       errored = true;
       recordBridgeFailure(`findReferences(${t})`, e);
@@ -689,10 +705,21 @@ export async function tryBridgeReferences(
 
   {
     const refs = { count: merged.length, references: merged };
+    const returnedMetadata = merged.filter(r => isMetadataSource(r.sourcePath)).length;
+    const total = exact ? exactTotal : refs.count;
+    const metadataTotal = exact ? exactMetadata : returnedMetadata;
+    const sampled = exact && refs.count < exactTotal;
 
     let out = `# References to \`${label}\`\n\n`;
-    out += `**Total:** ${refs.count} reference(s) found\n`;
-    out += `_Source: C# bridge (DYNAMICSXREFDB)_\n\n`;
+    out += `**Total:** ${total}${capped ? '+' : ''} reference(s) found${sampled ? ` (showing ${refs.count})` : ''}\n`;
+    out += `_Source: C# bridge (DYNAMICSXREFDB) — X++ code and declarative metadata references_\n\n`;
+    if (sampled) {
+      out += `> ℹ️ The bridge returns up to ${XREF_ROW_CAP} rows per lookup for code and for metadata: the totals are exact, ` +
+        `the rows below are a sample. Narrow the target (e.g. \`Owner.member\`) for a complete list.\n\n`;
+    } else if (capped) {
+      out += `> ⚠️ At least one lookup reached the bridge's limit of ${XREF_ROW_CAP} rows, so the real total is higher. ` +
+        `Narrow the target (e.g. \`Owner.member\`) for a complete list.\n\n`;
+    }
 
     // Group by reference type for summary
     const byType = new Map<string, number>();
@@ -700,17 +727,16 @@ export async function tryBridgeReferences(
     for (const r of refs.references) {
       const rt = r.referenceType || 'reference';
       byType.set(rt, (byType.get(rt) || 0) + 1);
-      const caller = r.callerClass
-        ? (r.callerMethod ? `${r.callerClass}.${r.callerMethod}` : r.callerClass)
-        : r.sourcePath;
+      const caller = referenceCaller(r);
       topCallers.set(caller, (topCallers.get(caller) || 0) + 1);
     }
 
     // Summary by type
-    out += `## 📊 Summary by Type\n\n`;
+    out += `## 📊 Summary by Type${sampled ? ' (in the rows returned)' : ''}\n\n`;
     for (const [type, count] of byType) {
       out += `- **${type}**: ${count} reference(s)\n`;
     }
+    out += `- From X++ code: ${total - metadataTotal} · from declarative metadata: ${metadataTotal}\n`;
     out += `\n`;
 
     // Top callers
@@ -724,28 +750,64 @@ export async function tryBridgeReferences(
     }
 
     // Detailed references
+    // Code and metadata each get a share of `limit`, so neither can crowd the
+    // other out of the list — rows come back code first, and a response trimmed
+    // to its first rows used to show code only.
     out += `## 📍 References\n\n`;
-    const visible = refs.references.slice(0, limit);
-    for (const r of visible) {
+    const metadataRows = refs.references.filter(r => isMetadataSource(r.sourcePath));
+    const codeRows = refs.references.filter(r => !isMetadataSource(r.sourcePath));
+    let codeShare = Math.min(codeRows.length, Math.ceil(limit / 2));
+    const metadataShare = Math.min(metadataRows.length, limit - codeShare);
+    codeShare = Math.min(codeRows.length, limit - metadataShare);
+    const renderRow = (r: BridgeReferenceInfo) => {
       const module = r.sourceModule ? ` [${r.sourceModule}]` : '';
       const loc = r.line > 0 ? `:${r.line}` : '';
       const refType = r.referenceType ? ` (${r.referenceType})` : '';
-      const caller = r.callerClass
-        ? (r.callerMethod ? `${r.callerClass}.${r.callerMethod}` : r.callerClass)
-        : null;
-      if (caller) {
-        out += `- **${caller}**${loc}${module}${refType}\n`;
-      } else {
-        out += `- **${r.sourcePath}**${loc}${module}${refType}\n`;
-      }
+      return `- **${referenceCaller(r)}**${loc}${module}${refType}\n`;
+    };
+    const groups: Array<[string, BridgeReferenceInfo[], number, number]> = [
+      ['From declarative metadata', metadataRows, metadataShare, metadataTotal],
+      ['From X++ code', codeRows, codeShare, total - metadataTotal],
+    ];
+    for (const [heading, rows, share, groupTotal] of groups) {
+      if (rows.length === 0) continue;
+      out += `### ${heading} (${share < groupTotal ? `${share} of ${groupTotal}` : share})\n\n`;
+      for (const r of rows.slice(0, share)) out += renderRow(r);
+      out += `\n`;
     }
 
     if (refs.count > limit) {
-      out += `\n> ⚠️ Showing first ${limit} of ${refs.count} references.\n`;
+      out += `> ⚠️ Showing ${limit} of the ${refs.count} rows returned. Raise \`limit\` to see more.\n`;
     }
 
     return { status: 'ok', result: { content: [{ type: 'text', text: out }] } };
   }
+}
+
+/** Rows the C# bridge returns per candidate path at most (its SELECT TOP 500). */
+const XREF_ROW_CAP = 500;
+
+/**
+ * Declarative metadata references are stored with a singular, slash-free source
+ * path carrying the referencing property ("Form/F/FormDataSourceRoot/T?Table");
+ * X++ code references with a plural, slash-prefixed one ("/Classes/C/Methods/m").
+ */
+function isMetadataSource(sourcePath: string): boolean {
+  return !!sourcePath && !sourcePath.startsWith('/');
+}
+
+/**
+ * Who references the target, for a reader: "Class.method" for code, and for
+ * metadata the object type, object and "member › property" (the same reading
+ * label where-used gives) — "Form MyJournalForm › MyCountingTrans › Table".
+ */
+function referenceCaller(r: BridgeReferenceInfo): string {
+  if (isMetadataSource(r.sourcePath)) {
+    const { type, objectName, detail } = parseLabelSource(r.sourcePath);
+    return `${type} ${objectName}${detail ? ` › ${detail}` : ''}`;
+  }
+  if (r.callerClass) return r.callerMethod ? `${r.callerClass}.${r.callerMethod}` : r.callerClass;
+  return r.sourcePath;
 }
 
 // LABEL REFERENCES (formatting)
@@ -1823,6 +1885,15 @@ export async function bridgeSetProperty(
 ): Promise<{ success: boolean; message: string } | null> {
   if (!bridge?.isReady || !bridge.metadataAvailable) return null;
   if (!BRIDGE_MODIFY_TYPES.has(objectType.toLowerCase())) return null;
+
+  // SubscriberAccessLevel (#1073): the bridge reads "Read=Allow,Create=Deny" or
+  // "None", so a JSON object value is passed in that form. An invalid value is not
+  // sent at all; the direct XML fallback refuses it with the reason.
+  if (objectType.toLowerCase() === 'table' && propertyPath.toLowerCase() === 'subscriberaccesslevel') {
+    const v = subscriberAccessLevelValue(propertyValue);
+    if (!v.ok) return null;
+    propertyValue = v.bridgeText;
+  }
 
   try {
     const result = await bridge.setProperty(objectType, objectName, propertyPath, propertyValue);

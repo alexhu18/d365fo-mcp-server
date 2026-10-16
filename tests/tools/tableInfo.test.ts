@@ -26,6 +26,18 @@ vi.mock('../../src/tools/write/modifyD365File', () => ({
   findD365FileOnDisk: vi.fn(async () => null), // no disk fallback hit either
 }));
 
+vi.mock('../../src/utils/metadataResolver', async (orig) => ({
+  ...(await orig<any>()),
+  remapDbPathLocally: vi.fn(async () => null), // no local packages root
+  resolveDbPathLocally: vi.fn(async () => null),
+}));
+
+vi.mock('../../src/utils/symbolLookup', async (orig) => ({
+  ...(await orig<any>()),
+  canonicalSymbolName: vi.fn((_db: unknown, name: string) =>
+    name.toLowerCase() === 'custtable' ? 'CustTable' : undefined),
+}));
+
 import { tableInfoTool } from '../../src/tools/readers/tableInfo';
 import * as fs from 'fs';
 
@@ -74,7 +86,8 @@ describe('tableInfoTool — stale symbol-index guard', () => {
     // Regression: this is the exact scenario — a rolled-back table's row survives
     // in the index; its file no longer exists.
     const ctx = buildContext({ name: 'ConDemoNoteHeader', filePath: 'K:\\Pkg\\Model\\AxTable\\ConDemoNoteHeader.xml', model: 'MyModel' });
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    // The model's AxTable folder is here; the table's file is not — it was deleted.
+    vi.mocked(fs.existsSync).mockImplementation((p: any) => !String(p).endsWith('.xml'));
 
     const result = await tableInfoTool(req({ tableName: 'ConDemoNoteHeader' }), ctx);
     // Falls through the DB hit (now rejected as stale), no disk fallback (mocked null),
@@ -82,6 +95,54 @@ describe('tableInfoTool — stale symbol-index guard', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).not.toContain('Served from symbol index');
     expect(result.content[0].text).toMatch(/not found/i);
+  });
+});
+
+describe('tableInfoTool — index rows whose path is not on this machine', () => {
+  // Regression: without the bridge, every standard table came back "not found".
+  // The index records the path it was BUILT at — a CI build agent for the shipped
+  // index, or an older UDE version folder after an upgrade — and the stale guard
+  // read "that path does not exist here" as "the table was deleted".
+  const custFields = [
+    { name: 'AccountNum', signature: 'CustAccount' },
+    { name: 'CustGroup', signature: 'CustGroupId' },
+  ];
+
+  it('serves a standard table indexed at a build-agent path', async () => {
+    const ctx = buildContext(
+      { name: 'CustTable', filePath: '/home/vsts/work/1/PackagesLocalDirectory/applicationsuite/Foundation/AxTable/CustTable.xml', model: 'Foundation' },
+      custFields,
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    const result = await tableInfoTool(req({ tableName: 'CustTable' }), ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('**AccountNum**: CustAccount');
+    expect(result.content[0].text).toContain('**CustGroup**: CustGroupId');
+  });
+
+  it('serves a table indexed under a UDE version folder that has since been replaced', async () => {
+    const ctx = buildContext(
+      { name: 'CustTable', filePath: 'C:\\Users\\dev\\AppData\\Local\\Microsoft\\Dynamics365\\10.0.1000.10\\PackagesLocalDirectory\\ApplicationSuite\\Foundation\\AxTable\\CustTable.xml', model: 'Foundation' },
+      custFields,
+    );
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+
+    const result = await tableInfoTool(req({ tableName: 'CustTable' }), ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('Fields (2)');
+  });
+
+  it('resolves the table name case-insensitively', async () => {
+    const ctx = buildContext(
+      { name: 'CustTable', filePath: 'K:\\Pkg\\M\\AxTable\\CustTable.xml', model: 'Foundation' },
+      custFields,
+    );
+
+    const result = await tableInfoTool(req({ tableName: 'custtable' }), ctx);
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('# Table: CustTable');
+    expect(result.content[0].text).toContain('**AccountNum**');
   });
 });
 

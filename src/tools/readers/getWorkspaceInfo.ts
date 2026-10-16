@@ -18,7 +18,7 @@ import { getStdioSessionInfo } from '../../utils/stdioSessionInfo.js';
 import { checkIndexStaleness } from '../../utils/indexStaleness.js';
 import {
   isCustomModel, getObjectSuffix, getExtensionNamingStyle, getExtensionClassNamingStyle, deriveExtensionInfix,
-  unrecognisedNamingStyleSettings,
+  unrecognisedNamingStyleSettings, isNoPrefixMode,
 } from '../../utils/modelClassifier.js';
 import { normalizeModelToken } from '../../utils/modelToken.js';
 import { buildPrefixDiagnostics, modelWritesLandIn } from '../analysis/prefixDiagnostics.js';
@@ -30,6 +30,7 @@ import { projectDisplayName } from '../../workspace/projectMembership.js';
 import { activeCrossModelAllowance } from '../../utils/crossModelWriteGuard.js';
 import { parseModuleReferences } from '../../metadata/modelDescriptor.js';
 import { findModelDescriptorPath } from '../../utils/objectFileLookup.js';
+import { assertProjectPathAllowed } from '../../utils/pathContainment.js';
 
 export async function getWorkspaceInfoTool(
   request: CallToolRequest,
@@ -73,11 +74,24 @@ export async function getWorkspaceInfoTool(
   }
 
   // projectPath: force-switch to specific .rnrproj
+  let switchWarning: string | null = null;
   if (args.projectPath && !selectionFailure) {
     const forced = await configManager.forceProject(args.projectPath);
     if (!forced) {
       selectionFailure =
         `❌ Could not read model name from: ${args.projectPath}\nMake sure the path points to a valid .rnrproj file.`;
+    } else if (forced.projectPath) {
+      // The switch stands — reads follow it — but a project a tool call activated is
+      // not a solution root, so every create would write its object and then report
+      // "failed to add to project". Said once, here, with the setting that fixes it.
+      const contained = await assertProjectPathAllowed(forced.projectPath).catch(() => null);
+      if (contained && !contained.ok) {
+        switchWarning =
+          `⚠️ Switched to ${forced.projectPath}, but it is outside the configured solution roots: objects ` +
+          `created from now on are still written, but NOT added to this project. ` +
+          `To register them, ask the user to set workspace.solutionsPath (D365FO_SOLUTIONS_PATH) to the folder ` +
+          `that holds it (e.g. ${nodePath.dirname(nodePath.dirname(forced.projectPath))}).`;
+      }
     }
   }
 
@@ -86,6 +100,7 @@ export async function getWorkspaceInfoTool(
     projectPath, projectSource, ambiguousProjects,
     packagePath, packageSource,
     customPackagesPath, customPackagesSource,
+    projectDetectionPending,
   } = await configManager.getWorkspaceInfoDiagnostics();
   const envType = await configManager.getDevEnvironmentType();
   const frameworkDirectory = await configManager.getMicrosoftPackagesPath();
@@ -136,7 +151,11 @@ export async function getWorkspaceInfoTool(
   // to spend another call on diagnostics=true just to learn what to pass.
   const projectDisplay = projectPath ?? (ambiguousProjects.length > 1
     ? `(not selected — ${ambiguousProjects.length} projects build this model; pass projectName to pick one)`
-    : '(not detected)');
+    : projectDetectionPending
+      // Not a problem to fix: the model is configured, so writes are already
+      // targeted; the .rnrproj scan is still running in the background.
+      ? '(still detecting — writes do not need it; the model is configured)'
+      : '(not detected)');
 
   const lines: string[] = diagnostics
     ? [
@@ -236,19 +255,27 @@ export async function getWorkspaceInfoTool(
   const extClassNamingStyle = getExtensionClassNamingStyle();
   const sampleClassExt = extClassNamingStyle === 'model-name' && writeModelToken
     ? `CustTable_${writeModelToken}_Extension`
-    : `CustTable${extInfix}_Extension`;
+    : extClassNamingStyle === 'prefix-leading'
+      ? `${extInfix}CustTable_Extension`
+      : `CustTable${extInfix}_Extension`;
   const sampleElemExt = extNamingStyle === 'model-name' && writeModelToken
     ? `CustTable.${writeModelToken}`
     : `CustTable.${extInfix}Extension`;
   // A misspelled style falls back in silence; say so in both renderings, since the
-  // samples right below are then names under a style nobody configured.
-  const styleTypos = unrecognisedNamingStyleSettings().map(w => `⚠️  ${w}`);
+  // samples right below are then names under a style nobody configured. Not under
+  // naming.prefixSource=none, which ignores both settings: "treated as prefix" is untrue there.
+  const noPrefix = isNoPrefixMode();
+  const styleTypos = noPrefix ? [] : unrecognisedNamingStyleSettings().map(w => `⚠️  ${w}`);
   if (diagnostics) {
     lines.push(
       `## Extension Naming`,
       ``,
-      `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
-      `EXTENSION_CLASS_NAMING_STYLE: ${process.env.EXTENSION_CLASS_NAMING_STYLE?.trim() || `(not set → inherits "${extNamingStyle}")`}`,
+      noPrefix
+        ? `EXTENSION_NAMING_STYLE: model-name (forced by naming.prefixSource=none — there is no prefix to embed)`
+        : `EXTENSION_NAMING_STYLE: ${process.env.EXTENSION_NAMING_STYLE?.trim() || '(not set → "prefix")'}`,
+      noPrefix
+        ? `EXTENSION_CLASS_NAMING_STYLE: model-name (forced by naming.prefixSource=none)`
+        : `EXTENSION_CLASS_NAMING_STYLE: ${process.env.EXTENSION_CLASS_NAMING_STYLE?.trim() || `(not set → inherits "${extNamingStyle}")`}`,
       extNamingStyle === 'model-name'
         ? `✅ model-name style — element extension token is the MODEL NAME (Visual Studio default).`
         : `ℹ️  prefix style (default) — element extension token is the EXTENSION_PREFIX infix.`,
@@ -258,7 +285,8 @@ export async function getWorkspaceInfoTool(
       ...styleTypos,
       `  • Extension class  → ${sampleClassExt}`,
       `  • Element extension → ${sampleElemExt}`,
-      `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — any infix you embed will be normalised to the above.`,
+      `  ⚠️  Pass the BASE object name (e.g. "CustTable") to d365fo_file(action="create") and let the tool apply the token — ` +
+        `a name that already carries it right after its base (CustTable${extClassNamingStyle === 'model-name' ? writeModelToken : extInfix}Credit_Extension) is kept, any other placement is normalised to the above.`,
       ``,
     );
   } else {
@@ -485,6 +513,11 @@ export async function getWorkspaceInfoTool(
       content: [{ type: 'text', text: `${selectionFailure}\n\n---\n\n${lines.join('\n')}` }],
       isError: true,
     };
+  }
+
+  // First, like a refusal: it qualifies the switch the caller just asked for.
+  if (switchWarning) {
+    return { content: [{ type: 'text', text: `${switchWarning}\n\n---\n\n${lines.join('\n')}` }] };
   }
 
   return { content: [{ type: 'text', text: lines.join('\n') }] };

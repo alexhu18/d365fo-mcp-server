@@ -111,18 +111,26 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'it as a "Note:" line in the result, instead of failing the call. false = strict: every such case ' +
       'errors again (deterministic callers, eval harness).',
   },
+  fieldAllowEdit: {
+    type: 'boolean',
+    description: 'modify-field: false writes <AllowEdit>No</AllowEdit> (e.g. staging key fields).',
+  },
+  fieldIgnoreEdtRelation: {
+    type: 'boolean',
+    description: 'modify-field: true writes <IgnoreEDTRelation>Yes</IgnoreEDTRelation> (EDT with a relation).',
+  },
   dataField: {
     type: 'string',
     description:
-      'add-field on a data-entity-extension: source table field name for the mapped field ' +
-      '(e.g. "MyField"). Required alongside dataSource — used instead of fieldType/fieldBaseType, ' +
-      'since a data-entity mapped field (AxDataEntityViewMappedField) has no EDT/base-type of its own.',
+      'add-field on a data-entity(-extension) or a view: source table field name for the mapped/bound field ' +
+      '(e.g. "MyField"). Entities: required alongside dataSource. Views: defaults to fieldName. Used ' +
+      'instead of fieldType/fieldBaseType — neither a mapped field nor a view field has an EDT of its own.',
   },
   dataSource: {
     type: 'string',
     description:
-      'add-field on a data-entity-extension: source data-source/table name on the entity for the ' +
-      'mapped field (e.g. "MyTable"). Required alongside dataField.',
+      'add-field on a data-entity(-extension) or a view: the data source the field reads from — a data ' +
+      'source NAME of the entity or view, not necessarily its table (e.g. "MyTable"). Required.',
   },
   fields: {
     type: 'array of { name, edt?, type?, mandatory?, label? }',
@@ -278,7 +286,31 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string',
     description:
       'Optional join/link type when joinSource is set: InnerJoin | OuterJoin | ExistJoin | NotExistJoin | ' +
-      'Delayed | Active | Passive.',
+      'Delayed | Active | Passive. On a data-entity it is the query join mode (InnerJoin default, ' +
+      'OuterJoin, ExistsJoin, NoExistsJoin).',
+  },
+  joinField: {
+    type: 'string',
+    description:
+      'add-data-source on a data-entity: the field of the JOIN (parent) datasource the relation starts ' +
+      'from (e.g. "DefaultDimension" on AssetTrans). Required with relatedField.',
+  },
+  relatedField: {
+    type: 'string',
+    description:
+      'add-data-source on a data-entity: the field of the NEW datasource\'s table it joins to ' +
+      '(e.g. "RecId" on DimensionSetEntity). Required with joinField.',
+  },
+  dataSourceReadOnly: {
+    type: 'boolean',
+    description: 'add-data-source on a data-entity: write <IsReadOnly>Yes</IsReadOnly> on the new datasource.',
+  },
+  insertIfEmpty: {
+    type: 'boolean',
+    description:
+      'add-data-source on a form/form-extension: false writes <InsertIfEmpty>No</InsertIfEmpty> — no empty ' +
+      'record is created when the data source returns none (the usual choice for a joined, read-only ' +
+      'source; 12,798 shipped form data sources set it, always to No). Omitted or true = platform default (Yes).',
   },
   // add-query-range
   rangeField: {
@@ -564,7 +596,7 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   'add-field': {
     required: ['fieldName'],
     optional: ['fieldType', 'fieldBaseType', 'fieldEnumType', 'fieldMandatory', 'fieldLabel', 'dataField', 'dataSource', 'fieldGroupName', 'autoCorrect'],
-    mutationOneOf: ['fieldType', 'fieldEnumType', 'dataField', 'fieldBaseType'],
+    mutationOneOf: ['fieldType', 'fieldEnumType', 'dataField', 'dataSource', 'fieldBaseType'],
     note:
       'Enum field: pass fieldEnumType="<enum name>" and NO fieldType — an enum-typed table field ' +
       'is an AxTableFieldEnum with an EnumType and needs no EDT. (fieldType is the EDT name here, ' +
@@ -574,12 +606,26 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       'dataSource instead — BOTH, or nothing is written; a mapped field has no EDT of its own, it points ' +
       'at dataField on the entity data source dataSource. fieldGroupName is optional and only applies to ' +
       'a data-entity-extension: it appends the field to that BASE-entity field group (shipped extensions ' +
-      'use AutoReport). It is not defaulted — a group the base entity does not have is a compile error.',
+      'use AutoReport). It is not defaulted — a group the base entity does not have is a compile error. ' +
+      'data-entity: same dataField + dataSource contract — adds an AxDataEntityViewMappedField to the ' +
+      'entity itself; dataSource must be a datasource of the entity\'s own query (add it first with ' +
+      'add-data-source, e.g. a DisplayValue field from an outer-joined DimensionSetEntity). ' +
+      'view: pass dataSource (a data source of the view, not necessarily its table name) and dataField ' +
+      '(defaults to fieldName) — writes an AxViewFieldBound, which has no EDT; fieldType does not apply. ' +
+      'fieldLabel is optional.',
   },
   'modify-field': {
     required: ['fieldName'],
-    optional: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize'],
-    mutationOneOf: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize'],
+    optional: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation'],
+    mutationOneOf: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation'],
+    note:
+      'fieldType (an EDT name) works on an ENUM field too — it re-types the field to that EDT; fieldLabel ' +
+      'takes a label id or raw text. fieldAllowEdit=false writes <AllowEdit>No</AllowEdit> (staging key ' +
+      'fields, BPErrorTablePrimaryKeyEditable); fieldIgnoreEdtRelation=true writes ' +
+      '<IgnoreEDTRelation>Yes</IgnoreEDTRelation> (a field whose EDT has a relation, ' +
+      'BPErrorEDTNotMigrated / BPUpgradeMetadataEDTRelation). Both are written by this server in ' +
+      'canonical element order (also without the bridge); create accepts the same as ' +
+      'fields[].allowEdit / fields[].ignoreEdtRelation.',
   },
   'rename-field': {
     required: ['fieldName', 'fieldNewName'],
@@ -660,8 +706,16 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   },
   'add-data-source': {
     required: ['dataSourceName', 'dataSourceTable'],
-    optional: ['joinSource', 'linkType'],
-    note: 'form-extension only.',
+    optional: ['joinSource', 'linkType', 'joinField', 'relatedField', 'dataSourceReadOnly', 'insertIfEmpty'],
+    note:
+      'form-extension: adds a data source to the extension; insertIfEmpty=false writes InsertIfEmpty=No ' +
+      '(what the VS designer writes for a new one, and what a joined read-only source wants). ' +
+      'data-entity: adds an embedded QUERY datasource with its join relation to the entity\'s ' +
+      'ViewMetadata — dataSourceName/dataSourceTable name it, joinSource is the datasource to nest under ' +
+      '(default: the root), linkType is the join mode (default InnerJoin; OuterJoin for optional ' +
+      'lookups), and joinField + relatedField are REQUIRED (joinField on the parent datasource, ' +
+      'relatedField on the new table — DefaultDimension → DimensionSetEntity.RecId). dataSourceReadOnly=true ' +
+      'writes IsReadOnly. Map its fields afterwards with add-field (dataField + dataSource).',
   },
   'report-design': {
     required: ['reportAction'],
@@ -721,9 +775,11 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       + 'designer. On an EXTENSION-OWNED <DataGroup> parent the control IS written, with a warning: '
       + 'nothing tops that group up, so the explicit control is what puts the field on the form, and '
       + 'the field group entry is needed as well so a later designer Refresh does not discard it. '
-      + 'previousSibling works under either parent — under an extension-defined parent it orders the '
-      + 'control in the XML, under a base-form parent it is written as '
-      + '<PositionType>AfterItem</PositionType> + <PreviousSibling>.',
+      + 'previousSibling / positionType (Begin, End) place the control: on objectType="form" and under an '
+      + 'extension-defined parent by its order among the children of the parent, under a base-form parent as '
+      + '<PositionType>AfterItem</PositionType> + <PreviousSibling>. On a control the file ALREADY defines, '
+      + 'add-control with previousSibling or positionType MOVES it there (same parent only; to change parent, '
+      + 'remove-control then add-control) — the way to put a field next to another after creating it.',
   },
   'remove-control': {
     required: ['controlName'],
@@ -851,13 +907,25 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
     required: ['propertyPath', 'propertyValue'],
     optional: ['controlName'],
     note:
-      'controlName is for objectType="form-extension" ONLY, and it is what customises a control of ' +
-      'the BASE form: the property goes to <ControlModifications>, the collection shipped extensions ' +
-      'use for exactly this (83 of 416, Visible/Enabled/Caption/HelpText/Label/CountryRegionCodes). ' +
-      'A dotted propertyPath ("MyGrid.Visible") is read the same way. WITHOUT a control the property ' +
-      'is the EXTENSION\'s own — on a form extension that changes the WHOLE FORM, so hiding one ' +
-      'control by omitting controlName hides the form instead. One envelope per control: a second ' +
-      'property joins the existing one. Idempotent.',
+      'controlName (or a dotted propertyPath, "MyButton.NeedsRecord") targets a form CONTROL. On ' +
+      'objectType="form", and for a control a form extension ADDS, the property is written on that ' +
+      'control (e.g. MenuItemName, MenuItemType, MultiSelect, NeedsRecord, Visible, Label) in the ' +
+      'element order shipped metadata uses for its type; a property that type never carries is refused, ' +
+      'and an empty value removes it. On objectType="form-extension" a name the extension does not ' +
+      'define is a control of the BASE form: the property goes to <ControlModifications>, the ' +
+      'collection shipped extensions use for exactly this (83 of 416, Visible/Enabled/Caption/' +
+      'HelpText/Label/CountryRegionCodes). WITHOUT a control the property is the form\'s Design ' +
+      'property, or the EXTENSION\'s own — on a form extension that changes the WHOLE FORM, so hiding ' +
+      'one control by omitting controlName hides the form instead. One envelope per control: a second ' +
+      'property joins the existing one. Idempotent. ' +
+      'data-entity: label, developerDocumentation, primaryKey, isPublic, publicEntityName, ' +
+      'publicCollectionName, dataManagementEnabled, dataManagementStagingTable, entityCategory, ' +
+      'allowRowVersionChangeTracking, allowRetention, tags, isReadOnly, supportsSetBasedSqlOperations, ' +
+      'and — written by this server in element order, one top-level property per call, no dotted ' +
+      'path — ConfigurationKey, PrimaryCompanyContext (e.g. "DataAreaId"), CountryRegionCodes, ' +
+      'SingularLabel, IsObsolete, AllowArchival, AutoCreateDataverse, EnableSetBasedSqlOperations and ' +
+      'ValidTimeStateEnabled. Modules, OperationalDomain and SubscriberAccessLevel are refused. ' +
+      'Yes/No properties take true/false/Yes/No.',
   },
 };
 
@@ -875,9 +943,12 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
   class: 'extends, implements, isFinal, isAbstract',
   table:
     'label, tableGroup, tableType, titleField1/2, cacheLookup?, primaryIndex?, ' +
-    'allowRowVersionChangeTracking? (dual-write), created/modifiedBy/DateTime?, ' +
-    'fields[{name,type?|edt?|fieldType?,enumType?,label?,mandatory?}] — enum fields need enumType ' +
-    '(+ optionally fieldType:"AxTableFieldEnum"), validTimeStateFieldType? (Date|UtcDateTime — then ADD the ValidFrom/ValidTo ' +
+    'allowRowVersionChangeTracking? (dual-write), subscriberAccessLevel? ("Read=Allow,Create=Deny" | ' +
+    '{read:"Allow"} | "None"; default Read=Allow, none on TempDB/InMemory), created/modifiedBy/DateTime?, ' +
+    'fields[{name,type?|edt?|fieldType?,enumType?,label?,mandatory?,allowEdit?,ignoreEdtRelation?}] — enum fields need ' +
+    'enumType ONLY (it makes the field an AxTableFieldEnum by itself; fieldType is optional), ' +
+    'allowEdit:false writes AllowEdit=No (staging key fields), ignoreEdtRelation:true writes IgnoreEDTRelation=Yes ' +
+    '(EDT with a relation), validTimeStateFieldType? (Date|UtcDateTime — then ADD the ValidFrom/ValidTo ' +
     'fields yourself and give the key index validTimeStateKey:true), ' +
     'indexes?[{name,fields[],allowDuplicates?,alternateKey?,validTimeStateKey?,validTimeStateMode?("Gap"|"NoGap")}]',
   enum:
@@ -914,7 +985,14 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
     'primaryKeyFields?[], isPublic?, entityCategory? ' +
     '(Master|Configuration|Transaction|Reference|Document|Parameters — note the plural), ' +
     'dynamicFields?, allowRowVersionChangeTracking? (dual-write: set on the source ' +
-    'TABLES too), dataManagementEnabled? (needs staging table)',
+    'TABLES too), dataManagementEnabled? (writes the staging-table REFERENCE only — the staging table is NOT ' +
+    'created, so create it yourself or the full build fails; the reply says so), ' +
+    'isReadOnly?, tags?, configurationKey?, primaryCompanyContext? (e.g. "DataAreaId"), ' +
+    'surrogateKey? (true: key EntityKey = a SourceKey field bound to RecId — instead of ' +
+    'primaryKeyFields). Any other key is not read and is listed in the reply as NOT written. ' +
+    'objectName: pass the BASE name — the model prefix is prepended ("BudgetLineEntity" → ' +
+    '"ContosoBudgetLineEntity"); pass the prefixed name and it is kept, never doubled. ' +
+    'Joined datasources and extra mapped fields come afterwards: modify add-data-source / add-field',
   map:
     'label?, developerDocumentation?, fields[{name,type?,edt?,enumType?,stringSize?}] — type is ' +
     'String|Integer|Int64|Real|Date|Time|UtcDateTime|Enum|Container|Guid (no Boolean: use Enum + ' +

@@ -32,7 +32,7 @@ export const buildD365foProjectTool = {
         },
         fullBuild: {
           type: 'boolean',
-          description: 'Full recompile of the TARGET model only (deps stay incremental). Use when xppc reports stale symbol errors.',
+          description: 'Full recompile of the TARGET model only; deps are not built. Use when xppc reports stale symbol errors.',
         },
         bpCheck: {
           type: 'boolean',
@@ -42,6 +42,14 @@ export const buildD365foProjectTool = {
           type: ['boolean', 'array'],
           items: { type: 'string' },
           description: 'On a SUCCESSFUL build, also run the database sync (SyncEngine.exe) — REQUIRED after any table/view/data-entity change. true = partial sync of the syncable objects in the project, full-model when it has none; an ARRAY syncs exactly those tables/views (much faster).',
+        },
+        restartAos: {
+          type: 'boolean',
+          description: 'After a successful build (+dbSync), restart the local IIS/IIS Express AOS serving aosUrl.',
+        },
+        aosUrl: {
+          type: 'string',
+          description: 'restartAos root. Default: Infrastructure.HostUrl in AosService web.config; required on UDE.',
         },
         wait: {
           type: 'boolean',

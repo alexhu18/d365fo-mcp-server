@@ -8,18 +8,16 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import * as fs from 'fs/promises';
-// Taken from node:fs rather than fs/promises: the value is the same, but the
-// promises namespace is routinely replaced wholesale by test mocks that only
-// stub the functions, and reading .constants off such a mock is a TypeError.
-import { constants as FS_CONSTANTS } from 'fs';
-import { execFile } from 'child_process';
-import util from 'util';
 
 import path from 'path';
 import { parseStringPromise } from '../../utils/xml.js';
 import { sayOncePerSession, resetRepeatedNoteMemory } from '../../utils/repeatedNotes.js';
+import {
+  planRecoverableModification, keptBackupNote, discardBackup, settleFailedModification, fileUnchangedSince, type BackupSlot,
+} from './modifyBackup.js';
 import { getConfigManager, extractModelFromFilePath } from '../../utils/configManager.js';
 import { isStandardModel, resolveRegularObjectPrefixToken, resolveObjectPrefix, deriveExtensionInfix } from '../../utils/modelClassifier.js';
+import { normalizeModelToken } from '../../utils/modelToken.js';
 import { normalizeObjectName } from '../../utils/objectNaming.js';
 import { findBaseObjectXml, findBaseFormXml } from '../../utils/baseObjectXml.js';
 import { describeTableAlreadyBound } from './formDataSourceNote.js';
@@ -48,6 +46,9 @@ import {
 import { ProjectFileFinder, registerFileInActiveProject } from '../../workspace/projectFile.js';
 import { heuristicEdtBaseType, resolveEdtBaseType, isEnumName, resolveEdtEnumType, bridgeEdtBaseType } from '../smart/generateSmartTable.js';
 import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
+import {
+  entityAddDataSource, entityAddFieldBindingError, entityAddField, modifyFieldOp, ENTITY_AND_FIELD_ZOD_PARAMS,
+} from './dataEntityOps.js';
 import {
   upsertFormExtensionControlProperty, resolveControlPropertyTarget,
 } from '../../utils/formExtensionControlModifications.js';
@@ -100,13 +101,15 @@ import {
   DELETE_ACTION_TYPES,
   directXmlDeleteAction,
   directXmlRemoveControl,
+  addBaseFormControl,
+  addControlMovesExisting,
   directXmlAddEntryPoint,
   directXmlRemoveEntryPoint,
   directXmlRemoveDiagnosticSuppression,
   directXmlAddDiagnosticSuppression,
   directXmlAddModuleReference,
   directXmlRemoveModuleReference,
-  directXmlEnsureRelationProperties,
+  directXmlEnsureRelationProperties, directXmlModifyControlProperty, directXmlAddViewField, directXmlSetFormDataSourceInsertIfEmpty,
 } from './directXmlWriters.js';
 import { addReportParameter, refreshReportDataset } from './reportDesignXml.js';
 
@@ -623,14 +626,15 @@ export const ModifyD365FileArgsSchema = z.object({
     'If omitted the tool auto-picks based on the EDT base type if controlDataField is provided.'
   ),
   controlLabel: z.string().optional().describe(
-    'Optional label for the new control (add-control). Becomes the control <Label>.'
+    'Caption of the new control (add-control); Label, Text or Caption by type.'
   ),
   positionType: z.string().optional().describe(
     'Optional positioning: AfterItem (needs previousSibling) | Begin | End. Omit to append at the ' +
     'end of the parent. Other values are refused — these are the ones D365FO metadata carries.'
   ),
   previousSibling: z.string().optional().describe(
-    'Name of the sibling control to position after. Implies positionType=AfterItem when that is omitted.'
+    'Name of the sibling control to position after. Implies positionType=AfterItem when that is omitted. ' +
+    'On a control the file already defines, add-control MOVES it there.'
   ),
   baseFormName: z.string().optional().describe(
     'Base form name used for auto-resolving parentControl when the extension name does not contain it. ' +
@@ -684,6 +688,7 @@ export const ModifyD365FileArgsSchema = z.object({
   fieldHelpText: z.string().optional().describe('Field help text (modify-field).'),
   fieldEnumType: z.string().optional().describe('Enum name for an enum-typed field. On add-field this replaces fieldType entirely — it writes AxTableFieldEnum + EnumType and needs no EDT. Also settable later with modify-field.'),
   fieldStringSize: z.string().optional().describe('String size to set on the field (modify-field, for string-typed fields).'),
+  ...ENTITY_AND_FIELD_ZOD_PARAMS,
   fields: z.array(z.object({
     name: z.string(),
     edt: z.string().optional(),
@@ -905,6 +910,9 @@ export const ModifyD365FileArgsSchema = z.object({
   ),
   linkType: z.string().optional().describe(
     'Optional join/link type when joinSource is set (add-data-source): InnerJoin | OuterJoin | ExistJoin | NotExistJoin | Delayed | Active | Passive.'
+  ),
+  insertIfEmpty: z.boolean().optional().describe(
+    'add-data-source on a form/form-extension: false writes <InsertIfEmpty>No</InsertIfEmpty> (no empty record is created when the data source has none). Omitted = platform default (Yes).'
   ),
 
   // For add-field on data-entity-extension: the mapped field's source binding.
@@ -1238,6 +1246,24 @@ export async function modifyD365FileTool(
   context: XppServerContext,
   outcome?: ModifyOutcome,
 ) {
+  const backup: BackupSlot = {};
+  const result = await runModify(request, context, outcome, backup);
+  // Every path that returns before the success response — a refusal, a bridge
+  // error, a throw — lands here with the backup still pending.
+  if (backup.pending && !backup.settled) {
+    const note = await settleFailedModification(backup.pending);
+    const first = result.content[0];
+    if (note && first?.type === 'text') first.text += note;
+  }
+  return result;
+}
+
+async function runModify(
+  request: CallToolRequest,
+  context: XppServerContext,
+  outcome: ModifyOutcome | undefined,
+  backup: BackupSlot,
+) {
   const timer = createPhaseTimer();
   try {
     // Aliases resolved and single-reading corrections applied BEFORE validation:
@@ -1446,12 +1472,17 @@ export async function modifyD365FileTool(
       // null → form not found or no match; proceed with original value (compiler will catch it)
     }
 
+    // A move (see addControlMovesExisting) uses neither argument the pre-flights below judge.
+    const isControlMove = operation === 'add-control'
+      && await addControlMovesExisting(args as any, objectType, objectName, explicitFilePath, symbolIndex);
+
     // ── DataGroup pre-flight for add-control ──────────────────────────────────
     // A parent carrying <DataGroup> is filled by the compiler from that table
     // field group. A hand-added bound control there duplicates the generated
     // one — an error that exists only after compilation, so it cannot be found
     // by inspecting the XML on disk.
     if (
+      !isControlMove &&
       operation === 'add-control' &&
       (objectType === 'form' || objectType === 'form-extension') &&
       args.parentControl &&
@@ -1514,6 +1545,7 @@ export async function modifyD365FileTool(
     // verify the new control's type is allowed there. Blocking when
     // FORM_PATTERN_ENFORCE is enabled (default); advisory note otherwise.
     if (
+      !isControlMove &&
       operation === 'add-control' &&
       (objectType === 'form' || objectType === 'form-extension') &&
       args.parentControl &&
@@ -1774,12 +1806,11 @@ export async function modifyD365FileTool(
       }
     }
 
-    // 3. Create backup of the actual XML file. When the target is NOT inside a
-    //    git work tree, the documented undo path (undo_last_modification →
-    //    git checkout) cannot revert the change — force a backup even with
-    //    createBackup=false so a bad modify is never unrecoverable. Skipped
-    //    outright when the file does not exist yet: there is nothing to back up.
-    const backupNote = targetFileExists ? await ensureRecoverableModification(actualFilePath, createBackup) : '';
+    // 3. Back up the file before the operation runs (planRecoverableModification
+    //    decides whether one is needed). Settled below on success, in
+    //    modifyD365FileTool on failure — a call that changed nothing keeps no copy.
+    //    Skipped outright when the file does not exist yet: nothing to back up.
+    backup.pending = targetFileExists ? await planRecoverableModification(actualFilePath, createBackup) : null;
 
     // 3b. Derive the authoritative object name from the resolved file path.
     //     The caller may pass objectName="RentEquipment" while the file on disk
@@ -2068,6 +2099,48 @@ export async function modifyD365FileTool(
           }
           break;
         }
+        // A data-entity's own mapped field (the bridge only maps fields on an EXTENSION).
+        if (objectType === 'data-entity' && args.fieldName) {
+          const bindingError = entityAddFieldBindingError(args as any);
+          if (bindingError) return { content: [{ type: 'text', text: bindingError }], isError: true };
+          bridgeResult = await entityAddField(actualFilePath, args as any);
+          break;
+        }
+        // A view field is an AxViewFieldBound: a field of one of the view's data
+        // sources, with no EDT of its own. Views used to fall through to the table
+        // path below — dataField/dataSource were refused as "data-entity only", and
+        // fieldType reached the bridge, whose AddField resolves tables only.
+        if (objectType === 'view' && args.fieldName) {
+          const dataSource = ((args as any).dataSource as string | undefined)?.trim();
+          const dataField = ((args as any).dataField as string | undefined)?.trim() || args.fieldName;
+          if (!dataSource) {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `❌ add-field on a view needs dataSource — nothing was written.\n` +
+                  `A view field has no EDT of its own: it binds fieldName to dataField (default: fieldName) ` +
+                  `on dataSource, one of the view's data sources.` +
+                  (args.fieldType || (args as any).fieldEnumType
+                    ? ` fieldType/fieldEnumType do not apply to a view field.` : '') +
+                  `\n\n${renderOpSpec('add-field')}`,
+              }],
+              isError: true,
+            };
+          }
+          const bad = [args.fieldName, dataField, dataSource].find(v => !/^[A-Za-z_]\w*$/.test(v));
+          if (bad) {
+            return {
+              content: [{ type: 'text', text: `❌ "${bad}" is not a valid AOT name — nothing was written.` }],
+              isError: true,
+            };
+          }
+          bridgeResult = viaXmlFallback(
+            await directXmlAddViewField(actualFilePath, args.fieldName, dataField, dataSource, args.fieldLabel),
+          );
+          break;
+        }
+
         // Everything else is an AxTableField. `required` on add-field is only fieldName
         // (the mapped-field path above has no fieldType at all), so the type-specific half
         // of the contract is enforced here instead of silently falling through to a null
@@ -2249,22 +2322,7 @@ export async function modifyD365FileTool(
         break;
       }
       case 'modify-field': {
-        if (args.fieldName) {
-          // Map the field-* params onto the bare prop keys the bridge expects.
-          const fieldProps: Record<string, string> = {};
-          if ((args as any).fieldLabel) fieldProps.label = (args as any).fieldLabel;
-          if ((args as any).fieldHelpText) fieldProps.helpText = (args as any).fieldHelpText;
-          if ((args as any).fieldMandatory !== undefined) fieldProps.mandatory = String((args as any).fieldMandatory);
-          if ((args as any).fieldType) fieldProps.edt = (args as any).fieldType;
-          if ((args as any).fieldEnumType) fieldProps.enumType = (args as any).fieldEnumType;
-          if ((args as any).fieldStringSize) fieldProps.stringSize = String((args as any).fieldStringSize);
-          bridgeResult = await bridgeModifyField(
-            context.bridge,
-            objectName,
-            args.fieldName,
-            Object.keys(fieldProps).length > 0 ? fieldProps : undefined,
-          );
-        }
+        if (args.fieldName) bridgeResult = await modifyFieldOp(context.bridge, objectName, actualFilePath, args as any);
         break;
       }
       case 'rename-field': {
@@ -2582,6 +2640,8 @@ export async function modifyD365FileTool(
       }
       case 'modify-property': {
         if (args.propertyPath && args.propertyValue !== undefined) {
+          const own = await directXmlModifyControlProperty(actualFilePath, objectType, objectName, args.propertyPath, String(args.propertyValue), (args as { controlName?: string }).controlName);
+          if (own) { bridgeResult = viaXmlFallback(own); break; } // a control this file defines (own form, or one an extension adds)
           // ── Form extension targeting a BASE-FORM control ─────────────────────
           // Must run BEFORE the bridge: a control-level request handed to the
           // generic property writer lands in the extension's ROOT
@@ -2819,7 +2879,8 @@ export async function modifyD365FileTool(
           const isFormExtension = objectType === 'form-extension';
 
           if (!isFormExtension) {
-            bridgeResult = await bridgeAddControl(
+            // The bridge appends; addBaseFormControl moves the control to previousSibling/positionType.
+            bridgeResult = await addBaseFormControl(actualFilePath, args as any, () => bridgeAddControl(
               context.bridge,
               objectName,
               (args as any).controlName,
@@ -2828,7 +2889,7 @@ export async function modifyD365FileTool(
               (args as any).controlDataSource,
               (args as any).controlDataField,
               (args as any).controlLabel,
-            );
+            ));
           }
 
           if (isFormExtension && (!bridgeResult || !bridgeResult.success)) {
@@ -2842,6 +2903,7 @@ export async function modifyD365FileTool(
               (args as any).controlLabel,
               (args as any).previousSibling,
               (args as any).positionType,
+              args as any,
             );
             if (xmlFallbackResult) bridgeResult = viaXmlFallback(xmlFallbackResult);
           }
@@ -2956,6 +3018,21 @@ export async function modifyD365FileTool(
         break;
       }
       case 'add-data-source': {
+        // InsertIfEmpty is a FORM data-source property: on a query, a view or an entity
+        // the data source would be added and the setter would then report it "not
+        // found" (or, on an entity, never run) — refuse before anything is written instead.
+        if ((args as any).insertIfEmpty !== undefined && objectType !== 'form' && objectType !== 'form-extension') {
+          bridgeResult = {
+            success: false,
+            message: `insertIfEmpty applies to form data sources only, not to objectType "${objectType}". Omit it and retry.`,
+          };
+          break;
+        }
+        // An entity's datasource is an embedded QUERY datasource the bridge cannot add.
+        if (objectType === 'data-entity') {
+          bridgeResult = await entityAddDataSource(actualFilePath, args as any);
+          break;
+        }
         if ((args as any).dataSourceName && (args as any).dataSourceTable) {
           bridgeResult = await bridgeAddDataSource(
             context.bridge,
@@ -2966,6 +3043,25 @@ export async function modifyD365FileTool(
             (args as any).joinSource,
             (args as any).linkType,
           );
+          // The bridge's AddDataSource takes no InsertIfEmpty, so it is set on the
+          // file it just wrote. On a skip too: the data source of that name is already
+          // there, and this is the only way to set the property on it — and the way a
+          // retry finishes a call whose setter failed after the data source was added.
+          const insertIfEmpty = (args as any).insertIfEmpty as boolean | undefined;
+          if (insertIfEmpty !== undefined && bridgeResult?.success) {
+            const set = await directXmlSetFormDataSourceInsertIfEmpty(actualFilePath, (args as any).dataSourceName, insertIfEmpty);
+            // Credit the writer that changed the file; a setter failure is never the bridge's.
+            const xmlOnly = !!bridgeResult.skipped && !!set.changed;
+            bridgeResult = set.success
+              ? { ...bridgeResult, skipped: bridgeResult.skipped && !set.changed, ...(xmlOnly ? { viaXmlFallback: true } : {}),
+                  message: `${bridgeResult.message} ${set.message}` }
+              : viaXmlFallback({
+                  success: false,
+                  message:
+                    `${bridgeResult.message} — but ${set.message} The data source is in the file; ` +
+                    `retry the same call to set InsertIfEmpty on it.`,
+                });
+          }
         }
         break;
       }
@@ -3322,6 +3418,14 @@ export async function modifyD365FileTool(
     // describe one that did not happen (runModifyBatch drops them the same way).
     const wasSkipped = bridgeResult.skipped === true;
 
+    // Settled here, so the failure path in modifyD365FileTool leaves it alone. A success
+    // can still have changed nothing (a value already set, an idempotent writer that
+    // does not say skipped): the bytes decide, as they do on the failure path.
+    backup.settled = true;
+    const keepBackup = !!backup.pending && !wasSkipped && !(await fileUnchangedSince(backup.pending));
+    if (backup.pending && !keepBackup) await discardBackup(backup.pending);
+    const backupNote = keepBackup ? keptBackupNote(backup.pending!) : '';
+
     let addFieldBpNote = '';
     if (!wasSkipped && operation === 'add-field' && (objectType === 'table' || objectType === 'table-extension')) {
       const notes: string[] = [];
@@ -3544,7 +3648,10 @@ export function baseObjectNameCandidates(objectName: string, modelName?: string)
   if (!stripped) return [];
   const out = [stripped];
   const prefix = resolveObjectPrefix(modelName ?? '');
-  for (const token of [deriveExtensionInfix(prefix, modelName), prefix]) {
+  // The model token too: model-name style (and naming.prefixSource=none, which
+  // forces it) writes Base_Model_Extension, whose base is Base.
+  const modelToken = modelName ? normalizeModelToken(modelName) : '';
+  for (const token of [deriveExtensionInfix(prefix, modelName), prefix, modelToken]) {
     if (!token) continue;
     if (stripped.toLowerCase().endsWith(token.toLowerCase())) {
       const shorter = stripped.slice(0, -token.length).replace(/_+$/, '');
@@ -3975,110 +4082,6 @@ async function resolveD365FileByName(
   // Filesystem fallback: handles newly created files not yet in the symbol index,
   // and all types not covered by the symbol DB (edt, report, extensions, security, menu …).
   return findD365FileOnDisk(objectType, objectName, modelName, packagePath);
-}
-
-
-/**
- * Create file backup and verify it was written successfully.
- * Throws if the source file is missing or the copy fails, so callers
- * always know whether a valid backup exists before overwriting.
- * Returns the backup file path.
- *
- * The name carries MILLISECONDS and, if that still collides, a counter. At the old
- * one-second resolution two modifies of the same file inside the same second
- * produced the same backup name, so the second copy overwrote the first with
- * already-modified content — on a target outside git (exactly the case that forces
- * a backup, see ensureRecoverableModification) the original was then unrecoverable.
- * COPYFILE_EXCL is what makes the retry a claim rather than a check: it fails
- * instead of overwriting, so two callers racing on the same name cannot both win.
- *
- * Exported for unit tests.
- */
-export async function createFileBackup(filePath: string): Promise<string> {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
-  const base = `${filePath}.backup-${timestamp}`;
-
-  for (let attempt = 0; ; attempt++) {
-    const backupPath = attempt === 0 ? base : `${base}-${attempt}`;
-    try {
-      await fs.copyFile(filePath, backupPath, FS_CONSTANTS.COPYFILE_EXCL);
-      // Confirm the backup has non-zero size before proceeding
-      const stat = await fs.stat(backupPath);
-      if (stat.size === 0) {
-        throw new Error('Backup file was created but is empty');
-      }
-      return backupPath;
-    } catch (error: any) {
-      if (error?.code === 'EEXIST' && attempt < 100) {
-        continue;
-      }
-      throw new Error(
-        `Failed to create backup at "${backupPath}": ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-}
-
-const execFileAsync = util.promisify(execFile);
-
-// Directory → inside-git-work-tree result, cached for the process lifetime so
-// repeated modifies don't re-spawn git for the same metadata folder.
-const gitWorkTreeCache = new Map<string, boolean>();
-
-/**
- * Cheap check whether a file lives inside a git work tree — i.e. whether
- * undo_last_modification (git checkout) could revert a change to it.
- * git not installed, timeout, or any other error → treated as "not a repo".
- */
-async function isInsideGitWorkTree(filePath: string): Promise<boolean> {
-  const dir = path.dirname(filePath);
-  const cached = gitWorkTreeCache.get(dir);
-  if (cached !== undefined) return cached;
-  let inside = false;
-  try {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: dir,
-      timeout: 5_000,
-      windowsHide: true,
-    });
-    inside = stdout.trim() === 'true';
-  } catch {
-    inside = false;
-  }
-  gitWorkTreeCache.set(dir, inside);
-  return inside;
-}
-
-/**
- * Backup guard for modify operations. Honors an explicit createBackup=true;
- * with createBackup=false it force-enables the backup when the target is not
- * inside a git work tree, because the documented undo path
- * (undo_last_modification → git checkout) only works inside a repo.
- * Returns a note to append to the success response ('' when no forced backup
- * was needed). Exported for unit tests.
- */
-export async function ensureRecoverableModification(
-  actualFilePath: string,
-  createBackup: boolean,
-): Promise<string> {
-  if (createBackup) {
-    await createFileBackup(actualFilePath);
-    return '';
-  }
-  if (await isInsideGitWorkTree(actualFilePath)) {
-    return '';
-  }
-  const backupPath = await createFileBackup(actualFilePath);
-  // Keyed by the MODEL folder (<...>/<Package>/<Model>/Ax<Type>/<file>.xml), not
-  // the file: "this metadata tree is not under git" is a property of the tree, so
-  // once said it is said for every object in it.
-  return sayOncePerSession(
-    'git-backup',
-    path.win32.dirname(path.win32.dirname(actualFilePath)),
-    `\n\nℹ️ Target is not under git — created backup ${backupPath} automatically ` +
-      `(d365fo_file(action="undo") would not work here — it is a git checkout).`,
-    `\n\nℹ️ Backup: ${backupPath}`,
-  );
 }
 
 // ─── Form parent-control auto-resolution ────────────────────────────────────
@@ -4569,9 +4572,10 @@ function resolveFieldEdt(tableName: string, fieldName: string, db: any): string 
       `SELECT signature FROM symbols WHERE type = 'field' AND parent_name = ? AND name = ? COLLATE NOCASE LIMIT 1`
     ).get(canonical, fieldName) as { signature: string | null } | undefined;
     const sig = row?.signature?.trim();
-    // The index stores the field's BASE TYPE (e.g. "String"), not its EDT. A base-type
-    // keyword is not a usable X++ parameter type, so treat it as unresolved — the caller
-    // then falls back to the field name, which is conventionally the EDT.
+    // The signature is the field's EDT/EnumType, but it is a BASE TYPE (e.g. "String") for
+    // a field that has neither, and for every field in an index built before the full build
+    // stored the EDT. A base-type keyword is not a usable X++ parameter type, so treat it as
+    // unresolved — the caller then falls back to the field name, which is conventionally the EDT.
     if (!sig || isMetadataBaseTypeKeyword(sig)) return null;
     return sig;
   } catch {

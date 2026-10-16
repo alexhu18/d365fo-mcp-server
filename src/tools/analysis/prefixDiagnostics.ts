@@ -22,6 +22,8 @@ import {
   prefixConflictWarning, resolveEffectivePrefix, sameModel,
 } from '../../utils/effectivePrefix.js';
 
+import { isNoPrefixMode } from '../../utils/modelClassifier.js';
+
 export { modelWritesLandIn } from '../../utils/effectivePrefix.js';
 
 export interface PrefixDiagnostics {
@@ -67,8 +69,11 @@ export function buildPrefixDiagnostics(
   // is one line above, so what is wrong is already visible.
   const lines = [`Prefix      : ${effectivePrefix || '(none)'}  (${source})`];
   if (switched) lines.push(switchNote);
+  const noPrefix = isNoPrefixMode();
   const conflictWarning = prefixConflictWarning(resolution);
-  if (conflictWarning) {
+  if (noPrefix) {
+    // A decision, not a gap: no "EXTENSION_PREFIX is not set" nag.
+  } else if (conflictWarning) {
     lines.push(`⚠️  ${conflictWarning}`);
   } else if (!learned?.regular && !extensionPrefixEnv) {
     lines.push(
@@ -80,12 +85,18 @@ export function buildPrefixDiagnostics(
   const verboseLines = [
     `## Prefix Configuration`,
     ``,
-    `EXTENSION_PREFIX: ${extensionPrefixEnv ?? '(not set — falling back to model name)'}`,
+    `EXTENSION_PREFIX: ${extensionPrefixEnv
+      ? `${extensionPrefixEnv}${noPrefix ? ' (ignored — naming.prefixSource=none)' : ''}`
+      : noPrefix ? '(not set)' : '(not set — falling back to model name)'}`,
     `Effective prefix: ${effectivePrefix || '(none)'}  (source: ${source})`,
   ];
   if (switched) verboseLines.push(switchNote);
   verboseLines.push(
-    resolution.conflict
+    noPrefix
+      ? `✅ naming.prefixSource=none — no prefix: new objects, fields and methods keep the name as given ` +
+        `(EXTENSION_PREFIX and the model's own objects are ignored); extension elements and classes embed ` +
+        `the model name.`
+      : resolution.conflict
       ? disagreeNote
       : learned?.regular
         ? `✅ Prefix "${effectivePrefix}" comes from the objects model "${writeModel}" already contains.`

@@ -13,6 +13,7 @@ import { isExtensionLabelFile } from '../../src/metadata/labelParser';
 import { resetLabelSearchHistory } from '../../src/tools/analysis/labelSearchHistory';
 import type { XppServerContext } from '../../src/types/context';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
+import path from 'path';
 
 // The search history is module state that deliberately outlives one call — reset
 // it per test so one suite's phrasings never become another's "you already asked".
@@ -1637,6 +1638,55 @@ describe('rename_label', () => {
     expect((fsMock.promises.writeFile as any)).not.toHaveBeenCalled();
   });
 
+  // A file without a BOM: its first line starts neither with "\n" nor with the
+  // BOM, which is all the existence and collision checks used to look for.
+  it('refuses to rename onto an ID declared on the first line of a file without a BOM', async () => {
+    const fsMock = await import('fs');
+    (fsMock.promises.writeFile as any).mockClear();
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    (fsMock.promises.readFile as any).mockResolvedValue('NewFeatureName=Already here\r\nOldFeatureName=Some text\r\n');
+
+    const result = await renameLabelTool(
+      req('rename_label', {
+        oldLabelId: 'OldFeatureName',
+        newLabelId: 'NewFeatureName',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+      }),
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('"NewFeatureName" already exists');
+    expect(fsMock.promises.writeFile as any).not.toHaveBeenCalled();
+  });
+
+  it('renames an ID declared on the first line of a file without a BOM, and adds no BOM', async () => {
+    const fsMock = await import('fs');
+    const writeCalls: Array<{ path: string; content: string }> = [];
+    (fsMock.promises.writeFile as any).mockImplementation(async (p: string, content: string) => {
+      writeCalls.push({ path: p, content });
+    });
+    (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+    (fsMock.promises.readFile as any).mockResolvedValue('OldFeatureName=Some text\r\n ;A comment\r\nZebraLabel=Zebra text\r\n');
+
+    const result = await renameLabelTool(
+      req('rename_label', {
+        oldLabelId: 'OldFeatureName',
+        newLabelId: 'NewFeatureName',
+        labelFileId: 'MyModel',
+        model: 'MyModel',
+        updateIndex: false,
+      }),
+      ctx,
+    );
+
+    if (result.isError) throw new Error(`rename_label failed: ${result.content[0].text}`);
+    const labelWrite = writeCalls.find(c => writeTargets(c.path, '.label.txt'));
+    expect(labelWrite!.content).toBe('NewFeatureName=Some text\r\n ;A comment\r\nZebraLabel=Zebra text\r\n');
+  });
+
   it('preserves CRLF line endings when renaming inside a CRLF .label.txt', async () => {
     const fsMock = await import('fs');
     const writeCalls: Array<{ path: string; content: string }> = [];
@@ -1713,6 +1763,143 @@ describe('rename_label', () => {
     expect(labelWrite!.content).toContain('AppleLabel=Apple text\n');
     // No CRLF sequences must be present — file must stay pure LF.
     expect(labelWrite!.content).not.toContain('\r\n');
+  });
+
+  describe('cross-model guard', () => {
+    afterEach(() => { delete process.env.D365FO_CROSS_MODEL_WRITE_MODELS; });
+
+    // labels(create) refused a label in another model's file, while a rename of a
+    // label in that same file went through and rewrote it.
+    it.each([false, true])('refuses a rename in another model\'s label file (dryRun=%s)', async (dryRun) => {
+      const fsMock = await import('fs');
+      (fsMock.promises.writeFile as any).mockClear();
+      (fsMock.promises.readdir as any).mockClear();
+
+      const result = await renameLabelTool(
+        req('rename_label', {
+          oldLabelId: 'OldName',
+          newLabelId: 'NewName',
+          labelFileId: 'ForeignLabels',
+          model: 'ForeignModel',
+          dryRun,
+        }),
+        ctx,
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('Refusing to modify "@ForeignLabels:OldName" in model "ForeignModel"');
+      expect(result.content[0].text).toContain('targets model "MyModel"');
+      expect(fsMock.promises.readdir as any).not.toHaveBeenCalled();
+      expect(fsMock.promises.writeFile as any).not.toHaveBeenCalled();
+    });
+
+    // The label-file check covered only the label file. A rename of the
+    // workspace's own label with searchPaths pointed at another model rewrote
+    // that model's objects — and the result told the caller to add searchPaths.
+    describe('references found through searchPaths', () => {
+      const root = 'K:\\PackagesLocalDirectory';
+      const dirent = (name: string, dir: boolean) => ({ name, isDirectory: () => dir, isFile: () => !dir });
+      const serve = (searchModel: string) => {
+        const searchDir = path.join(root, searchModel, searchModel);
+        (fsMock().readdir as any).mockImplementation(async (dir: string, opts?: any) => {
+          if (!opts) return ['en-US'];
+          if (dir === searchDir) return [dirent('AxClass', true)];
+          if (dir === path.join(searchDir, 'AxClass')) return [dirent('Foo.xml', false)];
+          return [];
+        });
+        (fsMock().readFile as any).mockImplementation(async (file: string) =>
+          file.endsWith('.label.txt') ? '\uFEFFOldName=Old text\r\n' : '<Label>@MyModel:OldName</Label>');
+        return searchDir;
+      };
+      let fsPromises: any;
+      const fsMock = () => fsPromises;
+      beforeEach(async () => {
+        fsPromises = (await import('fs')).promises;
+        (fsPromises.writeFile as any).mockClear();
+      });
+      afterEach(() => {
+        (fsPromises.readdir as any).mockReset().mockImplementation(async () => []);
+        (fsPromises.readFile as any).mockReset().mockImplementation(async () => '; Label file\nMyExistingLabel=Existing label text\n');
+      });
+
+      it.each([false, true])('refuses the whole rename when one lies in another model (dryRun=%s)', async (dryRun) => {
+        const searchDir = serve('ForeignModel');
+        const result = await renameLabelTool(
+          req('rename_label', {
+            oldLabelId: 'OldName', newLabelId: 'NewName', labelFileId: 'MyModel', model: 'MyModel',
+            searchPaths: [searchDir], updateIndex: false, dryRun,
+          }),
+          ctx,
+        );
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain('Refusing to rename "@MyModel:OldName"');
+        expect(result.content[0].text).toContain('in model "ForeignModel"');
+        // Not even the label file: half a rename leaves references to a missing ID.
+        expect(fsPromises.writeFile).not.toHaveBeenCalled();
+      });
+
+      it('refuses a reference outside every package root', async () => {
+        (fsPromises.readdir as any).mockImplementation(async (dir: string, opts?: any) => {
+          if (!opts) return ['en-US'];
+          if (dir === 'D:\\elsewhere') return [dirent('Foo.xml', false)];
+          return [];
+        });
+        (fsPromises.readFile as any).mockImplementation(async (file: string) =>
+          file.endsWith('.label.txt') ? '\uFEFFOldName=Old text\r\n' : '<Label>@MyModel:OldName</Label>');
+        const result = await renameLabelTool(
+          req('rename_label', {
+            oldLabelId: 'OldName', newLabelId: 'NewName', labelFileId: 'MyModel', model: 'MyModel',
+            searchPaths: ['D:\\elsewhere'], updateIndex: false,
+          }),
+          ctx,
+        );
+        expect(result.isError).toBe(true);
+        expect(result.content[0].text).toContain('outside the configured package roots');
+        expect(fsPromises.writeFile).not.toHaveBeenCalled();
+      });
+
+      it('rewrites a reference in the workspace model reached through searchPaths', async () => {
+        const searchDir = serve('MyModel');
+        const result = await renameLabelTool(
+          req('rename_label', {
+            oldLabelId: 'OldName', newLabelId: 'NewName', labelFileId: 'MyModel', model: 'MyModel',
+            searchPaths: [searchDir], updateIndex: false,
+          }),
+          ctx,
+        );
+        if (result.isError) throw new Error(result.content[0].text);
+        // Model dir and searchPath are the same directory: one file, rewritten once.
+        const xmlWrites = (fsPromises.writeFile as any).mock.calls.filter((c: any[]) => writeTargets(c[0], 'Foo.xml'));
+        expect(xmlWrites).toHaveLength(1);
+        expect(xmlWrites[0][1]).toBe('<Label>@MyModel:NewName</Label>');
+      });
+    });
+
+    it('lets configuration allow it, and says so on the result', async () => {
+      process.env.D365FO_CROSS_MODEL_WRITE_MODELS = 'ForeignModel';
+      const fsMock = await import('fs');
+      (fsMock.promises.readdir as any).mockResolvedValueOnce(['en-US']);
+      (fsMock.promises.readFile as any).mockResolvedValue('﻿OldName=Old text\r\n');
+
+      const result = await renameLabelTool(
+        req('rename_label', {
+          oldLabelId: 'OldName',
+          newLabelId: 'NewName',
+          labelFileId: 'ForeignLabels',
+          model: 'ForeignModel',
+          dryRun: true,
+        }),
+        ctx,
+      );
+
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain('DRY RUN');
+      expect(result.content[0].text).toContain('ForeignModel');
+      expect(result.content[0].text).toMatch(/D365FO_CROSS_MODEL_WRITE_MODELS|configuration/);
+      // A dry run wrote nothing, so the notice must not report a write.
+      expect(result.content[0].text).toContain('would be modified');
+      expect(result.content[0].text).not.toContain('was modified');
+    });
   });
 });
 

@@ -202,9 +202,8 @@ export function createXppMcpServer(context: XppServerContext): Server {
     })) as typeof allTools.tools;
 
     // Apply the locality + breadth filters. ALWAYS_TOOLS bypass the LOCAL_TOOLS
-    // partition and stay published in every mode. isToolEnabled is shared with
-    // the runtime gate in toolHandler so the list and the call-time enforcement
-    // can't drift.
+    // partition and stay published in every mode. The runtime gate in toolHandler
+    // applies the same mode and profile predicates (see isToolEnabled).
     const published = allTools.tools.filter(t => isToolEnabled(t.name));
     const modeNote =
       SERVER_MODE === 'read-only' ? ' · read-only (local tools excluded)' :

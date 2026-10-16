@@ -46,6 +46,7 @@
 import {
   type XmlNode, parseNodes, firstChild, textValueOf, isWithin, lineIndentOf,
 } from './xmlNodeTree.js';
+import { FORM_CONTROL_ELEMENT_ORDER } from '../validation/formControlElementOrder.generated.js';
 
 /**
  * The extension's own <Name> — the object the caller and the file are named
@@ -382,7 +383,7 @@ export function insertFormExtensionControl(
       ));
     }
 
-    const block = nestedControlLines(spec);
+    const block = nestedControlLines(spec, notes);
     const controls = firstChild(parentNode, 'Controls');
 
     // No <Controls> yet — the parent is childless. This is the normal state of a
@@ -430,7 +431,7 @@ export function insertFormExtensionControl(
   if (position.kind === 'invalid') return { kind: 'refused', message: position.message };
   if (position.note) notes.push(position.note);
 
-  const block = envelopeControlLines(spec, position);
+  const block = envelopeControlLines(spec, position, notes);
   const updated = insertIntoControls(xml, rootControls, block, undefined, notes);
   return finish(updated, spec, 'envelope', notes, baseline);
 }
@@ -447,12 +448,14 @@ export function insertFormExtensionControl(
  * because an unknown enum value is exactly the kind of thing that deserializes
  * to a discarded node under a silent build.
  */
-type ResolvedPosition =
+export type ResolvedPosition =
   | { kind: 'none'; note?: string }
   | { kind: 'placed'; positionType: 'AfterItem' | 'Begin'; previousSibling?: string; note?: string }
   | { kind: 'invalid'; message: string };
 
-function resolvePosition(spec: FormExtensionControlSpec): ResolvedPosition {
+export function resolvePosition(
+  spec: Pick<FormExtensionControlSpec, 'parentControl' | 'previousSibling' | 'positionType'>,
+): ResolvedPosition {
   const requested = spec.positionType?.trim();
   const sibling = spec.previousSibling?.trim() || undefined;
 
@@ -684,10 +687,10 @@ const escapeXmlAttr = (value: string): string =>
   escapeXmlText(value).replace(/"/g, '&quot;');
 
 /** The bare nested shape — no wrapper, no <Parent>; nesting encodes parentage. */
-function nestedControlLines(spec: FormExtensionControlSpec): string[] {
+function nestedControlLines(spec: FormExtensionControlSpec, notes: string[]): string[] {
   return [
     `<AxFormControl xmlns="" i:type="${escapeXmlAttr(spec.iType)}">`,
-    ...innerControlLines(spec).map(l => `\t${l}`),
+    ...innerControlLines(spec, notes).map(l => `\t${l}`),
     `</AxFormControl>`,
   ];
 }
@@ -701,12 +704,13 @@ function nestedControlLines(spec: FormExtensionControlSpec): string[] {
 function envelopeControlLines(
   spec: FormExtensionControlSpec,
   position: ResolvedPosition,
+  notes: string[],
 ): string[] {
   const lines = [
     `<AxFormExtensionControl xmlns="">`,
     `\t<Name>${escapeXmlText(spec.wrapperName)}</Name>`,
     `\t<FormControl xmlns="" i:type="${escapeXmlAttr(spec.iType)}">`,
-    ...innerControlLines(spec).map(l => `\t\t${l}`),
+    ...innerControlLines(spec, notes).map(l => `\t\t${l}`),
     `\t</FormControl>`,
     `\t<Parent>${escapeXmlText(spec.parentControl)}</Parent>`,
   ];
@@ -722,20 +726,67 @@ function envelopeControlLines(
 }
 
 /**
- * Control body, in the order the D365FO SDK serializes it:
- * Name → Type → FormControlExtension(nil) → DataField → DataSource → Label → [Items].
+ * The element a control's visible caption lives in, by preference. Field
+ * controls carry <Label>; buttons, menu buttons and static text carry <Text>;
+ * groups, tab pages and button groups carry <Caption>. Writing <Label> on a
+ * Button is the #1047 defect: the deserializer drops the unknown element
+ * without a word, the button renders blank, and the write still reads as ✅.
  */
-function innerControlLines(spec: FormExtensionControlSpec): string[] {
-  const lines = [
+const CAPTION_ELEMENTS = ['Label', 'Text', 'Caption'] as const;
+
+/**
+ * Control body: Name → Type → FormControlExtension(nil), then the optional
+ * properties in the canonical order for this i:type (mined from shipped forms —
+ * see formControlElementOrder.generated.ts; a Group's <Caption> precedes its
+ * <DataSource>, so no single fixed order is right for every type).
+ *
+ * A property the census shows this control type never carries is left out with
+ * a note rather than written: it would be discarded on load all the same, only
+ * silently. A type the census has never seen keeps the old behaviour.
+ */
+function innerControlLines(spec: FormExtensionControlSpec, notes: string[]): string[] {
+  const order = FORM_CONTROL_ELEMENT_ORDER[spec.iType];
+  const carries = (element: string): boolean => !order || order.includes(element);
+  const optional: Array<{ element: string; line: string }> = [];
+
+  const add = (param: string, element: string, value: string | undefined): void => {
+    if (!value) return;
+    if (!carries(element)) {
+      notes.push(
+        `${param} "${value}" was not written: ${spec.typeValue} controls have no <${element}> property, ` +
+        `and D365FO would silently discard it.`,
+      );
+      return;
+    }
+    optional.push({ element, line: `<${element}>${escapeXmlText(value)}</${element}>` });
+  };
+
+  add('dataField', 'DataField', spec.dataField);
+  add('dataSource', 'DataSource', spec.dataSource);
+  if (spec.label) {
+    const captionElement = order ? CAPTION_ELEMENTS.find(e => order.includes(e)) : 'Label';
+    if (captionElement) {
+      optional.push({ element: captionElement, line: `<${captionElement}>${escapeXmlText(spec.label)}</${captionElement}>` });
+    } else {
+      notes.push(`label "${spec.label}" was not written: ${spec.typeValue} controls have no caption property.`);
+    }
+  }
+  if (spec.typeValue === 'ComboBox') optional.push({ element: 'Items', line: '<Items />' });
+
+  if (order) {
+    const rank = (element: string): number => {
+      const at = order.indexOf(element);
+      return at < 0 ? Number.MAX_SAFE_INTEGER : at;
+    };
+    optional.sort((a, b) => rank(a.element) - rank(b.element));
+  }
+
+  return [
     `<Name>${escapeXmlText(spec.controlName)}</Name>`,
     `<Type>${escapeXmlText(spec.typeValue)}</Type>`,
     `<FormControlExtension i:nil="true" />`,
+    ...optional.map(o => o.line),
   ];
-  if (spec.dataField) lines.push(`<DataField>${escapeXmlText(spec.dataField)}</DataField>`);
-  if (spec.dataSource) lines.push(`<DataSource>${escapeXmlText(spec.dataSource)}</DataSource>`);
-  if (spec.label) lines.push(`<Label>${escapeXmlText(spec.label)}</Label>`);
-  if (spec.typeValue === 'ComboBox') lines.push(`<Items />`);
-  return lines;
 }
 
 /**

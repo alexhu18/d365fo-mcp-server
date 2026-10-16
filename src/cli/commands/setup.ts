@@ -13,18 +13,20 @@ import * as fs from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { DOTNET_MISSING, dataRoot, installMode, isWindows, paths, repoRoot, setDataRoot } from '../context.js';
 import type { SectionId } from '../../config/settings.js';
-import { settingByPath, settingsInSection } from '../../config/settings.js';
+import { settingByPath } from '../../config/settings.js';
 import { commandExists, runExe, runShell } from '../exec.js';
 import { pinBridgeExe } from '../bridgePath.js';
+import { bridgeFreshness } from '../bridgeSources.js';
 import { maybePrepareCopilotInstructions } from '../copilotFiles.js';
 import { mcpJsonNote, placementNote, stdioServer } from '../mcpJson.js';
 import { checkRelease } from '../npmRegistry.js';
-import { askAdvanced, askSecrets, askSetting, askSettings } from '../settingsPrompt.js';
+import { askAdvanced, askNaming, askSecrets, askSetting } from '../settingsPrompt.js';
 import { migrateLegacyEnv, openStore, readSetting, saveStore, writeSetting, type SettingsStore } from '../settingsStore.js';
 import { findPackagesRoot } from '../../utils/packagesRoot.js';
 import { rootTarget } from '../target.js';
 import { askConfirm, askSelect, askText, p, requireFullInstall } from '../ui.js';
 import { listXppConfigs } from '../xppConfig.js';
+import { configureSqlForEnvironment } from '../sqlEnvironmentSetup.js';
 import { rebuildIndex } from './indexCmd.js';
 import { instanceAddCommand } from './instance.js';
 
@@ -104,8 +106,17 @@ async function maybeBuildBridge(scenario: Scenario): Promise<boolean> {
     p.log.info('C# bridge skipped — it only builds on Windows D365FO VMs (writes stay unavailable here).');
     return true;
   }
-  if (fs.existsSync(paths.bridgeExe)) {
-    if (!await askConfirm('C# bridge already built — rebuild it?', false)) {
+  const freshness = bridgeFreshness();
+  if (freshness !== 'missing') {
+    // A bridge built from older sources is not "already built" for this
+    // version (#1115): default to rebuilding it, and say why.
+    const outdated = freshness !== 'current';
+    if (!await askConfirm(
+      outdated
+        ? 'C# bridge built from older or unrecorded sources — rebuild it for this version?'
+        : 'C# bridge already built — rebuild it?',
+      outdated,
+    )) {
       return true;
     }
     // user confirmed rebuild — skip the second confirmation
@@ -197,6 +208,7 @@ async function configureEnvironment(store: SettingsStore, scenario: Scenario): P
     } else {
       p.log.info('No XPP configs found — the server will auto-detect at runtime.');
     }
+    await configureSqlForEnvironment(store, 'ude');
     return 'ude';
   }
 
@@ -205,8 +217,9 @@ async function configureEnvironment(store: SettingsStore, scenario: Scenario): P
   // rest of setup into "no namespaces found" (#769).
   const detected = findPackagesRoot();
   if (detected) p.log.success(`Found PackagesLocalDirectory at ${detected}`);
-  await askSetting(store, setting('environment.packagePath'), { required: true, initial: detected ?? undefined });
+  const packagesRoot = await askSetting(store, setting('environment.packagePath'), { required: true, initial: detected ?? undefined });
   await askSetting(store, setting('environment.customModels'), { required: true });
+  await configureSqlForEnvironment(store, 'traditional', typeof packagesRoot === 'string' ? packagesRoot : undefined);
   return 'traditional';
 }
 
@@ -225,7 +238,7 @@ function solutionsPath(store: SettingsStore): string {
 
 async function configureNaming(store: SettingsStore): Promise<void> {
   p.log.step('Naming');
-  await askSettings(store, settingsInSection('naming', 'basic'));
+  await askNaming(store);
 }
 
 async function configureIndex(store: SettingsStore): Promise<void> {

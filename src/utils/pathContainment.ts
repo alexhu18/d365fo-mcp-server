@@ -422,3 +422,71 @@ export async function assertReadRootAllowed(dirPath: string): Promise<PathContai
 export function isFileUnderRoot(filePath: string, rootDir: string): boolean {
   return isUnder(filePath, rootDir);
 }
+
+/**
+ * Roots a Visual Studio project or solution may be written or deleted under.
+ *
+ * .rnrproj/.sln files live in a repo, not under the package roots above, so
+ * d365fo_file(action="project") needs a bound of its own. Only configuration
+ * counts: D365FO_SOLUTIONS_PATH and the context's workspacePath / solutionPath
+ * (.mcp.json, env, or what the client sent). Deliberately NOT the active project:
+ * the project action itself activates what it creates, so a root derived from it
+ * would let a project created in a foreign folder vouch for writes and deletes
+ * there on the next call. A projectPath the user configured is configuration,
+ * so its own folder counts — without it, a setup that names its project and
+ * nothing else could no longer register what it creates. So does the solution
+ * folder of a project the server detected itself (getServerDetectedProject),
+ * which excludes one a tool call activated.
+ */
+async function getProjectRoots(): Promise<string[]> {
+  const cfg = getConfigManager();
+  await cfg.ensureLoaded();
+  const ctx = cfg.getContext();
+  const roots = new Set<string>();
+  const add = (r: string | null | undefined) => {
+    if (!r || !r.trim()) return;
+    // solutionPath may name the .sln file rather than its folder.
+    const dir = /\.sln$/i.test(r.trim()) ? path.dirname(r.trim()) : r;
+    const norm = lexicalNorm(dir);
+    if (norm) roots.add(norm);
+  };
+  add(process.env.D365FO_SOLUTIONS_PATH);
+  add(ctx?.workspacePath);
+  add(ctx?.solutionPath);
+  const configuredProject = cfg.getConfiguredProjectPath();
+  if (configuredProject) add(path.dirname(configuredProject));
+  // A project the server detected on its own is not caller-chosen either: a
+  // zero-config install registers every create into it, and refusing that would
+  // write each object with a "could not add to project" warning instead.
+  const detected = cfg.getServerDetectedProject();
+  if (detected?.projectPath) add(detected.solutionPath || path.dirname(path.dirname(detected.projectPath)));
+  return [...roots];
+}
+
+/**
+ * Validate that a Visual Studio project/solution path (a projects folder, a
+ * .rnrproj or a .sln) lies under a configured solution root — see getProjectRoots.
+ * Symlinks are followed or not, as for the package roots (isUnder).
+ */
+export async function assertProjectPathAllowed(targetPath: string): Promise<PathContainmentResult> {
+  if (!targetPath || typeof targetPath !== 'string') return { ok: false, reason: 'path is empty' };
+  if (!isAbsoluteCrossPlatform(targetPath)) return { ok: false, reason: `path must be absolute: "${targetPath}"` };
+  if (!lexicalNorm(targetPath)) {
+    return { ok: false, reason: `Refusing a path that traverses above its own root: "${targetPath}"` };
+  }
+  const roots = await getProjectRoots();
+  const matchedRoot = roots.find(r => isUnder(targetPath, r));
+  if (!matchedRoot) {
+    return {
+      ok: false,
+      reason:
+        `Refusing to change Visual Studio projects outside the configured solution roots.\n` +
+        `  path: ${normalise(targetPath)}\n` +
+        `  allowed roots:\n` +
+        (roots.length ? roots.map(r => `    - ${r}`).join('\n') : '    (none configured)') +
+        `\nIf this folder really belongs to the workspace, ask the user to set D365FO_SOLUTIONS_PATH ` +
+        `(or workspacePath / solutionPath in .mcp.json) to the folder that holds its solutions.`,
+    };
+  }
+  return { ok: true, canonicalPath: normalise(targetPath), matchedRoot };
+}

@@ -169,6 +169,57 @@ describe('normalizeObjectName with EXTENSION_CLASS_NAMING_STYLE', () => {
   });
 });
 
+/**
+ * EXTENSION_CLASS_NAMING_STYLE="prefix-leading": the token sits before the base
+ * name instead of before "_Extension" — the shape the Avanade D365FO Development
+ * Guidelines use (AVAFLGCustTableDbt_Extension), which neither 'prefix' nor
+ * 'model-name' can express: both of those trail the token.
+ */
+describe('normalizeObjectName with EXTENSION_CLASS_NAMING_STYLE=prefix-leading', () => {
+  it('leads the class name with the prefix instead of trailing it', () => {
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    expect(normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt'))
+      .toBe('CtsoSalesFormLetter_Extension');
+  });
+
+  it('leaves element extensions on the trailing "prefix" default — only the class style changed', () => {
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    expect(normalizeObjectName('PurchTable', 'table-extension', 'ContosoExt'))
+      .toBe('PurchTable.CtsoExtension');
+  });
+
+  it('is idempotent over an already prefix-leading name', () => {
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    const once = normalizeObjectName('SalesFormLetter', 'class-extension', 'ContosoExt');
+    expect(normalizeObjectName(once, 'class-extension', 'ContosoExt')).toBe(once);
+  });
+
+  it('converts a name written under the trailing "prefix" style instead of growing a second infix', () => {
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    expect(normalizeObjectName('SalesFormLetterCtso_Extension', 'class', 'ContosoExt'))
+      .toBe('CtsoSalesFormLetter_Extension');
+  });
+
+  it('matches the Avanade Development Guidelines shape for a table CoC extension class', () => {
+    // The scenario this style exists for: Fulgard/AVAFLG names its table CoC
+    // extension classes AVAFLGCustTableDbt_Extension — prefix leading, the base
+    // object name (with its type abbreviation) immediately before "_Extension".
+    process.env.EXTENSION_PREFIX = 'AVAFLG';
+    registerCustomModel('AVAFLG');
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    expect(normalizeObjectName('CustTableDbt', 'class-extension', 'AVAFLG'))
+      .toBe('AVAFLGCustTableDbt_Extension');
+  });
+
+  it('leaves an already-conventional class name alone when the prefix is the model name', () => {
+    process.env.EXTENSION_PREFIX = 'AVAFLG';
+    registerCustomModel('AVAFLG');
+    process.env.EXTENSION_CLASS_NAMING_STYLE = 'prefix-leading';
+    expect(normalizeObjectName('AVAFLGCustTableDbt_Extension', 'class', 'AVAFLG'))
+      .toBe('AVAFLGCustTableDbt_Extension');
+  });
+});
+
 describe('isExtensionObjectType', () => {
   it('covers dot-notation extensions and class extensions', () => {
     expect(isExtensionObjectType('table-extension')).toBe(true);

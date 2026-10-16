@@ -90,7 +90,10 @@ export const CreateLabelArgsSchema = z.object({
     .min(1)
     .describe(
       'Label text for each language. At minimum provide en-US. ' +
-        'For languages without a translation the en-US text is used as fallback.',
+        'Matches locales case-insensitively (it_IT reads as it-IT), then uses the nearest supplied parent ' +
+        'locale (it for it-IT), or for a bare-language folder its one supplied regional translation ' +
+        '(de-DE for de). Otherwise uses en-US, or the first supplied translation. Every fallback is ' +
+        'reported, in bulk mode too.',
     ),
   languages: z
     .array(z.string())
@@ -171,8 +174,12 @@ export const CreateLabelArgsSchema = z.object({
     .default(false)
     .describe(
       'Update mode (set automatically by labels(action="update")): overwrite the text of an ' +
-        'existing label instead of skipping it. When the label is absent in a target language it ' +
-        'is created (upsert). Off by default so create never clobbers existing text.',
+        'existing label instead of skipping it — in the languages the call supplies a translation ' +
+        'for (exact, parent or regional). A language that would only get the en-US/first-supplied ' +
+        'fallback keeps its text, unless that text is a copy of the fallback source; an existing ' +
+        'comment is kept unless comment/defaultComment/description is given. When the label is ' +
+        'absent in a target language it is created (upsert). Off by default so create never ' +
+        'clobbers existing text.',
     ),
   createIfMissing: z
     .boolean()
@@ -380,6 +387,9 @@ export async function createLabelsBulk(
     } else {
       created++;
       lines.push(`🟢 ${labelId}: ${text.split('\n')[0]}`);
+      // The summary keeps one line per label; a fallback is the part of the
+      // detail that must not be dropped with the rest.
+      lines.push(...text.split('\n').filter((l: string) => /^⚠ (Translation fallback|Kept existing text)/.test(l.trimStart())).map((l: string) => `    ${l.trim()}`));
     }
   }
 
@@ -918,18 +928,75 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
     const labelResourcesDir = path.join(axLabelDir, 'LabelResources');
 
     // Build a quick lookup: language → translation entry
+    // `it_IT` is how agents spell `it-IT` often enough; no label folder uses `_`.
     const translationMap = new Map<string, { text: string; comment?: string }>();
+    // The comment each translation STATES (its own, defaultComment or description). Update
+    // keeps a label's existing comment where the call states none; effectiveDescription's
+    // project-name/labelFileId default is for new labels only. Keyed like translationMap,
+    // so a label's text and its comment always come from the same entry.
+    const statedComments = new Map<string, string | undefined>();
     for (const tr of translations) {
-      translationMap.set(tr.language, { text: tr.text, comment: tr.comment ?? defaultComment ?? effectiveDescription });
+      const language = tr.language.replace(/_/g, '-');
+      translationMap.set(language, { text: tr.text, comment: tr.comment ?? defaultComment ?? effectiveDescription });
+      statedComments.set(language, tr.comment ?? defaultComment ?? description);
     }
-    const enUsText = translationMap.get('en-US')?.text ?? translations[0].text;
+    // Case-insensitive view. The FIRST spelling of a locale keeps the key, so a
+    // later case variant (`IT-it` after `it-IT`) cannot overwrite it.
+    const translationsByLocale = new Map<string, { language: string; entry: { text: string; comment?: string } }>();
+    for (const [language, entry] of translationMap) {
+      const key = language.toLowerCase();
+      if (!translationsByLocale.has(key)) translationsByLocale.set(key, { language, entry });
+    }
+    const resolveTranslation = (language: string) => {
+      const exactSpelling = translationMap.get(language);
+      if (exactSpelling) return { language, entry: exactSpelling, fallback: '' };
+      const locale = language.toLowerCase();
+      const exact = translationsByLocale.get(locale);
+      if (exact) return { ...exact, fallback: '' };
+
+      // Walk only the target's parent chain: zh-Hant-TW → zh-Hant → zh.
+      // Never choose a sibling such as it-CH for it-IT. Strip dangling BCP-47
+      // extension singletons along with their final subtag during truncation.
+      const parts = locale.split('-');
+      while (parts.length > 1) {
+        parts.pop();
+        if (parts[parts.length - 1].length === 1) parts.pop();
+        const parent = translationsByLocale.get(parts.join('-'));
+        if (parent) return { ...parent, fallback: 'parent locale' };
+      }
+
+      // The other direction, which is the common one: label folders are mostly
+      // bare languages (Microsoft's `de`, `cs`, `it`) while agents supply a
+      // region (`de-DE`). A bare target takes the supplied regional translation
+      // of its language — but only when there is exactly one, so `de-AT` and
+      // `de-CH` together never pick for `de`, and a sibling never lands in a
+      // sibling (`de-AT` is not a bare target).
+      if (!locale.includes('-')) {
+        const regional = [...translationsByLocale].filter(([key]) => key.startsWith(`${locale}-`));
+        if (regional.length === 1) return { ...regional[0][1], fallback: 'regional locale' };
+      }
+
+      const english = translationsByLocale.get('en-us');
+      const source = english ?? { language: translations[0].language.replace(/_/g, '-'), entry: translations[0] };
+      return {
+        language: source.language,
+        // Preserve the existing last-resort comment behavior: use the target's
+        // default description rather than a comment specific to another locale.
+        entry: { text: source.entry.text, comment: defaultComment ?? effectiveDescription },
+        fallback: english ? 'en-US' : 'first supplied locale',
+      };
+    };
 
     // 2. Discover the language folders that already exist in the model.
     //    NOTE: LabelResources/ is shared by EVERY label file in the model, so this lists
     //    locales owned by sibling label files too. The `languages` arg scopes the writes.
-    const requestedLanguages = (args.languages ?? [])
-      .map(l => l.trim())
-      .filter(Boolean);
+    // `en-US` and `en_US` are one folder: list it once, or it is written and then
+    // reported as already existing.
+    // The FIRST spelling is kept, as in translationsByLocale (a Map built from pairs keeps the last).
+    const requestedLanguages: string[] = [];
+    for (const l of (args.languages ?? []).map(l => l.trim().replace(/_/g, '-')).filter(Boolean)) {
+      if (!requestedLanguages.some(r => r.toLowerCase() === l.toLowerCase())) requestedLanguages.push(l);
+    }
 
     let discoveredLanguages: string[] = [];
     try {
@@ -1032,7 +1099,11 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
     } else if (labelFileMissing) {
       // No explicit scope and nothing exists yet — seed the folders from the translations.
       existingLanguages = [];
+      const seeded = new Set<string>();
       for (const [lang] of translationMap) {
+        // `it-IT` and `IT-it` are one locale: one folder, one descriptor.
+        if (seeded.has(lang.toLowerCase())) continue;
+        seeded.add(lang.toLowerCase());
         await createLangDirectory(lang);
         existingLanguages.push(lang);
       }
@@ -1041,16 +1112,55 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       // exists in the model, plus any new languages supplied via translations.
       existingLanguages = [...discoveredLanguages];
       const existingSet = new Set(existingLanguages.map(l => l.toLowerCase()));
+      // A supplied regional translation that already fills an existing bare folder
+      // (`de-DE` → `de`) is not a request for a new `de-DE` locale: creating one
+      // would add a folder and a descriptor nobody asked for.
+      const consumedByRegional = new Set(
+        existingLanguages
+          .map(resolveTranslation)
+          .filter(r => r.fallback === 'regional locale')
+          .map(r => r.language.toLowerCase()),
+      );
       for (const [lang] of translationMap) {
-        if (!existingSet.has(lang.toLowerCase())) {
-          await createLangDirectory(lang);
-          existingLanguages.push(lang);
-        }
+        const key = lang.toLowerCase();
+        if (existingSet.has(key) || consumedByRegional.has(key)) continue;
+        await createLangDirectory(lang);
+        existingLanguages.push(lang);
+        existingSet.add(key);
       }
     }
 
+    // On update, a folder that would only get the last-resort fallback keeps its own text —
+    // unless that text is en-US's current text, i.e. a copy an earlier create seeded (only
+    // en-US supplied); a copy follows the update. Only en-US is a copy source: with en-US
+    // not supplied the fallback is the first supplied locale, and en-US itself would then
+    // be the folder judged a "copy" whenever the two texts agree (Status, Name, Filter…),
+    // overwriting the primary language with a translation.
+    const lastResortSource = translationsByLocale.get('en-us')?.language;
+    let lastResortSourceText: string | undefined;
+    if (args.overwriteExisting && lastResortSource) {
+      // Every folder on disk, not only the targeted ones: a `languages` scope that leaves
+      // en-US out must still recognise a copy of it.
+      const sourceFolder = [...existingLanguages, ...discoveredLanguages]
+        .find(l => l.toLowerCase() === lastResortSource.toLowerCase());
+      if (sourceFolder) {
+        try {
+          const sourceContent = await fs.readFile(path.join(labelResourcesDir, sourceFolder, `${labelFileId}.${sourceFolder}.label.txt`), 'utf-8');
+          lastResortSourceText = parseLabelMap(sourceContent).get(labelId)?.text;
+        } catch {
+          // No source file yet: nothing counts as a copy of it.
+        }
+      }
+    }
+    const keptExisting: string[] = [];
+
     // 4. Process each existing language
     const written: string[] = [];
+    const writtenDetails: string[] = [];
+    const translationWarnings: string[] = [];
+    // Last-resort fallbacks, grouped by source: on a model with seven locales and
+    // only en-US supplied that is the documented default, worth one line, not six.
+    const lastResortGroups = new Map<string, { kind: string; targets: string[] }>();
     const skipped: string[] = [];
     type LabelEntry = Parameters<XppSymbolIndex['bulkAddLabels']>[0][number];
     const indexEntries: LabelEntry[] = [];
@@ -1078,7 +1188,20 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       }
 
       // Determine text for this language
-      const entry = translationMap.get(lang) ?? { text: enUsText, comment: defaultComment ?? effectiveDescription };
+      const resolved = resolveTranslation(lang);
+      let { entry } = resolved;
+      const lastResort = resolved.fallback === 'en-US' || resolved.fallback === 'first supplied locale';
+      const current = labelMap.get(labelId);
+      if (current && args.overwriteExisting) {
+        // Update changes what the call states, nothing else (#1105): an existing translation
+        // is not replaced by a fallback, and an existing comment by a default.
+        if (lastResort && current.text !== lastResortSourceText) {
+          keptExisting.push(`${lang} ("${current.text}")`);
+          continue;
+        }
+        const stated = lastResort ? (defaultComment ?? description) : statedComments.get(resolved.language);
+        entry = { text: entry.text, comment: stated ?? current.comment };
+      }
       labelMap.set(labelId, entry);
 
       // Ensure the directory exists
@@ -1088,6 +1211,16 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       const newContent = serializeLabelMap(labelMap, shouldSort, eol);
       await writeFileWithBom(txtPath, newContent);
       written.push(lang);
+      writtenDetails.push(`  ✔ ${lang}  → ${entry.text}`);
+      if (lastResort) {
+        const group = lastResortGroups.get(resolved.language) ?? { kind: resolved.fallback, targets: [] };
+        group.targets.push(lang);
+        lastResortGroups.set(resolved.language, group);
+      } else if (resolved.fallback) {
+        translationWarnings.push(
+          `  ⚠ Translation fallback (${resolved.fallback}): ${resolved.language} → ${lang}; wrote "${entry.text}".`,
+        );
+      }
 
       // Prepare index update
       if (updateIndex) {
@@ -1138,7 +1271,7 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       }
 
       if (projectPath) {
-        const pfm = new ProjectFileManager();
+        const pfm = new ProjectFileManager({ withinSolutionRoots: true });
         // Collect all languages that have an XML descriptor
         const allLangs = [...new Set([...written, ...existingLanguages])];
         console.error(`[create_label] Adding label to project: ${projectPath} | labelFileId=${labelFileId} | langs=${allLangs.join(',')}`);
@@ -1224,7 +1357,9 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
     const ref = `@${labelFileId}:${labelId}`;
     const lines: string[] = [
       ...(collisionWarning ? [collisionWarning] : []),
-      `✅ Label "${ref}" ${args.overwriteExisting ? 'updated' : 'created'} successfully!`,
+      written.length === 0 && keptExisting.length > 0
+        ? `ℹ️ Label "${ref}" left unchanged — no supplied translation applies to the targeted languages.`
+        : `✅ Label "${ref}" ${args.overwriteExisting ? 'updated' : 'created'} successfully!`,
       // Immediately under the verdict, not at the end: a write into another model
       // is the first thing the reader needs to know, and the tail of this reply is
       // reference syntax nobody scrolls to.
@@ -1236,7 +1371,13 @@ export async function createLabelTool(request: CallToolRequest, context: XppServ
       `Location   : ${labelResourcesDir}`,
       '',
       'Written to languages:',
-      ...written.map(l => `  ✔ ${l}  → ${translationMap.get(l)?.text ?? enUsText}`),
+      ...writtenDetails,
+      ...translationWarnings,
+      ...[...lastResortGroups].map(([source, g]) =>
+        `  ⚠ Translation fallback (${g.kind}): ${source} text written to ${g.targets.join(', ')} — no translation supplied for ${g.targets.length === 1 ? 'it' : 'them'}.`),
+      ...(keptExisting.length > 0
+        ? [`  ⚠ Kept existing text in ${keptExisting.join(', ')} — no translation supplied for ${keptExisting.length === 1 ? 'it; pass one to change it' : 'them; pass theirs to change them'}.`]
+        : []),
     ];
     if (skipped.length > 0) {
       lines.push('');

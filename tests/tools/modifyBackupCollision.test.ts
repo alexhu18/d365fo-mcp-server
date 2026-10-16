@@ -6,7 +6,7 @@
  * the same second produced the same `<file>.backup-<stamp>` path and the second
  * copy silently replaced the first — with content that had already been modified.
  * On a target outside git that backup is the ONLY recovery route (see
- * ensureRecoverableModification, which forces one exactly there), so the original
+ * planRecoverableModification in modifyBackup.ts, which forces one exactly there), so the original
  * was gone for good.
  */
 
@@ -14,7 +14,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { createFileBackup } from '../../src/tools/write/modifyD365File';
+import { createFileBackup } from '../../src/tools/write/modifyBackup';
 
 const dirs: string[] = [];
 function tempObject(contents: string): string {

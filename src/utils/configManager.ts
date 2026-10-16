@@ -6,6 +6,7 @@
 import * as fs from 'fs/promises';
 import { existsSync, realpathSync } from 'fs';
 import * as path from 'path';
+import { findDescriptorPath } from '../metadata/modelDescriptor.js';
 import * as os from 'os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { autoDetectD365Project, detectD365Project, scanAllD365Projects, extractModelNameFromProject, detectGitBranch, isMicrosoftDemoModel, distinctCustomModels, type D365ProjectInfo } from './workspaceDetector.js';
@@ -54,6 +55,13 @@ function normalizePath(p: string): string {
   }
 }
 
+/** Two spellings of one project file — case-insensitively on Windows, as its paths are. */
+function sameProjectPath(a: string, b: string): boolean {
+  const x = path.normalize(a);
+  const y = path.normalize(b);
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+
 class ConfigManager {
   private config: McpConfig | null = null;
   private configPath: string;
@@ -90,6 +98,8 @@ class ConfigManager {
   // Promise for the in-progress background autoDetectProject() call, awaited by
   // getWorkspaceInfoDiagnostics() when autoDetectedProject is still null.
   private detectionInProgress: Promise<void> | null = null;
+  /** A .rnrproj scan is running right now (set for the whole of autoDetectProject's work). */
+  private projectScanRunning = false;
   private xppConfigProvider: XppConfigProvider | null = null;
   private xppConfig: XppEnvironmentConfig | null = null;
   private xppConfigLoaded: boolean = false;
@@ -97,6 +107,14 @@ class ConfigManager {
   // active project off the model this workspace itself resolved to. `anchorModel` is
   // that original model and it survives further switches — see getWriteAnchorModel().
   private toolForcedProject: { anchorModel: string; forcedModel: string } | null = null;
+  /** The .rnrproj forceProject() last activated — see getServerDetectedProject(). */
+  private lastForcedProjectPath: string | null = null;
+  /**
+   * The project detection itself found, as forceProject() saw it before switching.
+   * Activating THAT one through a tool call (an agent "confirming" its project) is
+   * not a caller's choice, so it keeps the solution root detection gave it.
+   */
+  private serverDetectedProjectPath: string | null = null;
   // The sources available the last time detection ran, and whether the retry that
   // a change in them buys has been spent — see ensureProjectDetection().
   private lastDetectionFingerprint: string | null = null;
@@ -157,7 +175,16 @@ class ConfigManager {
     if (this.autoDetectionAttempted) {
       return; // Only attempt once per workspace
     }
+    this.projectScanRunning = true;
+    try {
+      await this.runProjectDetection(workspacePath, generation);
+    } finally {
+      this.projectScanRunning = false;
+    }
+  }
 
+  /** The body of autoDetectProject; its synchronous start marks the attempt before any await. */
+  private async runProjectDetection(workspacePath?: string, generation?: number): Promise<void> {
     this.autoDetectionAttempted = true;
     this.lastDetectionFingerprint = this.detectionSourceFingerprint(workspacePath);
 
@@ -192,8 +219,18 @@ class ConfigManager {
         this.config?.servers?.context?.packagePath;
 
       if (packagePathHint) {
-        debugLog(`[ConfigManager] No .rnrproj in workspace — scanning packagePath: ${packagePathHint}`);
-        const pkgScan = await detectD365Project(packagePathHint, 4);
+        // When the workspace already named the model, its .rnrproj can only be in
+        // that model's package: scan it, not every package. The whole root is
+        // hundreds of packages — 7.5 s on the dev VM, for a project that is not
+        // there when the workspace is the package folder itself. The package is the
+        // one whose descriptor declares the model, not a folder named after it:
+        // the two names differ for an ISV model (#1086).
+        const modelPackage = detectedProject?.modelName
+          ? findDescriptorPath(packagePathHint, detectedProject.modelName)?.packageName
+          : undefined;
+        const scanRoot = modelPackage ? path.join(packagePathHint, modelPackage) : packagePathHint;
+        debugLog(`[ConfigManager] No .rnrproj in workspace — scanning packagePath: ${scanRoot}`);
+        const pkgScan = await detectD365Project(scanRoot, 4);
         if (pkgScan?.projectPath) {
           detectedProject = {
             ...pkgScan,
@@ -286,8 +323,25 @@ class ConfigManager {
       // a developer creates a new VS project and leaves the default model name unchanged.
       // Prefer the first custom (non-demo) model; only fall back to demo models when that
       // is ALL that was found (unusual, but possible in purely tutorial repos).
-      if (all.length > 0 && !this.autoDetectedProject && !isNowStale) {
-        const primary = all.find(p => !isMicrosoftDemoModel(p.modelName)) ?? all[0];
+      // A model the user configured decides which projects may be picked at all. The
+      // scan used to take the first project in disk order: a projects folder that
+      // also holds one stray project of another model (a mis-set <Model>, a build
+      // project) had that project selected as THE project, its model registered as
+      // custom, and every new object of the configured model registered into it —
+      // which fails that project's build. No project of the configured model under
+      // the root means nothing is picked; the configured name still sets the model.
+      const configuredModel = this.configuredModelName()?.toLowerCase();
+      const candidates = configuredModel
+        ? all.filter(p => p.modelName.toLowerCase() === configuredModel)
+        : all;
+      if (configuredModel && candidates.length === 0 && all.length > 0) {
+        console.error(
+          `[ConfigManager] ⚠️ No project under D365FO_SOLUTIONS_PATH builds the configured model ` +
+          `"${this.configuredModelName()}" — none auto-selected. Pass projectName/projectPath to target one.`
+        );
+      }
+      if (candidates.length > 0 && !this.autoDetectedProject && !isNowStale) {
+        const primary = candidates.find(p => !isMicrosoftDemoModel(p.modelName)) ?? candidates[0];
         if (isMicrosoftDemoModel(primary.modelName)) {
           console.error(
             `[ConfigManager] ⚠️ All detected projects are Microsoft demo models — using "${primary.modelName}" as fallback.`,
@@ -302,7 +356,7 @@ class ConfigManager {
         // model would break detection outright, and get_workspace_info already
         // lists every project with the projectName to switch by.
         const scannedModels = distinctCustomModels(all.map(p => p.modelName));
-        if (scannedModels.length > 1) {
+        if (scannedModels.length > 1 && !configuredModel) {
           const shown = scannedModels.slice(0, 6).join(', ');
           console.error(
             `[ConfigManager] ⚠️ D365FO_SOLUTIONS_PATH holds ${scannedModels.length} custom models ` +
@@ -443,6 +497,15 @@ class ConfigManager {
   }
 
   /**
+   * The model the USER named — D365FO_MODEL_NAME or modelName in the config file —
+   * not one detected from the workspace.
+   */
+  private configuredModelName(): string | undefined {
+    const fileContext = this.config?.context || this.config?.servers?.context || null;
+    return process.env.D365FO_MODEL_NAME?.trim() || fileContext?.modelName?.trim() || undefined;
+  }
+
+  /**
    * The one detection outcome worth a warning: the model named in static
    * configuration (D365FO_MODEL_NAME / .mcp.json) is not the model of the
    * project the workspace scan resolved.
@@ -457,7 +520,7 @@ class ConfigManager {
   private warnOnModelConflict(detected: D365ProjectInfo): void {
     const fileContext = this.config?.context || this.config?.servers?.context || null;
     const envModel = process.env.D365FO_MODEL_NAME?.trim();
-    const configured = envModel || fileContext?.modelName?.trim();
+    const configured = this.configuredModelName();
     if (!configured || configured.toLowerCase() === detected.modelName.toLowerCase()) return;
     if (process.env.D365FO_PROJECT_PATH || fileContext?.projectPath) return;
 
@@ -918,6 +981,29 @@ class ConfigManager {
   }
 
   /**
+   * The project path the USER configured — D365FO_PROJECT_PATH or projectPath in the
+   * config file — and nothing the server set at run time. getContext().projectPath is
+   * not that: forceProject() writes the project it activates into runtimeContext, so
+   * the merged value can name a project an earlier tool call chose.
+   */
+  /**
+   * The project the SERVER detected (cwd, workspace, well-known folders, the
+   * packages scan) — null when there is none, or when it is the one a tool call
+   * activated through forceProject(). Detection is not caller-chosen, so its
+   * folder may bound project writes; a project the caller activated may not.
+   */
+  getServerDetectedProject(): D365ProjectInfo | null {
+    const detected = this.autoDetectedProject;
+    if (!detected?.projectPath) return null;
+    if (this.lastForcedProjectPath && sameProjectPath(detected.projectPath, this.lastForcedProjectPath)) return null;
+    return detected;
+  }
+
+  getConfiguredProjectPath(): string | undefined {
+    return this.pinnedPath('projectPath')?.path.trim() || undefined;
+  }
+
+  /**
    * Run fn inside an isolated per-request AsyncLocalStorage context.
    * All calls to getContext() within fn (and any awaited Promises it starts)
    * will see ctx merged over runtimeContext, without mutating shared state.
@@ -1162,9 +1248,23 @@ class ConfigManager {
     packageSource: string;
     customPackagesPath: string | null;
     customPackagesSource: string;
+    /** The model is configured and the .rnrproj scan is still running in the background. */
+    projectDetectionPending: boolean;
   }> {
     // Ensure config is loaded and auto-detection has had a chance to run
     await this.ensureLoaded();
+    const ctx = this.config?.servers?.context;
+    const detectFrom = this.runtimeContext.workspacePath || ctx?.workspacePath;
+
+    // A model named in D365FO_MODEL_NAME or the config already answers what this
+    // call is for (where writes land, which naming applies); the scan below only
+    // adds the .rnrproj path. Waiting for it cost every first call 5 s whenever the
+    // workspace holds no .rnrproj — the scan ran on, the wait hit its cap. Let it
+    // finish in the background and say so.
+    if (this.configuredModelName()) {
+      this.ensureProjectDetection(detectFrom).catch(() => {});
+      return this.workspaceInfoDiagnostics(!this.autoDetectedProject && this.projectScanRunning);
+    }
 
     // If the D365FO_SOLUTIONS_PATH eager scan is still running, wait for it
     // first — that scan populates allDetectedProjects which setRuntimeContextFromRoots
@@ -1185,9 +1285,11 @@ class ConfigManager {
       ]);
       this.detectionInProgress = null;
     }
-    const ctx = this.config?.servers?.context;
-    await this.ensureProjectDetection(this.runtimeContext.workspacePath || ctx?.workspacePath);
+    await this.ensureProjectDetection(detectFrom);
+    return this.workspaceInfoDiagnostics(false);
+  }
 
+  private async workspaceInfoDiagnostics(projectDetectionPending: boolean): ReturnType<ConfigManager['getWorkspaceInfoDiagnostics']> {
     // Model name
     const { modelName, source: modelSource } = this.getModelNameWithSource();
 
@@ -1195,12 +1297,13 @@ class ConfigManager {
     let projectPath: string | null = null;
     let projectSource = '(not detected)';
 
+    const pinnedProject = this.pinnedPath('projectPath');
     if (this.runtimeContext.projectPath) {
       projectPath = this.runtimeContext.projectPath;
       projectSource = 'runtime context (from VS Code)';
-    } else if (this.config?.servers?.context?.projectPath) {
-      projectPath = this.config?.servers?.context?.projectPath ?? null;
-      projectSource = '.mcp.json';
+    } else if (pinnedProject) {
+      projectPath = pinnedProject.path;
+      projectSource = pinnedProject.source;
     } else if (this.autoDetectedProject?.projectPath) {
       projectPath = this.autoDetectedProject.projectPath;
       projectSource = 'auto-detected from .rnrproj';
@@ -1260,6 +1363,7 @@ class ConfigManager {
       projectPath, projectSource, ambiguousProjects,
       packagePath, packageSource,
       customPackagesPath, customPackagesSource,
+      projectDetectionPending,
     };
   }
 
@@ -1333,6 +1437,8 @@ class ConfigManager {
       // hand the caller exactly the bypass the anchor exists to deny.
       await this.awaitPendingDetection();
       const modelBeforeSwitch = this.getModelName();
+      const detectedBeforeSwitch = this.getServerDetectedProject()?.projectPath;
+      if (detectedBeforeSwitch) this.serverDetectedProjectPath = path.normalize(detectedBeforeSwitch);
       const normalizedPath = path.normalize(projectPath);
       const modelName = await extractModelNameFromProject(normalizedPath);
       if (!modelName) {
@@ -1345,6 +1451,13 @@ class ConfigManager {
         solutionPath: path.dirname(path.dirname(normalizedPath)),
       };
       this.autoDetectedProject = project;
+      // Re-selecting the project the server detected — now or before an earlier
+      // switch — leaves it detected: marking it forced took away the solution root
+      // a zero-config install registers every create through.
+      this.lastForcedProjectPath =
+        this.serverDetectedProjectPath && sameProjectPath(normalizedPath, this.serverDetectedProjectPath)
+          ? null
+          : normalizedPath;
       this.autoDetectionAttempted = true;
       // Cache under the project path key so direct lookups work.
       this.autoDetectionCache.set(normalizedPath, project);
@@ -1451,22 +1564,39 @@ class ConfigManager {
   }
 
   /**
+   * A pinned project / solution: D365FO_PROJECT_PATH / D365FO_SOLUTION_PATH, else
+   * the .mcp.json context — the same env-over-file order getContext() uses.
+   *
+   * The env var is also what `workspace.projectPath` in the config file becomes
+   * (configFile.ts loads settings into process.env), so reading only the .mcp.json
+   * context made that documented setting a no-op: the server reported
+   * "Project : (not detected)" and registered nothing, with the path configured.
+   */
+  private pinnedPath(key: 'projectPath' | 'solutionPath'): { path: string; source: string } | null {
+    const envName = key === 'projectPath' ? 'D365FO_PROJECT_PATH' : 'D365FO_SOLUTION_PATH';
+    const fromEnv = process.env[envName]?.trim();
+    if (fromEnv) return { path: fromEnv, source: `${envName} (env var or config file)` };
+    const fileContext = this.config?.context || this.config?.servers?.context || null;
+    const fromFile = fileContext?.[key];
+    return fromFile ? { path: fromFile, source: '.mcp.json' } : null;
+  }
+
+  /**
    * Get project path
-   * Priority: 1) Runtime context 2) .mcp.json config 3) Auto-detection from workspace
+   * Priority: 1) Runtime context 2) D365FO_PROJECT_PATH / .mcp.json 3) Auto-detection from workspace
    */
   async getProjectPath(): Promise<string | null> {
     // Priority 1: Runtime context
     if (this.runtimeContext.projectPath) {
       return this.runtimeContext.projectPath;
     }
-    
-    // Priority 2: Config file
-    const context = this.config?.servers?.context;
-    if (context?.projectPath) {
-      return context.projectPath;
-    }
+
+    // Priority 2: Pinned in the environment or the config file
+    const pinned = this.pinnedPath('projectPath');
+    if (pinned) return pinned.path;
 
     // Priority 3: Auto-detection
+    const context = this.config?.servers?.context;
     await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
 
     return this.autoDetectedProject?.projectPath || null;
@@ -1474,19 +1604,18 @@ class ConfigManager {
 
   /**
    * Get solution path
-   * Priority: 1) Runtime context 2) .mcp.json config 3) Auto-detection from workspace
+   * Priority: 1) Runtime context 2) D365FO_SOLUTION_PATH / .mcp.json 3) Auto-detection from workspace
    */
   async getSolutionPath(): Promise<string | null> {
     // Priority 1: Runtime context
     if (this.runtimeContext.solutionPath) {
       return this.runtimeContext.solutionPath;
     }
-    
-    // Priority 2: Config file
+
+    // Priority 2: Pinned in the environment or the config file
+    const pinned = this.pinnedPath('solutionPath');
+    if (pinned) return pinned.path;
     const context = this.config?.servers?.context;
-    if (context?.solutionPath) {
-      return context.solutionPath;
-    }
 
     // Priority 3: Auto-detection
     await this.ensureProjectDetection(this.runtimeContext.workspacePath || context?.workspacePath);
@@ -1509,12 +1638,14 @@ class ConfigManager {
     return {
       modelName,
       source,
+      // Same order as getProjectPath()/getSolutionPath(): a pinned path outranks a
+      // detected one, or the snapshot names a project writes do not go to.
       projectPath:  this.runtimeContext.projectPath  ??
-                    this.autoDetectedProject?.projectPath  ??
-                    this.config?.servers?.context?.projectPath  ?? null,
+                    this.pinnedPath('projectPath')?.path  ??
+                    this.autoDetectedProject?.projectPath  ?? null,
       solutionPath: this.runtimeContext.solutionPath ??
-                    this.autoDetectedProject?.solutionPath ??
-                    this.config?.servers?.context?.solutionPath ?? null,
+                    this.pinnedPath('solutionPath')?.path ??
+                    this.autoDetectedProject?.solutionPath ?? null,
       workspacePath: this.runtimeContext.workspacePath ??
                      this.config?.servers?.context?.workspacePath ?? null,
     };
@@ -1598,17 +1729,29 @@ class ConfigManager {
   }
 
   /**
-   * Get the cross-reference database server (UDE: CrossReferencesDbServerName).
+   * Get the cross-reference database server: bridge.xrefDbServer
+   * (D365FO_XREF_DB_SERVER) when configured, else the XPP config's
+   * CrossReferencesDbServerName (UDE), else null — the bridge then uses localhost.
+   *
+   * The XPP config exists only on UDE, so on a traditional VM the configured
+   * value is the only way to point the bridge at DYNAMICSXREFDB; without it
+   * find_references always fell back to its name-based search.
    */
   async getXrefDbServer(): Promise<string | null> {
+    const configured = process.env.D365FO_XREF_DB_SERVER?.trim();
+    if (configured) return configured;
     await this.ensureXppConfig();
     return this.xppConfig?.xrefDbServer || null;
   }
 
   /**
-   * Get the cross-reference database name (UDE: CrossReferencesDatabaseName).
+   * Get the cross-reference database name: bridge.xrefDbName
+   * (D365FO_XREF_DB_NAME) when configured, else the XPP config's
+   * CrossReferencesDatabaseName (UDE), else null — cross-references stay off.
    */
   async getXrefDbName(): Promise<string | null> {
+    const configured = process.env.D365FO_XREF_DB_NAME?.trim();
+    if (configured) return configured;
     await this.ensureXppConfig();
     return this.xppConfig?.xrefDbName || null;
   }

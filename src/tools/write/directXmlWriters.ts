@@ -20,13 +20,23 @@ import { withFileLock, writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { insertFormExtensionControl } from '../../utils/formExtensionControlXml.js';
 import { removeFormControl } from '../../utils/formControlRemoval.js';
+import { findBaseObjectXml } from '../../utils/baseObjectXml.js';
+import { checkNewControlPosition, findFormControl, formDefinesControl, placeFormControl, type PlaceFormControlSpec } from '../../utils/formControlPlacement.js';
 import { addSecurityEntryPoint, removeSecurityEntryPoint } from '../xml/securityPrivilegeXml.js';
 import { removeDiagnosticSuppression, addDiagnosticSuppression, emptySuppressionListXml } from '../../utils/ignoreDiagnosticListXml.js';
 import { buildSuppressionXml } from '../../knowledge/bpMonikers/index.js';
-import { upsertAxTableProperty, AX_TABLE_NON_EXISTENT_PROPERTIES } from '../../utils/axTablePropertyOrder.js';
+import { upsertAxTableProperty, upsertAxTableSubscriberAccessLevel, AX_TABLE_NON_EXISTENT_PROPERTIES } from '../../utils/axTablePropertyOrder.js';
+import { describeSubscriberAccessLevel, subscriberAccessLevelValue } from '../../utils/subscriberAccessLevel.js';
 import { upsertAxFormDesignProperty } from '../../utils/axFormDesignProperties.js';
+import { upsertFormControlProperty } from '../../utils/formControlPropertyXml.js';
+import { resolveControlPropertyTarget } from '../../utils/formExtensionControlModifications.js';
 import { buildAxDataEntityViewFieldXml } from '../xml/dataEntityViewExtensionXml.js';
+import {
+  upsertDataEntityProperty, addDataEntityDataSource, addDataEntityMappedField,
+  type EntityDataSourceSpec, type EntityMappedFieldSpec,
+} from '../xml/dataEntityViewEdit.js';
 import { escapeXml } from '../../utils/xmlEscape.js';
+import { upsertTableFieldProperty } from '../xml/tableFieldPropertyEdit.js';
 import {
   addModuleReference, removeModuleReference, parseModuleReferences, invalidateModelVisibility,
 } from '../../metadata/modelDescriptor.js';
@@ -159,6 +169,23 @@ export const directXmlModifyProperty = serializedOnFile(async (
     }
     const tagRe = tagName.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&');
 
+    // AxTable SubscriberAccessLevel holds child elements (one per permission), so
+    // the leaf replacement below would refuse it, and the bridge's setProperty has
+    // no case for it. "Read=Allow,Create=Deny", a JSON object, or "None" (#1073).
+    if (tagName.toLowerCase() === 'subscriberaccesslevel' && /<AxTable[\s>]/.test(content)) {
+      const parsed = subscriberAccessLevelValue(propertyValue);
+      if (!parsed.ok) return { success: false, message: `❌ ${parsed.error} Nothing was written.` };
+      const patched = upsertAxTableSubscriberAccessLevel(content, parsed.level);
+      if (!patched) return null;
+      if (patched !== content) await writeFileAtomic(filePath, normalizeD365Xml(patched));
+      return {
+        success: true,
+        message:
+          `✅ SubscriberAccessLevel set to ${describeSubscriberAccessLevel(parsed.level)} via direct XML ` +
+          `(${patched === content ? 'already in that state, nothing written' : 'in canonical AxTable element order'}). File: ${filePath}`,
+      };
+    }
+
     // Forms first: the bridge refuses modify-property for AxForm entirely, and the
     // generic path below cannot serve Design properties either — Caption/Style also
     // occur on controls, so it sees several matches and refuses (#37).
@@ -168,6 +195,31 @@ export const directXmlModifyProperty = serializedOnFile(async (
       return {
         success: true,
         message: `✅ Form Design property '${tagName}'='${propertyValue}' set via direct XML (the bridge does not support modify-property for forms). File: ${filePath}`,
+      };
+    }
+
+    // Entity properties: the element is usually absent (defaults are omitted) and names like
+    // Label recur inside fields, so the generic whole-file match below cannot serve them.
+    if (/<AxDataEntityView[\s>]/.test(content)) {
+      // tagName is the last segment: "Fields.X.Label" would otherwise rewrite the entity's own Label.
+      if (/[./]/.test(propertyPath)) {
+        return {
+          success: false,
+          message:
+            `❌ '${propertyPath}' is a nested path; this writer sets one top-level entity property ` +
+            `(e.g. "Label") — nothing was written.`,
+        };
+      }
+      const edited = upsertDataEntityProperty(content.replace(/\r\n/g, '\n'), tagName, String(propertyValue));
+      if (!edited.ok) {
+        return { success: false, message: `❌ ${edited.message} — nothing was written.` };
+      }
+      await writeFileAtomic(filePath, normalizeD365Xml(edited.xml!));
+      return {
+        success: true,
+        message:
+          `✅ Entity property '${tagName}'='${propertyValue}' set via direct XML (${edited.message}, ` +
+          `in canonical AxDataEntityView element order). File: ${filePath}`,
       };
     }
 
@@ -334,6 +386,10 @@ const CONTROL_TYPE_TO_FORM_CONTROL: Record<string, { iType: string; typeValue: s
   // becomes a String control over enum data.
   enum:        { iType: 'AxFormComboBoxControl', typeValue: 'ComboBox' },
   button:      { iType: 'AxFormButtonControl',   typeValue: 'Button' },
+  // Both are advertised by the controlType param; unmapped, they fell through to
+  // DEFAULT_FORM_CONTROL and a requested button was written as a String field.
+  commandbutton:      { iType: 'AxFormCommandButtonControl',      typeValue: 'CommandButton' },
+  menufunctionbutton: { iType: 'AxFormMenuFunctionButtonControl', typeValue: 'MenuFunctionButton' },
   group:       { iType: 'AxFormGroupControl',    typeValue: 'Group' },
 };
 const DEFAULT_FORM_CONTROL = { iType: 'AxFormStringControl', typeValue: 'String' };
@@ -387,7 +443,9 @@ export const directXmlAddControl = serializedOnFile(async (
   label?: string,
   previousSibling?: string,
   positionType?: string,
-): Promise<{ success: boolean; message: string } | null> => {
+  /** What the CALLER passed (controlType above is already defaulted), for the note on a control that exists. */
+  asked?: ControlCreationArgs,
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> => {
   try {
     const rawContent = await fs.readFile(filePath, 'utf-8');
     const content = rawContent.replace(/^﻿/, '').replace(/\r\n/g, '\n');
@@ -405,10 +463,22 @@ export const directXmlAddControl = serializedOnFile(async (
       case 'unsupported':
         return null; // not a form-extension shape we recognise — caller falls through
       case 'exists':
-        return {
+        // Asked for a position: the caller is moving the control it added earlier, and
+        // "skipped" with a ✅ would leave it where it was while saying all is well.
+        if (previousSibling || positionType) {
+          // Awaited, so a throw inside it reaches the catch below like every other failure here.
+          return withIgnoredOnExisting(
+            await placeInFile(filePath, content, { controlName, parentControl, previousSibling, positionType }),
+            asked,
+          );
+        }
+        return withIgnoredOnExisting({
           success: true,
-          message: `✅ Control '${controlName}' already present in ${filePath} — skipped (idempotent).`,
-        };
+          skipped: true,
+          message: `ℹ️ Control '${controlName}' already present${elsewhereNote(content, controlName, parentControl)} ` +
+            `in ${filePath} — skipped (idempotent). ` +
+            `To move it, call add-control again with previousSibling or positionType.`,
+        }, asked);
       case 'refused':
         return { success: false, message: outcome.message };
     }
@@ -433,6 +503,158 @@ export const directXmlAddControl = serializedOnFile(async (
     return null;
   }
 });
+
+/** What add-control CREATES a control with; none of it applies to a control that already exists. */
+export interface ControlCreationArgs {
+  controlType?: string;
+  controlDataSource?: string;
+  controlDataField?: string;
+  controlLabel?: string;
+}
+
+const CREATION_ARG_NAMES = ['controlType', 'controlDataSource', 'controlDataField', 'controlLabel'] as const;
+
+/**
+ * Append the creation arguments a call on an EXISTING control did not apply. The
+ * reply used to read "✅ moved" while a controlType/controlDataField in the same call
+ * was dropped without a word — read as a re-typed or re-bound control.
+ */
+function withIgnoredOnExisting<T extends { success: boolean; message: string }>(
+  result: T,
+  asked: ControlCreationArgs | undefined,
+): T {
+  const ignored = CREATION_ARG_NAMES.filter(k => {
+    const v = asked?.[k];
+    return typeof v === 'string' && v.trim() !== '';
+  });
+  if (!result.success || ignored.length === 0) return result;
+  return {
+    ...result,
+    message:
+      `${result.message}\n⚠️ Not applied: ${ignored.map(k => `${k}="${asked?.[k]}"`).join(', ')} — the control ` +
+      `already exists, so add-control only positions it. DataSource, DataField and Label are set on an ` +
+      `existing control with modify-property and controlName; another control type needs remove-control, ` +
+      `then add-control.`,
+  };
+}
+
+/**
+ * Whether this add-control MOVES a control the form (or extension) file already
+ * defines: a position is given and the control exists. Such a call creates nothing
+ * (addBaseFormControl / directXmlAddControl), so the DataGroup and sub-pattern
+ * pre-flights — which judge a NEW control by its controlType/controlDataField —
+ * must not refuse it over arguments it never applies. One read, and only for a
+ * positioned add-control.
+ */
+export async function addControlMovesExisting(
+  args: { controlName?: string; previousSibling?: string; positionType?: string },
+  objectType: string,
+  objectName: string,
+  explicitFilePath: string | undefined,
+  symbolIndex: unknown,
+): Promise<boolean> {
+  if (objectType !== 'form' && objectType !== 'form-extension') return false;
+  if (!args.controlName || !(args.previousSibling?.trim() || args.positionType?.trim())) return false;
+  let ownXml: string | null = null;
+  if (explicitFilePath) ownXml = await fs.readFile(explicitFilePath, 'utf-8').catch(() => null);
+  ownXml ??= await findBaseObjectXml(objectType, objectName, symbolIndex).catch(() => null);
+  return !!ownXml && formDefinesControl(ownXml, args.controlName);
+}
+
+/** " (in 'Grp', not 'Design')" when the control lives under another parent than the one named. */
+function elsewhereNote(xml: string, controlName: string, parentControl: string | undefined): string {
+  const found = findFormControl(xml, controlName, parentControl);
+  return found && !found.inRequestedParent ? ` (in '${found.parentName}', not '${parentControl}')` : '';
+}
+
+/** Move a control the file defines; shared by the two writers below, which hold the file lock. */
+async function placeInFile(
+  filePath: string,
+  content: string,
+  spec: PlaceFormControlSpec,
+): Promise<{ success: boolean; message: string; skipped?: boolean }> {
+  const outcome = placeFormControl(content, spec);
+  switch (outcome.kind) {
+    case 'unsupported':
+      return { success: false, message: `${filePath} is not an AxForm or AxFormExtension; no control could be positioned in it.` };
+    case 'not-found':
+      return {
+        success: false,
+        message: `Control '${spec.controlName}' is not defined in ${filePath}. ` +
+          (outcome.present.length ? `Controls in this file: ${outcome.present.join(', ')}.` : 'This file defines no controls.'),
+      };
+    case 'refused':
+      return { success: false, message: outcome.message };
+  }
+  if (outcome.changed) await writeFileAtomic(filePath, normalizeD365Xml(outcome.xml));
+  return {
+    success: true,
+    ...(outcome.changed ? {} : { skipped: true }),
+    message: `${outcome.changed ? '✅' : 'ℹ️'} ${outcome.detail}. File: ${filePath}`,
+  };
+}
+
+/** Move a control already in the file to previousSibling / positionType. */
+export const directXmlPlaceControl = serializedOnFile(async (
+  filePath: string,
+  spec: PlaceFormControlSpec,
+): Promise<{ success: boolean; message: string; skipped?: boolean }> => {
+  const content = (await fs.readFile(filePath, 'utf-8')).replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  return placeInFile(filePath, content, spec);
+});
+
+/**
+ * add-control on a plain form: the bridge creates the control, the XML puts it in place.
+ *
+ * The bridge's AddControl has no position (it appends to the parent) and no duplicate
+ * check, so a control the form already defines is not added again: it is moved when a
+ * position was asked for, and reported as present otherwise. A control the bridge did
+ * add is then moved to previousSibling / positionType; a failure there leaves it, added,
+ * at the end of its parent, and says so. A position that cannot work is refused before
+ * the bridge writes anything.
+ *
+ * Every outcome the bridge took no part in is marked viaXmlFallback (and skipped when
+ * nothing was written), so the reply neither credits nor blames IMetadataProvider.
+ */
+export async function addBaseFormControl(
+  filePath: string,
+  spec: PlaceFormControlSpec & { parentControl: string } & ControlCreationArgs,
+  addViaBridge: () => Promise<{ success: boolean; message: string } | null>,
+): Promise<{ success: boolean; message: string; viaXmlFallback?: boolean; skipped?: boolean } | null> {
+  const positioned = !!(spec.previousSibling || spec.positionType);
+  let existing = '';
+  try { existing = (await fs.readFile(filePath, 'utf-8')).replace(/\r\n/g, '\n'); } catch { /* the bridge resolves the form itself */ }
+  if (existing && formDefinesControl(existing, spec.controlName)) {
+    return viaXmlFallback(withIgnoredOnExisting(positioned
+      ? await directXmlPlaceControl(filePath, spec)
+      : {
+          success: true,
+          skipped: true,
+          message: `ℹ️ Control '${spec.controlName}' is already on the form` +
+            `${elsewhereNote(existing, spec.controlName, spec.parentControl)} — nothing added. ` +
+            `To move it, call add-control again with previousSibling or positionType. File: ${filePath}`,
+        }, spec));
+  }
+  const refusal = positioned ? checkNewControlPosition(existing, spec) : undefined;
+  if (refusal) return viaXmlFallback({ success: false, message: refusal });
+  const added = await addViaBridge();
+  if (!added?.success || !positioned) return added;
+  // The bridge has saved the control: from here every outcome is a success that says
+  // where the control is. A throw (a locked file, say) must not become ❌ over a
+  // control that IS on the form.
+  let placed: { success: boolean; message: string };
+  try {
+    placed = await directXmlPlaceControl(filePath, spec);
+  } catch (err) {
+    placed = { success: false, message: err instanceof Error ? err.message : String(err) };
+  }
+  return {
+    success: true,
+    message: placed.success
+      ? `${added.message}\n${placed.message}`
+      : `${added.message}\n⚠️ Added at the END of '${spec.parentControl}' — it could not be positioned: ${placed.message}`,
+  };
+}
 
 /**
  * Normalises a NoYes-shaped flag to a boolean.
@@ -1165,6 +1387,150 @@ export const directXmlAddDataEntityExtensionField = serializedOnFile(async (
   }
 });
 
+/**
+ * add-field on a VIEW: appends an `AxViewFieldBound` to the view's own <Fields>.
+ *
+ * A view field has no EDT of its own — it names a field (`dataField`) of one of the
+ * view's data sources (`dataSource`). The bridge has no view path (its AddField
+ * resolves tables and table extensions only), so this is the only writer.
+ *
+ * Shape measured on the 2,987 shipped views (source XML, not XppMetadata): 28,493
+ * bound fields, every one with a <DataSource>; 25,946 are exactly Name, DataField,
+ * DataSource, and an optional Label (1,325 + 100) sits between Name and DataField.
+ *
+ * `dataSource` is checked against the data sources the view declares in its own
+ * <ViewMetadata> and takes their casing. A view built on an AxQuery declares none
+ * of its own, so there the name cannot be checked here — the build checks it.
+ */
+export const directXmlAddViewField = serializedOnFile(async (
+  filePath: string,
+  fieldName: string,
+  dataField: string,
+  dataSource: string,
+  label?: string,
+): Promise<{ success: boolean; message: string; skipped?: boolean }> => {
+  const rawContent = await fs.readFile(filePath, 'utf-8');
+  const content = rawContent.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  if (!/<AxView\b/.test(content)) {
+    return { success: false, message: `${filePath} is not an AxView — nothing was written.` };
+  }
+
+  const declared = [...content.matchAll(
+    /<AxQuerySimple(?:Root|Embedded|Derived)DataSource>\s*<Name>([^<]+)<\/Name>/g,
+  )].map(m => m[1].trim());
+  let boundTo = dataSource;
+  if (declared.length > 0) {
+    const match = declared.find(d => d.toLowerCase() === dataSource.toLowerCase());
+    if (!match) {
+      return {
+        success: false,
+        message:
+          `View data source '${dataSource}' does not exist — nothing was written. ` +
+          `This view declares: ${declared.join(', ')}. ` +
+          `dataSource names a data source of the view, which is not always its table name.`,
+      };
+    }
+    boundTo = match;
+  }
+
+  // Scoped to this field's own element: a bare <Name> match would also hit the
+  // view's name, its field groups and its data sources.
+  const fieldsBlock = /^\t<Fields>[\s\S]*?^\t<\/Fields>/m.exec(content)?.[0] ?? '';
+  const escapedName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const existing = new RegExp(
+    `<AxViewField\\b[^>]*>\\s*<Name>${escapedName}</Name>[\\s\\S]*?</AxViewField>`, 'i',
+  ).exec(fieldsBlock);
+  if (existing) {
+    const has = (tag: string, value: string) => existing[0].toLowerCase().includes(`<${tag}>${value}</${tag}>`.toLowerCase());
+    const same = has('DataField', dataField) && has('DataSource', boundTo);
+    return same
+      ? { success: true, skipped: true, message: `View field '${fieldName}' (${boundTo}.${dataField}) is already there — skipped (idempotent).` }
+      : { success: false, message: `View '${filePath}' already has a field '${fieldName}' with a different binding — nothing was written. Pick another fieldName.` };
+  }
+
+  const element =
+    `\t\t<AxViewField xmlns=""\n\t\t\ti:type="AxViewFieldBound">\n` +
+    `\t\t\t<Name>${fieldName}</Name>\n` +
+    (label ? `\t\t\t<Label>${escapeXml(label)}</Label>\n` : '') +
+    `\t\t\t<DataField>${dataField}</DataField>\n` +
+    `\t\t\t<DataSource>${boundTo}</DataSource>\n` +
+    `\t\t</AxViewField>`;
+
+  const target = findTopLevelCollection(content, 'AxView', 'Fields');
+  if (!target) {
+    return { success: false, message: `${filePath} has no top-level <Fields> collection — nothing was written.` };
+  }
+  const updated = 'selfClosingAt' in target
+    ? `${content.slice(0, target.selfClosingAt[0])}<Fields>\n${element}\n\t</Fields>${content.slice(target.selfClosingAt[1])}`
+    : `${content.slice(0, target.insertAt)}${element}\n\t${content.slice(target.insertAt)}`;
+
+  await writeFileAtomic(filePath, normalizeD365Xml(updated));
+  return {
+    success: true,
+    message:
+      `✅ View field '${fieldName}' bound to ${boundTo}.${dataField} (AxViewFieldBound)` +
+      (declared.length === 0 ? ` — the view is built on a query, so '${boundTo}' was not checked here; the build will.` : '.'),
+  };
+});
+
+/**
+ * Elements that FOLLOW <InsertIfEmpty> in an AxFormDataSource. Measured over the
+ * 21,168 data sources of the shipped forms and form extensions (source XML): every
+ * other child element only ever precedes it, and none appears on both sides.
+ */
+const AFTER_INSERT_IF_EMPTY = [
+  'StartPosition', 'MaxAccessRight', 'ValidTimeStateUpdate', 'ValidTimeStateAutoQuery',
+  'OptionalRecordMode', 'DataSourceLinks', 'DerivedDataSources',
+];
+
+/**
+ * Sets InsertIfEmpty on the form data source `dataSourceName` — after the bridge has
+ * added it, since its AddDataSource takes no such property.
+ *
+ * The 12,798 shipped data sources that carry the element all say No: Yes is the
+ * default and the serializer omits it. So `false` writes `<InsertIfEmpty>No</…>`
+ * before the first element that follows it (AFTER_INSERT_IF_EMPTY), and `true`
+ * removes the element — the file then reads exactly as a defaulted one.
+ */
+export const directXmlSetFormDataSourceInsertIfEmpty = serializedOnFile(async (
+  filePath: string,
+  dataSourceName: string,
+  insertIfEmpty: boolean,
+): Promise<{ success: boolean; message: string; changed?: boolean }> => {
+  const content = (await fs.readFile(filePath, 'utf-8')).replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const escaped = dataSourceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Case-insensitive, like the bridge's own "already exists" check: a call naming
+  // "custtable" is skipped there as the existing CustTable, and must then find it here.
+  const block = new RegExp(
+    `^(\\t+)<AxFormDataSource xmlns="">\\n\\1\\t<Name>${escaped}</Name>\\n[\\s\\S]*?^\\1</AxFormDataSource>`, 'mi',
+  ).exec(content);
+  if (!block) {
+    return { success: false, message: `InsertIfEmpty not set: data source '${dataSourceName}' was not found in ${filePath}.` };
+  }
+  const childIndent = `${block[1]}\t`;
+  const existing = new RegExp(`^${childIndent}<InsertIfEmpty>\\w*</InsertIfEmpty>\\n`, 'm');
+  let updated = block[0].replace(existing, '');
+  if (!insertIfEmpty) {
+    const next = new RegExp(`^${childIndent}<(?:${AFTER_INSERT_IF_EMPTY.join('|')})\\b`, 'm').exec(updated);
+    if (!next) {
+      return { success: false, message: `InsertIfEmpty not set: no insertion point in data source '${dataSourceName}'.` };
+    }
+    updated = `${updated.slice(0, next.index)}${childIndent}<InsertIfEmpty>No</InsertIfEmpty>\n${updated.slice(next.index)}`;
+  }
+  const changed = updated !== block[0];
+  if (changed) {
+    const result = content.slice(0, block.index) + updated + content.slice(block.index + block[0].length);
+    await writeFileAtomic(filePath, normalizeD365Xml(result));
+  }
+  return {
+    success: true,
+    changed,
+    message: insertIfEmpty
+      ? (changed ? 'InsertIfEmpty set back to its default (Yes).' : 'InsertIfEmpty left at its default (Yes).')
+      : (changed ? 'InsertIfEmpty=No set on the data source.' : 'InsertIfEmpty is already No.'),
+  };
+});
+
 /** DeleteAction values accepted by the AxTable serialiser. */
 export const DELETE_ACTION_TYPES = ['None', 'Restricted', 'Cascade', 'CascadeRestricted'] as const;
 
@@ -1302,6 +1668,70 @@ export const directXmlDeleteAction = serializedOnFile(async (
  * in formControlRemoval.ts — pure and unit-tested, because a `<Name>` substring
  * replace here would cut the wrong element and report a ✅ for it.
  */
+/**
+ * modify-property on a control the FILE ITSELF defines: a control of the agent's
+ * own form, or one a form extension ADDS. The bridge has no modify-property for
+ * forms and the Design writer stops at <Design>, so without this a button's
+ * MenuItemName or NeedsRecord could only be set by rewriting the whole form. The
+ * property becomes a child of that control, in the order shipped metadata uses
+ * for its type — see formControlPropertyXml.ts.
+ *
+ * Returns null when the request is not for such a control, so the caller carries
+ * on: a form extension then means a BASE-form control (<ControlModifications>),
+ * and a form with a dotted path that names no control ("Design.Caption") goes to
+ * the Design writer, as before. A form with an explicit controlName it does not
+ * define is refused instead — writing a Design property there would be a ✅ on
+ * the wrong element. So is a dotted path whose first segment is neither Design
+ * nor a control of the form ("PostButon.Caption"): the Design writer keeps only
+ * the last segment, and would set the form's caption.
+ */
+export const directXmlModifyControlProperty = serializedOnFile(async (
+  filePath: string,
+  objectType: string,
+  objectName: string,
+  propertyPath: string,
+  propertyValue: string,
+  controlName: string | undefined,
+): Promise<{ success: boolean; message: string; skipped?: boolean } | null> => {
+  if (objectType !== 'form' && objectType !== 'form-extension') return null;
+  const noSuchControl = (name: string) => ({
+    success: false,
+    message:
+      `Form ${objectName} has no control named '${name}' — nothing was written. Read the form ` +
+      `with get_object_info to see its control names. Without controlName or a dotted path, ` +
+      `modify-property on a form sets a <Design> property (Caption, Style, …).`,
+  });
+  const firstSegment = propertyPath.split(/[./]/)[0];
+  const namesDesign = firstSegment.toLowerCase() === 'design';
+  const target = resolveControlPropertyTarget(propertyPath, controlName);
+  if (!target) {
+    // "PostButon.Caption.Text": not a control path, and not a Design one either.
+    if (objectType === 'form' && /[./]/.test(propertyPath) && !namesDesign) return noSuchControl(firstSegment);
+    return null;
+  }
+
+  const content = (await fs.readFile(filePath, 'utf-8')).replace(/^\uFEFF/, '');
+  const outcome = upsertFormControlProperty(content, target.controlName, target.propertyName, propertyValue);
+  if (!outcome) {
+    if (objectType === 'form' && (controlName || !namesDesign)) return noSuchControl(target.controlName);
+    return null;
+  }
+  if (!outcome.ok) {
+    return {
+      success: false,
+      message: `Could not modify '${target.controlName}.${target.propertyName}' on ${objectName}: ${outcome.reason}`,
+    };
+  }
+  if (outcome.changed) await writeFileAtomic(filePath, normalizeD365Xml(outcome.xml));
+  return {
+    success: true,
+    ...(outcome.changed ? {} : { skipped: true }),
+    message:
+      `${outcome.changed ? '✅' : 'ℹ️'} ${outcome.detail} on control '${target.controlName}'` +
+      `${outcome.changed ? '' : ' — nothing written'}. File: ${filePath}`,
+  };
+});
+
 export const directXmlRemoveControl = serializedOnFile(async (
   filePath: string,
   controlName: string,
@@ -2028,5 +2458,90 @@ export const directXmlRemoveModuleReference = serializedOnFile(async (
       message:
         `❌ Could not remove the module reference from ${filePath}: ${err instanceof Error ? err.message : err}`,
     };
+  }
+});
+
+/** add-data-source on a data-entity: an embedded, joined query datasource (no bridge operation exists). */
+export const directXmlAddDataEntityDataSource = serializedOnFile(async (
+  filePath: string,
+  spec: EntityDataSourceSpec,
+): Promise<{ success: boolean; message: string } | null> => {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    const content = raw.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+    if (!/<AxDataEntityView[\s>]/.test(content)) return null;
+    const r = addDataEntityDataSource(content, spec);
+    if (!r.ok) return { success: false, message: `❌ add-data-source: ${r.message} — nothing was written.` };
+    await writeFileAtomic(filePath, normalizeD365Xml(r.xml!));
+    return {
+      success: true,
+      message:
+        `✅ Datasource '${spec.name}' (${spec.table}, ${spec.joinMode ?? 'InnerJoin'} on ` +
+        `${spec.joinSource ?? 'the root datasource'}.${spec.joinField} = ${spec.name}.${spec.relatedField}) ` +
+        `added to the entity query via direct XML. Map its fields with add-field ` +
+        `(dataField + dataSource="${spec.name}"). File: ${filePath}`,
+    };
+  } catch (err) {
+    console.error(`[modify_d365fo_file] directXmlAddDataEntityDataSource failed: ${err}`);
+    return null;
+  }
+});
+
+/** add-field on a data-entity: one mapped field bound to an existing datasource of its query. */
+export const directXmlAddDataEntityField = serializedOnFile(async (
+  filePath: string,
+  spec: EntityMappedFieldSpec,
+): Promise<{ success: boolean; message: string } | null> => {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    const content = raw.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+    if (!/<AxDataEntityView[\s>]/.test(content)) return null;
+    const known = [...content.matchAll(/<(?:AxQuerySimpleRootDataSource|AxQuerySimpleEmbeddedDataSource)>\s*<Name>([^<]+)<\/Name>/g)]
+      .map(m => m[1]);
+    if (!known.includes(spec.dataSource)) {
+      return {
+        success: false,
+        message:
+          `❌ add-field: the entity has no datasource '${spec.dataSource}' (have: ${known.join(', ') || 'none'}). ` +
+          `Add it first with add-data-source — nothing was written.`,
+      };
+    }
+    const r = addDataEntityMappedField(content, spec);
+    if (!r.ok) return { success: false, message: `❌ add-field: ${r.message} — nothing was written.` };
+    await writeFileAtomic(filePath, normalizeD365Xml(r.xml!));
+    return {
+      success: true,
+      message:
+        `✅ Mapped field '${spec.name}' (${spec.dataSource}.${spec.dataField}) added to the entity via direct XML. ` +
+        `File: ${filePath}`,
+    };
+  } catch (err) {
+    console.error(`[modify_d365fo_file] directXmlAddDataEntityField failed: ${err}`);
+    return null;
+  }
+});
+
+/** modify-field AllowEdit / IgnoreEDTRelation, written to the XML; writes nothing when the field is absent. */
+export const directXmlSetTableFieldProperties = serializedOnFile(async (
+  filePath: string,
+  fieldName: string,
+  props: Record<string, string>,
+): Promise<{ success: boolean; message: string } | null> => {
+  try {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    let content = raw.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+    if (!/<AxTable(Extension)?[\s>]/.test(content)) return null;
+    const done: string[] = [];
+    for (const [prop, value] of Object.entries(props)) {
+      const r = upsertTableFieldProperty(content, fieldName, prop, value);
+      if (!r.ok) return { success: false, message: `❌ modify-field: ${r.message} — nothing was written.` };
+      content = r.xml!;
+      done.push(r.message);
+    }
+    await writeFileAtomic(filePath, normalizeD365Xml(content));
+    return { success: true, message: `✅ Field property set via direct XML (canonical order): ${done.join(', ')}. File: ${filePath}` };
+  } catch (err) {
+    console.error(`[modify_d365fo_file] directXmlSetTableFieldProperties failed: ${err}`);
+    return null;
   }
 });

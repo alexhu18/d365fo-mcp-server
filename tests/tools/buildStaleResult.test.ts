@@ -23,7 +23,8 @@
  *
  * The fix keys the decision on the disk rather than on the caller's intent,
  * which is unknowable: a finished result may be reused only when no source
- * changed after it ended.
+ * changed after the build started — xppc read them then, and anything written
+ * later, even before endTime, is not in the result.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -80,12 +81,12 @@ afterEach(async () => {
   await fs.rm(packagesDir, { recursive: true, force: true });
 });
 
-const state = (endTime: string | undefined) => ({
+const state = (endTime: string | undefined, startTime = new Date(0).toISOString()) => ({
   pid: 1234,
   modelName: MODEL,
   targetModel: MODEL,
   tool: 'xppc',
-  startTime: new Date(0).toISOString(),
+  startTime,
   logFile: 'irrelevant.log',
   status: 'succeeded' as const,
   endTime,
@@ -147,21 +148,77 @@ describe('hasSourceChangesSince', () => {
   });
 });
 
+
+describe('hasSourceChangesSince: the package root', () => {
+  it('ignores the root folder\'s own mtime, which bin/XppMetadata creation and deletion move', async () => {
+    // A full build deletes <Package>/XppMetadata and xppc writes it back, so the
+    // package folder's own mtime moves during every such build. Measured from the
+    // build's start, that alone would make every result stale.
+    const started = Date.now() - 60_000;
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, started);
+    await backdateDirs(modelDir, -120, started);
+    await fs.mkdir(path.join(modelDir, 'XppMetadata'));
+    await fs.utimes(modelDir, new Date(started + 30_000), new Date(started + 30_000));
+    expect(await hasSourceChangesSince(modelDir, started)).toBe(false);
+  });
+
+  it('ignores Resources/, which labelc rewrites at the start of every build', async () => {
+    // Seen on the VM: every MCP build of VLTBase logged "Labels compiled" and
+    // rewrote <Package>\Resources after the build started. Scanned, it made
+    // every finished result stale, so every status call started a new build.
+    const started = Date.now() - 60_000;
+    await writeAt(path.join(modelDir, MODEL, 'AxLabelFile', 'LabelResources', 'en-US', 'L.en-US.label.txt'), -120, started);
+    await writeAt(path.join(modelDir, 'Resources', 'L.dll'), 10, started);
+    await writeAt(path.join(modelDir, 'Resources', 'en-US', 'L.resources.dll'), 10, started);
+    await backdateDirs(path.join(modelDir, MODEL), -120, started);
+    expect(await hasSourceChangesSince(modelDir, started)).toBe(false);
+  });
+});
+
 describe('finishedResultStillDescribesDisk', () => {
-  it('allows collecting a finished result when nothing changed since', async () => {
-    const ended = Date.now() - 10_000;
-    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, ended);
-    await backdateDirs(modelDir, -120, ended);
+  it('allows collecting a finished result when nothing changed since it started', async () => {
+    const started = Date.now() - 60_000;
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, started);
+    await backdateDirs(modelDir, -120, started);
     expect(await finishedResultStillDescribesDisk(
-      state(new Date(ended).toISOString()), MODEL, packagesDir,
+      state(new Date(started + 50_000).toISOString(), new Date(started).toISOString()), MODEL, packagesDir,
     )).toBe(true);
   });
 
-  it('refuses to replay it once a source changed — the incident', async () => {
+  it('refuses to replay it once a source changed after it ended — the incident', async () => {
     const ended = Date.now() - 60_000;
     await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), 42, ended);
     expect(await finishedResultStillDescribesDisk(
-      state(new Date(ended).toISOString()), MODEL, packagesDir,
+      state(new Date(ended).toISOString(), new Date(ended - 30_000).toISOString()), MODEL, packagesDir,
+    )).toBe(false);
+  });
+
+  it('refuses it when a source changed while the build ran, before endTime was written', async () => {
+    // xppc read the sources at the start; endTime is written only after runtime
+    // metadata regeneration (and a restart). On the VM: start 19:39:55, xppc done
+    // after 190 s, endTime 19:43:42 — a file edited in that window is older than
+    // endTime and was never compiled.
+    const started = Date.now() - 120_000;
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, started);
+    await backdateDirs(modelDir, -120, started);
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), 60, started);
+    expect(await finishedResultStillDescribesDisk(
+      state(new Date(started + 90_000).toISOString(), new Date(started).toISOString()), MODEL, packagesDir,
+    )).toBe(false);
+  });
+
+  it('measures from sourcesAsOf, which the queue does not reset', async () => {
+    // A queued build resets startTime for each model; the job start stays put.
+    const jobStart = Date.now() - 120_000;
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, jobStart);
+    await backdateDirs(modelDir, -120, jobStart);
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), 20, jobStart);
+    expect(await finishedResultStillDescribesDisk(
+      {
+        ...state(new Date(jobStart + 90_000).toISOString(), new Date(jobStart + 40_000).toISOString()),
+        sourcesAsOf: new Date(jobStart).toISOString(),
+      },
+      MODEL, packagesDir,
     )).toBe(false);
   });
 
@@ -172,8 +229,10 @@ describe('finishedResultStillDescribesDisk', () => {
   });
 
   it('refuses a state whose endTime is unparseable', async () => {
-    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, Date.now());
-    expect(await finishedResultStillDescribesDisk(state('not a date'), MODEL, packagesDir))
-      .toBe(false);
+    await writeAt(path.join(modelDir, MODEL, 'AxClass', 'A.xml'), -120, Date.now() - 60_000);
+    await backdateDirs(modelDir, -120, Date.now() - 60_000);
+    expect(await finishedResultStillDescribesDisk(
+      state('not a date', new Date(Date.now() - 30_000).toISOString()), MODEL, packagesDir,
+    )).toBe(false);
   });
 });

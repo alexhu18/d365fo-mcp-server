@@ -28,6 +28,655 @@ those are called out explicitly below.
 
 ## [Unreleased]
 
+## [1.21.0] — 2026-10-15
+
+### Added
+- **Optional `trace_d365fo`: measure X++ and SQL time with ETW instead of timer
+  code.** Published only when `trace.enabled` is true (`config trace`). `start`
+  runs a `logman` capture of the AOS's X++ method and SQL latency events — the
+  agent reproduces the scenario itself (`mode: auto`, e.g. through a browser
+  extension) or asks the user to (`mode: manual`) — and it stops by itself at a
+  time and size limit. `analyze` reads the `.etl` in the bridge binary
+  (`--analyze-trace`, its own process): enter/exit paired per thread,
+  exclusive/inclusive time, SQL by statement and by caller, statements repeated
+  in loops; parameter values are never returned. When no folder is set, or it
+  lacks space, `start` lists the drives and remembers the folder chosen. See
+  [docs/TRACE.md](docs/TRACE.md). Statements are grouped by their whole text — the
+  kernel lists every column, so FROM and WHERE often start past the 300 characters
+  shown, and a cut key merged different queries on a table into one "repeated"
+  row; the shown text keeps `FROM … WHERE`. The drive list is probed off the event
+  loop with the packages-root scan's budget and `D365FO_SCAN_DRIVES` (a dead mapped
+  drive cannot stall the server), a relative `outputDir` is refused, a failed
+  analysis no longer reads as "analysing" on the retry, a capture whose state file
+  cannot be written is stopped at once (`TRACE_STATE_FAILED`), and a capture that
+  ended while `stop` was asked is reported stopped, not `TRACE_STOP_FAILED`.
+- **No prefix at all: `naming.prefixSource=none` (#1085).** For teams on a
+  suffix convention (`CustomerSettings_ABC`). An empty `naming.prefix` never
+  meant "no prefix": the server inferred one from the model's objects, then fell
+  back to the model name. `none` (env `EXTENSION_PREFIX_SOURCE=none`) skips all
+  of it — new objects, fields and methods keep the name as given, `naming.suffix`
+  is still appended (and its own underscore no longer trips the naming check),
+  and extension elements and classes embed the model name (`CustTable.ABC`,
+  `CustTable_ABC_Extension`), since they still need a collision-avoiding token.
+  `validate_object_naming` stops asking for a prefix, `generate_object` stops
+  warning "No prefix resolved", and `get_workspace_info` / `doctor` report the
+  choice (including the model-name class style it forces) (doctor warns when it ignores a `naming.prefix` that is still set). The
+  cross-model refusal suggests the model-name extension, modify can auto-create
+  a missing `Base_Model_Extension` class, report copies from `generate_object`
+  carry the model token trailing (`SalesInvoiceABC`), and the type checks read
+  a role suffix before the configured one (`CustomerExportEntity_ABC`).
+  `naming.prefix` is no longer marked required; `setup` asks which one you mean
+  when you leave it empty. Without the setting nothing changes.
+- **`modify-property` sets properties on a form's own controls.** With
+  `controlName` (or a dotted `propertyPath`, `"PostButton.NeedsRecord"`), it now
+  reaches a control of an `objectType="form"` and a control a form extension
+  ADDS — before, it stopped at `<Design>` and at base-form controls through
+  `<ControlModifications>`, so setting MenuItemName, MultiSelect or NeedsRecord
+  on such a button meant rewriting the whole form XML. The property is written
+  on that control in the element order shipped metadata uses for its type (the
+  census in `formControlElementOrder.generated.ts`), since the deserializer
+  drops an out-of-order element silently (#979); a property the type never
+  carries (MenuItemName on a plain Button) is refused, an empty value removes
+  the element, and an ambiguous or unknown control name writes nothing. That
+  holds for a dotted path too: its first segment must be `Design` or a control
+  of the form, so a misspelt `PostButon.Caption` is refused instead of setting
+  the form's own caption. A value that is already set is reported as a skip.
+- **Optional `axdb_sql`: read-only, live SQL against AxDB on the development VM,
+  for debugging.** Off by default, and not published at all until a SQL server
+  is configured, so a default install's tool list is unchanged. Setup offers it
+  only on a classic AOSService VM whose `AosService\WebRoot\web.config` names
+  the AOS database server (`DataAccess.DbServer`; the database is
+  `DataAccess.Database`, AxDB when it is absent), proposing those values; UDE
+  skips it, and `d365fo-mcp config sql` configures it by hand.
+  The bridge runs it with Windows authentication over an encrypted connection,
+  opened on demand. Actions: `contract`, `status`, `schema` (columns, keys,
+  defaults of a physical table) and `query` (one parameterized SELECT, bounded
+  rows and bytes, counted cell by cell as the rows stream in; a capped answer
+  cancels the rest of the result set instead of reading it to the end). Two guards, because the dev-VM account is normally sysadmin:
+  the statement must be exactly one SELECT on the ScriptDom syntax tree, and
+  every operation runs in a transaction that is always rolled back. Catalog
+  reads are limited to database-scoped sys views (no `sys.sql_logins`,
+  server principals or DMVs). No result cache, no replay, no retry. Excluded
+  from `read-only` mode. See [docs/AXDB_SQL.md](docs/AXDB_SQL.md).
+- **`add-field` on a view.** `modify` had no view path: `dataField` + `dataSource`
+  (the natural guess — it is the data-entity shape) was refused as data-entity
+  only, and `fieldType` reached the bridge, whose AddField resolves tables only, so
+  it failed with "Table or table-extension not found" and blamed a same-session
+  create. It now writes an `AxViewFieldBound` — `dataSource` (a data source of the
+  view, case-corrected against the ones the view declares), `dataField` (defaults
+  to `fieldName`), optional `fieldLabel` — in the shape 25,946 of the 28,493
+  shipped bound view fields use. `prepare` and the op-spec describe the view
+  contract instead of the table/entity one.
+- **`add-data-source` takes `insertIfEmpty` on a form or form extension.** The
+  bridge's AddDataSource has no such property, so a new data source always kept
+  the platform default (Yes), while the VS designer writes `<InsertIfEmpty>No` for
+  one — the usual choice for a joined, read-only source. `insertIfEmpty=false`
+  writes it where all 12,798 shipped occurrences sit (every one of them `No`;
+  Yes is never serialized), `true` removes it. The data source's `<Fields>` list
+  stays empty: the designer fills it on save, but Microsoft ships a view data
+  source with an empty one whose controls bind to its fields, so it is not needed.
+  When a data source of that name is already there (the bridge skips the add),
+  it is set on that one, which is the only way to set it on an existing data
+  source. If it cannot be placed, the call fails and says that the same call,
+  retried, finishes it. On any other type, data entities included, it is
+  refused before anything is written. The existing data source is found whatever
+  the case of the name (as the bridge's skip does), and the reply credits the XML
+  writer when that is what changed the file.
+
+### Changed
+- **`build_d365fo_project` no longer carries the multi-model build queue (#1122).**
+  Building referenced models has been switched off for a while and the queue
+  could not form, but its result branch would have skipped `bpCheck`, `dbSync`
+  and the last-build note had it ever run. The queue is removed; a
+  `buildReferencedModels` argument from an older client is still ignored, and a
+  full build now reports itself as `full build`, not `full build (target),
+  incremental (deps)`.
+- **Code comments are written in English.** Neither the system instructions nor
+  the knowledge base said which language a `//` or `///` comment is in, so an
+  agent talking to the user in Czech often commented the X++ in Czech, and
+  nothing caught it (xppc and BP never check the language of a comment). Both
+  now say: always English, whatever language the conversation is in, and
+  another language only when the user explicitly asks. A comment explains what
+  the code below it does and why, not the syntax. Templates were already English.
+- **Every `.rnrproj` write is bounded by the configured solution roots.**
+  `d365fo_file(action="project")` refused a project outside them, while
+  `create`'s `addToProject` — and modify, labels and generate_object
+  registration — wrote whatever `.rnrproj` it was given, so `add-object` refused
+  the very project `create` had just registered objects into. They now share the
+  bound; a refused registration is reported and the object is still written.
+  The folder of a configured `workspace.projectPath` / `D365FO_PROJECT_PATH`
+  counts as a root, a project activated with `get_workspace_info(projectPath=…)`
+  does not — set `workspace.solutionsPath` to the folder holding your projects.
+  That switch now says so at once (new objects are written but not added to the
+  project) instead of leaving it to a "failed to add to project" on every later
+  create. Activating the project the server itself detected keeps its root.
+  `delete` still removes its own entry from any project listing it, since a
+  dangling include stops the project loading.
+
+### Fixed
+- **A boolean written as text in the config file was always on.** A hand-edited
+  `"enabled": "false"` (or `"no"`, `"off"`, `"0"`) is a non-empty string, and the
+  projection onto the environment read it by truthiness — so, for example,
+  `sql.enabled: "false"` published `axdb_sql`. Text is now read the way `.env`
+  values are (`true`/`1`/`yes`/`on`), for every boolean setting. `doctor`'s
+  `sql.enabled` check reads it the same way and, like the server, lets a variable
+  set in the real environment outrank the config file.
+- **`update` left an old bridge binary in place when the bridge's sources changed
+  (#1115).** It judged the bridge only by whether the exe survived, and `git pull`
+  never touches `bin\Release` while `npm install -g` never touches the data
+  directory, so the rebuild was offered as "recommended after a D365FO version
+  upgrade" and the server could run new TypeScript against an old bridge without a
+  word. Every bridge build now writes `D365MetadataBridge.sources.json` next to the
+  exe (an MSBuild target, the same source hash `bridgeAttest.mjs` computes);
+  `update` requires the rebuild when that stamp is missing or differs from the
+  sources, `doctor` warns, and `setup` defaults to rebuilding such a bridge. A
+  bridge built before the stamp existed is asked about once. The D365FO-upgrade
+  prompt is unchanged for a bridge that matches its sources.
+- **`trace_d365fo(action="analyze")` refused when the bridge had not started.** The
+  analysis runs the bridge binary as a separate `--analyze-trace` process and needs no
+  D365FO assembly, but it took the binary's path from the running bridge only, so a
+  bridge that failed to start (no packages path, a cold-VM timeout) meant
+  `TRACE_BRIDGE_UNAVAILABLE`. It now falls back to the binary the server would start:
+  the configured `bridge.exePath`, else the first built candidate.
+- **`add-control` puts a control where it was asked, and moves one that exists.**
+  On `objectType="form"` `previousSibling`/`positionType` were dropped (the bridge
+  appends to the parent), and an existing control could not be moved at all:
+  add-control again answered "already present — skipped" with a ✅ and
+  modify-property refuses `PositionType`/`PreviousSibling`. Display-method fields
+  added to a custom form stayed at the end of their group. A control the file
+  already defines is now moved (same parent; by order, or by the envelope's
+  position pair on a base-form parent) and never added a second time. A position
+  that cannot work (unknown `positionType`, a `previousSibling` outside the parent)
+  is refused before the bridge writes the control, the design-root names the
+  bridge accepts (`FormDesign`, `Root`, `<Form>Design`) work for placement too,
+  and a move or refusal the bridge took no part in no longer reads as
+  "applied via IMetadataProvider.Update()" / "Bridge operation failed". A move
+  names the creation arguments it did not apply (`controlType`,
+  `controlDataSource`, `controlDataField`, `controlLabel`) instead of dropping them
+  silently, and is not refused by the DataGroup or pattern pre-flight over them;
+  "already on the form" names the parent the control is really in.
+- **`doctor` said nothing when `axdb_sql` was missing because `sql.enabled` was
+  off.** The tool is published only when `sql.enabled` is true and `sql.server`
+  is set. The wizard writes both, but a hand-edited config can carry the server
+  alone, and then `axdb_sql` is simply absent. `doctor` now warns about it for
+  the root config and for each instance, and names the fix.
+- **`axdb_sql` refused `maxRows` and `parameters` a client sent as text.** The
+  MCP inputSchema declares only `action` (the strict schema is the contract), so
+  a client has no type for the other parameters and may send `maxRows: "50"` or
+  `parameters` as a JSON string, which failed with "expected number, received
+  string". Those two are now read back from text; limits still apply, and a
+  parameter's value is never converted (an `int` sent as `"5"` is still refused).
+  Blank text counts as omitted, and a whole number written `"1e3"` or `"50.0"` is
+  read as one.
+- **`build_d365fo_project(bpCheck: true)` could return megabytes.** The build
+  result is uncapped, and the BP section was the whole `run_bp_check` text: on a
+  model with ~5,300 warnings, 2.7 MB in one result, past what an MCP client shows
+  inline. Past 12,000 characters the section is now a summary — the verdict,
+  xppbp's own Errors/Warnings totals, findings counted by rule (top 25) and the
+  first 15 — and the complete text is saved next to the build log
+  (`<log>.bp.txt`); `run_bp_check` still returns it in full. The summary leads
+  with xppbp's totals because the parser counts only BP rule lines (not
+  CodeAnalysis ones), so its own count can be lower. Error rules and error
+  findings come first whatever their count — one error among thousands of
+  warnings is the finding that fails a pipeline — and `run_bp_check`'s
+  label-compile caveat is kept.
+- **`labels(action="update")` with only en-US overwrote every other language
+  with English, and every developer comment with the default (#1105).** Update
+  writes each existing language folder; one with no supplied translation got the
+  en-US (last-resort) text, and every written label got `description`'s default
+  (the VS project name, else the labelFileId) as its comment. Now, for a label that
+  already exists in a folder, update writes the text only where the call supplies
+  a translation (exact, parent or regional match) — a folder that would only get
+  the fallback keeps its text, unless that text is a copy of the current en-US
+  text, which follows the update. Only en-US counts as a copy source: when a call
+  leaves en-US out, en-US is never taken for a copy of the language it supplies,
+  although two languages often share a word (Status, Name, Filter). A genuine
+  translation that reads exactly like the old English cannot be told apart from
+  such a copy, and follows it too. Update replaces the comment only with a
+  `comment`, `defaultComment` or `description` the call states, and adds none to
+  a label that had none; text and comment come from the same entry when a locale
+  is given twice. The reply lists
+  the kept folders with their text (bulk mode too). A folder where the label is
+  missing still gets it, and create is unchanged.
+- **Modify no longer leaves `.backup-*` files for calls that changed nothing.**
+  Outside git the pre-modify copy was taken before the operation was validated,
+  so every refused call left a copy of an unchanged file beside the AOT source —
+  on a TFVC workspace, a pending add each. The copy is still taken first, and is
+  now removed when the call ends without changing the file: a refusal, a skip,
+  or a success that changed nothing, such as a value that was already set. A
+  file created in the same session gets none (undo deletes it), so `create` with
+  `operations[]` no longer leaves one per operation. `createBackup=true` now
+  names its copy in the response (and, like the forced copy, it is removed when
+  the call left the file unchanged). `insertIfEmpty` on a type other than a form
+  is refused before anything is written.
+- **`undo` described a non-git workspace wrongly.** The schema said "untracked →
+  deleted" and the forced-backup note said undo "would not work here". Outside git
+  undo deletes a file `create` made in this server session and refuses everything
+  else; both texts now say so.
+- **The solutions-path scan could pick a project of another model.** With no
+  project resolved from the workspace, the `workspace.solutionsPath` scan took
+  the first project in disk order. A projects folder that also held one stray
+  project of another model — scanned first, the only one of its model — had that
+  project selected, its model registered as custom, and every new object of the
+  configured model registered into it, failing that project's build. A configured
+  `modelName` now limits the pick to that model's projects; if the folder holds
+  none, nothing is selected and the server says so.
+- **Wrong headings and progress labels.** `create` with `operations[]` headed its
+  results `d365fo_file(action="modify")`; `undo`, `delete` and `project` calls
+  showed "📁 Creating …" while they ran.
+- **`workspace.projectPath` / `D365FO_PROJECT_PATH` pins the project again.**
+  The config file loads its settings as `D365FO_*` environment variables, but
+  `getProjectPath()`, `getSolutionPath()` and `get_workspace_info` read only the
+  `.mcp.json` context — so the documented "Pinned .rnrproj file" setting did
+  nothing: `Project : (not detected)`, and no write could register a file in the
+  project. Both are read now, the environment first (the order `getContext()`
+  already used), and the top-level `context` block of `.mcp.json` as well as
+  `servers.context`; the same holds for `workspace.solutionPath`. A pinned path
+  also outranks a detected one in the context snapshot, as it does for writes.
+- **`d365fo_file(action="create")` keeps an extension class name that already
+  carries the model's token after its base.** `SalesTableMcpCreditHold_Extension`
+  with `[ExtensionOf(tableStr(SalesTable))]` was written as
+  `SalesTableMcpCreditHoldMcp_Extension` — the token was only looked for at
+  either end of the name — and a delete + re-create renamed it again, so the name
+  a task asked for could not be written through the server at all. The base named
+  in `[ExtensionOf]` (or `properties.baseClass`) now decides: base, then the
+  token as its own word, means already prefixed. Without a stated base the
+  symbol index stands in: the longest known table/class/form/view/query/entity/map
+  the token follows is the base, and with none known nothing changes.
+  `validate_object_naming`, `prepare(mode="create")` and create all derive the
+  base the same way, and try the same tokens (the learned infix and the raw
+  prefix), so they predict and write the same name. A stem that is itself a known
+  object is its own base: `AgreementAutolinkHelperSalesLine_Extension` under the
+  token `Sales` is not read as `AgreementAutolinkHelper` already prefixed, which
+  matters for model names that are ordinary D365 words (Sales, Invent, Tax,
+  Ledger) and most under `naming.prefixSource=none`. Found by the model ×
+  MCP benchmark (`ref-credit-hold-extension`), where it cost three with-MCP runs
+  a check the runs without MCP passed.
+- **Form and form-extension XML passed as `xmlContent` gets the metadata
+  namespace.** Written without `xmlns="Microsoft.Dynamics.AX.Metadata.V6"`, an
+  `AxFormExtension` builds clean and then fails xppbp ("Error reading
+  FormExtension … not found"); create now adds it to the root and `xmlns=""` to
+  the grandchildren — the layout every one of the 10,530 shipped `AxForm` /
+  `AxFormExtension` files has (no other root type carries the namespace) — and
+  says so in the response. Matched pair on the benchmark's own files: as written,
+  2 xppbp errors; fixed, 0.
+- **A label could land in English in a language folder, without a word.**
+  `labels(action="create")` looked up each existing language folder's
+  translation by exact, case-sensitive name, and fell back to the en-US text
+  for anything else — so `it` for an `it-IT` folder, `it-it`, and above all
+  `de-DE` for the bare `de` folders Microsoft's own models use all wrote
+  English, listed as written with nothing saying it was a substitute. Locales
+  now match case-insensitively (`it_IT` reads as `it-IT`; the exact spelling,
+  then the first case variant, wins), then fall back along the target's parent
+  chain (`it-IT` → `it`; `zh-Hant-TW` → `zh-Hant` → `zh`), then — for a
+  bare-language folder — to the one supplied regional translation of that
+  language (`de-DE` → `de`; two candidates such as `de-AT` and `de-CH` fall
+  through, and a sibling region is never used), and only then to en-US or the
+  first supplied translation. Each parent or regional fallback is reported on
+  its own line, the last-resort ones in one line per source, and bulk mode
+  (`labels[]`) forwards those lines instead of dropping them.
+- **`get_workspace_info` no longer waits 5 s for a `.rnrproj` scan it does not
+  need.** When `D365FO_MODEL_NAME` or the config names the model, the first call
+  answered only after the background project scan — and with the server started
+  in a folder that holds no `.rnrproj` (a package folder, a CLI session outside
+  the solution), that scan fell back to every package under
+  PackagesLocalDirectory (7.5 s on the dev VM, nothing found), so the call hit
+  its 5 s cap on every session. It now answers at once (0.2 s, measured) and
+  reports the project as still being detected; the scan finishes in the
+  background. When nothing names the model the call still waits, since the scan
+  is how the model is found. The fallback scan itself now covers only the
+  package whose descriptor declares the detected model instead of the whole
+  root, so it also holds when the package and model names differ (#1086).
+- **The form element-order check no longer reports an empty element as unknown
+  (#1093).** Microsoft's own `CustInvoiceJournal.ApplicationSuite_Extension`
+  (ApplicationSuite 10.36) writes an empty `<Items />` on a string control, so
+  the shipped-metadata census failed on that VM, and a form write carrying the
+  same element got a warning about a value the platform would ignore. An empty
+  element carries no value, so it is no longer an `unknown` finding; one with
+  content still is, and the blocking `order` check is unchanged.
+- **The bridge build command the CLI prints failed in Windows PowerShell 5.1.**
+  `doctor` and `update` suggested `cd "…\D365MetadataBridge" && dotnet build -c
+  Release`, and the bridge's "executable not found" error a relative
+  `cd … && …`. PowerShell 5.1 — the default shell on D365FO VMs — rejects `&&`
+  as a statement separator, so the suggested fix failed exactly where it is
+  printed. Both now name the project in a single `dotnet build` invocation
+  (`dotnet build "<repo>\bridge\D365MetadataBridge\D365MetadataBridge.csproj"
+  -c Release`, plus `-o` for an npm install), which runs from any directory in
+  any shell.
+- **Creates into a model whose package has a different name reported failure
+  (#1086).** The C# bridge built the reported path as `{Model}\{Model}\Ax…`, so
+  for package `Enhancements` holding model `Sales Integration` it named a folder
+  that does not exist. The object itself was written correctly, but the server
+  checks, indexes and adds to the `.rnrproj` the *reported* path, so the create
+  came back as "the file is NOT on disk after a reported success". The bridge now
+  looks up the package from the model descriptor. The on-disk fallback that
+  finds which model an existing object belongs to had the same `{pkg}\{pkg}`
+  assumption and now walks the model folders.
+
+## [1.20.0] — 2026-10-02
+
+### Added
+- **`naming.extensionClassStyle` / `EXTENSION_CLASS_NAMING_STYLE` accepts a new
+  value, `prefix-leading`.** `prefix` and `model-name` both put the token right
+  before `_Extension` (`CustTableCr_Extension`); some conventions instead lead
+  the class name with it (`CRCustTable_Extension`) — the Avanade D365FO
+  Development Guidelines are one, and neither existing value can express it.
+  `validate_object_naming` and `get_workspace_info` recognise and render the
+  new style; `d365fo_file(action="create")` and `normalizeObjectName` write it,
+  including converting a name written under the trailing `prefix` style
+  instead of double-prefixing it. The prefix is matched only as a separate
+  PascalCase word, with one derivation shared by the writer and the validator, so
+  a base ending in the same letters keeps them (`Le` + `SalesTable` →
+  `LeSalesTable_Extension`), and a camelCase base is upper-cased behind the prefix
+  (`CtsoWhsWorkExecute_Extension`) so re-running stays stable. Element extensions are unaffected — the new
+  style only applies to CoC classes, since Microsoft's own dot-notation shape
+  (`Base.{Infix}Extension`) cannot lead with the infix.
+- **Edit an existing data entity in place, and set AllowEdit and IgnoreEDTRelation on
+  table fields.** `d365fo_file(action="modify", objectType="data-entity")` now supports
+  `modify-property` for `ConfigurationKey`, `PrimaryCompanyContext`, `CountryRegionCodes`,
+  `SingularLabel` and the Yes/No entity properties (`IsObsolete`, `AllowArchival`,
+  `AutoCreateDataverse`, `EnableSetBasedSqlOperations`, `ValidTimeStateEnabled`, alongside the
+  ones the bridge already handled). It writes one top-level property per call, in the
+  serialised element order measured over shipped entities. A nested path is refused, and
+  `Modules`, `OperationalDomain` and `SubscriberAccessLevel` are refused because their values
+  are not validated here; `EntityCategory` must be one of the enum's values. Space-indented
+  entity and table files are edited too. `add-data-source` adds an embedded, joined query datasource
+  (`joinField`, `relatedField`, `linkType`, `dataSourceReadOnly`) and `add-field` a mapped
+  field (`dataField` + `dataSource`). These used to fail with "Unknown AxDataEntityView
+  property" / "add-data-source not supported for objectType 'data-entity'" and ended in a
+  hand-edited file. Entity `create` now also honours `isReadOnly`, `tags`, `configurationKey`,
+  `primaryCompanyContext` and `surrogateKey` (a `SourceKey` field mapped to `RecId`, as
+  shipped entities name it), lists any `properties` key it does not read instead of dropping
+  it silently, and says when `dataManagementEnabled` writes a staging-table reference that
+  nothing creates. `dataManagementEnabled` now accepts `"Yes"` / `"true"` as well as `true`,
+  like the other Yes/No properties. Table `create` accepts `fields[].allowEdit` and
+  `fields[].ignoreEdtRelation`, and `modify-field` accepts `fieldAllowEdit` and
+  `fieldIgnoreEdtRelation` (for `BPErrorTablePrimaryKeyEditable` and `BPErrorEDTNotMigrated`).
+  A table field given only `enumType` is now an enum field (it became a string field through
+  the bridge).
+- **Tables get "Subscriber access level", as Visual Studio creates them
+  (#1073).** A new regular table now carries
+  `<SubscriberAccessLevel><Read>Allow</Read></SubscriberAccessLevel>`, which
+  VS writes on every new table. TempDB/InMemory tables get none — a choice
+  rather than a measured rule, since about a quarter of shipped temporary
+  tables carry the element, the same share as regular ones. The property
+  can be set on create (`properties.subscriberAccessLevel`: `"Read=Allow,Create=Deny"`,
+  `{ "read": "Allow" }` or `"None"`) and with
+  `modify-property propertyPath="SubscriberAccessLevel"`; an invalid value is
+  refused before anything is written. Table reads show
+  it together with `AllowRowVersionChangeTracking`. It holds one child element
+  per permission, so the scalar property writer could neither express nor place
+  it, and the name was dropped. `AllowRowVersionChangeTracking` stays opt-in:
+  it is not a Visual Studio default. The regular-table eval goldens now include
+  the element.
+
+### Fixed
+- **Extension-class names under the `prefix` and `model-name` class styles now
+  match the infix / model token only as a separate PascalCase word. This changes
+  the name existing `prefix`-style users get for some bases.**
+  - A base whose last letters spelled the infix was read as already prefixed and
+    never got one: with prefix `Le`, `SalesTable` was written as
+    `SalesTable_Extension`; it is now `SalesTableLe_Extension` (likewise `Ne` +
+    `SalesLine` → `SalesLineNe_Extension`). Names that really end in the infix
+    (`CustTableCtso_Extension`, `CustTableCTSO_Extension`) are kept as before.
+  - A bare base that begins with the infix as a word was also read as already
+    prefixed: `ProjTable` under prefix `Proj` gave `ProjTable_Extension`, and is
+    now `ProjTableProj_Extension` (also `TaxTrans` + `Tax`, `CRMTable` + `Cr`).
+    A full name you pass already ending in `_Extension` (`ProjTable_Extension`)
+    is still kept as given — from the name alone it cannot be told apart from a
+    prefixed one.
+  - `model-name` style no longer cuts a base whose last letters spell the model
+    token (`SalesTable` under model `Able` was written `SalesT_Able_Extension`).
+  - `validate_object_naming` derives the base by the same rule, so it no longer
+    accepts `SalesTable_Extension` as carrying the infix `Le`.
+  - A class-extension skeleton created without `properties.baseClass` derived its
+    `[ExtensionOf(classStr(…))]` target with a regex that only fit the
+    `model-name` shape — `CustTableCtso_Extension` targeted itself. It now uses
+    the same base derivation for all three class styles.
+- **`labels(action="rename")` is now held to the cross-model write guard.**
+  `labels(action="create")` refused to write a label into another model's
+  label file, but a rename of a label in that same file went through and
+  rewrote it. The rename now gets the same refusal (also for `dryRun:true`),
+  and the same configuration (`D365FO_CROSS_MODEL_WRITE_MODELS`,
+  `D365FO_ALLOW_CROSS_MODEL_WRITE`) allows it, with a note on the result.
+  References the rename finds through `searchPaths` are held to the same
+  guard: a file in another model, or outside every package root, refuses the
+  whole rename before anything is written.
+- **`labels(action="rename")` no longer creates a duplicate label ID.** In a
+  `.label.txt` without a BOM, an ID on the first line was invisible to the
+  "target already exists" check, so renaming another label onto it left two
+  declarations of the same ID (and renaming that first-line label itself
+  answered "not found"). The checks and the rewrite now read the file the same
+  way. The rename also keeps the file's BOM as it was instead of adding one.
+- **`find_references` without the xref database no longer drops calls written
+  in a different letter case or with a space before the parenthesis.** X++
+  identifiers are case-insensitive, so `this.validatewrite()` and
+  `this.validateWrite ()` call `validateWrite` — the index lookup matched them,
+  then an exact `validateWrite(` text match threw them away. The same applies
+  to instantiations (`new mycontroller ()`). The match also no longer takes a
+  longer name ending in the target (`revalidateWrite(`) for a call, and a
+  call found both in the index and in the declaring type's file is listed once.
+- **`web.config` / `SysTestConsole.exe.config` settings are read as XML reads
+  them.** A previous `Infrastructure.HostUrl` kept in a `<!-- … -->` comment
+  above the live one was taken as the AOS address by `restartAos` without an
+  `aosUrl`, and the SysTest data-access check read commented-out entries too.
+  That check also missed an entry written `value="…" key="…"` and compared
+  `&amp;` undecoded. Both now go through one reader (`src/utils/appSettings.ts`)
+  that skips comments, accepts any attribute order and quote style, decodes
+  entities and reads only `<appSettings>`.
+- **A source changed while a build was running no longer comes back as
+  compiled.** Whether a finished build result still describes the disk was
+  measured from when the build *ended* — written only after runtime metadata
+  regeneration (and the AOS restart, when asked for). A file edited during
+  the compile or the "finalizing" phase (~40 s on a real VM) was older than
+  that, so the next call collected "✅ Build succeeded" for sources xppc never
+  saw. It is now measured from when the build started; the build's own
+  outputs (`bin`, `XppMetadata`, and labelc's `Resources`) are not counted.
+- **labelc no longer runs on every build of a model whose label file has
+  its own name.** The "are the label assemblies current?" check looked for
+  `Resources\<model>.dll`, but labelc writes one assembly per label file
+  (`Resources\<LabelFile>.dll`). A model such as `VLTBase` with label file
+  `VLTLabel` never had the file it looked for, so every build recompiled
+  its labels and rewrote `Resources`.
+- **Table info without the C# bridge no longer answers "not found" for
+  standard tables.** The symbol-index fallback rejected every row whose
+  recorded file path did not exist on this machine, but the index records the
+  path it was built at: a CI build agent for the shipped index, or an older
+  UDE version folder after an upgrade. So `CustTable` and every other standard
+  table came back "not found" although the index held the full field list. A
+  row now counts as stale only when the table's folder is present here and the
+  file is not, which is the rolled-back object the check was written for. Table
+  names also resolve case-insensitively (#1071).
+
+## [1.19.1] — 2026-09-30
+
+### Fixed
+- **`d365fo-mcp update` no longer fails on Windows when it renames the
+  installed package.** npm replaces a global package by first renaming its
+  folder under `%APPDATA%\npm\node_modules`. The update started npm from inside
+  that same folder, and Windows does not rename a folder that is a running
+  process's working directory, so npm stopped with `EBUSY`/`EPERM`. npm now
+  runs from the home directory. If the install still fails, the command says
+  that a running MCP server can also lock the folder.
+
+  **Updating from 1.19.0 or older:** `d365fo-mcp update` still runs the old
+  code, so it fails once more. Install this release by hand. Close VS Code /
+  Visual Studio first if they run the MCP server, then start npm from any
+  folder outside the package:
+
+  ```
+  cd C:\
+  npm install -g d365fo-mcp@latest
+  ```
+
+  From 1.19.1 on, `d365fo-mcp update` works again.
+
+## [1.19.0] — 2026-09-29
+
+### Added
+- **`build_d365fo_project` can restart the local AOS after a successful build**
+  (`restartAos: true`, off by default). A build can succeed while a new object,
+  for example a menu item, is still missing in the browser until the AOS is
+  restarted. With `restartAos` the tool does that restart itself, once
+  compilation, runtime metadata and any requested DB sync have succeeded. It
+  restarts only the one local IIS `AOSService` pool or IIS Express instance that
+  matches the environment URL, then waits until the AOS answers again. The URL
+  is `aosUrl`, or on a classic VM `Infrastructure.HostUrl` from
+  `AosService\WebRoot\web.config` (UDE needs `aosUrl`). When the match is
+  ambiguous or the restart can't be confirmed, it says so instead of guessing,
+  and collecting the result later never restarts again. If the server exits
+  before the restart stage, the next build releases its reservation; only an
+  exit during the restart itself needs a manual check. See `docs/AOS_RUNTIME_RESTART.md`.
+- **`d365fo_file(action="project")` manages Visual Studio projects.** The server could
+  add objects to an existing `.rnrproj` but not make, remove or re-populate one, so a new
+  ticket started with a hand-written project file and a hand-edited `.sln`. One action,
+  picked with `params.operation`:
+  - `create` writes `<projectsRoot>/<name>/<name>.rnrproj` (BOM + CRLF, fresh GUID, build
+    tasks version taken from a sibling project) and registers it in the solution — a
+    shared `<Model>.sln` (with `dependsOn` written as `ProjectDependencies`) or a new
+    per-project `.sln`, detected from the folder; an undecidable layout stops and asks.
+    It is configured for every configuration the solution declares, mapped the way its
+    existing projects are. The new project becomes the active one, and a project made
+    for another model keeps the write anchor on the workspace's own model.
+  - `delete` takes a project out of its solution (entry, configuration and dependency
+    lines) and, with `removeFiles`, deletes only its own files. A folder holding anything
+    else, or a project no solution lists, is refused. Model metadata is never touched.
+  - `add-object` / `remove-object` register existing objects in, or unregister them from,
+    a project (up to 20 per call, objects of its own model only), including label
+    files (`objectType="label-file"`, add only). The files stay; removing the last reference needs `allowOrphan`.
+
+  Nothing is overwritten, and the folder must already look like a projects folder.
+  Contract: `get_knowledge(kind="op-spec", topic="project")`.
+
+### Fixed
+- **`d365fo_file(action="project")` checks an explicit label-file `languages` list
+  against the files on disk.** `add-object` with `objectType: "label-file"` and a
+  `languages` list wrote an entry for every listed language without looking for its
+  `<name>_<lang>.xml`, so a language with no file (or a mistyped tag) was registered and
+  the Visual Studio build failed later. Without the list the languages already came from
+  disk; with it, a language that has no file is now refused, naming the ones that exist.
+- **The name-based `find_references` fallback no longer counts a method's declaration as
+  a call to it, and says what a table count leaves out.** In the declaring method's own
+  body the first `name(` is `public void name(`, which was reported as a caller; it is
+  skipped now (a recursive call still counts). A table target used to get a bare number,
+  although its declarative references — form data sources, relations, entity mappings —
+  are only in the cross-reference database; it now says so, as an EDT target already did.
+- **`find_references` finds methods added by `[ExtensionOf]` classes.** The
+  cross-reference database records such a method under the extension class only
+  (`/Classes/<Ext>/Methods/<m>`); `Owner.method` queried `/Tables/<Owner>/Methods/<m>`,
+  which does not exist, and reported 0 for a method with callers. It now also queries
+  every class extension of the owner that declares the method, from the index's
+  extension records. A bare method name (no owner) is resolved to the types that
+  declare it and queried by their full paths, instead of reaching the bridge as a bare
+  name that matches nothing and falling back to the name-based search; past 25
+  declaring types it stays a bare-name lookup.
+- **`find_references` includes declarative metadata references.** The bridge looked
+  a target up only in its X++ shape (`/Tables/X`, `/Edts/X`), on the belief that
+  targets are always plural with a leading slash. Metadata references are stored
+  singular and without it, and for an EDT under its concrete subtype (`Table/X`,
+  `Form/X`, `EdtString/X`, members `Table/X/TableFieldString/F`, `Table/X/Method/M`):
+  on a live DYNAMICSXREFDB 2.3M of 19.5M references. A custom table's where-used
+  returned 334 of its 785 references, missing every form data source and entity
+  mapping; a custom EDT's, 12 of 108, missing every table field typed with it. Both
+  shapes are queried now — including for `Owner.member` and explicit AOT paths, whose
+  metadata twins are derived for methods of tables, classes, forms, views, data entities
+  and maps, and for fields of tables, maps, views and data entities, each field under
+  its exact type segment (a wildcard also matched a field group of the same name) —
+  and metadata rows read as "object › member › property".
+  The bridge returns exact totals split into code and metadata (references whose source
+  no longer exists in the database are left out of both, as they are of the rows), and up to 500 rows per
+  shape instead of 500 in all: sorted by source path, code rows used to fill the cap, so
+  a large table (CustTable) showed no metadata reference at all. The list gives each
+  shape its share of `limit`. A `targetType` that names a type now scopes a bare name to
+  it (`CustTable` with `table` no longer counts the form, menu item and query named
+  CustTable). The bridge's `--xref-database` help no longer claims a default it does
+  not have.
+- **The cross-reference database can be configured on a traditional VM.** The bridge got
+  its DYNAMICSXREFDB server and name only from the XPP config, which exists only on UDE,
+  so on a traditional VM it always started without cross-references and `find_references`
+  quietly answered from its name-based search, missing every metadata reference. New
+  settings `bridge.xrefDbName` / `D365FO_XREF_DB_NAME` (usually `DYNAMICSXREFDB`) and
+  `bridge.xrefDbServer` / `D365FO_XREF_DB_SERVER` (defaults to localhost) take
+  precedence over the XPP config, and `doctor` says when a traditional VM has none set.
+- **`find_references` finds enum values, members an extension adds, entity members,
+  table indexes, field groups and form data source methods.**
+  An enum value is found as `Enum::Value` or `Enum.Value` (`/Enums/E/EnumValues/v`,
+  `Enum/E/EnumValue/v`); there was no way to ask for one. A table field or enum value
+  an extension adds is stored under the extension only (`/TableExtensions/T.Ext/Fields/f`,
+  `/EnumExtensions/E.Ext/EnumValues/v`, and their metadata shapes), so `PurchLine.<added
+  field>` returned 0; those are queried now. The index records a data entity as a view,
+  so `Entity.field` was looked up under `/Views/` and matched nothing. New `targetType`
+  values `data-entity`, `map` and `menu-item` scope a bare name like the other types do:
+  an entity is not under `/Views/`, and a menu item often shares its name with the class
+  or report it runs. `Table.Name` with `targetType` `index` or `field-group` finds a table
+  index (`/Tables/T/TableIndexs/i`, `Table/T/TableIndex/i`) or field group
+  (`/Tables/T/TableFieldGroups/g`, `Table/T/TableFieldGroup/g`); only when asked, because
+  they often share a name with a field. `Form.DataSource.method` finds a form data source's
+  method (`/Forms/F/DataSources/DS/Methods/m`, `Form/F/FormDataSourceRoot/DS/Method/m`).
+- **A button added with `add-control` shows its caption** (#1047). The label was always
+  written as `<Label>`, but buttons keep their caption in `<Text>` and groups in
+  `<Caption>`. D365FO dropped the unknown element without an error, so the button
+  rendered blank while the tool reported success. The caption element now follows the
+  control type, in the order shipped forms use, on both the form-extension writer and
+  the bridge. A data binding that the control type cannot carry (for example
+  `dataField` on a Button) is no longer written; the reply says it was skipped.
+  `controlType: "CommandButton"` and `"MenuFunctionButton"` in a form extension were
+  written as String controls; they now produce the requested button.
+- **`d365fo_file(action="project")` only touches projects under the configured solution
+  roots.** Its `.rnrproj`/`.sln` writes and deletes were bounded only by "the folder looks
+  like a projects folder", which every Visual Studio repo on the machine passes, and so
+  does `%TEMP%`. One call could take a project out of another repo's solution and
+  delete its files, or add a project there. `create`, `delete`, `add-object` and
+  `remove-object` now refuse a path outside `D365FO_SOLUTIONS_PATH`, `workspacePath` or
+  `solutionPath`. The error names these settings. The active project does not
+  count as a root, because `create` activates what it makes and a project created in a
+  foreign folder would otherwise vouch for the next call there. `delete` checks the
+  projects folder rather than the project, since the shared `.sln` it rewrites sits one
+  level above the project folder.
+- **A table field's length is available without the bridge.** The full index
+  build stored a field's bare base type as its signature and dropped the EDT the
+  extracted metadata carried, so `DirPartyTable.Name` indexed as `String`
+  rather than `DirPartyName`. `update_symbol_index` already stored the EDT, so
+  the same column meant different things depending on which path last wrote the
+  table. On a deployment with no bridge, `get_object_info(table)` therefore could
+  not give a field's length at all, and an agent asked for it had to guess. The full
+  build now stores the EDT (or enum type, or the base type when a field has
+  neither), the same as the incremental path. The index-only table reader
+  resolves each field's size through the EDT chain in `edt_metadata`:
+  `Name: DirPartyName (String Size 160)`, and for a derived EDT that declares
+  no size of its own, `(String Size 160, inherited from DirPartyName)`.
+  The EDT is found whatever casing the field spells it in, and the output says
+  the size leaves EDT extensions out — the index stores none, and an extension
+  can change `StringSize`. Consumers that read the signature as an EDT —
+  relation generation, table patterns, find-method parameter types, "fields
+  typed as X" — now get one on a full index too. **Takes effect only after a
+  full index rebuild.**
+- **`search` ranking is unchanged by the above.** `search` full-text-matches
+  the signature, and a table field is very often named after its EDT, so such a
+  field would have matched the EDT's name twice and outscored everything that
+  matches it once: on an ApplicationPlatform + Directory + Foundation index,
+  `CustName` returned 20 fields called CustName out of 20 and lost every EDT and
+  method. Table fields are now scored without their signature, which is exactly
+  how they scored when it held a base type; view and data-entity fields, whose
+  signature was never an EDT, keep theirs. Across 12 common EDT-name queries the
+  top 20 is identical to the previous index's. The query still sorts by FTS5's own
+  `rank` and re-scores the streamed rows, stopping as soon as no later row can enter
+  the window: sorting on the score expression in SQL gave the same answer but made a
+  broad query 2–3× slower on a full index (`Trans` 172 → 499 ms). Streamed, it costs
+  0–45 ms (`Trans` 189 ms, `Name` 64 → 107 ms, warm cache).
+
+### Dependencies
+- **Major:** `vitest` and `@vitest/coverage-v8` 4.1.11 → 5.0.2 (dev only; no test or
+  config change was needed, the coverage thresholds hold) and `dotenv` 17.4.2 → 18.0.4.
+  dotenv 18 keeps the `config`/`parse` API the server uses; its log line moved from
+  stdout to stderr, and the server passes `quiet: true` anyway, so the MCP stdio stream
+  stays clean (checked with an `initialize` + `tools/list` round trip).
+- Within the existing ranges: `@modelcontextprotocol/sdk` 1.30.0 → 1.31.0,
+  `@azure/storage-blob` 12.33.0 → 12.34.0, `@types/node` 26.6.1 → 26.6.3, `tsx`
+  4.23.13 → 4.23.15, plus transitive updates. Supersedes Dependabot #1058–#1063.
+
+## [1.18.0] — 2026-09-24
+
 ### Added
 - **Extension classes can follow their own naming style.** `EXTENSION_NAMING_STYLE`
   drove two independent decisions — the token of an element extension
@@ -165,17 +814,15 @@ those are called out explicitly below.
   sat behind was kept, so the infix landed one character late. It is now
   `CustTableCtso_Extension`, the spelling every name of this shape in
   PackagesLocalDirectory uses.
-
-### Dependencies
-- Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
-  1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →
-  26.6.1, `zod` 4.6.1 → 4.6.5, `hono` 4.13.7 → 4.13.8, plus transitive updates
-  (`package-lock.json` only). `@clack/prompts` 1.8.1 now types a cancelled
-  prompt as `typeof CANCEL_SYMBOL` instead of `symbol`, which broke the
-  type-check of every CLI prompt; the CLI's `ensure()` helper now strips any
-  symbol from the result type. No runtime change.
-
-### Fixed
+- **A full build shipped runtime metadata for code that no longer existed**
+  (#1026). xppc's metadata write-back does not reliably refresh an existing
+  `XppMetadata` tree: a class whose field was removed compiled to IL without it,
+  while its `XppMetadata` — and so the binary `.md` manifest serialized from it —
+  still declared it, under a green build. `build_d365fo_project(fullBuild: true)`
+  now clears the model's compiler-metadata tree before compiling, so the
+  write-back is unconditional; a failed delete warns (the `.md` may then not
+  match the code) rather than failing the build. The incremental counterpart is
+  the next entry.
 - **An incremental build still shipped runtime metadata for code that no longer
   existed.** xppc's metadata write-back rewrites an element's
   `XppMetadata` file when the element gains something, but never when it loses
@@ -191,6 +838,22 @@ those are called out explicitly below.
   xppc on a UDE box: removed fields and deleted classes disappear from the
   metadata and the `.md`, unchanged elements are untouched, and the scan takes
   ~0.3 s for a 4,400-element package.
+- **Writing a descriptor no longer invents a class or a missing project entry**
+  (#1030). A file in no `Ax*` folder was classified as a class by the symbol
+  indexer — every descriptor write added a phantom CLASS named after the model,
+  which `search` returned as an exact match — and the inline write verification
+  reported a missing `.rnrproj` entry for an invented `AxClass\<Model>`. Such
+  files are no longer indexed (a re-index cleans up earlier phantoms), and the
+  membership check is skipped for any type with no `Ax*` folder.
+
+### Dependencies
+- Routine lockfile refresh within the existing semver ranges: `@clack/prompts`
+  1.8.0 → 1.8.1, `@biomejs/biome` 2.5.12 → 2.5.14, `@types/node` 26.5.1 →
+  26.6.1, `zod` 4.6.1 → 4.6.5, `hono` 4.13.7 → 4.13.8, plus transitive updates
+  (`package-lock.json` only). `@clack/prompts` 1.8.1 now types a cancelled
+  prompt as `typeof CANCEL_SYMBOL` instead of `symbol`, which broke the
+  type-check of every CLI prompt; the CLI's `ensure()` helper now strips any
+  symbol from the result type. No runtime change.
 
 ## [1.17.4] — 2026-09-10
 

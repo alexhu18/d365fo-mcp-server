@@ -36,6 +36,13 @@ namespace D365MetadataBridge.Models
         [JsonPropertyName("saveDataPerCompany")]
         public string? SaveDataPerCompany { get; set; }
 
+        /// <summary>"Read=Allow, Create=Deny" — the set permissions; null when none are.</summary>
+        [JsonPropertyName("subscriberAccessLevel")]
+        public string? SubscriberAccessLevel { get; set; }
+
+        [JsonPropertyName("allowRowVersionChangeTracking")]
+        public string? AllowRowVersionChangeTracking { get; set; }
+
         [JsonPropertyName("extends")]
         public string? Extends { get; set; }
 

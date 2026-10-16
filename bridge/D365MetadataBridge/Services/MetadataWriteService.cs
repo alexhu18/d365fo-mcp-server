@@ -14,7 +14,7 @@ namespace D365MetadataBridge.Services
     /// Uses interface casts (IMetaClassProvider, IMetaTableProvider, etc.) because DiskProvider
     /// implements Create/Update as explicit interface members (dynamic dispatch fails).
     /// </summary>
-    public class MetadataWriteService
+    public partial class MetadataWriteService
     {
         private IMetadataProvider _provider;
         private readonly string _packagesPath;
@@ -25,6 +25,11 @@ namespace D365MetadataBridge.Services
         // Cache the publisher verdict per model name — see IsMicrosoftModel. Cleared with
         // _modelCache in UpdateProvider for the same reason: it is read off the provider.
         private readonly Dictionary<string, bool> _microsoftModelCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        // Cache the package (top-level PackagesLocalDirectory folder) each model lives in —
+        // see ResolvePackageName. Cleared in UpdateProvider: a model deployed or created
+        // since the last refresh may be the one that finally resolves.
+        private readonly Dictionary<string, string> _packageNameCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         public MetadataWriteService(IMetadataProvider provider, string packagesPath)
         {
@@ -70,6 +75,7 @@ namespace D365MetadataBridge.Services
             _modelCache.Clear();
             _microsoftModelCache.Clear();
             _objectModelCache.Clear();
+            _packageNameCache.Clear();
         }
 
         // ========================
@@ -323,6 +329,10 @@ namespace D365MetadataBridge.Services
 
             var axTable = new AxTable { Name = name };
 
+            // Visual Studio puts SubscriberAccessLevel Read=Allow on a new table (issue
+            // #1073). Set before the caller's properties so an explicit value wins.
+            axTable.SubscriberAccessLevel = AccessGrantText.VisualStudioDefault();
+
             // Apply table-level properties (Label, TableGroup, CacheLookup, etc.).
             // Finding #35: an unknown key was dropped in silence — report it instead.
             var unsupportedProperties = new List<string>();
@@ -332,6 +342,12 @@ namespace D365MetadataBridge.Services
                     if (!SetAxTableProperty(axTable, kv.Key, kv.Value))
                         unsupportedProperties.Add(kv.Key);
             }
+
+            // ...except on TempDB/InMemory tables, which VS creates without one.
+            if ((axTable.TableType == Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableType.TempDB
+                    || axTable.TableType == Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableType.InMemory)
+                && !(properties?.Keys.Any(k => k.Equals("subscriberAccessLevel", StringComparison.OrdinalIgnoreCase)) ?? false))
+                axTable.SubscriberAccessLevel = new Microsoft.Dynamics.AX.Metadata.Core.MetaModel.AccessGrant();
 
             // Add fields
             if (fields != null)
@@ -492,6 +508,12 @@ namespace D365MetadataBridge.Services
             axTable.SaveDataPerCompany = isTempTable
                 ? Microsoft.Dynamics.AX.Metadata.Core.MetaModel.NoYes.No
                 : Microsoft.Dynamics.AX.Metadata.Core.MetaModel.NoYes.Yes;
+
+            // ── SubscriberAccessLevel — Read=Allow, as Visual Studio writes on a new
+            // regular table (issue #1073); none on TempDB/InMemory. extraProperties
+            // below can still set another value. ──
+            if (!isTempTable)
+                axTable.SubscriberAccessLevel = AccessGrantText.VisualStudioDefault();
 
             // ── Add fields ──
             var fieldNames = new List<string>();
@@ -1663,7 +1685,7 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"Table '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.Tables, objectName);
                     if (!SetAxTableProperty(obj, propertyPath, propertyValue))
-                        throw new ArgumentException($"Unknown AxTable property '{propertyPath}' — nothing was written. Supported: label, developerDocumentation, configurationKey, formRef, tableGroup, cacheLookup, clusteredIndex, primaryIndex, replacementKey, saveDataPerCompany, allowRowVersionChangeTracking, createdBy, createdDateTime, createdTransactionId, modifiedBy, modifiedDateTime, modifiedTransactionId, tableType, supportInheritance, instanceRelationType, extends, titleField1, titleField2.");
+                        throw new ArgumentException($"Unknown AxTable property '{propertyPath}' — nothing was written. Supported: label, developerDocumentation, configurationKey, formRef, tableGroup, cacheLookup, clusteredIndex, primaryIndex, replacementKey, saveDataPerCompany, allowRowVersionChangeTracking, subscriberAccessLevel, createdBy, createdDateTime, createdTransactionId, modifiedBy, modifiedDateTime, modifiedTransactionId, tableType, supportInheritance, instanceRelationType, extends, titleField1, titleField2.");
                     ((IMetaTableProvider)_provider.Tables).Update(obj, msi);
                     return new { success = true, operation = "modify-property", objectType, objectName, propertyPath, propertyValue, api = "Update" };
                 }
@@ -3663,55 +3685,14 @@ namespace D365MetadataBridge.Services
         {
             switch (prop.ToLowerInvariant())
             {
-                // ── String properties ──────────────────────────────────────────────
-                case "label":                       tbl.Label = value; break;
-                case "singularlabel":               tbl.SingularLabel = value; break;
-                case "developerdocumentation":      tbl.DeveloperDocumentation = value; break;
-                case "clusteredindex":              tbl.ClusteredIndex = value; break;
-                case "primaryindex":                tbl.PrimaryIndex = value; break;
-                case "extends":                     tbl.Extends = value; break;
-                case "titlefield1":                 tbl.TitleField1 = value; break;
-                case "titlefield2":                 tbl.TitleField2 = value; break;
-                case "replacementkey":              tbl.ReplacementKey = value; break;
-                case "formref":                     tbl.FormRef = value; break;
-                case "listpageref":                 tbl.ListPageRef = value; break;
-                case "reportref":                   tbl.ReportRef = value; break;
-                case "previewpartref":              tbl.PreviewPartRef = value; break;
+                case "label": tbl.Label = value; break;
+                case "developerdocumentation": tbl.DeveloperDocumentation = value; break;
                 // ConfigurationKey / FormRef were missing here, so EVERY writer that
                 // funnels through this switch (CreateTable, CreateSmartTable,
                 // modify-property) discarded them while answering success — the table
                 // half of finding #35. Both are plain string properties on AxTable.
-                case "configurationkey":            tbl.ConfigurationKey = value; break;
-                case "countryregioncodes":          tbl.CountryRegionCodes = value; break;
-                case "countryregioncontextfield":   tbl.CountryRegionContextField = value; break;
-                case "tags":                        tbl.Tags = value; break;
-
-                // ── NoYes properties ───────────────────────────────────────────────
-                // Dual-write's table-side change-tracking prerequisite.
-                case "allowrowversionchangetracking":   tbl.AllowRowVersionChangeTracking = ParseNoYes(value); break;
-                case "allowchangetracking":             tbl.AllowChangeTracking = ParseNoYes(value); break;
-                case "allowarchival":                   tbl.AllowArchival = ParseNoYes(value); break;
-                case "allowretention":                  tbl.AllowRetention = ParseNoYes(value); break;
-                case "allowoverride":                   tbl.AllowOverride = ParseNoYes(value); break;
-                case "abstract":                        tbl.Abstract = ParseNoYes(value); break;
-                case "supportinheritance":              tbl.SupportInheritance = ParseNoYes(value); break;
-                case "savedatapercompany":              tbl.SaveDataPerCompany = ParseNoYes(value); break;
-                case "savedataperpartition":            tbl.SaveDataPerPartition = ParseNoYes(value); break;
-                case "systemtable":                     tbl.SystemTable = ParseNoYes(value); break;
-                case "createrecidindex":                tbl.CreateRecIdIndex = ParseNoYes(value); break;
-                case "createddatetime":                 tbl.CreatedDateTime = ParseNoYes(value); break;
-                case "createdby":                       tbl.CreatedBy = ParseNoYes(value); break;
-                case "createdtransactionid":            tbl.CreatedTransactionId = ParseNoYes(value); break;
-                case "modifieddatetime":                tbl.ModifiedDateTime = ParseNoYes(value); break;
-                case "modifiedby":                      tbl.ModifiedBy = ParseNoYes(value); break;
-                case "modifiedtransactionid":           tbl.ModifiedTransactionId = ParseNoYes(value); break;
-                case "occentabled":                     tbl.OccEnabled = ParseNoYes(value); break;
-                case "disabledatabaselogging":          tbl.DisableDatabaseLogging = ParseNoYes(value); break;
-                case "disablelockescalation":           tbl.DisableLockEscalation = ParseNoYes(value); break;
-                case "isobsolete":                      tbl.IsObsolete = ParseNoYes(value); break;
-                case "visible":                         tbl.Visible = ParseNoYes(value); break;
-
-                // ── Enum properties ────────────────────────────────────────────────
+                case "configurationkey": tbl.ConfigurationKey = value; break;
+                case "formref": tbl.FormRef = value; break;
                 case "tablegroup":
                     if (!Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableGroup>(value, true, out var tg))
                         throw new ArgumentException(
@@ -3726,6 +3707,27 @@ namespace D365MetadataBridge.Services
                             string.Join(", ", Enum.GetNames(typeof(Microsoft.Dynamics.AX.Metadata.Core.MetaModel.RecordCacheLevel))) + ".");
                     tbl.CacheLookup = cl;
                     break;
+                case "clusteredindex": tbl.ClusteredIndex = value; break;
+                case "primaryindex": tbl.PrimaryIndex = value; break;
+                case "replacementkey": tbl.ReplacementKey = value; break;
+                case "savedatapercompany":
+                    tbl.SaveDataPerCompany = ParseNoYes(value);
+                    break;
+                // Dual-write's table-side change-tracking prerequisite.
+                case "allowrowversionchangetracking":
+                    tbl.AllowRowVersionChangeTracking = ParseNoYes(value);
+                    break;
+                // "Subscriber access level": an AccessGrant (a struct of six permissions),
+                // written as "Read=Allow,Create=Deny" or "None" (issue #1073).
+                case "subscriberaccesslevel":
+                    tbl.SubscriberAccessLevel = AccessGrantText.Parse(value);
+                    break;
+                case "createdby": tbl.CreatedBy = ParseNoYes(value); break;
+                case "createddatetime": tbl.CreatedDateTime = ParseNoYes(value); break;
+                case "createdtransactionid": tbl.CreatedTransactionId = ParseNoYes(value); break;
+                case "modifiedby": tbl.ModifiedBy = ParseNoYes(value); break;
+                case "modifieddatetime": tbl.ModifiedDateTime = ParseNoYes(value); break;
+                case "modifiedtransactionid": tbl.ModifiedTransactionId = ParseNoYes(value); break;
                 case "tabletype":
                     if (!Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableType>(value, true, out var tt))
                         throw new ArgumentException(
@@ -3733,37 +3735,8 @@ namespace D365MetadataBridge.Services
                             string.Join(", ", Enum.GetNames(typeof(Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableType))) + ".");
                     tbl.TableType = tt;
                     break;
-                case "aosauthorization":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.AosAuthorization>(value, true, out var aa))
-                        tbl.AosAuthorization = aa;
-                    break;
-                case "entityrelationshiptype":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.EntityRelationshipType>(value, true, out var ert))
-                        tbl.EntityRelationshipType = ert;
-                    break;
-                case "validtimestatefieldtype":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.ValidTimeStateFieldType>(value, true, out var vts))
-                        tbl.ValidTimeStateFieldType = vts;
-                    break;
-                case "tablecontents":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.TableContents>(value, true, out var tc))
-                        tbl.TableContents = tc;
-                    break;
-                case "datasharingtype":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.SysDataSharingType>(value, true, out var dst))
-                        tbl.DataSharingType = dst;
-                    break;
-                case "durability":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.Durability>(value, true, out var dur))
-                        tbl.Durability = dur;
-                    break;
-                case "operationaldomain":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.OperationalDomain>(value, true, out var od))
-                        tbl.OperationalDomain = od;
-                    break;
-                case "storagemode":
-                    if (Enum.TryParse<Microsoft.Dynamics.AX.Metadata.Core.MetaModel.StorageMode>(value, true, out var sm))
-                        tbl.StorageMode = sm;
+                case "supportinheritance":
+                    tbl.SupportInheritance = ParseNoYes(value);
                     break;
                 case "instancerelationtype":
                     // Table-inheritance discriminator: the value is the NAME of the
@@ -3772,8 +3745,12 @@ namespace D365MetadataBridge.Services
                     // SupportInheritance=Yes on the same table.
                     tbl.InstanceRelationType = value;
                     break;
-
+                case "extends": tbl.Extends = value; break;
+                case "titlefield1": tbl.TitleField1 = value; break;
+                case "titlefield2": tbl.TitleField2 = value; break;
                 default:
+                    // sa.global fork: properties upstream does not cover (MetadataWriteService.SabTableProperties.cs).
+                    if (SetAxTablePropertySab(tbl, prop, value)) return true;
                     Console.Error.WriteLine($"[WriteService] Unknown AxTable property: {prop}");
                     return false;
             }
@@ -4380,8 +4357,14 @@ namespace D365MetadataBridge.Services
             }
             if (!string.IsNullOrEmpty(label))
             {
-                try { ctrl.Label = label; }
-                catch { unsupportedProperties.Add("label"); }
+                // The caption is not always "Label": field controls carry Label, buttons
+                // and menu buttons carry Text, groups and tab pages carry Caption. Always
+                // assigning Label left every Button without a caption (#1047).
+                var captionProperty = new[] { "Label", "Text", "Caption" }
+                    .Select(n => ctrlType.GetProperty(n))
+                    .FirstOrDefault(p => p != null && p.CanWrite && p.PropertyType == typeof(string));
+                if (captionProperty != null) captionProperty.SetValue(ctrl, label);
+                else unsupportedProperties.Add("label");
             }
             return ctrl;
         }
@@ -4889,7 +4872,10 @@ namespace D365MetadataBridge.Services
             }
 
             // Strategy 3: infer model from on-disk file path
-            //   Files live at {packagesPath}/{ModelName}/{ModelName}/Ax{Type}/{Name}.xml
+            //   Files live at {packagesPath}/{PackageName}/{ModelName}/Ax{Type}/{Name}.xml.
+            //   The package and the model are NOT always the same name (#1086: package
+            //   "Enhancements" holding model "Sales Integration"), so every model folder
+            //   of every package is probed and the model is taken from the folder name.
             //   We scan common AOT folders for the object name. A union scan, not a
             //   type mapping: every folder is tried, so AxClass already covers class
             //   extensions ([ExtensionOf(...)] AxClass files) and an AxClassExtension
@@ -4905,17 +4891,19 @@ namespace D365MetadataBridge.Services
             {
                 foreach (var packageDir in Directory.GetDirectories(_packagesPath))
                 {
-                    var packageName = Path.GetFileName(packageDir);
-                    foreach (var aotFolder in aotFolders)
+                    foreach (var modelDir in Directory.GetDirectories(packageDir))
                     {
-                        var filePath = Path.Combine(packageDir, packageName, aotFolder, objectName + ".xml");
-                        if (File.Exists(filePath))
+                        var modelName = Path.GetFileName(modelDir);
+                        foreach (var aotFolder in aotFolders)
                         {
-                            // Found the file — resolve model from this package name
-                            var msi = ResolveModelSaveInfo(packageName);
+                            var filePath = Path.Combine(modelDir, aotFolder, objectName + ".xml");
+                            if (!File.Exists(filePath)) continue;
+
+                            // Found the file — the folder it sits in names the model.
+                            var msi = ResolveModelSaveInfo(modelName);
                             if (msi != null)
                             {
-                                Console.Error.WriteLine($"[WriteService] GetModelSaveInfoForObject: resolved '{objectName}' via file path → model '{packageName}'");
+                                Console.Error.WriteLine($"[WriteService] GetModelSaveInfoForObject: resolved '{objectName}' via file path → model '{modelName}'");
                                 return msi;
                             }
                         }
@@ -4955,9 +4943,85 @@ namespace D365MetadataBridge.Services
         // HELPERS: Path + Parse
         // ========================
 
+        /// <summary>
+        /// Where the SDK's Create() put the object: {packages}/{Package}/{Model}/{AxFolder}/{Name}.xml.
+        /// This path is what the TS side verifies on disk, adds to the .rnrproj and indexes,
+        /// so it must name the package the model really lives in — not assume the two names
+        /// match (#1086).
+        /// </summary>
         private string GetExpectedPath(string aotFolder, string objectName, string modelName)
         {
-            return Path.Combine(_packagesPath, modelName, modelName, aotFolder, objectName + ".xml");
+            return Path.Combine(_packagesPath, ResolvePackageName(modelName), modelName, aotFolder, objectName + ".xml");
+        }
+
+        /// <summary>
+        /// The package a model belongs to: the folder whose Descriptor/ declares a model of
+        /// that name. Most models live in a package of the same name, so that is probed
+        /// first; otherwise every package's descriptors are read. Falls back to the model
+        /// name when nothing declares it (the historical behaviour) and does not cache the
+        /// miss, so a model deployed later still resolves.
+        /// </summary>
+        private string ResolvePackageName(string modelName)
+        {
+            if (_packageNameCache.TryGetValue(modelName, out var cached))
+                return cached;
+
+            string? found = null;
+            try
+            {
+                if (DescriptorDeclaresModel(Path.Combine(_packagesPath, modelName, "Descriptor", modelName + ".xml"), modelName))
+                {
+                    found = modelName;
+                }
+                else
+                {
+                    var packageDirs = Directory.GetDirectories(_packagesPath);
+
+                    // Cheap pass: a descriptor file named after the model, in any package.
+                    foreach (var packageDir in packageDirs)
+                    {
+                        if (DescriptorDeclaresModel(Path.Combine(packageDir, "Descriptor", modelName + ".xml"), modelName))
+                        { found = Path.GetFileName(packageDir); break; }
+                    }
+
+                    // Full pass: the descriptor's <Name>, whatever the file is called.
+                    if (found == null)
+                    {
+                        foreach (var packageDir in packageDirs)
+                        {
+                            var descDir = Path.Combine(packageDir, "Descriptor");
+                            if (!Directory.Exists(descDir)) continue;
+                            if (Directory.GetFiles(descDir, "*.xml").Any(f => DescriptorDeclaresModel(f, modelName)))
+                            { found = Path.GetFileName(packageDir); break; }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WriteService] Package lookup failed for model '{modelName}': {ex.Message}");
+            }
+
+            if (found == null) return modelName;
+            _packageNameCache[modelName] = found;
+            return found;
+        }
+
+        private static bool DescriptorDeclaresModel(string xmlPath, string modelName)
+        {
+            if (!File.Exists(xmlPath)) return false;
+            try
+            {
+                var root = XDocument.Load(xmlPath).Root;
+                if (root == null) return false;
+                var ns = root.GetDefaultNamespace();
+                var nameEl = root.Element(ns + "Name") ?? root.Element("Name");
+                return nameEl != null && string.Equals(nameEl.Value.Trim(), modelName, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool ParseBool(string value)

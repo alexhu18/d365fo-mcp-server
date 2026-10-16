@@ -20,6 +20,9 @@ import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { lookupSymbolNocase } from '../../utils/symbolLookup.js';
 import { scaffoldWriteRefusalResult } from '../write/writeAnchorGuard.js';
 import { upsertWrittenFileIntoIndex } from '../write/inlineIndexUpsert.js';
+import { reconcileTableCreateProperties } from '../xml/createTablePropertyHonesty.js';
+import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
+import * as debouncedRefresh from '../../bridge/debouncedRefresh.js';
 
 interface GenerateSmartTableArgs {
   name: string;
@@ -926,6 +929,22 @@ export async function handleGenerateSmartTable(
     if (bridgeResult?.success && bridgeResult.filePath) {
       console.log(`[generateSmartTable] ✅ Created via C# bridge: ${bridgeResult.filePath}`);
 
+      // CreateSmartTable writes no SubscriberAccessLevel; give the table Visual
+      // Studio's Read=Allow (none on TempDB/InMemory), as the XML builder does.
+      // The bridge refreshed its provider from the pre-patch bytes, so refresh
+      // again after this write — otherwise the next bridge Update() serialises
+      // the cached copy back over it.
+      try {
+        const onDisk = await fs.promises.readFile(bridgeResult.filePath, 'utf-8');
+        const reconciled = reconcileTableCreateProperties(onDisk, undefined);
+        if (reconciled.xml !== onDisk) {
+          await writeFileAtomic(bridgeResult.filePath, normalizeD365Xml(reconciled.xml));
+          void debouncedRefresh.refresh(bridge);
+        }
+      } catch (e) {
+        console.error(`[generateSmartTable] SubscriberAccessLevel default skipped: ${e}`);
+      }
+
       // Add to Visual Studio project
       let projectMessage = '';
       const effectiveProjectPath = resolvedProjectPath ||
@@ -934,7 +953,7 @@ export async function handleGenerateSmartTable(
 
       if (effectiveProjectPath) {
         try {
-          const projectManager = new ProjectFileManager();
+          const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
           const wasAdded = await projectManager.addToProject(
             effectiveProjectPath,
             'table',
@@ -1070,7 +1089,7 @@ export async function handleGenerateSmartTable(
 
   if (effectiveProjectPath) {
     try {
-      const projectManager = new ProjectFileManager();
+      const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
       const wasAdded = await projectManager.addToProject(
         effectiveProjectPath,
         'table',
@@ -1448,9 +1467,9 @@ export interface EdtResolutionContext {
  * The EDT a field of this exact name already carries in the TARGET model — the
  * strongest signal there is: same name, same model, same concept.
  *
- * The index stores a field's PRIMITIVE in `symbols.signature`, not its EDT, so
- * the EDT is read from the owning table's XML. Best-effort: an unreadable file
- * just means "no answer".
+ * The EDT is read from the owning table's XML rather than `symbols.signature`:
+ * an index built before the full build stored the EDT there holds the field's
+ * PRIMITIVE instead. Best-effort: an unreadable file just means "no answer".
  */
 export function lookupModelFieldEdt(
   fieldName: string,

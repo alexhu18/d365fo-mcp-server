@@ -10,12 +10,8 @@
  *
  * Not a compiler: a table in a referenced package can still need a further
  * reference because a third package contributes a table extension to it.
- *
- * build_d365fo_project reads the same element to order its build queue and
- * calls straight into `parseModuleReferences`.
  */
 
-import { readFile } from 'fs/promises';
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import * as path from 'path';
 
@@ -35,18 +31,17 @@ import * as path from 'path';
  * `Foundation.xml` answered 157 for a model that references 46;
  * `ApplicationPlatform.xml` answered 19 for a model that references NONE.
  *
- * That is not cosmetic. Both readers of this function treat the result as the
- * set of packages a model may see: build_d365fo_project orders its build queue
- * by it, and getModelVisibility turns it into `visiblePackages`, the oracle
+ * That is not cosmetic. Its reader treats the result as the set of packages a
+ * model may see: getModelVisibility turns it into `visiblePackages`, the oracle
  * resolve_references uses to decide an indexed type is invisible to the model
  * being compiled. Every phantom entry made that oracle MORE permissive, so the
  * missing-reference defect it exists to catch was silently waved through —
  * which is the exact compile-time `classStr`/type failure this module's own
  * header describes.
  *
- * Returns [] for a nil or absent element: a model that references nothing. The
- * "descriptor unreadable" case is null, and it is readModuleReferences's to
- * report, not this one's.
+ * Returns [] for a nil or absent element: a model that references nothing. An
+ * unreadable descriptor is the caller's to report (getModelVisibility answers
+ * null), never an empty list.
  */
 export function parseModuleReferences(descriptorXml: string): string[] {
   const element = findModuleReferencesElement(descriptorXml);
@@ -54,23 +49,6 @@ export function parseModuleReferences(descriptorXml: string): string[] {
   return Array.from(element.inner.matchAll(/<d2p1:string>\s*([^<\s]+)\s*<\/d2p1:string>/g))
     .map(m => m[1].trim())
     .filter(Boolean);
-}
-
-/**
- * Read a model's direct module references, or null when it has no readable
- * descriptor — which callers must treat as unknown, never as "references nothing".
- */
-export async function readModuleReferences(
-  packagesPath: string,
-  modelName: string,
-): Promise<string[] | null> {
-  try {
-    return parseModuleReferences(
-      await readFile(path.join(packagesPath, modelName, 'Descriptor', `${modelName}.xml`), 'utf-8'),
-    );
-  } catch {
-    return null;
-  }
 }
 
 /** The PackagesLocalDirectory root contained in a package or workspace path. */
@@ -443,7 +421,7 @@ export function removeModuleReference(xml: string, moduleName: string): RemoveMo
 
 /**
  * Where a model's descriptor actually is under `packagesRoot`, or null when it
- * is not there — the write side's equivalent of readModuleReferences, which
+ * is not there — the write side's equivalent of buildModelVisibility, which
  * collapses "no such file" into the same null as "unreadable".
  *
  * Reuses findDescriptor's probe order (package == model first, then a bounded

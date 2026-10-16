@@ -1,4 +1,4 @@
-﻿/**
+/**
  * D365FO File Creator Tool
  * Creates physical XML files in the AOT package structure
  */
@@ -7,6 +7,8 @@ import * as fs from 'fs/promises';
 import { directXmlSetIndexValidTimeState, coerceNoYesFlag } from './directXmlWriters.js';
 import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import { XmlTemplateGenerator } from '../xml/xmlTemplateGenerator.js';
+import { findIgnoredEntityProperties, stagingTableNote } from '../xml/dataEntityXml.js';
+import { fieldPropertiesFromSpecs, applyFieldPropertyPatches } from '../xml/tableFieldPropertyEdit.js';
 import * as path from 'path';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -18,7 +20,8 @@ import { verifyWrittenFile, renderWriteVerification, runInlineBpCheck, membershi
 import { validateWrittenXpp } from './inlineXppValidation.js';
 import { createPhaseTimer } from '../../utils/phaseTimer.js';
 import { registerCustomModel } from '../../utils/modelClassifier.js';
-import { normalizeObjectName } from '../../utils/objectNaming.js';
+import { COC_BASE_SYMBOL_TYPES, inferExtendedBase, normalizeObjectName } from '../../utils/objectNaming.js';
+import { lookupSymbolsNocase } from '../../utils/symbolLookup.js';
 import { PackageResolver } from '../../utils/packageResolver.js';
 import { crossModelWriteRefusal, standDownNotice } from '../../utils/crossModelWriteGuard.js';
 import { resolveAnchorModel } from './writeAnchorGuard.js';
@@ -26,6 +29,7 @@ import { xppMethodSourceForXml } from '../../utils/xppFormat.js';
 import { bridgeValidateAfterWrite, canBridgeCreate, bridgeCreateObject, bridgeCreateSmartTable, isBridgeFailure, describeBridgeFailure } from '../../bridge/index.js';
 import type { BridgeFailure } from '../../bridge/index.js';
 import * as debouncedRefresh from '../../bridge/debouncedRefresh.js';
+import { subscriberAccessLevelValue } from '../../utils/subscriberAccessLevel.js';
 import {
   checkObjectIdentity,
   renderIdentityRefusal,
@@ -42,6 +46,8 @@ import { recordCreatedArtifact } from '../../workspace/createdArtifactLedger.js'
 import { resolveOrCreateLabelRef, type AutoLabelTarget } from './createLabel.js';
 import { isRawLabelText } from '../../utils/labelReference.js';
 import { sayOncePerSession } from '../../utils/repeatedNotes.js';
+import { ensureFormMetadataNamespace, FORM_METADATA_NAMESPACE } from '../../utils/formMetadataNamespace.js';
+import { parseExtensionOfAttribute } from '../../metadata/xppDeclaration.js';
 import {
   reconcileTableCreateProperties,
   renderTableCreateHonestyReport,
@@ -349,6 +355,8 @@ export function normalizeFieldSpecsForBridge(
   return fields.map((f) => {
     let fieldType = f.type ?? f.fieldType;
     if (typeof fieldType === 'string') fieldType = fieldType.replace(/^AxTableField/, '');
+    // enumType alone is the type: without it the bridge writes an AxTableFieldString with an <EnumType>.
+    if ((fieldType == null || fieldType === '') && f.enumType) fieldType = 'Enum';
     const out: Record<string, unknown> = { name: f.name };
     if (fieldType != null && fieldType !== '') out.type = fieldType;
     if (f.edt != null) out.edt = f.edt;
@@ -580,6 +588,21 @@ export function sourceAsWritten(sourceCode: string | undefined, finalObjectName:
   }
 }
 
+/** Notes for a data-entity create: `properties` keys it did not read, and the staging table it did not create. */
+function dataEntityCreateNotes(objectType: string, properties: unknown, entityName: string): string {
+  if (objectType !== 'data-entity') return '';
+  const props = properties as Record<string, any> | undefined;
+  const ignored = findIgnoredEntityProperties(props);
+  return (
+    (ignored.length
+      ? `\n⚠️ ${ignored.length} property key(s) were NOT written — the data-entity generator does not read: ` +
+        `${ignored.join(', ')}. Anything else can be set afterwards with modify (modify-property / ` +
+        `add-data-source / add-field).`
+      : '') +
+    stagingTableNote(entityName, props)
+  );
+}
+
 /**
  * Warn, on an extensible enum create, that xppc allows only equality on it.
  *
@@ -602,6 +625,18 @@ function extensibleEnumOrderingWarning(objectType: string, properties: unknown, 
 }
 
 /**
+ * `subscriberAccessLevel` in the "Read=Allow,Create=Deny" / "None" text the
+ * bridge's property setter reads, so an object value reaches it too. Any other
+ * key passes through unchanged. An invalid value never gets here:
+ * handleCreateD365File refuses it before the create.
+ */
+function bridgeSubscriberAccessLevel(key: string, value: unknown): unknown {
+  if (key.toLowerCase() !== 'subscriberaccesslevel' || value === null || value === undefined) return value;
+  const v = subscriberAccessLevelValue(value);
+  return v.ok ? v.bridgeText : value;
+}
+
+/**
  * Post-write parameter honesty for a table create (cluster #35).
  *
  * The metadata writer — bridge or template — accepts `properties` it does not know
@@ -616,14 +651,31 @@ async function reconcileCreatedTableProperties(
   filePath: string | undefined,
   properties: unknown,
 ): Promise<string> {
-  if (!filePath || !properties || typeof properties !== 'object') return '';
+  if (!filePath) return '';
   try {
     const onDisk = await fs.readFile(filePath, 'utf-8');
-    const reconciled = reconcileTableCreateProperties(onDisk, properties as Record<string, unknown>);
-    if (reconciled.patched.length > 0) {
-      await writeFileAtomic(filePath, normalizeD365Xml(reconciled.xml));
+    // No properties still reconciles: a regular table gets Visual Studio's
+    // SubscriberAccessLevel, which no bridge create writes.
+    const props = properties && typeof properties === 'object' ? (properties as Record<string, unknown>) : undefined;
+    const reconciled = reconcileTableCreateProperties(onDisk, props);
+    // AllowEdit / IgnoreEDTRelation have no key in the bridge's create payload: applied to the XML on top of the reconcile.
+    const fieldSpecs = props?.fields;
+    const fieldPatches = Array.isArray(fieldSpecs)
+      ? fieldPropertiesFromSpecs(fieldSpecs as Array<Record<string, unknown>>)
+      : [];
+    let fieldNote = '';
+    let finalXml = reconciled.xml;
+    if (fieldPatches.length > 0) {
+      const applied = applyFieldPropertyPatches(finalXml.replace(/\r\n/g, '\n'), fieldPatches);
+      finalXml = applied.xml;
+      if (applied.failed.length > 0) {
+        fieldNote = `\n⚠️ Field properties NOT applied: ${applied.failed.join('; ')}`;
+      }
     }
-    return renderTableCreateHonestyReport(reconciled);
+    if (finalXml !== onDisk) {
+      await writeFileAtomic(filePath, normalizeD365Xml(finalXml));
+    }
+    return renderTableCreateHonestyReport(reconciled) + fieldNote;
   } catch (e) {
     console.error(`[create_d365fo_file] table property reconcile skipped: ${e}`);
     return '';
@@ -727,7 +779,7 @@ export async function handleCreateD365File(
 
     // If projectPath is available, extract model name from it
     if (projectPathToUse) {
-      const projectManager = new ProjectFileManager();
+      const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
       const extractedModelName = await timer.time('model name from .rnrproj', () =>
         projectManager.extractModelName(projectPathToUse!));
       if (extractedModelName) {
@@ -749,7 +801,7 @@ export async function handleCreateD365File(
       );
       
       if (foundProjectPath) {
-        const projectManager = new ProjectFileManager();
+        const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
         const extractedModelName = await projectManager.extractModelName(
           foundProjectPath
         );
@@ -847,6 +899,23 @@ export async function handleCreateD365File(
       `[create_d365fo_file] Final ModelName to use: ${actualModelName}${wasAutoExtracted ? ' (auto-extracted ✓)' : ' (as-is, NOT auto-extracted ⚠️)'}`
     );
 
+    // An invalid subscriberAccessLevel is refused before anything is written. Sent
+    // on, it made the bridge's AccessGrant parse throw inside Create(), and the
+    // whole table fell back to the XML template for one bad property value.
+    if (args.objectType === 'table' && args.properties && typeof args.properties === 'object') {
+      const salKey = Object.keys(args.properties).find(k => k.toLowerCase() === 'subscriberaccesslevel');
+      const salValue = salKey ? (args.properties as Record<string, unknown>)[salKey] : undefined;
+      if (salValue !== undefined && salValue !== null) {
+        const parsed = subscriberAccessLevelValue(salValue);
+        if (!parsed.ok) {
+          return {
+            content: [{ type: 'text', text: `❌ ${parsed.error} Nothing was created.` }],
+            isError: true,
+          };
+        }
+      }
+    }
+
     // Guard: refuse to create objects in generic placeholder model names.
     // These are never real D365FO models — if the AI reaches this point with a placeholder,
     // the workspace was not detected correctly and the file would land in the wrong location.
@@ -904,11 +973,29 @@ export async function handleCreateD365File(
     // Name normalisation lives in utils/objectNaming so that modify resolves the
     // very same name from the very same arguments — the ninety lines that used to
     // sit here inline were the reason it did not. See normalizeObjectName.
+    // The base an extension class names in [ExtensionOf] (or properties.baseClass)
+    // tells "SalesTable + Mcp + CreditHold" — a name that already carries the token —
+    // apart from a base that merely contains it. See ApplyObjectPrefixOptions.extendedBase.
+    const statedBaseClass = (args.properties as Record<string, unknown> | undefined)?.baseClass;
+    // With neither, the index stands in — the same inference prepare and
+    // validate_object_naming use, so the name they predict is the name written.
+    const extendedBase =
+      parseExtensionOfAttribute(args.sourceCode ?? args.xmlContent ?? '')?.baseObjectName ??
+      (typeof statedBaseClass === 'string' && statedBaseClass ? statedBaseClass : undefined) ??
+      inferExtendedBase(args.objectName, actualModelName, n => {
+        try {
+          const db = context?.symbolIndex?.getReadDb?.();
+          return !!db && lookupSymbolsNocase(db, n, { types: COC_BASE_SYMBOL_TYPES, limit: 1 }).length > 0;
+        } catch {
+          return false;
+        }
+      });
     const finalObjectName = normalizeObjectName(
       args.objectName,
       args.objectType,
       actualModelName,
       (note: string) => console.error(`[create_d365fo_file] ${note}`),
+      { extendedBase },
     );
     if (finalObjectName !== args.objectName) {
       console.error(`[create_d365fo_file] Applied naming: ${args.objectName} → ${finalObjectName}`);
@@ -1289,6 +1376,7 @@ export async function handleCreateD365File(
         const scalarProperties: Record<string, string> | undefined = args.properties
           ? Object.fromEntries(
               Object.entries(args.properties as Record<string, unknown>)
+                .map(([k, v]): [string, unknown] => [k, bridgeSubscriberAccessLevel(k, v)])
                 .filter(([, v]) => v != null && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
                 .map(([k, v]) => [k, String(v)]),
             )
@@ -1498,7 +1586,7 @@ export async function handleCreateD365File(
               if (args.addToProject !== false) {
                 if (projectPathToUse) {
                   try {
-                    const projectManager = new ProjectFileManager();
+                    const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
                     await projectManager.addToProject(
                       projectPathToUse,
                       args.objectType,
@@ -1516,7 +1604,7 @@ export async function handleCreateD365File(
                       actualModelName,
                     );
                     if (detectedPath) {
-                      const projectManager = new ProjectFileManager();
+                      const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
                       await projectManager.addToProject(
                         detectedPath,
                         args.objectType,
@@ -1629,7 +1717,7 @@ export async function handleCreateD365File(
           if (args.addToProject !== false) {
             if (projectPathToUse) {
               try {
-                const projectManager = new ProjectFileManager();
+                const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
                 await projectManager.addToProject(
                   projectPathToUse,
                   args.objectType,
@@ -1648,7 +1736,7 @@ export async function handleCreateD365File(
                   actualModelName,
                 );
                 if (detectedPath) {
-                  const projectManager = new ProjectFileManager();
+                  const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
                   await projectManager.addToProject(
                     detectedPath,
                     args.objectType,
@@ -1761,7 +1849,11 @@ export async function handleCreateD365File(
           args.objectType,
           finalObjectName,
           args.sourceCode,
-          effectiveProperties
+          // A class-extension skeleton derives its [ExtensionOf] target from the name
+          // when no baseClass is given — against THIS model's prefix and token.
+          args.objectType === 'class-extension' && !effectiveProperties?.modelName
+            ? { ...effectiveProperties, modelName: actualModelName }
+            : effectiveProperties
         );
 
     // Guard against HTML-entity-escaped xmlContent (e.g. "&lt;?xml..." instead of "<?xml...").
@@ -1848,6 +1940,22 @@ export async function handleCreateD365File(
     // Applies to both template-generated and caller-provided xmlContent.
     if (args.objectType === 'enum') {
       xmlContent = XmlTemplateGenerator.sanitizeEnumXml(xmlContent);
+    }
+
+    // Forms and form extensions are the only AOT roots in the metadata namespace,
+    // and their grandchildren must leave it again. Caller XML without it builds
+    // clean and then fails xppbp ("Error reading FormExtension") — so fix it here
+    // and say so. See formMetadataNamespace.ts for the census.
+    let namespaceNote = '';
+    if ((args.objectType === 'form' || args.objectType === 'form-extension') && args.xmlContent) {
+      const ns = ensureFormMetadataNamespace(xmlContent);
+      if (ns.changed) {
+        xmlContent = ns.xml;
+        namespaceNote =
+          `\n🔧 Added xmlns="${FORM_METADATA_NAMESPACE}" to the root and xmlns="" to its grandchildren — ` +
+          `the layout every shipped ${args.objectType === 'form' ? 'AxForm' : 'AxFormExtension'} has. ` +
+          `Without it the file builds but xppbp cannot read it.`;
+      }
     }
 
     // Safety net: ensure every pair of adjacent </Method>…<Method> is separated by
@@ -2073,7 +2181,7 @@ export async function handleCreateD365File(
           const absoluteXmlPath = normalizedFullPath;
 
           // Add to project
-          const projectManager = new ProjectFileManager();
+          const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
           const wasAdded = await timer.time('.rnrproj registration', () => projectManager.addToProject(
             projectPath,
             args.objectType,
@@ -2173,12 +2281,14 @@ export async function handleCreateD365File(
             `${finalObjectName !== args.objectName ? ` (prefixed from "${args.objectName}")` : ''}` +
             `${crossModelNotice}\n📁 ${normalizedFullPath}\n` +
             bridgeValidation +
+            namespaceNote +
             formPatternWarnings +
             bridgeFallbackNote +
             tableHonestyReport +
             rawLabelBpWarning(args.properties, finalObjectName) +
             labelAutoNote +
             extensibleEnumOrderingWarning(args.objectType, args.properties, finalObjectName) +
+            dataEntityCreateNotes(args.objectType, args.properties, finalObjectName) +
             projectMessage +
             verifyNote +
             indexNote +

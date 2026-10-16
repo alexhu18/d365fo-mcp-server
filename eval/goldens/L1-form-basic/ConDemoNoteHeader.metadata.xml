@@ -36,6 +36,9 @@ public class ConDemoNoteHeader extends common
 		<Methods />
 	</SourceCode>
 	<Label>@TaxTransactionInquiry:HeaderNote</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>Subject</TitleField1>
 	<DeleteActions />

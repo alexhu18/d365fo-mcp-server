@@ -13,6 +13,9 @@ public class ConDemoTimeEntry extends common
 		<Methods />
 	</SourceCode>
 	<Label>@TaxTransactionInquiry:HeaderNote</Label>
+	<SubscriberAccessLevel>
+		<Read>Allow</Read>
+	</SubscriberAccessLevel>
 	<TableGroup>Main</TableGroup>
 	<TitleField1>EntryId</TitleField1>
 	<TitleField2>StartedDateTime</TitleField2>

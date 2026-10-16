@@ -37,11 +37,17 @@ namespace D365MetadataBridge
         private static string? _binPath = null;               // Explicit bin path (UDE: microsoftPackagesPath/bin)
         private static string _xrefServer = "localhost";
         private static string _xrefDatabase = string.Empty;
+        private static readonly Models.AxDbSqlOptions AxDbOptions = new Models.AxDbSqlOptions();
         private static string? _logFile = null;
         private static readonly TextWriter Log = Console.Error;
 
         static async Task<int> Main(string[] args)
         {
+            // A separate one-shot mode: analyse an ETW capture and exit. It runs in its own process
+            // (started by the MCP server), so a multi-minute analysis never holds the bridge.
+            if (args.Length > 0 && args[0] == "--analyze-trace")
+                return Services.Trace.TraceAnalysisCommand.Run(args);
+
             // Parse command-line arguments — NO D365FO type references allowed here!
             for (int i = 0; i < args.Length; i++)
             {
@@ -64,6 +70,25 @@ namespace D365MetadataBridge
                         break;
                     case "--log-file" when i + 1 < args.Length:
                         _logFile = args[++i];
+                        break;
+                    case "--axdb-server" when i + 1 < args.Length:
+                        AxDbOptions.Server = args[++i];
+                        break;
+                    case "--axdb-database" when i + 1 < args.Length:
+                        AxDbOptions.Database = args[++i];
+                        break;
+                    case "--axdb-trust-certificate":
+                        AxDbOptions.TrustCertificate = true;
+                        break;
+                    case "--axdb-timeout" when i + 1 < args.Length:
+                        if (!int.TryParse(args[++i], out var timeout) || timeout < 1 || timeout > 30)
+                        { Log.WriteLine("[FATAL] --axdb-timeout must be 1..30 seconds."); return 1; }
+                        AxDbOptions.TimeoutSeconds = timeout;
+                        break;
+                    case "--axdb-max-rows" when i + 1 < args.Length:
+                        if (!int.TryParse(args[++i], out var maxRows) || maxRows < 1 || maxRows > 1000)
+                        { Log.WriteLine("[FATAL] --axdb-max-rows must be 1..1000."); return 1; }
+                        AxDbOptions.MaxRows = maxRows;
                         break;
                     case "--help":
                         PrintUsage();
@@ -147,7 +172,8 @@ namespace D365MetadataBridge
             }
 
             // Create request dispatcher
-            var dispatcher = new RequestDispatcher(metadataService, writeService, xrefService);
+            var axdbService = new Services.AxDbSqlService(AxDbOptions);
+            var dispatcher = new RequestDispatcher(metadataService, writeService, xrefService, axdbService);
 
             // Send ready signal
             var readyResponse = new BridgeResponse
@@ -160,7 +186,8 @@ namespace D365MetadataBridge
                     packagesPath = _packagesPath,
                     referencePackagesPath = _referencePackagesPath,
                     metadataAvailable = metadataService != null,
-                    xrefAvailable = xrefService != null
+                    xrefAvailable = xrefService != null,
+                    axdbSqlAvailable = axdbService.Enabled
                 })
             };
             await WriteResponse(readyResponse);
@@ -522,6 +549,9 @@ D365 Metadata Bridge — stdin/stdout JSON protocol for D365FO metadata access
 
 Usage:
   D365MetadataBridge.exe [options]
+  D365MetadataBridge.exe --analyze-trace <file.etl> --out <result.json> [--focus A;B] [--pid N]
+                         [--scope thread|subtree] [--top N] [--repeat N] [--progress <file>]
+                                    One-shot: analyse an ETW capture (X++ and SQL time) and exit.
 
 Options:
   --packages-path <path>            Path to primary PackagesLocalDirectory (required; the server detects it per machine)
@@ -530,7 +560,13 @@ Options:
                                     Microsoft-shipped metadata in UDE environments.
   --bin-path <path>                 Explicit DLL directory (UDE: microsoftPackagesPath\bin). If omitted, uses {packages-path}\bin.
   --xref-server <server>            SQL Server for cross-reference DB (default: localhost)
-  --xref-database <db>              Cross-reference database name (default: DYNAMICSXREFDB)
+  --xref-database <db>              Cross-reference database name, e.g. DYNAMICSXREFDB
+                                    (no default: without it cross-references are off)
+  --axdb-server <server>            Enable separate, lazy, read-only AxDB SQL debug access (Windows integrated authentication)
+  --axdb-database <db>              SQL debug database (default: AxDB)
+  --axdb-trust-certificate          Trust the SQL certificate (encryption remains enabled)
+  --axdb-timeout <seconds>          Per-command timeout, 1..30 (default: 30)
+  --axdb-max-rows <rows>            Default SQL query row cap, 1..1000 (default: 100)
   --log-file <path>                 Write all diagnostic logs to this file (append mode)
   --help                            Show this help
 

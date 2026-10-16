@@ -33,6 +33,8 @@ const D365FO_ENV_KEYS = [
   'D365FO_SOLUTION_PATH',
   'D365FO_DEV_ENVIRONMENT_TYPE',
   'D365FO_BRIDGE_LOG_FILE',
+  'D365FO_XREF_DB_SERVER',
+  'D365FO_XREF_DB_NAME',
 ] as const;
 
 let savedEnv: Partial<Record<string, string>> = {};
@@ -485,5 +487,45 @@ describe('getWorkspaceInfoDiagnostics provenance', () => {
     const diag = await mgr.getWorkspaceInfoDiagnostics();
     expect(diag.customPackagesPath).toBeNull();
     expect(diag.customPackagesSource).toBe('(not configured)');
+  });
+});
+
+// ─── Cross-reference database ────────────────────────────────────────────────
+// The XPP config exists only on UDE, so on a traditional VM the configured
+// setting (bridge.xrefDbServer / bridge.xrefDbName) is the only way to point the
+// bridge at DYNAMICSXREFDB. Precedence: configured value, then XPP config, then null.
+
+describe('cross-reference database', () => {
+  const ude = { xrefDbServer: 'ude-sql.example', xrefDbName: 'UdeXref' };
+
+  it('is off on a traditional VM when nothing configures it', async () => {
+    const mgr = makeManager();
+    expect(await mgr.getXrefDbServer()).toBeNull();
+    expect(await mgr.getXrefDbName()).toBeNull();
+  });
+
+  it('uses the configured values on a traditional VM', async () => {
+    process.env.D365FO_XREF_DB_SERVER = 'localhost';
+    process.env.D365FO_XREF_DB_NAME = 'DYNAMICSXREFDB';
+    const mgr = makeManager();
+    expect(await mgr.getXrefDbServer()).toBe('localhost');
+    expect(await mgr.getXrefDbName()).toBe('DYNAMICSXREFDB');
+  });
+
+  it('falls back to the XPP config (UDE) when nothing is configured', async () => {
+    const mgr = makeManager();
+    (mgr as any).xppConfig = ude;
+    expect(await mgr.getXrefDbServer()).toBe('ude-sql.example');
+    expect(await mgr.getXrefDbName()).toBe('UdeXref');
+  });
+
+  it('lets a configured value win over the XPP config, field by field', async () => {
+    process.env.D365FO_XREF_DB_NAME = 'OtherXref';
+    process.env.D365FO_XREF_DB_SERVER = '   ';
+    const mgr = makeManager();
+    (mgr as any).xppConfig = ude;
+    expect(await mgr.getXrefDbName()).toBe('OtherXref');
+    // A blank value counts as unset.
+    expect(await mgr.getXrefDbServer()).toBe('ude-sql.example');
   });
 });

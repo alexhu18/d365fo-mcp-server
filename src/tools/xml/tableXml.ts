@@ -17,6 +17,8 @@ import { escapeXml } from '../../utils/xmlEscape.js';
 import { axTableFieldElement, baseTypeFromEdtName, normalizeFieldBaseType } from '../../utils/axFieldTypes.js';
 import { renderAxTableProperties } from '../../utils/axTablePropertyOrder.js';
 import { isYes } from './dataEntityXml.js';
+import { tableSubscriberAccessLevel } from '../../utils/subscriberAccessLevel.js';
+import { yesNo } from './tableFieldPropertyEdit.js';
 
 /** Field spec as accepted by the tool surface; every key is optional but `name`. */
 export interface AxTableFieldSpec {
@@ -27,6 +29,12 @@ export interface AxTableFieldSpec {
   enumType?: string;
   mandatory?: boolean;
   label?: string;
+  /** AllowEdit — false/"No" writes <AllowEdit>No</AllowEdit> (staging key fields). */
+  allowEdit?: boolean | string;
+  /** IgnoreEDTRelation — true/"Yes" writes <IgnoreEDTRelation>Yes</IgnoreEDTRelation>. */
+  ignoreEdtRelation?: boolean | string;
+  /** Same as ignoreEdtRelation — the spelling fieldPropertiesFromSpecs also accepts. */
+  ignoreEDTRelation?: boolean | string;
 }
 
 /** X++ source already split by the caller (see XmlTemplateGenerator.parseSourceForBridge). */
@@ -180,7 +188,12 @@ export function buildAxTableFieldsXml(fieldSpecs: AxTableFieldSpec[]): string {
       ?? fieldTypeToAxType(f.type || (f.enumType ? 'Enum' : 'String'), f.edt);
     xml += `\t\t<AxTableField xmlns=""\n\t\t\ti:type="${iType}">\n`;
     xml += `\t\t\t<Name>${f.name}</Name>\n`;
+    // Order: Name, AllowEdit, ExtendedDataType, IgnoreEDTRelation, Label, Mandatory, EnumType.
+    const allowEdit = yesNo(f.allowEdit);
+    if (allowEdit)   xml += `\t\t\t<AllowEdit>${allowEdit}</AllowEdit>\n`;
     if (f.edt)       xml += `\t\t\t<ExtendedDataType>${f.edt}</ExtendedDataType>\n`;
+    const ignoreRel = yesNo(f.ignoreEdtRelation ?? f.ignoreEDTRelation);
+    if (ignoreRel)   xml += `\t\t\t<IgnoreEDTRelation>${ignoreRel}</IgnoreEDTRelation>\n`;
     if (f.label)     xml += `\t\t\t<Label>${escapeXml(f.label)}</Label>\n`;
     if (f.mandatory) xml += `\t\t\t<Mandatory>Yes</Mandatory>\n`;
     if (f.enumType)  xml += `\t\t\t<EnumType>${f.enumType}</EnumType>\n`;
@@ -214,6 +227,10 @@ export function buildAxTableXml(
     FormRef: properties?.formRef,
     Label: properties?.label || tableName,
     TableGroup: properties?.tableGroup || 'Main',
+    // Read=Allow, as Visual Studio writes on a new table, unless the caller set
+    // one; none on TempDB/InMemory. An invalid value is left for the create
+    // reconcile to report.
+    SubscriberAccessLevel: tableSubscriberAccessLevel(properties?.subscriberAccessLevel, properties?.tableType),
     TitleField1: properties?.titleField1,
     TitleField2: properties?.titleField2,
     // Dual-write's table-side prerequisite; without it the entity syncs once

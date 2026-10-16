@@ -169,11 +169,16 @@ namespace D365MetadataBridge.Services
 
             var pathVariants = new List<string>();
             bool memberQualified = false;
-            if (objectPath.StartsWith("/"))
+            if (objectPath.Contains("/"))
             {
-                // Explicit AOT path — use exactly as given (e.g. /Tables/SalesTable/Methods/initFromX).
+                // Explicit path — as given: an AOT path ("/Tables/SalesTable/Methods/initFromX")
+                // or a metadata one ("Table/SalesTable"). An X++ one gets its metadata twin below.
                 pathVariants.Add(objectPath);
-                memberQualified = objectPath.Contains("/Methods/") || objectPath.Contains("/Fields/");
+                memberQualified = objectPath.Contains("/Methods/") || objectPath.Contains("/Fields/") ||
+                    objectPath.Contains("/Method/") || objectPath.Contains("/TableField") ||
+                    objectPath.Contains("/EnumValues/") || objectPath.Contains("/EnumValue/") ||
+                    objectPath.Contains("/TableIndexs/") || objectPath.Contains("/TableIndex/") ||
+                    objectPath.Contains("/TableFieldGroups/") || objectPath.Contains("/TableFieldGroup/");
             }
             else if (objectPath.Contains("."))
             {
@@ -190,16 +195,33 @@ namespace D365MetadataBridge.Services
                     pathVariants.Add($"/{c}/{owner}/Methods/{member}");
                     pathVariants.Add($"/{c}/{owner}/Fields/{member}");
                 }
+                pathVariants.Add($"/Enums/{owner}/EnumValues/{member}");
+                // "Form.DataSource.method": a form data source's method.
+                var ownerDot = owner.IndexOf('.');
+                if (ownerDot > 0 && owner.IndexOf('.', ownerDot + 1) < 0)
+                    pathVariants.Add($"/Forms/{owner.Substring(0, ownerDot)}/DataSources/{owner.Substring(ownerDot + 1)}/Methods/{member}");
             }
             else
             {
                 // Bare name — we do not know which AOT type it is, so try every container
-                // that can be the TARGET of a reference. All of these were verified against a
-                // live DYNAMICSXREFDB: the target convention is plural + leading slash, even
-                // though SOURCE paths for declarative metadata use the singular, slash-free
-                // form ("EdtString/Foo?HelpText") that parseLabelSource() on the TS side
-                // handles. In particular an EDT is "/Edts/<name>" — NOT "/EdtString/<name>":
-                // the concrete subtype appears only in source paths.
+                // that can be the TARGET of a reference. A target is stored in one of TWO
+                // shapes, depending on which provider wrote the reference:
+                //
+                //   X++ code (provider Xppc.exe): plural + leading slash — "/Tables/<name>",
+                //     "/Edts/<name>", children "/Tables/<name>/Fields/<f>", ".../Methods/<m>".
+                //   Declarative metadata (provider Metadata): singular, NO leading slash, and
+                //     for an EDT its concrete subtype — "Table/<name>", "Form/<name>",
+                //     "EdtString/<name>", children "Table/<name>/TableFieldString/<f>",
+                //     "Table/<name>/Method/<m>". Source paths of these rows carry the referencing
+                //     property ("Form/F/FormDataSourceRoot/<name>?Table").
+                //
+                // Only the first shape used to be queried, on the belief — stated here — that
+                // targets were always plural + slash. On a live DYNAMICSXREFDB (platform
+                // 7.0.7858, 19.5M references) the second shape holds 2.3M of them, every one
+                // Kind 2: a table's form data sources, relations, entity mappings and field
+                // bindings, and the table fields typed with an EDT. A where-used on a custom
+                // table returned 334 of its 785 references; on a custom EDT, 12 of 108, and
+                // none of the fields using it.
                 //
                 // Edts/Maps/Reports/MenuItem* were missing here, so a where-used on any of
                 // them returned zero rows and the TS caller silently degraded to its
@@ -216,6 +238,17 @@ namespace D365MetadataBridge.Services
                     pathVariants.Add($"/{c}/{objectPath}");
                 }
             }
+
+            // Every X++-shaped target also exists in the metadata shape; query both,
+            // whichever way the target was given. A table field or enum value may also come
+            // from an extension, which is matched by pattern (see AddExtensionMembers).
+            var extensionPatterns = new List<string>();
+            foreach (var p in pathVariants.ToList())
+            {
+                AddMetadataTwins(p, pathVariants);
+                AddExtensionMembers(p, extensionPatterns);
+            }
+            pathVariants = pathVariants.Distinct(StringComparer.Ordinal).ToList();
 
             // Also add sub-paths (methods, fields) so we catch method-level references.
             // A member-qualified target already points at an exact leaf path, so adding
@@ -241,31 +274,52 @@ namespace D365MetadataBridge.Services
                 allParams.Add(($"@P{i}", pathVariants[i]));
             }
             var likeConditions = new List<string>();
-            for (int i = 0; i < extraPaths.Count; i++)
+            var likePatterns = extraPaths.Concat(extensionPatterns).ToList();
+            for (int i = 0; i < likePatterns.Count; i++)
             {
                 var pname = $"@L{i}";
                 likeConditions.Add($"tgt.Path LIKE {pname}");
-                allParams.Add((pname, extraPaths[i]));
+                allParams.Add((pname, likePatterns[i]));
             }
 
             var whereClause = $"tgt.Path IN ({string.Join(",", paramNames)})";
             if (likeConditions.Count > 0)
                 whereClause += $" OR {string.Join(" OR ", likeConditions)}";
 
+            // Rows are capped PER SHAPE and the totals counted separately. With one cap for
+            // both, rows sorted by source path put every "/Classes/…" code row before any
+            // "Form/…" metadata row, so a table with 500 code references (CustTable)
+            // returned no metadata at all — the very rows this lookup exists to add. The
+            // candidate names are resolved once: the LIKEs against Names are the costly
+            // part, the joins on [References].TargetId are indexed. The totals join the
+            // source name exactly as the rows do: [References] keeps rows whose SourceId is
+            // no longer in Names (77 of the 93 references to one table field on a live
+            // database), and counting those made the rows look like a sample of a total
+            // nobody could list.
+            string ShapeRows(string shape) => $@"
+                SELECT * FROM (
+                    SELECT TOP ({RowsPerShape})
+                        src.Path AS SourcePath, t.Path AS TargetPath, sm.Module AS SourceModule,
+                        r.Kind, r.Line, r.[Column]
+                    FROM #xrefTargets t
+                    INNER JOIN [References] r ON r.TargetId = t.Id
+                    INNER JOIN dbo.Names src ON src.Id = r.SourceId
+                    LEFT  JOIN dbo.Modules sm ON sm.Id = src.ModuleId
+                    WHERE {shape}
+                    ORDER BY src.Path, r.Line) AS shapeRows";
             var query = $@"
-                SELECT TOP 500
-                    src.Path AS SourcePath,
-                    tgt.Path AS TargetPath,
-                    sm.Module AS SourceModule,
-                    r.Kind,
-                    r.Line,
-                    r.[Column]
-                FROM [References] r
-                INNER JOIN dbo.Names tgt ON tgt.Id = r.TargetId
-                INNER JOIN dbo.Names src ON src.Id = r.SourceId
-                LEFT  JOIN dbo.Modules sm ON sm.Id = src.ModuleId
-                WHERE ({whereClause})
-                ORDER BY src.Path, r.Line";
+                SELECT tgt.Id, tgt.Path INTO #xrefTargets FROM dbo.Names tgt WHERE ({whereClause});
+                SELECT SourcePath, TargetPath, SourceModule, Kind, Line, [Column] FROM (
+                    {ShapeRows("t.Path LIKE N'/%'")}
+                    UNION ALL
+                    {ShapeRows("t.Path NOT LIKE N'/%'")}
+                ) AS rows
+                ORDER BY CASE WHEN TargetPath LIKE N'/%' THEN 0 ELSE 1 END, SourcePath, Line;
+                SELECT COUNT(*), SUM(CASE WHEN t.Path LIKE N'/%' THEN 0 ELSE 1 END)
+                FROM #xrefTargets t INNER JOIN [References] r ON r.TargetId = t.Id
+                INNER JOIN dbo.Names src ON src.Id = r.SourceId;
+                DROP TABLE #xrefTargets;";
+            int total = 0, metadataTotal = 0;
 
             try
             {
@@ -300,6 +354,11 @@ namespace D365MetadataBridge.Services
                                     CallerMethod = srcSeg == "Methods" ? srcSegName : null,
                                 });
                             }
+                            if (reader.NextResult() && reader.Read())
+                            {
+                                total = reader.IsDBNull(0) ? 0 : reader.GetInt32(0);
+                                metadataTotal = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
+                            }
                         }
                     }
                 }
@@ -309,7 +368,153 @@ namespace D365MetadataBridge.Services
                 throw QueryFailed("findReferences", objectPath, ex);
             }
 
-            return new { objectPath, count = references.Count, references };
+            // count: rows returned; total / metadataTotal: every matching reference.
+            return new { objectPath, count = references.Count, total, metadataTotal, references };
+        }
+
+        /// <summary>Rows returned per target shape (X++ code, declarative metadata).</summary>
+        private const int RowsPerShape = 500;
+
+        /// <summary>
+        /// The singular metadata type names a plural X++ container is stored under, with
+        /// every EDT subtype found as a target in a live DYNAMICSXREFDB.
+        /// </summary>
+        private static readonly Dictionary<string, string[]> MetadataTypes = new Dictionary<string, string[]>(StringComparer.Ordinal)
+        {
+            ["Tables"] = new[] { "Table" },
+            ["Classes"] = new[] { "Class" },
+            ["Enums"] = new[] { "Enum" },
+            ["Views"] = new[] { "View" },
+            ["DataEntityViews"] = new[] { "DataEntityView" },
+            ["Queries"] = new[] { "QuerySimple", "QueryComposite" },
+            ["Forms"] = new[] { "Form" },
+            ["Maps"] = new[] { "Map" },
+            ["Reports"] = new[] { "Report" },
+            ["MenuItemDisplays"] = new[] { "MenuItemDisplay" },
+            ["MenuItemActions"] = new[] { "MenuItemAction" },
+            ["MenuItemOutputs"] = new[] { "MenuItemOutput" },
+            ["Edts"] = new[]
+            {
+                "EdtString", "EdtReal", "EdtEnum", "EdtInt64", "EdtDate", "EdtInt", "EdtUtcDateTime",
+                "EdtContainer", "EdtGuid", "EdtTime",
+            },
+        };
+
+        /// <summary>
+        /// The segment a field is stored under in the metadata shape, per container — it
+        /// names the field's type, so there is one per type. Every segment found as a
+        /// target in a live DYNAMICSXREFDB. Listed rather than matched with
+        /// "TableField%": in LIKE "%" also crosses "/", so "Table/T/TableField%/Name"
+        /// matched the field group "Table/T/TableFieldGroup/Name" as well — and a table
+        /// with a field and a field group of the same name is common
+        /// (AccountingDistributionTemplate.Name).
+        /// </summary>
+        private static readonly Dictionary<string, string[]> MetadataFieldSegments = new Dictionary<string, string[]>(StringComparer.Ordinal)
+        {
+            ["Tables"] = new[]
+            {
+                "TableFieldString", "TableFieldEnum", "TableFieldReal", "TableFieldInt64", "TableFieldInt",
+                "TableFieldDate", "TableFieldUtcDateTime", "TableFieldGuid", "TableFieldContainer", "TableFieldTime",
+            },
+            ["Maps"] = new[]
+            {
+                "MapFieldString", "MapFieldEnum", "MapFieldReal", "MapFieldInt64", "MapFieldInt",
+                "MapFieldDate", "MapFieldUtcDateTime", "MapFieldGuid", "MapFieldContainer", "MapFieldTime",
+            },
+            ["Views"] = new[]
+            {
+                "ViewFieldBound", "ViewFieldComputedString", "ViewFieldComputedEnum", "ViewFieldComputedReal",
+                "ViewFieldComputedInt64", "ViewFieldComputedInt", "ViewFieldComputedDate", "ViewFieldComputedUtcDateTime",
+            },
+            ["DataEntityViews"] = new[]
+            {
+                "DataEntityViewMappedField", "DataEntityViewUnmappedFieldString", "DataEntityViewUnmappedFieldEnum",
+                "DataEntityViewUnmappedFieldReal", "DataEntityViewUnmappedFieldInt64", "DataEntityViewUnmappedFieldInt",
+                "DataEntityViewUnmappedFieldDate", "DataEntityViewUnmappedFieldUtcDateTime",
+                "DataEntityViewUnmappedFieldGuid", "DataEntityViewUnmappedFieldContainer",
+            },
+        };
+
+        /// <summary>
+        /// Add the metadata twin of an X++-shaped target path: "/Tables/T" → "Table/T",
+        /// "/Edts/E" → "EdtString/E", … ; for a member, "/Views/V/Methods/m" →
+        /// "View/V/Method/m" (tables, classes, forms, views, data entities, maps) and
+        /// "/Tables/T/Fields/f" → "Table/T/TableFieldString/f", "Table/T/TableFieldEnum/f", …
+        /// (tables, maps, views, data entities); "/Tables/T/TableIndexs/i" → "Table/T/TableIndex/i",
+        /// "/Tables/T/TableFieldGroups/g" → "Table/T/TableFieldGroup/g"; a form data source's
+        /// method "/Forms/F/DataSources/DS/Methods/m" → "Form/F/FormDataSourceRoot/DS/Method/m".
+        /// Metadata-shaped and unknown paths add nothing.
+        /// </summary>
+        private static void AddMetadataTwins(string xppPath, List<string> exact)
+        {
+            if (!xppPath.StartsWith("/")) return;
+            var parts = xppPath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2 || !MetadataTypes.TryGetValue(parts[0], out var types)) return;
+            if (parts.Length == 2)
+            {
+                foreach (var t in types) exact.Add($"{t}/{parts[1]}");
+            }
+            else if (parts.Length == 4)
+            {
+                if (parts[2] == "Methods")
+                {
+                    foreach (var t in types) exact.Add($"{t}/{parts[1]}/Method/{parts[3]}");
+                }
+                else if (parts[2] == "Fields" && MetadataFieldSegments.TryGetValue(parts[0], out var segments))
+                {
+                    foreach (var t in types)
+                        foreach (var s in segments) exact.Add($"{t}/{parts[1]}/{s}/{parts[3]}");
+                }
+                else if (parts[2] == "EnumValues" && parts[0] == "Enums")
+                {
+                    exact.Add($"Enum/{parts[1]}/EnumValue/{parts[3]}");
+                }
+                // X++ spells these "TableIndexs" / "TableFieldGroups"; metadata singular.
+                else if (parts[2] == "TableIndexs")
+                {
+                    foreach (var t in types) exact.Add($"{t}/{parts[1]}/TableIndex/{parts[3]}");
+                }
+                else if (parts[2] == "TableFieldGroups")
+                {
+                    foreach (var t in types) exact.Add($"{t}/{parts[1]}/TableFieldGroup/{parts[3]}");
+                }
+            }
+            else if (parts.Length == 6 && parts[0] == "Forms" && parts[2] == "DataSources" && parts[4] == "Methods")
+            {
+                // A form data source's method: "/Forms/F/DataSources/DS/Methods/m" and
+                // "Form/F/FormDataSourceRoot/DS/Method/m". Every data source is stored at the
+                // root, joined ones included, under its own name (not its table's).
+                exact.Add($"Form/{parts[1]}/FormDataSourceRoot/{parts[3]}/Method/{parts[5]}");
+            }
+        }
+
+        /// <summary>
+        /// A field a table extension adds, and a value an enum extension adds, are stored
+        /// under the extension only, in both shapes: "/TableExtensions/T.Ext/Fields/f" and
+        /// "TableExtension/T.Ext/TableFieldString/f", "/EnumExtensions/E.Ext/EnumValues/v"
+        /// and "EnumExtension/E.Ext/EnumValue/v". On a live DYNAMICSXREFDB that is 17,788 and
+        /// 8,769 references, and a where-used on "PurchLine.&lt;added field&gt;" found none of them:
+        /// "/Tables/PurchLine/Fields/&lt;f&gt;" has no references at all. An extension is always
+        /// named "&lt;base&gt;.&lt;suffix&gt;" (every one of the 1,104 on that database), so the
+        /// suffix is the only wildcard; the member segment after it is exact.
+        /// </summary>
+        private static void AddExtensionMembers(string xppPath, List<string> patterns)
+        {
+            var parts = xppPath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (!xppPath.StartsWith("/") || parts.Length != 4) return;
+            var baseName = EscapeLike(parts[1]);
+            var member = EscapeLike(parts[3]);
+            if (parts[0] == "Tables" && parts[2] == "Fields")
+            {
+                patterns.Add($"/TableExtensions/{baseName}.%/Fields/{member}");
+                foreach (var s in MetadataFieldSegments["Tables"])
+                    patterns.Add($"TableExtension/{baseName}.%/{s}/{member}");
+            }
+            else if (parts[0] == "Enums" && parts[2] == "EnumValues")
+            {
+                patterns.Add($"/EnumExtensions/{baseName}.%/EnumValues/{member}");
+                patterns.Add($"EnumExtension/{baseName}.%/EnumValue/{member}");
+            }
         }
 
         // ============================================================

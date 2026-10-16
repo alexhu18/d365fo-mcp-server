@@ -265,24 +265,39 @@ describe('a derived base does not swallow the token the rules check for', () => 
 /**
  * A name the check passes must also be the name the write path uses.
  *
- * An assembled name like `CustTable_CR_Table_Extension` satisfies every rule — it starts
+ * An assembled name like `UnknownBase_CR_Table_Extension` satisfies every rule — it starts
  * with a base, ends with _Extension, embeds CR — and then lands on disk as
- * `CustTable_CR_TableCR_Extension`, because the trailing "_Extension" makes the whole
- * string read as a base class and the infix is applied a second time. The caller looks
+ * `UnknownBase_CR_TableCR_Extension`, because nothing says where the base stops, the
+ * whole stem reads as a base class and the infix is applied a second time. (When the
+ * base is known — from [ExtensionOf] or the index — the name is kept; see #1103.) The caller looks
  * for the file under the name it asked for. Same shape as #986/#987, where the checker
  * and the writer disagreed in the other direction.
  */
 describe('the check discloses the name the write path will actually use', () => {
-  it('names the rewritten form for an assembled extension-class name', async () => {
-    const written = normalizeObjectName('CustTable_CR_Table_Extension', 'class-extension', MODEL);
-    expect(written).toBe('CustTable_CR_TableCR_Extension');
+  it('names the rewritten form for an assembled name whose base the index does not know', async () => {
+    const written = normalizeObjectName('UnknownBase_CR_Table_Extension', 'class-extension', MODEL);
+    expect(written).toBe('UnknownBase_CR_TableCR_Extension');
+
+    const out = textOf(await validateObjectNamingTool(
+      req('validate_object_naming', { proposedName: 'UnknownBase_CR_Table_Extension', objectType: 'class-extension' }),
+      buildContext()));
+
+    expect(out).toMatch(/will not use this name as given/i);
+    expect(out).toContain(written);
+  });
+
+  it('keeps an assembled name whose base the index knows — as create does (#1103)', async () => {
+    // CustTable|_CR|_Table: the token follows a known base as its own word, so create
+    // (reading [ExtensionOf], or the index without one) writes the name as given.
+    expect(normalizeObjectName('CustTable_CR_Table_Extension', 'class-extension', MODEL, undefined, { extendedBase: 'CustTable' }))
+      .toBe('CustTable_CR_Table_Extension');
 
     const out = textOf(await validateObjectNamingTool(
       req('validate_object_naming', { proposedName: 'CustTable_CR_Table_Extension', objectType: 'class-extension' }),
       buildContext()));
 
-    expect(out).toMatch(/will not use this name as given/i);
-    expect(out).toContain(written);
+    expect(out).not.toMatch(/will not use this name as given/i);
+    expect(out).not.toContain('CustTable_CR_TableCR_Extension');
   });
 
   it('says nothing for a name the write path returns untouched', async () => {
