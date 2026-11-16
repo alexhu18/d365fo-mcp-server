@@ -44,6 +44,11 @@ import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { canonicalSymbolName, lookupSymbolNocase } from '../../utils/symbolLookup.js';
 import { scaffoldWriteRefusalResult } from '../write/writeAnchorGuard.js';
 import { upsertWrittenFileIntoIndex } from '../write/inlineIndexUpsert.js';
+import { recordCreatedArtifact } from '../../workspace/createdArtifactLedger.js';
+import { reconcileTableCreateProperties } from '../xml/createTablePropertyHonesty.js';
+import { fieldEdtNames, resolveEdtRelations } from '../xml/edtRelationResolver.js';
+import { applyMenuItemBpDefaults } from '../xml/menuItemBpDefaults.js';
+import { menuItemKindOf } from '../../utils/bpCreateDefaults.js';
 
 /**
  * The field a report temp table's unique index is built on.
@@ -1143,6 +1148,24 @@ export async function handleGenerateSmartReport(
   });
   log(`Generated Report: ${finalName} (${reportFieldDefs.length} fields, ${reportContractParams.length} contract params, ${resolvedExtraDatasets.length} extra datasets)`);
 
+  // ── BP defaults ────────────────────────────────────────────────────────────
+  // The same defaults d365fo_file(create) writes: OperationalDomain Local and No
+  // Access on the TempDB tables, key fields, field groups and EDT relations on
+  // them (xppbp checks TempDB tables too), and OperationalDomain plus Read on
+  // the output menu item. See bpCreateDefaults.ts and tableBpDefaults.ts.
+  {
+    let db: unknown;
+    try { db = symbolIndex.getReadDb(); } catch { db = undefined; }
+    for (const obj of generatedObjects) {
+      if (obj.aotFolder === 'AxTable') {
+        const edtRelations = await resolveEdtRelations(fieldEdtNames(obj.content), db);
+        obj.content = reconcileTableCreateProperties(obj.content, undefined, { edtRelations, dropWriterDeleteActions: true }).xml;
+      } else if (menuItemKindOf(obj.aotFolder)) {
+        obj.content = applyMenuItemBpDefaults(obj.content).xml;
+      }
+    }
+  }
+
   // ── Output ─────────────────────────────────────────────────────────────────
   const objectSummary = generatedObjects.map(o => `   - ${o.objectType}: **${o.objectName}**`).join('\n');
 
@@ -1232,12 +1255,15 @@ export async function handleGenerateSmartReport(
       continue;
     }
 
+    // Only a file this call brings into being may later be deleted by undo.
+    const existedBefore = fs.existsSync(normalizedPath);
     fs.writeFileSync(normalizedPath, normalizeD365Xml(obj.content), 'utf-8');
     // Same reason as the other generators: an object the index never hears
     // about is missing from the untyped `search` that now answers from it.
     await upsertWrittenFileIntoIndex(normalizedPath, { symbolIndex });
 
     let projectMsg = '';
+    let addedToProject: string | undefined;
     if (effectiveProjectPath) {
       try {
         const projectManager = new ProjectFileManager({ withinSolutionRoots: true });
@@ -1247,10 +1273,14 @@ export async function handleGenerateSmartReport(
           obj.objectName,
           normalizedPath
         );
+        if (wasAdded) addedToProject = effectiveProjectPath;
         projectMsg = wasAdded ? ' ✅ added to project' : ' (already in project)';
       } catch (e) {
         projectMsg = ` ⚠️ project add failed: ${e instanceof Error ? e.message : String(e)}`;
       }
+    }
+    if (!existedBefore) {
+      recordCreatedArtifact({ filePath: normalizedPath, objectType: obj.objectType, objectName: obj.objectName, projectPath: addedToProject });
     }
 
     results.push(`📁 ${obj.objectType}: ${normalizedPath}${projectMsg}`);

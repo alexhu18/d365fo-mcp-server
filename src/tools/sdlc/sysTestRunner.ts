@@ -1,5 +1,5 @@
 import { execFile } from 'child_process';
-import { parseSysTestXml } from './sysTestXml.js';
+import { parseSysTestXml, type SysTestCaseOutcome } from './sysTestXml.js';
 import util from 'util';
 import path from 'path';
 import os from 'os';
@@ -9,6 +9,17 @@ import { defaultPackagesRoot } from '../../utils/packagesRoot.js';
 import { readAppSetting } from '../../utils/appSettings.js';
 import { withOperationLock } from '../../utils/operationLocks.js';
 import { wasCreatedThisSession } from '../../workspace/createdArtifactLedger.js';
+import { findD365FileOnDisk } from '../../utils/objectFileLookup.js';
+import { DEFAULT_DATAVERSE_CLIENT_ID, getDataverseAccessToken, readDataverseSettings } from '../../utils/dataverseAuth.js';
+import {
+  buildTestSuiteXml,
+  type DataverseClient,
+  findRuntimeAssembly,
+  parseTrxResults,
+  readTestClass,
+  runTestRequestInCloud,
+  saveTrx,
+} from './udeSysTest.js';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -65,10 +76,12 @@ function describeSetting(key: string, value: string | undefined): string {
 export async function compareSysTestDataAccess(
   packagesRoot: string,
   webConfigPath = path.join(packagesRoot, '..', 'WebRoot', 'web.config'),
+  /** The .config of the binary that ran: a versioned SysTestConsole has its own. */
+  runnerConfigPath = path.join(packagesRoot, 'Bin', 'SysTestConsole.exe.config'),
 ): Promise<DataAccessDrift[] | undefined> {
   try {
     const [runnerXml, aosXml] = await Promise.all([
-      fs.readFile(path.join(packagesRoot, 'Bin', 'SysTestConsole.exe.config'), 'utf-8'),
+      fs.readFile(runnerConfigPath, 'utf-8'),
       fs.readFile(webConfigPath, 'utf-8'),
     ]);
 
@@ -84,6 +97,68 @@ export async function compareSysTestDataAccess(
   } catch {
     return undefined;
   }
+}
+
+/** `SysTestConsole.exe`, or a versioned `SysTestConsole.17.0.exe`; group 1 is the version. */
+const SYSTEST_CONSOLE_RE = /^SysTestConsole((?:\.\d+)+)?\.exe$/i;
+
+/**
+ * Every SysTestConsole binary in `binDir`, in the order to try them; empty when there is none.
+ *
+ * Current platforms ship it named after the test platform it targets — `SysTestConsole.17.0.exe`
+ * (#1143) — and an upgraded box keeps the plain `SysTestConsole.exe` of the platform it started on.
+ * Seen on a 7.0.7858 dev VM: `SysTestConsole.17.0.exe` at 7.0.7858.111, the same build as xppc.exe,
+ * beside a `SysTestConsole.exe` at 7.0.7452.66 left from December 2024. So the highest versioned
+ * name comes first, compared as numbers, and the plain name last.
+ *
+ * Last, not dropped: on another 7.0.7858 VM the versioned one cannot start at all (System.ValueTuple
+ * 4.0.3.0 is not in Bin) and its .config is the unconfigured template, while the plain one beside it
+ * was configured and runs green. The caller falls back along this list when a runner cannot start.
+ */
+export async function findSysTestConsoles(binDir: string): Promise<string[]> {
+  let names: string[] = [];
+  try {
+    names = await fs.readdir(binDir);
+  } catch { /* unreadable: only the plain name can still be probed */ }
+  const found = names
+    .map(name => ({ name, version: SYSTEST_CONSOLE_RE.exec(name)?.[1] }))
+    .filter((c): c is { name: string; version: string } => !!c.version)
+    .map(c => ({ name: c.name, parts: c.version.slice(1).split('.').map(Number) }))
+    .sort((a, b) => compareVersionParts(b.parts, a.parts))
+    .map(c => path.join(binDir, c.name));
+  const plain = path.join(binDir, 'SysTestConsole.exe');
+  try {
+    await fs.access(plain);
+    found.push(plain);
+  } catch { /* none */ }
+  return found;
+}
+
+/** The SysTestConsole to try first in `binDir`, or null when there is none. */
+export async function findSysTestConsole(binDir: string): Promise<string | null> {
+  return (await findSysTestConsoles(binDir))[0] ?? null;
+}
+
+/**
+ * Why a SysTestConsole run never got as far as a test, or null when it did (or failed some other
+ * way). Only these two are worth retrying with another SysTestConsole: both live in the binary's
+ * own .config and Bin, which a second binary does not share.
+ */
+function runnerStartupFault(error: any): string | null {
+  const output = [error?.stdout, error?.stderr, error?.message].filter(Boolean).join('\n');
+  const assembly = /Could not load file or assembly '([^']+?),\s*Version=([\d.]+)/i.exec(output);
+  if (assembly) return `${assembly[1]} ${assembly[2]} would not load`;
+  const login = /Login failed for user '([^']+)'/i.exec(output);
+  if (login) return `its .config could not log in as '${login[1]}'`;
+  return null;
+}
+
+function compareVersionParts(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
 }
 
 // This handler has no schema of its own — it is reached through a unified
@@ -149,15 +224,218 @@ export function renderRedPhaseNote(
   return '';
 }
 
+/**
+ * Counts, then the failures, then the passes: which test failed and why is the answer being
+ * asked for, and the response cap keeps the head of the text. '' when there is nothing to list.
+ */
+export function renderOutcomeList(outcomes: readonly SysTestCaseOutcome[]): string {
+  if (outcomes.length === 0) return '';
+  const failed = outcomes.filter(o => !o.passed);
+  const passed = outcomes.filter(o => o.passed);
+  return `\n\n${passed.length}/${outcomes.length} passed` +
+    (failed.length > 0 ? `, ${failed.length} failed.` : '.') +
+    '\n\n' + [...failed, ...passed]
+    .map(o => `${o.passed ? '✅' : '❌'} ${o.name}${o.message ? ` — ${o.message}` : ''}`)
+    .join('\n');
+}
+
+const notRun = (text: string) => ({ content: [{ type: 'text', text: `❌ ${text}` }], isError: true });
+
+/** How many base classes up the test methods of a class are looked for. */
+const MAX_TEST_BASE_DEPTH = 5;
+
+/** An X++ class or method name. They become file paths here, so nothing else is accepted. */
+const XPP_IDENTIFIER = /^[A-Za-z_]\w*$/;
+
+/** For a box wrongly detected as UDE: the setup replies point at UDE-only settings otherwise. */
+const NOT_UDE_HINT = '\n\nIf this machine is not a UDE box, set `environment.type` (D365FO_DEV_ENVIRONMENT_TYPE) to ' +
+  '"traditional": UDE is detected from the XPP config files in %LOCALAPPDATA%\\Microsoft\\Dynamics365\\XPPConfig.';
+
+/**
+ * A test class on a UDE box, run in the cloud runtime (see udeSysTest.ts for the protocol).
+ *
+ * SysTestConsole cannot be used there at all: it runs tests against a local AOS, and a UDE
+ * machine has none — started from the framework Bin it dies with "Failed to obtain app setting
+ * from for: Common.HostingEnvironment" before the first test. Visual Studio's test adapter sends
+ * UDE tests to the cloud runtime through the environment's Dataverse instead, and so does this.
+ *
+ * Tests run against the code DEPLOYED to the environment, not the local build, so the reply says
+ * which environment ran them and that an undeployed change is not in the result.
+ */
+async function runSysTestOnUde(
+  params: { className: string; testMethod?: string; modelName?: string },
+  configManager: ReturnType<typeof getConfigManager>,
+) {
+  const className = String(params.className ?? '').trim();
+  // `Class::method` and `Class.method` are what the results print; accept them as well.
+  const focus = params.testMethod?.trim().replace(/^.*(::|\.)/, '') || undefined;
+  const fallback = `Until then, run \`${className}\` from Visual Studio Test Explorer and ask the user for the result.`;
+
+  if (!XPP_IDENTIFIER.test(className)) return notRun(`Invalid parameter: className "${className}" is not an X++ class name.`);
+  if (focus && !XPP_IDENTIFIER.test(focus)) return notRun(`Invalid parameter: testMethod "${focus}" is not an X++ method name.`);
+
+  const modelName = params.modelName || configManager.getModelName() || await configManager.getAutoDetectedModelName();
+  if (!modelName) return notRun('Cannot determine model name.\n\nProvide modelName parameter or set it in .mcp.json.');
+  try {
+    assertSafePath(modelName, 'modelName');
+  } catch (error: any) {
+    return notRun(`Invalid parameter: ${error.message}`);
+  }
+
+  // The class file names the package, which names the module assembly the runtime loads.
+  const classFile = await findD365FileOnDisk('class', className, modelName);
+  if (!classFile) {
+    return notRun(`Class \`${className}\` was not found in model \`${modelName}\`, so no test ran.\n\n` +
+      'Check the class name, or pass modelName when the test class lives in another model.');
+  }
+  const packageName = path.basename(path.resolve(classFile, '..', '..', '..'));
+
+  // The test methods: the cloud runtime runs only the methods a request lists.
+  const own = readTestClass(await fs.readFile(classFile, 'utf-8'));
+  if (!own) return notRun(`The declaration of \`${className}\` could not be read, so no test ran.`);
+  if (own.isAbstract) return notRun(`\`${className}\` is abstract; SysTest runs only concrete test classes. No test ran.`);
+  const methods = new Map(own.methods.map(m => [m.name.toLowerCase(), m]));
+  const notes: string[] = [];
+  let base = own.extends;
+  for (let depth = 0; base && !/^SysTest/i.test(base) && depth < MAX_TEST_BASE_DEPTH; depth++) {
+    const baseFile = await findD365FileOnDisk('class', base, modelName);
+    const baseClass = baseFile ? readTestClass(await fs.readFile(baseFile, 'utf-8')) : null;
+    if (!baseClass) {
+      notes.push(`Test methods inherited from \`${base}\` were not looked for: it is not in model \`${modelName}\`.`);
+      break;
+    }
+    // A method the class overrides is already listed under the class's own spelling.
+    for (const m of baseClass.methods) if (!methods.has(m.name.toLowerCase())) methods.set(m.name.toLowerCase(), m);
+    base = baseClass.extends;
+  }
+
+  let selected = [...methods.values()];
+  if (focus) {
+    selected = selected.filter(m => m.name.toLowerCase() === focus.toLowerCase());
+    if (selected.length === 0) {
+      const names = [...methods.values()].map(m => m.name).join(', ') || '(none)';
+      return notRun(`\`${className}\` has no test method named "${focus}", so no test ran.\n\nIts test methods: ${names}.`);
+    }
+  }
+  const inactive = selected.filter(m => m.inactive);
+  const toRun = selected.filter(m => !m.inactive);
+  if (inactive.length > 0) {
+    notes.push(`Skipped, marked [SysTestInactiveTest]: ${inactive.map(m => m.name).join(', ')}.`);
+  }
+  if (toRun.length === 0) {
+    return notRun(`\`${className}\` has no test method to run, so no test ran.\n\n` +
+      'A test method is public, returns void, takes no parameters and is named test… or marked [SysTestMethod].' +
+      (notes.length ? `\n\n${notes.join('\n')}` : ''));
+  }
+
+  // The built module assembly, under the runtime packages folder the cloud runtime knows it by.
+  const runtimeDir = (await configManager.getActiveXppConfig())?.runtimePackagesDirectory;
+  if (!runtimeDir) {
+    return notRun('The XPP config names no RuntimePackagesDirectory, so the test request cannot name the module ' +
+      `assembly. No test ran.\n\n${fallback}${NOT_UDE_HINT}`);
+  }
+  const assemblyPath = await findRuntimeAssembly(runtimeDir, packageName);
+  if (!assemblyPath) {
+    return notRun(`Dynamics.AX.${packageName}.dll was not found under ${runtimeDir}. Build the model ` +
+      `and deploy it to the environment (build_d365fo_project with deploy: true), then run the tests again. No test ran.`);
+  }
+
+  const dataverse = readDataverseSettings();
+  if (!dataverse) {
+    return notRun('Tests on UDE run in the cloud runtime, which this server reaches through the Dataverse ' +
+      'environment the UDE belongs to — and no Dataverse URL is configured. No test ran.\n\n' +
+      'Set `environment.dataverseUrl` (D365FO_DATAVERSE_URL) to that environment\'s URL, e.g. ' +
+      'https://contoso-dev.crm.dynamics.com — not the Finance and Operations URL. `pac org list` or the Power ' +
+      'Platform admin center shows it. Then restart the server. The first run opens a sign-in page in the browser.' +
+      `\n\n${fallback}${NOT_UDE_HINT}`);
+  }
+
+  // Signed in before the lock is taken: a sign-in can take minutes, and a second run of the same
+  // class waiting on the lock should not spend its wait on someone else's browser tab.
+  try {
+    await getDataverseAccessToken(dataverse);
+  } catch (error: any) {
+    return notRun(`Signing in to ${dataverse.url} failed: ${error?.message ?? error}\n\nNo test ran. ` +
+      'Run the tool again to get a new sign-in page.' +
+      (dataverse.clientId === DEFAULT_DATAVERSE_CLIENT_ID
+        ? ' If your tenant blocks the default client, set `environment.dataverseClientId` to your own public ' +
+          'client (redirect URI http://localhost).'
+        : '') +
+      `\n\n${fallback}`);
+  }
+
+  const { xml, cases } = buildTestSuiteXml(assemblyPath, className, toRun.map(m => m.name), classFile);
+  let trx: string;
+  try {
+    const client: DataverseClient = { url: dataverse.url, getToken: () => getDataverseAccessToken(dataverse) };
+    ({ trx } = await withOperationLock(`systest:${modelName}:${className}`, () =>
+      runTestRequestInCloud(client, `${packageName}_${className}_${Date.now()}.tsx`, xml, {
+        log: line => console.error(`[run_systest_class] ${line}`),
+      })));
+  } catch (error: any) {
+    const message = String(error?.message ?? error);
+    if (/Timeout waiting for filesystem lock/i.test(message)) {
+      return notRun(`Another run of \`${className}\` was still in progress and did not finish in time, so this one ` +
+        'did not start. No test ran. Run it again once the other run has reported.');
+    }
+    return notRun(`The tests could not be run in the cloud runtime of ${dataverse.url}: ${message}\n\n` +
+      'No test result came back, and this says nothing about the test class itself. A run that cannot start often ' +
+      'means the model is not deployed to the environment (build_d365fo_project with deploy: true deploys it), or ' +
+      'the sign-in has no access to it.' +
+      `\n\n${fallback}`);
+  }
+
+  const resultFile = await saveTrx(className, trx);
+  const returned = parseTrxResults(trx);
+  if (returned.length === 0) {
+    return notRun(`The cloud runtime of ${dataverse.url} finished, but its results name no test. No test result ` +
+      `came back for ${cases.length} requested method(s).` + (resultFile ? `\n\nResult file: ${resultFile}` : ''));
+  }
+  // A requested method missing from the results did not pass, whatever the others did: count
+  // it as failed, so a run cut short can never read as green.
+  const outcomes: SysTestCaseOutcome[] = [
+    ...returned,
+    ...cases
+      .filter(c => !returned.some(o => o.name.toLowerCase() === c.name.toLowerCase()))
+      .map(c => ({ name: c.name, passed: false, message: 'No result came back for this test.' })),
+  ];
+  const status = outcomes.some(o => !o.passed) ? '❌ Tests FAILED' : '✅ Tests passed';
+
+  return {
+    content: [{
+      type: 'text',
+      text: `${status}\n\nClass: ${className}${focus ? `::${toRun[0].name}` : ''}\nModel: ${modelName}` +
+        `\nRan in the cloud runtime of ${dataverse.url}, against the code deployed there — a change that is not ` +
+        'deployed yet is not in this result (build_d365fo_project with deploy: true deploys it).' +
+        notes.map(n => `\n⚠️ ${n}`).join('') +
+        renderOutcomeList(outcomes) +
+        renderRedPhaseNote(className, outcomes) +
+        (resultFile ? `\n\nResult file: ${resultFile}` : ''),
+    }],
+  };
+}
+
 export const sysTestRunnerTool = async (params: any, _context: any) => {
   const { className, testMethod } = params;
   // Hoisted out of the try: the failure diagnosis in the catch reads the
   // runner's own .config out of this directory, and a diagnosis that cannot
   // find the file falls back to generic advice rather than guessing.
   let packagesRoot = '';
+  // The binary that ran, so messages and the .config a diagnosis reads name a
+  // versioned SysTestConsole rather than the plain one.
+  let runnerName = 'SysTestConsole.exe';
+  // A SysTestConsole that could not start, and the one tried after it. Said in
+  // every reply, so a run on the plain binary never passes for the versioned one.
+  const fallbackNotes: string[] = [];
+  const fallbackNote = () => fallbackNotes.map(n => `\n⚠️ ${n}`).join('');
   try {
     const configManager = getConfigManager();
     await configManager.ensureLoaded();
+
+    // Before any Bin lookup: on UDE no SysTestConsole can run, wherever it is found.
+    if (await configManager.getDevEnvironmentType() === 'ude') {
+      return await runSysTestOnUde(params, configManager);
+    }
 
     const resolvedModelName = params.modelName || configManager.getModelName();
     if (!resolvedModelName) {
@@ -174,20 +452,20 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
     // SysTestConsole.exe is the binary D365FO ships for running SysTest classes from the CLI
     // (`/test:<class> /xml:<file>`). xppbp.exe is the BP checker and cannot run tests.
     // SysTestRunner.exe is a legacy/forward-compat fallback, not observed on real installs.
-    const sysTestConsolePath = path.join(packagesRoot, 'Bin', 'SysTestConsole.exe');
+    const sysTestConsoles = await findSysTestConsoles(path.join(packagesRoot, 'Bin'));
     const sysTestRunnerPath = path.join(packagesRoot, 'Bin', 'SysTestRunner.exe');
 
     let runnerPath: string;
-    try {
-      await fs.access(sysTestConsolePath);
-      runnerPath = sysTestConsolePath;
-    } catch {
+    if (sysTestConsoles.length > 0) {
+      runnerPath = sysTestConsoles[0];
+      runnerName = path.basename(runnerPath);
+    } else {
       try {
         await fs.access(sysTestRunnerPath);
         runnerPath = sysTestRunnerPath;
       } catch {
         return {
-          content: [{ type: 'text', text: `❌ Neither SysTestConsole.exe nor SysTestRunner.exe found in:\n${path.join(packagesRoot, 'Bin')}\n\nMake sure PackagesLocalDirectory is correctly configured.` }],
+          content: [{ type: 'text', text: `❌ Neither SysTestConsole.exe nor SysTestRunner.exe found in:\n${path.join(packagesRoot, 'Bin')}\n\nNo versioned SysTestConsole.<version>.exe (e.g. SysTestConsole.17.0.exe) either. Make sure PackagesLocalDirectory is correctly configured.` }],
           isError: true
         };
       }
@@ -229,25 +507,52 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
       args = [`/test:${className}`, `/xml:${xmlResultPath}`, '/unattended'];
     }
 
-    console.error(`[run_systest_class] Running: "${runnerPath}" ${args.join(' ')}`);
-
-    const { stdout, stderr } = await withOperationLock(
-      `systest:${resolvedModelName}:${className}`,
-      () => execFileAsync(runnerPath, args, {
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 300_000, // 5 minutes
-        windowsHide: true,
-      }),
-    );
-
+    // A SysTestConsole that cannot start (an assembly its Bin lacks, a .config never
+    // filled in for this machine) hands over to the next one; any other failure is
+    // the answer and is not retried.
+    let stdout = '';
+    let stderr = '';
     let xmlResult = '';
-    if (xmlResultPath) {
+    const readXmlResult = async () => {
+      if (!xmlResultPath) return '';
       try {
-        xmlResult = await fs.readFile(xmlResultPath, 'utf8');
+        return await fs.readFile(xmlResultPath, 'utf8');
       } catch {
-        // Best-effort — fall back to stdout/stderr below.
+        return ''; // Best-effort — fall back to stdout/stderr below.
+      }
+    };
+    for (let attempt = 0; ; attempt++) {
+      console.error(`[run_systest_class] Running: "${runnerPath}" ${args.join(' ')}`);
+      try {
+        ({ stdout, stderr } = await withOperationLock(
+          `systest:${resolvedModelName}:${className}`,
+          () => execFileAsync(runnerPath, args, {
+            maxBuffer: 10 * 1024 * 1024,
+            timeout: 300_000, // 5 minutes
+            windowsHide: true,
+          }),
+        ));
+        break;
+      } catch (error: any) {
+        // SysTestConsole exits non-zero when a test FAILS. A run that wrote its
+        // results is a finished run with red tests, not a runner error. The catch
+        // below never reads the XML, so it would report only the raw log.
+        xmlResult = await readXmlResult();
+        if (parseSysTestXml(xmlResult).length > 0) {
+          stdout = error?.stdout ?? '';
+          stderr = error?.stderr ?? '';
+          break;
+        }
+        const next = sysTestConsoles[attempt + 1];
+        const fault = next && runnerPath === sysTestConsoles[attempt] ? runnerStartupFault(error) : null;
+        if (!fault) throw error;
+        fallbackNotes.push(`${runnerName} could not start (${fault}), so ${path.basename(next)} ran instead.`);
+        runnerPath = next;
+        runnerName = path.basename(next);
       }
     }
+
+    if (!xmlResult) xmlResult = await readXmlResult();
 
     const output = [stdout, stderr, xmlResult].filter(Boolean).join('\n').trim();
 
@@ -264,18 +569,17 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
       : /passed|success/i.test(output);
 
     const status = hasFailed ? '❌ Tests FAILED' : passed ? '✅ Tests passed' : '⚠️ Tests completed (check output)';
-    const methodNote = testMethod && runnerPath === sysTestConsolePath
-      ? `\n⚠️ testMethod="${testMethod}" was requested but SysTestConsole.exe has no per-method filter — the whole class ran.`
+    const methodNote = testMethod && runnerPath !== sysTestRunnerPath
+      ? `\n⚠️ testMethod="${testMethod}" was requested but ${runnerName} has no per-method filter — the whole class ran.`
       : '';
 
-    // Per-method lines first: which test failed and why is the answer being asked
-    // for, and it is otherwise buried in the raw document.
-    const perMethod = outcomes.length > 0
-      ? '\n\n' + outcomes
-        .map(o => `${o.passed ? '✅' : '❌'} ${o.name}${o.message ? ` — ${o.message}` : ''}`)
-        .join('\n') +
-        `\n\n${outcomes.length - failedOutcomes.length}/${outcomes.length} passed.`
-      : '';
+    const perMethod = renderOutcomeList(outcomes);
+    // The document itself is rendered above, so it is named rather than repeated:
+    // what is shown at the end is the console log, plus the document only when it
+    // could not be read into results.
+    const resultFileNote = outcomes.length > 0 ? `\n\nResult file: ${xmlResultPath}` : '';
+    const displayOutput = (outcomes.length > 0 ? [stdout, stderr] : [stdout, stderr, xmlResult])
+      .filter(Boolean).join('\n').trim();
 
     // A test method the caller asked about that never appears in the results is
     // worth saying out loud: a misspelt name otherwise reads as a clean run.
@@ -292,16 +596,21 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
         text: `${status}\n\nClass: ${className}` +
           (testMethod && runnerPath === sysTestRunnerPath ? `::${testMethod}` : '') +
           `\nModel: ${resolvedModelName}` +
+          fallbackNote() +
           methodNote +
           perMethod +
           focusNote +
           redPhaseNote +
-          `\n\n${output || '(no output)'}`
+          resultFileNote +
+          `\n\n${displayOutput || '(no output)'}`
       }]
     };
   } catch (error: any) {
     console.error('Error running test:', error);
     const output = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
+    const runnerConfigName = `${runnerName}.config`;
+    // What ran before the runner that failed: the reply would otherwise blame only the last one.
+    const shownOutput = (fallbackNotes.length ? `${fallbackNote().slice(1)}\n\n` : '') + output;
 
     // A binding redirect that names a version the install does not have. Seen on
     // 10.0.4x: SysTestConsole.exe.config redirects Microsoft.ApplicationInsights
@@ -319,7 +628,7 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
       const missingFile = /cannot find the file specified|FileNotFoundException/i.test(output);
       if (versionMismatch || missingFile) {
         const diagnosis = versionMismatch
-          ? `PackagesLocalDirectory\\Bin\\SysTestConsole.exe.config redirects ${assembly} to ${wanted}, ` +
+          ? `PackagesLocalDirectory\\Bin\\${runnerConfigName} redirects ${assembly} to ${wanted}, ` +
             'while the DLL shipped next to it is a different version. Read the version actually ' +
             'present and point the redirect at it:\n' +
             `  [Reflection.AssemblyName]::GetAssemblyName("<PackagesLocalDirectory>\\Bin\\${assembly}.dll").Version\n` +
@@ -337,7 +646,7 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
               `the PLATFORM install, not in the model.\n\n${diagnosis}\n\n` +
               'Either fix touches the platform installation, so make it deliberately and keep a backup. ' +
               'Until then the tests still run from Visual Studio Test Explorer, which does not go ' +
-              'through this binary.\n\n' + output,
+              'through this binary.\n\n' + shownOutput,
           }],
           isError: true,
         };
@@ -358,18 +667,20 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
     // password for weeks when nothing had rotated. So compare them and say which.
     const sqlLogin = /Login failed for user '([^']+)'/i.exec(output);
     if (sqlLogin) {
-      const drift = packagesRoot ? await compareSysTestDataAccess(packagesRoot) : undefined;
+      const drift = packagesRoot
+        ? await compareSysTestDataAccess(packagesRoot, undefined, path.join(packagesRoot, 'Bin', runnerConfigName))
+        : undefined;
       const diagnosis = drift?.length
         ? 'The runner\'s own configuration does not match this machine\'s AOS. ' +
-          `\`Bin\\SysTestConsole.exe.config\` disagrees with \`WebRoot\\web.config\` on ` +
+          `\`Bin\\${runnerConfigName}\` disagrees with \`WebRoot\\web.config\` on ` +
           `${drift.length} of the four DataAccess settings:\n\n` +
           drift.map(d => `  • \`${d.key}\` — runner: ${d.runner}, AOS: ${d.aos}`).join('\n') +
           '\n\nThat is a template that was never filled in for this install, not a credential that ' +
-          'stopped working. Copy the four values from web.config into SysTestConsole.exe.config ' +
+          `stopped working. Copy the four values from web.config into ${runnerConfigName} ` +
           '(keep a backup beside it). It touches the PLATFORM install, so make it deliberately — ' +
           'and note that the password there is an encrypted blob: copy it verbatim, do not retype it.'
         : 'SysTestConsole opens the AOS connection itself, using its own configuration in ' +
-          '`Bin\\SysTestConsole.exe.config`. Compare its DataAccess.Database / SqlUser / SqlPwd / ' +
+          `\`Bin\\${runnerConfigName}\`. Compare its DataAccess.Database / SqlUser / SqlPwd / ` +
           'DbServer against `WebRoot\\web.config`: the shipped template ships a placeholder password ' +
           'and its own guesses for the rest, and a mismatch there reads exactly like a rotated ' +
           'credential. If they already agree, the login itself is the problem — check that SQL Server ' +
@@ -383,7 +694,7 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
             'No test ran, and nothing is wrong with the test class or the model.\n\n' +
             `${diagnosis}\n\n` +
             'Until then the tests still run from Visual Studio Test Explorer, which uses the ' +
-            'developer session\'s own connection and does not go through this binary.\n\n' + output,
+            'developer session\'s own connection and does not go through this binary.\n\n' + shownOutput,
         }],
         isError: true,
       };
@@ -393,17 +704,17 @@ export const sysTestRunnerTool = async (params: any, _context: any) => {
       return {
         content: [{
           type: 'text',
-          text: '❌ SysTestConsole.exe stopped at its debugger-attach prompt (Console.ReadKey).\n\n' +
+          text: `❌ ${runnerName} stopped at its debugger-attach prompt (Console.ReadKey).\n\n` +
             'This tool already passes /unattended, which is what normally skips that prompt. If it ' +
             'still appears, run the test from an interactive RDP/console session on the dev VM, or ' +
-            'from Visual Studio Test Explorer.\n\n' + output,
+            'from Visual Studio Test Explorer.\n\n' + shownOutput,
         }],
         isError: true,
       };
     }
 
     return {
-      content: [{ type: 'text', text: '❌ Tests failed:\n\n' + output }],
+      content: [{ type: 'text', text: '❌ Tests failed:\n\n' + shownOutput }],
       isError: true
     };
   }

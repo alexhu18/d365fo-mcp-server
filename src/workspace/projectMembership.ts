@@ -266,6 +266,7 @@ export function renderMembership(m: Membership, axFolder: string, objectName: st
         `project does not contain what you just changed. Re-send with addToProject=true to add it here too.`;
     }
     case 'missing':
-      return `\n⚠️ No .rnrproj of this model references \`${axFolder}\\${objectName}\` — it will not compile until one does.`;
+      return `\n⚠️ No .rnrproj of this model references \`${axFolder}\\${objectName}\` — it still compiles (xppc builds the whole model folder), but no project shows it in Visual Studio. ` +
+        `Re-send with addToProject=true to add it to the active project.`;
   }
 }

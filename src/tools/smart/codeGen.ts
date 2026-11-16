@@ -9,10 +9,11 @@ import { z } from 'zod';
 import { readMethodCall } from '../../utils/methodBodyHint.js';
 import {
   resolveObjectPrefix, applyObjectPrefix, deriveExtensionInfix, getObjectSuffix, applyObjectSuffix,
-  getExtensionClassNamingStyle, isNoPrefixMode,
+  getExtensionClassNamingStyle, isAsGivenNamingMode, isNoPrefixMode,
 } from '../../utils/modelClassifier.js';
 import { normalizeModelToken } from '../../utils/modelToken.js';
-import { normalizeObjectName } from '../../utils/objectNaming.js';
+import { normalizeObjectName, resolveFormattedExtensionName } from '../../utils/objectNaming.js';
+import { classFormatsActive } from '../../utils/extensionNameFormat.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { enforceGrounding } from '../../utils/provenanceStore.js';
 
@@ -49,6 +50,10 @@ const CodeGenArgsSchema = z.object({
     'Actual model name from .mcp.json — used to derive the naming infix when EXTENSION_PREFIX env var is not set (e.g. "ContosoExt", "WHSExt", "ApplicationSuite"). ' +
     'Required for extension patterns when EXTENSION_PREFIX is not configured. ' +
     'NEVER pass generic placeholders like "MyModel" — always use the real model name from .mcp.json.'
+  ),
+  className: z.string().optional().describe(
+    'For the CoC extension patterns, under a configured extension class name format: the full class name ' +
+    '(ending in _Extension) the user chose for a case no format defines — the server asks for it.'
   ),
   menuItemType: z.enum(['display', 'action', 'output']).optional()
     .describe('For menu-item pattern: type of menu item (display=form, action=class, output=report)'),
@@ -1998,25 +2003,31 @@ public class ${name}Controller extends MenuFunction
 function dataEntityStagingTemplate(name: string): string {
   return `// ══════════════════════════════════════════════════════════════════════════
 // Data Entity with Staging Table: ${name}
-// 3 objects required (use d365fo_file(action="create") for each):
-//   1. ${name}StagingTable  — TempDB staging table
-//   2. ${name}Entity        — Data entity (AxDataEntityView)
-//   3. ${name}EntityService — Optional: AIF service class
+// 3 objects:
+//   1. ${name}Entity        — Data entity (AxDataEntityView)
+//   2. ${name}EntityStaging — Staging table, created WITH the entity (see Object 2)
+//   3. ${name}EntityClass   — Optional: class with custom staging-to-target logic
 // ══════════════════════════════════════════════════════════════════════════
 
-// ── Object 1: Staging table ${name}Staging ─────────────────────────────────
-// d365fo_file(action="create", objectType="table", objectName="${name}Staging", xmlContent=...)
-// Set: TableType=TempDB (NOT RegularTable), TableGroup=Main
-// Fields mirror the entity's public fields exactly (same names, same EDTs)
-
-// ── Object 2: Data entity ${name}Entity ──────────────────────────────────
+// ── Object 1: Data entity ${name}Entity ──────────────────────────────────
+// d365fo_file(action="create", objectType="data-entity", objectName="${name}Entity",
+//   properties={ primaryTable, fields, dataManagementEnabled: true })
 // AxDataEntityView XML — key properties:
 //   <IsPublic>Yes</IsPublic>
 //   <PublicEntityName>${name}</PublicEntityName>
 //   <PublicCollectionName>${name}s</PublicCollectionName>
-//   <StagingTable>${name}Staging</StagingTable>
 //   <DataManagementEnabled>Yes</DataManagementEnabled>
-//   <DataManagementStagingTable>${name}Staging</DataManagementStagingTable>
+//   <DataManagementStagingTable>${name}EntityStaging</DataManagementStagingTable>
+
+// ── Object 2: Staging table ${name}EntityStaging ───────────────────────────
+// Do NOT create it yourself: the data-entity create above writes it when
+// dataManagementEnabled is true, and its reply lists any field it left out.
+// Its shape (as on shipped staging tables such as CustCustomerGroupEntityStaging):
+//   a REGULAR table (no TableType, never TempDB), TableGroup=Staging, SaveDataPerCompany=No,
+//   the DMF fields DefinitionGroup, ExecutionId, IsSelected and TransferStatus,
+//   one field per public entity field (same name, same EDT or enum),
+//   the alternate-key index StagingIdx on DefinitionGroup, ExecutionId and the entity key fields,
+//   and the relation DataEntity to the entity.
 
 // ── Object 3: Entity class (copyCustomStagingToTarget override) ───────────
 /// <summary>
@@ -2030,7 +2041,7 @@ public class ${name}EntityClass extends DMFEntityBase
     /// </summary>
     public boolean copyCustomStagingToTarget(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
     {
-        ${name}Staging  staging;
+        ${name}EntityStaging  staging;
         ${name}          target;
         boolean          ret = true;
 
@@ -2728,6 +2739,18 @@ const EXTENSION_PATTERNS = new Set([
   'report-dataset-extension', 'report-custom-design', 'report-menu-redirect',
 ]);
 const XML_PATTERNS = new Set(['security-privilege', 'menu-item']);
+/**
+ * The type of the object each CoC pattern's [ExtensionOf] names — what selects an
+ * extension class name format. event-handler and the report trio write no CoC class.
+ */
+const PATTERN_BASE_TYPE: Record<string, string> = {
+  'class-extension': 'class',
+  'table-extension': 'table',
+  'form-handler': 'form',
+  'map-extension': 'map',
+  'form-datasource-extension': 'form-datasource',
+  'form-control-extension': 'form-control',
+};
 
 export async function codeGenTool(request: CallToolRequest) {
   try {
@@ -2809,25 +2832,44 @@ export async function codeGenTool(request: CallToolRequest) {
       );
       if (groundingError) return groundingError;
 
+      // A configured extension class name format names the CoC class instead of the
+      // style, from the base `name` and the type this pattern extends — the same
+      // resolution d365fo_file(action="create") applies to the [ExtensionOf] it writes.
+      const patternBaseType = PATTERN_BASE_TYPE[args.pattern];
+      const formatted = patternBaseType
+        ? resolveFormattedExtensionName(args.className?.trim() || args.name, 'class-extension', {
+            extendedBase: args.name,
+            baseType: patternBaseType,
+          })
+        : ({ kind: 'none' } as const);
+      if (formatted.kind === 'ask' || formatted.kind === 'invalid') {
+        return { content: [{ type: 'text', text: `❌ Not generated: ${formatted.message}` }], isError: true };
+      }
+      const nameClass = (stem: string) => (formatted.kind === 'name' ? formatted.name : extensionClassName(stem));
+      const styleLine = formatted.kind === 'name'
+        ? `  Format: ${formatted.setting} — the name d365fo_file(action="create") writes.`
+        : classStyleLine;
+      const named = !!extensionInfix || formatted.kind === 'name';
+
       // ── form-datasource-extension / form-control-extension (3-param templates) ──
       if (args.pattern === 'form-datasource-extension') {
         const formName = args.name;
         const dsName = args.baseName || args.name;
-        const className = extensionClassName(`${formName}_${dsName}DS`);
+        const className = nameClass(`${formName}_${dsName}DS`);
         code = formDataSourceExtensionTemplate(formName, className, dsName);
         displayName = formName;
-        namingNote = extensionInfix
-          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, DataSource: \`${dsName}\`\n${classStyleLine}`
+        namingNote = named
+          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, DataSource: \`${dsName}\`\n${styleLine}`
           : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${className}\` (not MS-compliant without infix).`;
 
       } else if (args.pattern === 'form-control-extension') {
         const formName = args.name;
         const ctrlName = args.baseName || 'ControlName';
-        const className = extensionClassName(`${formName}_${ctrlName}Ctrl`);
+        const className = nameClass(`${formName}_${ctrlName}Ctrl`);
         code = formControlExtensionTemplate(formName, className, ctrlName);
         displayName = formName;
-        namingNote = extensionInfix
-          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, Control: \`${ctrlName}\`\n${classStyleLine}`
+        namingNote = named
+          ? `📌 **Naming:** Generated class: \`${className}\`\n  Form: \`${formName}\`, Control: \`${ctrlName}\`\n${styleLine}`
           : `⚠️ **No prefix resolved** — pass \`modelName\` or set \`EXTENSION_PREFIX\` env var.\n  Generated bare name: \`${className}\` (not MS-compliant without infix).`;
 
       } else if (args.pattern === 'report-dataset-extension') {
@@ -2920,7 +2962,7 @@ export async function codeGenTool(request: CallToolRequest) {
           };
         }
         // event-handler is not an extension class and ignores the name.
-        const className = extensionClassName(args.pattern === 'form-handler' ? `${baseName}Form` : baseName);
+        const className = nameClass(args.pattern === 'form-handler' ? `${baseName}Form` : baseName);
         code = extTemplate(baseName, className);
         displayName = baseName;
 
@@ -2929,8 +2971,8 @@ export async function codeGenTool(request: CallToolRequest) {
             `  Handles onInserted and onValidatedWrite events of \`${baseName}\`\n` +
             `  Add more handlers by repeating the [SubscribesTo] pattern.`;
         } else if (args.pattern === 'class-extension') {
-          const namingLine = extensionInfix
-            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base class: \`${baseName}\`\n${classStyleLine}`
+          const namingLine = named
+            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base class: \`${baseName}\`\n${styleLine}`
             : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` argument.\n  Generated bare name without prefix infix (e.g. \`${baseName}_Extension\`) which is **not MS-compliant**.`;
           namingNote = namingLine + '\n\n' +
             `🚨 **REQUIRED before adding CoC methods:**\n` +
@@ -2939,8 +2981,8 @@ export async function codeGenTool(request: CallToolRequest) {
             `   in the same class will always cause a compile error.\n` +
             `   The signature tool tells you whether the original is \`static\` or instance, so you generate exactly ONE CoC method.`;
         } else {
-          namingNote = extensionInfix
-            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base element: \`${baseName}\`\n${classStyleLine}`
+          namingNote = named
+            ? `📌 **Naming:** Generated class: \`${className}\`\n  Base element: \`${baseName}\`\n${styleLine}`
             : `⚠️ **No prefix resolved** — set \`EXTENSION_PREFIX\` env var or pass \`modelName\` argument.\n  Generated bare name without prefix infix (e.g. \`${baseName}_Extension\`) which is **not MS-compliant**.`;
         }
       }
@@ -3071,6 +3113,13 @@ export async function codeGenTool(request: CallToolRequest) {
             `\`\`\`xpp${code}\n\`\`\`\n\n` +
             `---\n\n` +
             namingNote +
+            // as-given (#1134): the server adds no token, so a name derived above is a
+            // placeholder the caller has to rename before create writes it.
+            // A class format named the CoC class: that name is the convention, not a placeholder.
+            (isAsGivenNamingMode() && !(PATTERN_BASE_TYPE[args.pattern] && classFormatsActive())
+              ? `\n⚠️ naming.prefixSource=as-given: names derived here carry no token and are written exactly ` +
+                `as passed — rename them by the project's instruction file before d365fo_file(action="create").`
+              : '') +
             // Only the CoC signature rule earns a line here: guessing static vs
             // instance produces code that fails to compile. The rest was a menu
             // of optional follow-ups — and it named tools that do not exist

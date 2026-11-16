@@ -9,7 +9,8 @@ import type { XppServerContext } from '../../types/context.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { scanFsExtensions } from '../../utils/fsExtensionScanner.js';
 import { tryBridgeCocExtensions } from '../../bridge/index.js';
-import { canonicalSymbolName } from '../../utils/symbolLookup.js';
+import { xrefSource } from '../../xref/xrefSource.js';
+import { canonicalSymbolName, subscribesToFtsMatch } from '../../utils/symbolLookup.js';
 
 /**
  * Object kinds a class extension can be based on. [ExtensionOf] takes
@@ -40,7 +41,7 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
 
     // Bridge fast-path (DYNAMICSXREFDB): returns method-level CoC detail (wrappedMethods per
     // extension class), so it can be used even when a methodName filter is specified.
-    const bridgeResult = await tryBridgeCocExtensions(context.bridge, className, methodName);
+    const bridgeResult = await tryBridgeCocExtensions(xrefSource(context), className, methodName);
     if (bridgeResult) return bridgeResult;
 
     let output = `CoC Extensions of: ${className}\n`;
@@ -139,24 +140,29 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
               setTimeout(() => reject(new Error('filesystem scan timeout')), FS_SCAN_TIMEOUT_MS)
             );
             const fsExts = await Promise.race([scanPromise, timeoutPromise]);
-            // Apply methodName filter the same way we do for DB results
-            const filtered2 = methodName
-              ? fsExts.filter(e =>
-                  e.cocMethods.some(m => m.toLowerCase() === methodName.toLowerCase()) ||
-                  e.addedMethods.some(m => m.toLowerCase() === methodName.toLowerCase()) ||
-                  e.cocMethods.length === 0
-                )
-              : fsExts;
+            // Unlike the DB rows above, an empty cocMethods here is not "unknown": the scanner
+            // has just tested every method body for `next`, so a class whose list is empty and
+            // which defines no method of that name wraps nothing. It used to be counted as a
+            // wrapper anyway; it is now listed after the wrappers, under its own count.
+            const wraps = (e: (typeof fsExts)[number]) =>
+              e.cocMethods.some(m => m.toLowerCase() === methodName?.toLowerCase()) ||
+              e.addedMethods.some(m => m.toLowerCase() === methodName?.toLowerCase());
+            const filtered2 = methodName ? fsExts.filter(wraps) : fsExts;
+            const others2 = methodName ? fsExts.filter(e => !wraps(e)) : [];
 
-            if (filtered2.length > 0) {
-              output += `\nFound ${filtered2.length} class extension(s) on disk (not yet in index):\n\n`;
-              for (let i = 0; i < filtered2.length; i++) {
-                const ext = filtered2[i];
+            if (filtered2.length > 0 || others2.length > 0) {
+              output += `\nFound ${filtered2.length} class extension(s) on disk (not yet in index)${methodName ? ` wrapping "${methodName}"` : ''}:\n\n`;
+              const listed = [...filtered2, ...others2];
+              for (let i = 0; i < listed.length; i++) {
+                const ext = listed[i];
+                if (i === filtered2.length) {
+                  output += `\nOther class extensions of ${className} on disk (no wrap of "${methodName}" found): ${others2.length}\n\n`;
+                }
                 output += `[${i + 1}] ${ext.name} (${ext.model})\n`;
                 output += `    File: ${ext.filePath}\n`;
 
                 if (ext.cocMethods.length > 0) {
-                  const displayMethods = methodName
+                  const displayMethods = methodName && i < filtered2.length
                     ? ext.cocMethods.filter(m => m.toLowerCase() === methodName.toLowerCase())
                     : ext.cocMethods;
                   if (displayMethods.length > 0) {
@@ -239,12 +245,12 @@ export async function findCocExtensionsTool(request: CallToolRequest, context: X
         ftsHandlers = rdb.prepare(
           `SELECT s.name, s.parent_name, s.model, s.source_snippet
            FROM symbols_fts fts JOIN symbols s ON s.id = fts.rowid
-           WHERE symbols_fts MATCH 'source_snippet:SubscribesTo'
+           WHERE symbols_fts MATCH ?
            AND s.type = 'method'
            AND (s.source_snippet LIKE ? OR s.source_snippet LIKE ?)
            ORDER BY s.model, s.parent_name, s.name
            LIMIT 20`
-        ).all(`%classStr(${className}%`, `%tableStr(${className}%`) as any[];
+        ).all(subscribesToFtsMatch(className), `%classStr(${className}%`, `%tableStr(${className}%`) as any[];
       } catch {
         // FTS5 fallback — use LIKE on source_snippet
         ftsHandlers = rdb.prepare(

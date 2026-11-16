@@ -9,9 +9,10 @@ import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { getConfigManager } from '../../utils/configManager.js';
 import { scanFsExtensions, EXTENSION_FOLDER_CONFIG } from '../../utils/fsExtensionScanner.js';
-import { canonicalSymbolName } from '../../utils/symbolLookup.js';
+import { canonicalSymbolName, subscribesToFtsMatch } from '../../utils/symbolLookup.js';
 import { inheritanceAncestors } from '../../utils/inheritanceChain.js';
 import type { BridgeClient } from '../../bridge/bridgeClient.js';
+import { xrefSource } from '../../xref/xrefSource.js';
 
 /**
  * Access modifiers straight from IMetadataProvider, keyed by lowercase method
@@ -179,9 +180,10 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
 
       // Bridge enrichment: when the DB index has no extension_metadata, try the C# bridge
       // (DYNAMICSXREFDB), which provides compiler-resolved extension data with method-level CoC detail.
-      if (existingExtensions.length === 0 && context.bridge?.isReady && context.bridge.xrefAvailable) {
+      const xref = xrefSource(context);
+      if (existingExtensions.length === 0 && xref?.isReady && xref.xrefAvailable) {
         try {
-          const bridgeExts = await context.bridge.findExtensionClasses(objName);
+          const bridgeExts = await xref.findExtensionClasses(objName);
           if (bridgeExts && bridgeExts.count > 0) {
             existingExtensions = bridgeExts.extensions.map((ext: any) => ({
               extension_name: ext.className,
@@ -254,10 +256,10 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
       const subHandlers = rdb.prepare(
         `SELECT s.name, s.parent_name, s.source_snippet FROM symbols_fts fts
          JOIN symbols s ON s.id = fts.rowid
-         WHERE symbols_fts MATCH 'source_snippet:SubscribesTo' AND s.type = 'method'
+         WHERE symbols_fts MATCH ? AND s.type = 'method'
          AND s.source_snippet LIKE ?
          LIMIT 30`
-      ).all(`%${objName}%`) as any[];
+      ).all(subscribesToFtsMatch(objName), `%${objName}%`) as any[];
 
       for (const h of subHandlers) {
         const delegateMatch = (h.source_snippet || '').match(/delegateStr\([^,]+,\s*(\w+)\)/);
@@ -400,11 +402,11 @@ export async function analyzeExtensionPointsTool(request: CallToolRequest, conte
         const allEvHandlers = rdb.prepare(
           `SELECT s.source_snippet FROM symbols_fts fts
            JOIN symbols s ON s.id = fts.rowid
-           WHERE symbols_fts MATCH 'source_snippet:SubscribesTo'
+           WHERE symbols_fts MATCH ?
            AND s.type = 'method'
            AND s.source_snippet LIKE ?
            LIMIT 200`
-        ).all(`%${objName}%`) as any[];
+        ).all(subscribesToFtsMatch(objName), `%${objName}%`) as any[];
 
         for (const row of allEvHandlers) {
           const src = row.source_snippet || '';

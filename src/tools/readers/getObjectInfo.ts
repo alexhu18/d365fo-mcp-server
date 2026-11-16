@@ -30,9 +30,9 @@ const MAX_OBJECTS = 10;
 
 const OBJECT_TYPE_DESCRIPTION =
   'Kind of object to read: class, table, form, query, view, enum, edt, report, ' +
-  'data-entity, menu-item, service, map, config-key, security-policy, macro. ' +
+  'data-entity, menu-item, menu (the submenu tree), service, map, config-key, security-policy, macro. ' +
   'Extension types list every extension of a base object: table-extension, ' +
-  'form-extension, enum-extension, edt-extension, data-entity-extension, class-extension. ' +
+  'form-extension, enum-extension, edt-extension, data-entity-extension, class-extension, menu-extension. ' +
   'For any *-extension the name may be either the full extension name ' +
   '(e.g. "CustInvoiceJour.Extension") or just the base object name — ' +
   'both are accepted; the base object name is extracted automatically.';
@@ -166,7 +166,7 @@ function applyCompactTranslation(objectType: string, options: Record<string, any
  * is the tool this option delegates to, and the two disagreeing is what made a
  * table's `validateWrite` unreadable through the folded call.
  */
-const METHOD_OWNER_TYPES = new Set(['class', 'table', 'view', 'data-entity']);
+const METHOD_OWNER_TYPES = new Set(['class', 'table', 'view', 'data-entity', 'map']);
 
 /**
  * The get_object_info `objectType` that reads an index row of this type, or null

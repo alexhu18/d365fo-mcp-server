@@ -8,6 +8,8 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { tryBridgeEventHandlers } from '../../bridge/index.js';
+import { xrefSource } from '../../xref/xrefSource.js';
+import { subscribesToFtsMatch } from '../../utils/symbolLookup.js';
 
 const FindEventHandlersArgsSchema = z.object({
   targetClass: z.string().optional().describe('Class whose events to find handlers for'),
@@ -79,7 +81,7 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
 
     // Bridge fast-path (DYNAMICSXREFDB): supports eventName and handlerType filtering directly in C#
     const bridgeResult = await tryBridgeEventHandlers(
-      context.bridge,
+      xrefSource(context),
       targetName,
       args.eventName,
       args.handlerType,
@@ -117,12 +119,13 @@ export async function findEventHandlersTool(request: CallToolRequest, context: X
         ftsHandlers = rdb.prepare(
           `SELECT s.name, s.parent_name, s.model, s.source_snippet
            FROM symbols_fts fts JOIN symbols s ON s.id = fts.rowid
-           WHERE symbols_fts MATCH 'source_snippet:SubscribesTo'
+           WHERE symbols_fts MATCH ?
            AND s.type = 'method'
            AND (s.source_snippet LIKE ? OR s.source_snippet LIKE ? OR s.source_snippet LIKE ?)
            ORDER BY s.model, s.parent_name, s.name
            LIMIT 50`
         ).all(
+          subscribesToFtsMatch(targetName),
           `%SubscribesTo(classStr(${targetName}%`,
           `%SubscribesTo(tableStr(${targetName}%`,
           `%SubscribesTo(formStr(${targetName}%`

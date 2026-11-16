@@ -23,6 +23,10 @@ import { upsertWrittenFileIntoIndex } from '../write/inlineIndexUpsert.js';
 import { reconcileTableCreateProperties } from '../xml/createTablePropertyHonesty.js';
 import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import * as debouncedRefresh from '../../bridge/debouncedRefresh.js';
+import { recordCreatedArtifact } from '../../workspace/createdArtifactLedger.js';
+import { isKernelEdt, kernelEdtBaseType } from '../../knowledge/kernelEdts.js';
+import { resolveEdtRelations } from '../xml/edtRelationResolver.js';
+import { isOwnKeyEdtRelation } from '../xml/tableBpDefaults.js';
 
 interface GenerateSmartTableArgs {
   name: string;
@@ -505,32 +509,28 @@ export async function handleGenerateSmartTable(
   // BP rule BPErrorEDTNotMigrated: a field whose EDT carries an implicit relation
   // (e.g. ItemId → InventTable) requires an explicit table relation. Auto-detect
   // from edt_metadata.reference_table and generate matching relations.
+  // The EDT's own <Relations> names the table AND the related field
+  // (CustAccount → CustTable.AccountNum). edt_metadata.reference_table only
+  // holds the legacy ReferenceTable property, so it missed such EDTs and could
+  // only guess the related field from the EDT name. See edtRelationResolver.ts.
   {
     const db = symbolIndex.getReadDb();
+    const edtTargets = await resolveEdtRelations(
+      [...new Set(fields.map(f => f.edt).filter((e): e is string => !!e))],
+      db,
+    );
     for (const f of fields) {
       if (!f.edt) continue;
       // Skip if a relation for this field already exists
       if (relations.some(r => r.constraints.some(c => c.field === f.name))) continue;
-
-      try {
-        const edtRow = db.prepare(
-          `SELECT reference_table FROM edt_metadata WHERE edt_name = ? AND reference_table IS NOT NULL AND reference_table != '' LIMIT 1`
-        ).get(f.edt) as { reference_table: string } | undefined;
-
-        if (edtRow?.reference_table) {
-          // The EDT name is typically the PK field name on the target table too
-          // (e.g. ItemId EDT → InventTable.ItemId).
-          const relatedField = f.edt;
-          relations.push({
-            name: f.name,
-            targetTable: edtRow.reference_table,
-            constraints: [{ field: f.name, relatedField }],
-          });
-          console.log(`[generateSmartTable] Auto-migrated EDT relation: ${f.name} (${f.edt}) → ${edtRow.reference_table}.${relatedField}`);
-        }
-      } catch {
-        // Skip if edt_metadata query fails
-      }
+      const target = edtTargets[f.edt];
+      if (!target) continue;
+      relations.push({
+        name: f.name,
+        targetTable: target.table,
+        constraints: [{ field: f.name, relatedField: target.relatedField }],
+      });
+      console.log(`[generateSmartTable] Auto-migrated EDT relation: ${f.name} (${f.edt}) → ${target.table}.${target.relatedField}`);
     }
   }
 
@@ -658,6 +658,10 @@ export async function handleGenerateSmartTable(
   let finalName = objectPrefix ? applyObjectPrefix(name, objectPrefix, resolvedModel ?? undefined) : name;
   const objectSuffix = getObjectSuffix();
   finalName = applyObjectSuffix(finalName, objectSuffix);
+  // The relations above were built before the final name was known: drop one that ties a
+  // key field to itself because its EDT points back at this table (isOwnKeyEdtRelation).
+  relations = relations.filter(r => r.constraints.length === 0 ||
+    !r.constraints.every(c => isOwnKeyEdtRelation(finalName, c.field, { table: r.targetTable, relatedField: c.relatedField })));
   if (finalName !== name) {
     console.log(`[generateSmartTable] Applied naming: ${name} → ${finalName}`);
   }
@@ -780,7 +784,7 @@ export async function handleGenerateSmartTable(
   // Text-only path: non-Windows (bridge unavailable, the local companion writes the file)
   // or an explicit preview=true, which is the only way to scaffold without a disk write.
   if (isNonWindows || preview) {
-    const xml = builder.buildTableXml({
+    const xml = withTableBpDefaults(builder.buildTableXml({
       name: finalName,
       label: label || finalName,
       tableGroup,
@@ -789,7 +793,7 @@ export async function handleGenerateSmartTable(
       indexes,
       relations,
       methods: generatedMethods.length > 0 ? generatedMethods : undefined,
-    });
+    }));
 
     console.log(`[generateSmartTable] Generated XML for Azure/Linux (${xml.length} bytes)`);
 
@@ -929,14 +933,16 @@ export async function handleGenerateSmartTable(
     if (bridgeResult?.success && bridgeResult.filePath) {
       console.log(`[generateSmartTable] ✅ Created via C# bridge: ${bridgeResult.filePath}`);
 
-      // CreateSmartTable writes no SubscriberAccessLevel; give the table Visual
-      // Studio's Read=Allow (none on TempDB/InMemory), as the XML builder does.
+      // CreateSmartTable writes neither OperationalDomain nor the access level
+      // xppbp expects, puts parent-pointing delete actions on the new table and
+      // leaves key fields editable: the reconcile writes the BP defaults
+      // (bpCreateDefaults.ts, tableBpDefaults.ts), as the XML builder path does.
       // The bridge refreshed its provider from the pre-patch bytes, so refresh
       // again after this write — otherwise the next bridge Update() serialises
       // the cached copy back over it.
       try {
         const onDisk = await fs.promises.readFile(bridgeResult.filePath, 'utf-8');
-        const reconciled = reconcileTableCreateProperties(onDisk, undefined);
+        const reconciled = reconcileTableCreateProperties(onDisk, undefined, { dropWriterDeleteActions: true });
         if (reconciled.xml !== onDisk) {
           await writeFileAtomic(bridgeResult.filePath, normalizeD365Xml(reconciled.xml));
           void debouncedRefresh.refresh(bridge);
@@ -947,6 +953,7 @@ export async function handleGenerateSmartTable(
 
       // Add to Visual Studio project
       let projectMessage = '';
+      let addedToProject: string | undefined;
       const effectiveProjectPath = resolvedProjectPath ||
         (await getConfigManager().getProjectPath()) ||
         undefined;
@@ -960,6 +967,7 @@ export async function handleGenerateSmartTable(
             finalName,
             bridgeResult.filePath,
           );
+          if (wasAdded) addedToProject = effectiveProjectPath;
           projectMessage = wasAdded
             ? `\n✅ Added to Visual Studio project:\n📋 Project: ${effectiveProjectPath}`
             : `\n✅ Already in Visual Studio project:\n📋 Project: ${effectiveProjectPath}`;
@@ -969,6 +977,9 @@ export async function handleGenerateSmartTable(
       } else {
         projectMessage = `\n⚠️ addToProject skipped — no projectPath found in .mcp.json or tool args.`;
       }
+
+      // The guard above refused an existing file, so this one is new: undo may delete it.
+      recordCreatedArtifact({ filePath: bridgeResult.filePath, objectType: 'table', objectName: finalName, projectPath: addedToProject });
 
       const edtWarningBlock = edtWarnings.length > 0
         ? `\n### ⚠️ EDT Validation Warnings\n${edtWarnings.join('\n')}\n`
@@ -1016,7 +1027,7 @@ export async function handleGenerateSmartTable(
 
   // ── Fallback: SmartXmlBuilder → fs.writeFile (no bridge or bridge unavailable) ──
   // Generate XML
-  const xml = builder.buildTableXml({
+  const xml = withTableBpDefaults(builder.buildTableXml({
     name: finalName,
     label: label || finalName,
     tableGroup,
@@ -1025,7 +1036,7 @@ export async function handleGenerateSmartTable(
     indexes,
     relations,
     methods: generatedMethods.length > 0 ? generatedMethods : undefined,
-  });
+  }));
 
   console.log(`[generateSmartTable] Generated XML via SmartXmlBuilder (${xml.length} bytes)`);
 
@@ -1083,6 +1094,7 @@ export async function handleGenerateSmartTable(
 
   // Add to Visual Studio project if a projectPath is known
   let projectMessage = '';
+  let addedToProject: string | undefined;
   const effectiveProjectPath = resolvedProjectPath ||
     (await getConfigManager().getProjectPath()) ||
     undefined;
@@ -1096,6 +1108,7 @@ export async function handleGenerateSmartTable(
         finalName,
         normalizedPath
       );
+      if (wasAdded) addedToProject = effectiveProjectPath;
       projectMessage = wasAdded
         ? `\n✅ Added to Visual Studio project:\n📋 Project: ${effectiveProjectPath}`
         : `\n✅ Already in Visual Studio project:\n📋 Project: ${effectiveProjectPath}`;
@@ -1107,6 +1120,9 @@ export async function handleGenerateSmartTable(
   } else {
     projectMessage = `\n⚠️ addToProject skipped — no projectPath found in .mcp.json or tool args.`;
   }
+
+  // The guard above refused an existing file, so this one is new: undo may delete it.
+  recordCreatedArtifact({ filePath: normalizedPath, objectType: 'table', objectName: finalName, projectPath: addedToProject });
 
   const edtWarningBlock = edtWarnings.length > 0
     ? `\n### ⚠️ EDT Validation Warnings\n${edtWarnings.join('\n')}\n`
@@ -1208,13 +1224,17 @@ export async function bridgeEdtBaseType(bridge: BridgeClient | undefined, edtNam
 export function resolveEdtBaseType(edtName: string, db: any, depth = 0): string | undefined {
   // D365FO primitive types − these map directly to AxTableField types
   const PRIMITIVES = new Set([
-    'String', 'Integer', 'Int64', 'Real', 'Date', 'UtcDateTime', 'DateTime',
+    'String', 'Integer', 'Int64', 'Real', 'Date', 'Time', 'UtcDateTime', 'DateTime',
     'Enum', 'Container', 'Guid', 'GUID',
   ]);
 
   if (depth > 8) return 'String'; // guard against circular chains
 
   if (PRIMITIVES.has(edtName)) return edtName;
+  // A kernel EDT has no edt_metadata row, so a chain ending in one (MyTime → TimeOfDay,
+  // RefRecId → RecId) used to stop at "unknown" here.
+  const kernel = kernelEdtBaseType(edtName);
+  if (kernel) return kernel;
 
   try {
     const row = db.prepare(
@@ -1290,6 +1310,10 @@ export function resolveEdtEnumType(edtName: string, db: any, depth = 0): string 
  * Returns undefined for genuinely unrecognizable names (caller keeps EDT-as-string).
  */
 export function heuristicEdtBaseType(edtName: string): string | undefined {
+  // A kernel EDT is not a guess: its base type is what every shipped field on it uses,
+  // and the name heuristics below miss most of them (TimeOfDay, FieldId, TableId …).
+  const kernel = kernelEdtBaseType(edtName);
+  if (kernel) return kernel;
   const e = edtName.toLowerCase();
   if (e === 'recid' || e.endsWith('recid') || e.includes('refrecid')) return 'Int64';
   // Any "...DateTime" name (TransDateTime, CreatedDateTime, ModifiedDateTime, UtcDateTime,
@@ -1353,7 +1377,7 @@ function validateEdtExists(edtName: string, db: any): boolean {
   const SYSTEM_EDTS = new Set([
     'RecId', 'String255', 'Name', 'Description', 'NoYesId', 'RefRecId',
   ]);
-  if (SYSTEM_EDTS.has(edtName)) return true;
+  if (SYSTEM_EDTS.has(edtName) || isKernelEdt(edtName)) return true;
 
   try {
     // Check edt_metadata first (most reliable)
@@ -1639,3 +1663,13 @@ export function suggestEdtFromFieldName(fieldName: string): string {
 }
 
 // extractModelFromProject and findProjectInSolution moved to ../utils/projectUtils.ts
+
+/**
+ * The SmartXmlBuilder document with the create reconcile's BP defaults applied
+ * (key fields, field-group coverage, relation properties, OperationalDomain,
+ * SubscriberAccessLevel), so the preview, the non-Windows text and the fallback
+ * write match what the bridge path ends up with.
+ */
+function withTableBpDefaults(xml: string): string {
+  return reconcileTableCreateProperties(xml, undefined, { dropWriterDeleteActions: true }).xml;
+}

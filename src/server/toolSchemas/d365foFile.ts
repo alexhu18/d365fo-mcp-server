@@ -24,7 +24,7 @@ export const d365foFileTool = {
 • project → VS project + .sln ops via params.operation: create|delete (confirm first)|add-object|remove-object.
 • modify → edit an EXISTING object. APPLIES IMMEDIATELY, no dry-run — confirm with the user first; revert with action="undo". Needs \`operation\`.
 • delete → remove an object's XML from disk AND un-register it from every .rnrproj listing it. IRREVERSIBLE — confirm with the user first.
-• undo → roll back \`filePath\`: git-tracked → git checkout HEAD, which discards ALL uncommitted changes to that file, not just the last edit; untracked → deleted; outside git, only if created this session.
+• undo → roll back \`filePath\`: git-tracked → git checkout HEAD, which discards ALL uncommitted changes to that file, not just the last edit; untracked/outside git → deleted only if created this session.
 • generate → XML as TEXT only, no write (Azure/Linux fallback). Try create first. The rest need Windows.
 📖 Parameters are NOT inlined here: get_knowledge(kind="op-spec", topic="<operation>"|"<objectType>") returns its contract — pass its values nested in \`params\` (modify) / \`properties\` (create), along with any packageName/packagePath/solutionPath/workspacePath override.
 Model + prefix auto-applied.`,
@@ -69,9 +69,7 @@ Model + prefix auto-applied.`,
         properties: {
           type: 'object',
           additionalProperties: true,
-          description:
-            '[create] Per-objectType creation properties (label, fields[], extends, enumValues[], primaryTable, …) — ' +
-            'per the op-spec lookup above.'
+          description: '[create] Per-objectType properties, per the op-spec lookup above.'
         },
         addToProject: { type: 'boolean', description: 'Add to the ACTIVE .rnrproj — keep the default.', default: true },
         projectPath: {
@@ -100,23 +98,24 @@ Model + prefix auto-applied.`,
             'add-field-modification',
             'add-data-source', 'add-control', 'remove-control',
             'add-entry-point', 'remove-entry-point',
+            'add-duty', 'remove-duty', 'add-privilege', 'remove-privilege',
             'remove-diagnostic-suppression', 'add-diagnostic-suppression',
             'add-module-reference', 'remove-module-reference',
             'add-enum-value', 'modify-enum-value', 'remove-enum-value',
-            'add-menu-item-to-menu',
+            'add-menu-item-to-menu', 'add-submenu', 'move-control', 'wrap-controls',
             'modify-property',
             'add-query-range', 'remove-query-range',
             'report-design',
           ],
           description:
             '[modify] REQUIRED unless using operations[]. add-method also UPDATES in place; ' +
-            'replace-code is the surgical oldCode→newCode path.'
+            'replace-code: surgical oldCode→newCode.'
         },
         operations: {
           type: 'array',
           maxItems: 20,
           description:
-            '[modify|create] PREFERRED for 2+ edits to the SAME object — ONE call, not one per edit. ' +
+            '[modify|create] PREFERRED for 2+ edits to the SAME object — ONE call. ' +
             'On create they run against the just-created object, under the name it actually got. ' +
             'Entries are {operation, …op-spec params}; objectType/objectName/modelName stay top-level. ' +
             'Applied in order, stopped at the first failure, per-operation results back.',

@@ -16,6 +16,7 @@ import type {
   XppIndexInfo,
   XppRelationInfo,
   XppViewFieldInfo,
+  XppViewDataSourceInfo,
   XppViewRelationFieldInfo,
   XppViewRelationInfo,
 } from './types.js';
@@ -229,6 +230,9 @@ export class XppMetadataParser {
         indexes: this.parseIndexes(axTable.Indexes?.AxTableIndex),
         relations: this.parseRelations(axTable.Relations?.AxTableRelation),
         methods: this.parseMethods(axTable.SourceCode?.Methods?.Method, tableName),
+        // Table→map bindings this table declares in its own <Mappings>. A map can
+        // declare bindings too — see parseMapFile for that side.
+        mapMappings: this.parseTableMapMappings(axTable.Mappings),
       };
 
       return { success: true, data: tableInfo };
@@ -245,7 +249,15 @@ export class XppMetadataParser {
    */
   async parseViewFile(filePath: string, model?: string): Promise<XppParseResult<XppViewInfo>> {
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
+      return await this.parseViewXml(await fs.readFile(filePath, 'utf-8'), filePath, model);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** parseViewFile on XML already in hand (e.g. the copy stored in the index). */
+  async parseViewXml(content: string, filePath: string, model?: string): Promise<XppParseResult<XppViewInfo>> {
+    try {
       const parsed = await this.parser.parseStringPromise(content);
 
       const axView = parsed.AxDataEntityView || parsed.AxView;
@@ -269,7 +281,14 @@ export class XppMetadataParser {
         fields: this.parseViewFields(axView.Fields),
         relations: this.parseViewRelations(axView.Relations),
         methods: this.parseMethods(axView.SourceCode?.Methods?.Method, viewName),
+        dataSources: this.parseViewDataSources(axView.ViewMetadata?.DataSources),
       };
+      if (isDataEntity) {
+        viewInfo.publicEntityName = axView.PublicEntityName || undefined;
+        viewInfo.publicCollectionName = axView.PublicCollectionName || undefined;
+        viewInfo.dataManagementEnabled = axView.DataManagementEnabled === 'Yes';
+        viewInfo.entityCategory = axView.EntityCategory || undefined;
+      }
 
       return { success: true, data: viewInfo };
     } catch (error) {
@@ -378,6 +397,23 @@ export class XppMetadataParser {
     const lower = vis.toLowerCase();
     if (lower === 'private' || lower === 'protected' || lower === 'internal') return lower;
     return 'public';
+  }
+
+  /**
+   * Parses the table's <Mappings> element: zero or more <AxTableMapping>
+   * blocks, each binding this table to a map (MappingTable) through field
+   * connections. Either side can declare a binding, and the shipped AOT uses
+   * both without overlap: 1,913 bindings in 1,134 tables' XML, 147 in 56 maps'.
+   */
+  private parseTableMapMappings(mappingsData: any): { map: string; fieldConnections: number }[] {
+    if (!mappingsData) return [];
+    const raw = mappingsData.AxTableMapping;
+    const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    return arr.map((m: any) => {
+      const rawConn = m.Connections?.AxTableMappingConnection;
+      const connArr = Array.isArray(rawConn) ? rawConn : rawConn ? [rawConn] : [];
+      return { map: m.MappingTable || '', fieldConnections: connArr.length };
+    }).filter((m: { map: string }) => m.map);
   }
 
   /**
@@ -495,6 +531,26 @@ export class XppMetadataParser {
       labelId: this.extractLabelId(field.Label),
       isComputed: !!field.DataMethod,
     }));
+  }
+
+  private parseViewDataSources(node: any, parent?: string, out: XppViewDataSourceInfo[] = []): XppViewDataSourceInfo[] {
+    if (!node || typeof node !== 'object') return out;
+    const nodes = [
+      ...this.ensureArray(node.AxQuerySimpleRootDataSource),
+      ...this.ensureArray(node.AxQuerySimpleEmbeddedDataSource),
+    ];
+    for (const ds of nodes) {
+      if (!ds?.Name) continue;
+      out.push({ name: ds.Name, table: ds.Table || '', joinMode: ds.JoinMode || undefined, parent });
+      this.parseViewDataSources(ds.DataSources, ds.Name, out);
+      // Tables that inherit from this one (table inheritance), not joins.
+      for (const derived of this.ensureArray(ds.DerivedDataSources?.AxQuerySimpleDerivedDataSource)) {
+        if (!derived?.Name) continue;
+        out.push({ name: derived.Name, table: derived.Table || '', joinMode: 'Derived', parent: ds.Name });
+        this.parseViewDataSources(derived.DataSources, derived.Name, out);
+      }
+    }
+    return out;
   }
 
   private parseViewRelations(relationsData: any): XppViewRelationInfo[] {
@@ -1106,21 +1162,48 @@ export class XppMetadataParser {
     name: string;
     extends?: string;
     sourcePath: string;
-    methods: string[];
+    declaration: string;
+    fields: { name: string; type: string; edt?: string; enumType?: string }[];
+    methods: XppMethodInfo[];
     mappings: { table: string; fieldConnections: number }[];
   }>> {
     try {
-      const content = await fs.readFile(filePath, 'utf-8');
+      return await this.parseMapXml(await fs.readFile(filePath, 'utf-8'), filePath);
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /** parseMapFile on XML already in hand (e.g. the copy stored in the index). */
+  async parseMapXml(content: string, filePath: string): Promise<XppParseResult<{
+    name: string;
+    extends?: string;
+    sourcePath: string;
+    declaration: string;
+    fields: { name: string; type: string; edt?: string; enumType?: string }[];
+    methods: XppMethodInfo[];
+    mappings: { table: string; fieldConnections: number }[];
+  }>> {
+    try {
       const parsed = await this.parser.parseStringPromise(content);
       const root = parsed?.AxMap;
       if (!root) return { success: false, error: 'Not an AxMap file' };
 
-      const decl: string = root.SourceCode?.Declaration || '';
+      const decl: string = this.cdataText(root.SourceCode?.Declaration) || root.SourceCode?.Declaration || '';
       const extendsMatch = decl.match(/\bextends\s+(\w+)/i);
 
-      const rawMethods = root.SourceCode?.Methods?.Method;
-      const methodArr = Array.isArray(rawMethods) ? rawMethods : rawMethods ? [rawMethods] : [];
-      const methods: string[] = methodArr.map((m: any) => m.Name || '').filter(Boolean);
+      const parsedMethods = this.parseMethods(root.SourceCode?.Methods?.Method, root.Name || 'Map');
+
+      const rawFields = root.Fields?.AxMapBaseField;
+      const fieldArr = Array.isArray(rawFields) ? rawFields : rawFields ? [rawFields] : [];
+      const fields = fieldArr.map((f: any) => ({
+        name: f.Name || '',
+        // i:type is an XML attribute; the parser runs with mergeAttrs:true, so
+        // it lands on the node itself (not under $). Flavour: AxMapFieldString etc.
+        type: (f['i:type'] || '').replace(/^AxMapField/, '') || 'Unknown',
+        edt: f.ExtendedDataType || undefined,
+        enumType: f.EnumType || undefined,
+      })).filter((f: { name: string }) => f.name);
 
       const rawMappings = root.Mappings?.AxTableMapping;
       const mapArr = Array.isArray(rawMappings) ? rawMappings : rawMappings ? [rawMappings] : [];
@@ -1132,7 +1215,15 @@ export class XppMetadataParser {
 
       return {
         success: true,
-        data: { name: root.Name || '', extends: extendsMatch?.[1], sourcePath: filePath, methods, mappings },
+        data: {
+          name: root.Name || '',
+          extends: extendsMatch?.[1],
+          sourcePath: filePath,
+          declaration: decl,
+          fields,
+          methods: parsedMethods,
+          mappings,
+        },
       };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };

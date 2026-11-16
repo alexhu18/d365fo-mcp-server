@@ -422,7 +422,9 @@ These items had no home anywhere else and would otherwise have gone with it:
 
 - ALM / LCS / pipelines / deployable packages / TFVC-git workflow / version-update
   guidance — outside the copilot's tool reach; a knowledge entry would be prose
-  the model already has.
+  the model already has. (Knowledge entries only. Deploying a built model to its UDE
+  environment is a tool, `build_d365fo_project(deploy)`, since tests there run
+  against deployed code.)
 - Extensible controls, embedded Power Apps / Power BI, SSRS sub-reports, Financial
   Reporting, Document Routing Agent internals, Key Vault / Blob SDKs — carried
   from v3, still no demand.
@@ -454,10 +456,6 @@ shapes the catalog already covers with recorded SysTest runs — `L2-coc-extensi
 `L3-data-entity-extension-field`. Duplicates would add catalog weight and no
 evidence. **Trigger to revisit:** a corpus record showing one of those shapes
 failing in a way the existing case does not exercise.
-
-**One defect noted and not fixed.** `remove-field` leaves the field's
-`AxTableFieldGroupField` entry behind, so a table can be left referencing a field
-that no longer exists. Small, real, and wants its own change.
 
 ## X++ coverage v3 non-goals — recorded here when the plan file was deleted
 

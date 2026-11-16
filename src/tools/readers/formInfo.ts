@@ -155,10 +155,11 @@ export async function getFormInfoTool(request: CallToolRequest, context: XppServ
     );
     if (indexed) {
       try {
-        return await parseAndFormatForm(
+        const result = await parseAndFormatForm(
           indexed.ref.name, indexed.ref.model, indexed.xml,
           includeControls, includeDataSources, includeMethods, searchControl, maxControls,
         );
+        return indexed.source === 'stored' ? appendNote(result, storedCopyNote(indexed.storedAt)) : result;
       } catch { /* not a usable AxForm XML — fall through to the error below */ }
     }
 
@@ -280,6 +281,21 @@ function prefixResult<T extends { content?: Array<{ text?: string }> }>(result: 
   const first = result.content?.[0];
   if (first && typeof first.text === 'string') first.text = note + first.text;
   return result;
+}
+
+function appendNote<T extends { content?: Array<{ text?: string }> }>(result: T, note: string): T {
+  const first = result.content?.[0];
+  if (note && first && typeof first.text === 'string') first.text = first.text + note;
+  return result;
+}
+
+/**
+ * Footer for an answer rendered from the copy the index stored, not from a file on
+ * this machine: it is as old as the last index build, and the live AOT may differ.
+ */
+function storedCopyNote(storedAt?: string): string {
+  return `\n\n_Source: the index's stored copy of this form${storedAt ? `, written ${storedAt}` : ''} — ` +
+    `no AOT file was readable on this host, so it may differ from the live AOT._\n`;
 }
 
 /**
@@ -674,7 +690,8 @@ function formatFormOutput(
     output += `## 🔧 Form Methods\n\n`;
     for (const method of formInfo.methods) {
       output += `### ${method.name}\n\n`;
-      output += `\`\`\`xpp\n${method.signature}\n\`\`\`\n\n`;
+      // A compiled (binary ISV) form lists method names only; an empty code block would read as an empty method.
+      if (method.signature) output += `\`\`\`xpp\n${method.signature}\n\`\`\`\n\n`;
     }
   }
 

@@ -9,6 +9,7 @@ import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { XppServerContext } from '../../types/context.js';
 import { checkObjectNaming } from '../../utils/objectNamingRules.js';
+import { isAsGivenNamingMode } from '../../utils/modelClassifier.js';
 
 const ValidateObjectNamingArgsSchema = z.object({
   proposedName: z.string().describe('The proposed object name to validate'),
@@ -35,6 +36,10 @@ const ValidateObjectNamingArgsSchema = z.object({
     ])
     .describe('Type of the D365FO object'),
   baseObjectName: z.string().optional().describe('Required for extension types: name of the object being extended'),
+  baseObjectType: z
+    .string()
+    .optional()
+    .describe('class-extension: type of the extended object (class, table, form, …) — selects the configured class name format'),
   modelPrefix: z
     .string()
     .optional()
@@ -78,7 +83,13 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
       const modelPart = modelName && !origin.includes(`"${modelName}"`) ? `model ${modelName}, ` : '';
       output += `Model Prefix: ${prefix}${modelName ? ` (${modelPart}${origin})` : ''}\n`;
     }
-    if (isExtension) {
+    const asGiven = isAsGivenNamingMode();
+    const { formatNote } = check;
+    if (formatNote) {
+      output += `Naming: format — ${formatNote}\n`;
+    } else if (asGiven) {
+      output += `Naming: as given (naming.prefixSource=as-given) — structure only; the token and prefix are your instruction file's\n`;
+    } else if (isExtension) {
       // A class extension follows the class style, everything else the element style;
       // the two are the same unless EXTENSION_CLASS_NAMING_STYLE says otherwise.
       const isClassExt = args.objectType === 'class-extension';
@@ -149,7 +160,11 @@ export async function validateObjectNamingTool(request: CallToolRequest, context
 
     output += '\n';
 
-    const rules = isExtension
+    const rules = formatNote
+      ? ['Configured extension name format (exact, base case-insensitive)', 'Valid AOT name (characters, length)']
+      : asGiven
+      ? ['Valid AOT name (characters, length)', isExtension ? 'Extension shape (Base.Token / …_Extension)' : 'No extension shape required']
+      : isExtension
       ? ['Extension suffix pattern', 'Model prefix included', 'Base object exists in index']
       : ['No underscore in non-extension names', 'Model prefix', 'Type-specific conventions'];
     output += `Naming Rules Applied:\n`;

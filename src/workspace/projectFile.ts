@@ -18,6 +18,7 @@ import { Parser, Builder } from '../utils/xml.js';
 // withProjectFileLock this used to carry, so the second copy is retired rather
 // than moved along with the classes.
 import { withFileLock } from '../utils/atomicFileWrite.js';
+import { detectEol, withEol } from '../utils/eolUtils.js';
 import { recordCreatedProjectFolder, takeCreatedProjectFolder } from './createdArtifactLedger.js';
 import {
   axFolderForObjectType, resolveMembership, projectDisplayName, includeKey, normalizeInclude,
@@ -99,11 +100,13 @@ export async function registerFileInActiveProject(
     : '';
 
   if (!projectPath) {
-    // Nothing to add it TO. Only worth saying when no project has it at all;
-    // a sibling already references it, so the element does compile.
+    // Nothing to add it TO. Only worth saying when no project has it at all:
+    // it compiles either way (xppc builds the whole model folder), but a
+    // sibling project already shows it in Visual Studio.
     if (alsoIn) return '';
     return `\n\n⚠️ No project of model "${modelName ?? '(unknown)'}" references \`${axFolder}\\${objectName}\`, ` +
-      `and no active projectPath is configured to add it to. It will not compile until some project does.`;
+      `and no active projectPath is configured to add it to. It still compiles (xppc builds the whole model folder), ` +
+      `but no project shows it in Visual Studio.`;
   }
   try {
     const added = await new ProjectFileManager({ withinSolutionRoots: true }).addToProject(projectPath, objectType, objectName, '');
@@ -144,68 +147,116 @@ function normalizedInclude(node: any): string {
  */
 export class ProjectFileFinder {
   /**
-   * Find .rnrproj file in solution directory
-   * Recursively searches for .rnrproj files matching the model name (up to 3 levels deep)
+   * Find the .rnrproj of a model in a solution directory (up to 3 levels deep).
+   *
+   * `<Model>.rnrproj` wins wherever it sits. Otherwise a project whose file name
+   * contains the model name is returned only when it is the ONLY one. This used to
+   * return the first substring match in readdir order: in a solution whose projects
+   * are named per feature (ContosoCoreBilling, ContosoCoreClaims, … for model
+   * ContosoCore) every project matched, so every create, modify and label write
+   * that fell back to this scan registered into the alphabetically first project.
+   * That is the same arbitrary pick autoDetectProject stopped making when several
+   * projects share a model (solutionsPathAmbiguity.test.ts), and null is the same
+   * answer: the caller then leaves the project alone and says so.
+   *
+   * With no model name there is nothing to be ambiguous about, so the first
+   * project found is still returned — callers use it to read the model name.
    */
   static async findProjectInSolution(
     solutionPath: string,
     modelName: string
   ): Promise<string | null> {
-    return ProjectFileFinder.findRecursive(solutionPath, modelName, 0, 3);
+    const candidates: string[] = [];
+    await ProjectFileFinder.collectRecursive(solutionPath, modelName, 0, 3, candidates);
+    if (candidates.length === 0) return null;
+    if (!modelName) return candidates[0];
+
+    const exactName = `${modelName}.rnrproj`.toLowerCase();
+    const exact = candidates.filter(p => path.basename(p).toLowerCase() === exactName);
+    if (exact.length === 1) return exact[0];
+    if (exact.length === 0 && candidates.length === 1) return candidates[0];
+
+    console.error(
+      `[ProjectFileFinder] ${exact.length || candidates.length} projects in ${solutionPath} match model ` +
+      `"${modelName}" — not picking one. Set projectPath to the project to write to.`
+    );
+    return null;
   }
 
-  private static async findRecursive(
+  /**
+   * Why findProjectInSolution returned null, for the reply to the caller.
+   *
+   * "Could not find .rnrproj" was the only wording, and since several matching
+   * projects also give null it read as a missing project when 45 were there.
+   * Scans again, which costs one directory walk on a path that already failed.
+   */
+  static async describeNoProject(solutionPath: string, modelName: string): Promise<string> {
+    const candidates: string[] = [];
+    await ProjectFileFinder.collectRecursive(solutionPath, modelName, 0, 3, candidates);
+    if (candidates.length > 1) {
+      return `${candidates.length} projects in ${solutionPath} match model '${modelName}', so none was picked. ` +
+        `Pass projectPath with the project to add it to.`;
+    }
+    return `No .rnrproj for model '${modelName}' in ${solutionPath}. Pass projectPath with the project to add it to.`;
+  }
+
+  private static async collectRecursive(
     dir: string,
     modelName: string,
     currentDepth: number,
-    maxDepth: number
-  ): Promise<string | null> {
-    if (currentDepth > maxDepth) return null;
+    maxDepth: number,
+    found: string[],
+  ): Promise<void> {
+    if (currentDepth > maxDepth) return;
 
+    // Every candidate is needed now, not just the first, so the whole tree is
+    // walked: entry types come with the listing instead of one stat per file.
+    let entries: Array<{ name: string; isDirectory(): boolean; isSymbolicLink(): boolean }>;
     try {
-      await fs.access(dir);
+      entries = await fs.readdir(dir, { withFileTypes: true });
     } catch {
-      return null;
+      return;
     }
 
-    let files: string[];
-    try {
-      files = await fs.readdir(dir);
-    } catch {
-      return null;
-    }
-
-    // Check .rnrproj files at this level first
-    const projectFiles = files.filter(file =>
-      file.endsWith('.rnrproj') &&
-      (file.includes(modelName) || file === `${modelName}.rnrproj`)
-    );
-
-    if (projectFiles.length > 0) {
-      return path.join(dir, projectFiles[0]);
-    }
-
-    // Recurse into subdirectories
-    for (const file of files) {
-      const fullPath = path.join(dir, file);
-      try {
-        const stat = await fs.stat(fullPath);
-        if (stat.isDirectory()) {
-          const found = await ProjectFileFinder.findRecursive(fullPath, modelName, currentDepth + 1, maxDepth);
-          if (found) return found;
-        }
-      } catch {
-        continue;
+    for (const entry of entries) {
+      if (entry.name.endsWith('.rnrproj') && entry.name.includes(modelName)) {
+        found.push(path.join(dir, entry.name));
       }
     }
 
-    return null;
+    for (const entry of entries) {
+      // A Dirent does not follow links, where the fs.stat it replaced did: a project
+      // folder linked into the solution (junction or symlink) is still walked. A link
+      // to a file fails readdir, which returns quietly.
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        await ProjectFileFinder.collectRecursive(path.join(dir, entry.name), modelName, currentDepth + 1, maxDepth, found);
+      }
+    }
   }
 }
 
 /**
  * Visual Studio Project (.rnrproj) Manipulator
  */
+/**
+ * Run a .rnrproj read or write, retrying while Visual Studio or another process
+ * holds the file (EBUSY / EPERM / EACCES), with the same back-off as the inline
+ * loops of the other project writers.
+ */
+async function retryWhileLocked<T>(op: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (err: any) {
+      if ((err?.code === 'EBUSY' || err?.code === 'EPERM' || err?.code === 'EACCES') && attempt < 4) {
+        await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export class ProjectFileManager {
   private parser: Parser;
   private builder: Builder;
@@ -443,7 +494,9 @@ export class ProjectFileManager {
     // Write back to project file (with retry for transient VS file locks)
     const updatedXml = this.builder.buildObject(project);
     // Restore UTF-8 BOM if the original file had one (VS 2022 writes .rnrproj with BOM)
-    const output = hadBom ? '\uFEFF' + updatedXml : updatedXml;
+    // VS writes .rnrproj with CRLF; xml2js emits LF, which would rewrite every line.
+    const eolXml = withEol(updatedXml, detectEol(projectXml));
+    const output = hadBom ? '\uFEFF' + eolXml : eolXml;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         await fs.writeFile(projectPath, output, 'utf-8');
@@ -557,7 +610,9 @@ export class ProjectFileManager {
     }
 
     const updatedXml = this.builder.buildObject(project);
-    const output = hadBom ? '\uFEFF' + updatedXml : updatedXml;
+    // VS writes .rnrproj with CRLF; xml2js emits LF, which would rewrite every line.
+    const eolXml = withEol(updatedXml, detectEol(projectXml));
+    const output = hadBom ? '\uFEFF' + eolXml : eolXml;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         await fs.writeFile(projectPath, output, 'utf-8');
@@ -572,6 +627,45 @@ export class ProjectFileManager {
     }
     console.error(`[ProjectFileManager] Removed '${objectName}' from project ${path.basename(projectPath)}`);
     return true;
+  }
+
+  /**
+   * Remove the Content entry whose Include is exactly `include` (compared like every
+   * other include, see normalizeInclude). For entries that are not `<AOT folder>\<name>`
+   * — a label file's `AxLabelFile\<File>_<lang>` descriptor and its
+   * `<File>.<lang>.label.txt` resource — which removeFromProject cannot address.
+   * Folder entries are left alone. Returns true when an entry was removed.
+   */
+  async removeIncludeFromProject(projectPath: string, include: string): Promise<boolean> {
+    await this.assertWithinRoots(projectPath);
+    return withFileLock(projectPath, async () => {
+      // Visual Studio holds the .rnrproj open; retry a locked read/write like the
+      // other project writers do, or undo leaves the entry behind.
+      const projectXml = await retryWhileLocked(() => fs.readFile(projectPath, 'utf-8'));
+      const hadBom = projectXml.charCodeAt(0) === 0xFEFF;
+      const body = hadBom ? projectXml.slice(1) : projectXml;
+      const project = await this.parser.parseStringPromise(body);
+      if (!project.Project?.ItemGroup) return false;
+      const itemGroups = Array.isArray(project.Project.ItemGroup)
+        ? project.Project.ItemGroup
+        : [project.Project.ItemGroup];
+      const wanted = normalizeInclude(include);
+      let removed = false;
+      for (const group of itemGroups) {
+        if (group.Content === undefined) continue;
+        const contents = Array.isArray(group.Content) ? group.Content : [group.Content];
+        const kept = contents.filter((c: any) => normalizedInclude(c) !== wanted);
+        if (kept.length !== contents.length) {
+          removed = true;
+          group.Content = kept;
+        }
+      }
+      if (!removed) return false;
+      const eolXml = withEol(this.builder.buildObject(project), detectEol(body));
+      await retryWhileLocked(() => fs.writeFile(projectPath, hadBom ? '\uFEFF' + eolXml : eolXml, 'utf-8'));
+      console.error(`[ProjectFileManager] Removed '${include}' from project ${path.basename(projectPath)}`);
+      return true;
+    });
   }
 
   /**
@@ -694,7 +788,9 @@ export class ProjectFileManager {
 
     // Write back
     const updatedXml = this.builder.buildObject(project);
-    const output = hadBom ? '\uFEFF' + updatedXml : updatedXml;
+    // VS writes .rnrproj with CRLF; xml2js emits LF, which would rewrite every line.
+    const eolXml = withEol(updatedXml, detectEol(projectXml));
+    const output = hadBom ? '\uFEFF' + eolXml : eolXml;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         await fs.writeFile(projectPath, output, 'utf-8');

@@ -751,6 +751,7 @@ namespace D365MetadataBridge.Services
                 case "int": case "integer": axEdt = new AxEdtInt { Name = name }; break;
                 case "real": axEdt = new AxEdtReal { Name = name }; break;
                 case "date": axEdt = new AxEdtDate { Name = name }; break;
+                case "time": case "timeofday": axEdt = new AxEdtTime { Name = name }; break;
                 case "utcdatetime": case "datetime": axEdt = new AxEdtUtcDateTime { Name = name }; break;
                 case "int64": axEdt = new AxEdtInt64 { Name = name }; break;
                 case "enum": axEdt = new AxEdtEnum { Name = name }; break;
@@ -1478,6 +1479,22 @@ namespace D365MetadataBridge.Services
 
                     return new { success = true, operation = "add-method", objectType, objectName, methodName, api = "IMetaViewProvider.Update" };
                 }
+                case "data-entity":
+                {
+                    var axEntity = _provider.DataEntityViews.Read(objectName)
+                        ?? throw new ArgumentException($"Data entity '{objectName}' not found");
+                    var msi = GetModelSaveInfoForObject(_provider.DataEntityViews, objectName);
+
+                    if (!TryUpdateMethodSourceInPlace(axEntity, methodName, source))
+                    {
+                        var axMethod = new AxMethod { Name = methodName, Source = source };
+                        ((dynamic)axEntity).Methods.Add(axMethod);
+                    }
+
+                    ((IMetaDataEntityViewProvider)_provider.DataEntityViews).Update(axEntity, msi);
+
+                    return new { success = true, operation = "add-method", objectType, objectName, methodName, api = "IMetaDataEntityViewProvider.Update" };
+                }
                 case "form-extension":
                 {
                     var axExt = _provider.FormExtensions.Read(objectName)
@@ -1572,6 +1589,8 @@ namespace D365MetadataBridge.Services
             var axTable = _provider.Tables.Read(tableName);
             if (axTable != null)
             {
+                if (HasMemberNamed(axTable.Fields, fieldName))
+                    return AlreadyPresent("add-field", tableName, $"field '{fieldName}'", "Use modify-field to change it.", "IMetaTableProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.Tables, tableName);
                 axTable.AddField(axField);
                 var tableProvider = _provider.Tables as IMetaTableProvider
@@ -1583,6 +1602,8 @@ namespace D365MetadataBridge.Services
             var axExt = _provider.TableExtensions.Read(tableName);
             if (axExt != null)
             {
+                if (HasMemberNamed(axExt.Fields, fieldName))
+                    return AlreadyPresent("add-field", tableName, $"field '{fieldName}'", "Use modify-field to change it.", "IMetaTableExtensionProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.TableExtensions, tableName);
                 axExt.Fields.Add(axField);
                 var extProvider = _provider.TableExtensions as IMetaTableExtensionProvider
@@ -1593,6 +1614,30 @@ namespace D365MetadataBridge.Services
 
             throw new ArgumentException($"Table or table-extension '{tableName}' not found");
         }
+
+        /// <summary>
+        /// True when a metadata collection already holds a member of this name (by its Name
+        /// property, case-insensitive, as the AOT compares names).
+        /// </summary>
+        /// <remarks>
+        /// The table Add* writes did not look before adding. A field group the caller re-sends
+        /// (table create already writes AutoReport, AutoLookup, …) failed inside the SDK with
+        /// "already exists among elements" and stopped the batch it was in, and the comment on
+        /// the enum add-field path records AddField ending up with the field twice.
+        /// </remarks>
+        private static bool HasMemberNamed(System.Collections.IEnumerable items, string name)
+        {
+            foreach (var item in items)
+            {
+                var itemName = item?.GetType().GetProperty("Name")?.GetValue(item) as string;
+                if (string.Equals(itemName, name, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>The skip answer for an element that is already there: nothing written, and why.</summary>
+        private static object AlreadyPresent(string operation, string objectName, string what, string hint, string api) =>
+            new { success = true, operation, objectName, skipped = true, reason = $"{what} already exists on '{objectName}', nothing was written. {hint}", api };
 
         /// <summary>
         /// add-field on a data-entity-view-extension: appends an AxDataEntityViewMappedField
@@ -1705,7 +1750,7 @@ namespace D365MetadataBridge.Services
                         ?? throw new ArgumentException($"EDT '{objectName}' not found");
                     var msi = GetModelSaveInfoForObject(_provider.Edts, objectName);
                     if (!SetAxEdtProperty(obj, propertyPath, propertyValue))
-                        throw new ArgumentException($"Unknown AxEdt property '{propertyPath}' — nothing was written. Supported: label, helpText, extends, stringSize, referenceTable.");
+                        throw new ArgumentException($"Unknown AxEdt property '{propertyPath}' — nothing was written. Supported: label, helpText, extends, stringSize, referenceTable, enumType (enum EDTs).");
                     ((IMetaEdtProvider)_provider.Edts).Update(obj, msi);
                     return new { success = true, operation = "modify-property", objectType, objectName, propertyPath, propertyValue, api = "Update" };
                 }
@@ -1951,6 +1996,17 @@ namespace D365MetadataBridge.Services
                     ((IMetaViewProvider)_provider.Views).Update(obj, msi);
                     return new { success = true, operation = "replace-code", objectType, objectName, methodName, api = "Update" };
                 }
+                case "data-entity":
+                {
+                    var obj = _provider.DataEntityViews.Read(objectName)
+                        ?? throw new ArgumentException($"Data entity '{objectName}' not found");
+                    var msi = GetModelSaveInfoForObject(_provider.DataEntityViews, objectName);
+                    var replaced = ReplaceInMethods(obj, methodName, oldCode, newCode);
+                    if (!replaced)
+                        throw new InvalidOperationException($"oldCode not found in {objectName}" + (methodName != null ? $".{methodName}" : ""));
+                    ((IMetaDataEntityViewProvider)_provider.DataEntityViews).Update(obj, msi);
+                    return new { success = true, operation = "replace-code", objectType, objectName, methodName, api = "Update" };
+                }
                 case "form-extension":
                 {
                     var obj = _provider.FormExtensions.Read(objectName)
@@ -2051,6 +2107,16 @@ namespace D365MetadataBridge.Services
                     ((IMetaViewProvider)_provider.Views).Update(obj, msi);
                     return new { success = true, operation = "remove-method", objectType, objectName, methodName, api = "IMetaViewProvider.Update" };
                 }
+                case "data-entity":
+                {
+                    var obj = _provider.DataEntityViews.Read(objectName)
+                        ?? throw new ArgumentException($"Data entity '{objectName}' not found");
+                    var msi = GetModelSaveInfoForObject(_provider.DataEntityViews, objectName);
+                    if (!RemoveMethodByName(obj, methodName))
+                        throw new InvalidOperationException($"Method '{methodName}' not found on data entity '{objectName}'");
+                    ((IMetaDataEntityViewProvider)_provider.DataEntityViews).Update(obj, msi);
+                    return new { success = true, operation = "remove-method", objectType, objectName, methodName, api = "IMetaDataEntityViewProvider.Update" };
+                }
                 case "form-extension":
                 {
                     var obj = _provider.FormExtensions.Read(objectName)
@@ -2132,6 +2198,8 @@ namespace D365MetadataBridge.Services
             var axTable = _provider.Tables.Read(tableName);
             if (axTable != null)
             {
+                if (HasMemberNamed(axTable.Indexes, indexName))
+                    return AlreadyPresent("add-index", tableName, $"index '{indexName}'", "To change it, remove-index then add-index.", "IMetaTableProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.Tables, tableName);
                 axTable.AddIndex(axIdx);
                 ((IMetaTableProvider)_provider.Tables).Update(axTable, msi);
@@ -2141,6 +2209,8 @@ namespace D365MetadataBridge.Services
             var axExt = _provider.TableExtensions.Read(tableName);
             if (axExt != null)
             {
+                if (HasMemberNamed(axExt.Indexes, indexName))
+                    return AlreadyPresent("add-index", tableName, $"index '{indexName}'", "To change it, remove-index then add-index.", "IMetaTableExtensionProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.TableExtensions, tableName);
                 axExt.Indexes.Add(axIdx);
                 var extProvider = _provider.TableExtensions as IMetaTableExtensionProvider
@@ -2443,6 +2513,8 @@ namespace D365MetadataBridge.Services
             var axTable = _provider.Tables.Read(tableName);
             if (axTable != null)
             {
+                if (HasMemberNamed(axTable.Relations, relationName))
+                    return AlreadyPresent("add-relation", tableName, $"relation '{relationName}'", "To change it, remove-relation then add-relation.", "IMetaTableProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.Tables, tableName);
                 axTable.AddRelation(axRel);
                 ((IMetaTableProvider)_provider.Tables).Update(axTable, msi);
@@ -2520,6 +2592,8 @@ namespace D365MetadataBridge.Services
                     };
                 }
 
+                if (HasMemberNamed(axExt.Relations, relationName))
+                    return AlreadyPresent("add-relation", tableName, $"relation '{relationName}'", "To change it, remove-relation then add-relation.", "IMetaTableExtensionProvider.Update");
                 axExt.Relations.Add(axRel);
                 extProvider.Update(axExt, msi);
                 return new
@@ -2619,6 +2693,8 @@ namespace D365MetadataBridge.Services
             var axTable = _provider.Tables.Read(tableName);
             if (axTable != null)
             {
+                if (HasMemberNamed(axTable.FieldGroups, groupName))
+                    return AlreadyPresent("add-field-group", tableName, $"field group '{groupName}'", "Use add-field-to-field-group to add fields to it.", "IMetaTableProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.Tables, tableName);
                 axTable.AddFieldGroup(axFg);
                 ((IMetaTableProvider)_provider.Tables).Update(axTable, msi);
@@ -2628,6 +2704,8 @@ namespace D365MetadataBridge.Services
             var axExt = _provider.TableExtensions.Read(tableName);
             if (axExt != null)
             {
+                if (HasMemberNamed(axExt.FieldGroups, groupName))
+                    return AlreadyPresent("add-field-group", tableName, $"field group '{groupName}'", "Use add-field-to-field-group to add fields to it.", "IMetaTableExtensionProvider.Update");
                 var msi = GetModelSaveInfoForObject(_provider.TableExtensions, tableName);
                 axExt.FieldGroups.Add(axFg);
                 var extProvider = _provider.TableExtensions as IMetaTableExtensionProvider
@@ -2727,6 +2805,11 @@ namespace D365MetadataBridge.Services
                 if (targetFg == null)
                     throw new InvalidOperationException($"Field group '{groupName}' not found on table '{tableName}'");
 
+                foreach (AxTableFieldGroupField existing in targetFg.Fields)
+                {
+                    if (string.Equals(existing.DataField, fieldName, StringComparison.OrdinalIgnoreCase))
+                        return new { success = true, operation = "add-field-to-field-group", objectName = tableName, groupName, fieldName, extendBaseFieldGroup = false, skipped = true, reason = $"field '{fieldName}' already in field group '{groupName}'", api = "IMetaTableProvider.Update" };
+                }
                 targetFg.AddField(new AxTableFieldGroupField { DataField = fieldName });
 
                 ((IMetaTableProvider)_provider.Tables).Update(axTable, msi);
@@ -2776,6 +2859,11 @@ namespace D365MetadataBridge.Services
                         $"Field group '{groupName}' not found on table-extension '{tableName}'. " +
                         "If it is a group defined by the BASE table, pass extendBaseFieldGroup=true to append the field through <FieldGroupExtensions> instead.");
 
+                foreach (AxTableFieldGroupField existing in targetFg.Fields)
+                {
+                    if (string.Equals(existing.DataField, fieldName, StringComparison.OrdinalIgnoreCase))
+                        return new { success = true, operation = "add-field-to-field-group", objectName = tableName, groupName, fieldName, extendBaseFieldGroup = false, skipped = true, reason = $"field '{fieldName}' already in field group '{groupName}'", api = "IMetaTableExtensionProvider.Update" };
+                }
                 targetFg.AddField(new AxTableFieldGroupField { DataField = fieldName });
                 extProvider.Update(axExt, msi);
                 return new { success = true, operation = "add-field-to-field-group", objectName = tableName, groupName, fieldName, extendBaseFieldGroup = false, api = "IMetaTableExtensionProvider.Update" };
@@ -3559,6 +3647,30 @@ namespace D365MetadataBridge.Services
         // ========================
 
         /// <summary>
+        /// Kernel EDTs: defined by the X++ runtime, with no AxEdt file, so IMetaEdtProvider.Exists
+        /// answers false for them although shipped tables use them (DataAreaId 841 fields, UserId
+        /// 331, RecId 319, ValidFromDateTime 245 ...). Derived by census + readEdt probe on
+        /// 7.0.7996.33 (#1179). Mirrors src/knowledge/kernelEdts.ts; a parity test keeps the two equal.
+        /// </summary>
+        private static readonly HashSet<string> KernelEdtNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "DataAreaId", "SelectableDataArea", "UserId", "RecId", "ValidFromDateTime", "ValidToDateTime",
+            "ValidFromDate", "ValidToDate", "TableName", "FieldName", "CreatedDateTime", "RelationType",
+            "FieldId", "TimeOfDay", "ClassName", "ClassId", "TableId", "IdentifierName",
+            "SecurityRoleAotName", "ModifiedDateTime", "SecurityRoleName", "CreatedBy", "EnumName", "SysRowVersionNumber",
+            "CreatedTransactionId", "NetworkAlias", "ExtendedTypeId", "PartitionKey", "UtilElementName", "UserIdStr",
+            "MethodName", "RecVersion", "InstalledLanguageId", "NetworkDomain", "ModifiedBy", "FormName",
+            "QueryName", "SequenceNum", "EnumId", "SecurityDutyName", "ConfigurationKeyName", "SecurityDutyIdentifier",
+            "MenuItemName", "ReportName", "ResourceName", "ConfigurationKeyId", "ExtendedDataTypeName", "Partition",
+            "MoneyMST", "UtilElementId", "Sid", "SecurityPrivilegeName", "SecurityPrivilegeIdentifier", "SecurableName",
+            "SecurityRoleDescription", "MetadataXmlObject", "PreferredLocale", "WorkflowCategoryName", "MenuItemNameDisplay", "WorkflowTypeName",
+            "LicenseCodeId", "SegregationOfDutiesRuleName", "IndexName", "RowNumber", "ModelName", "WebUrlItemName",
+            "MenuItemNameAction", "DeploymentRecId", "MenuItemNameOutput", "ServiceName", "TableCollectionName", "ModelElementRecid",
+            "SecurityRisk", "SecurityMitigation", "SegregationOfDutiesOverrideComment", "TitleFields", "GlobalObjectCacheScope", "WorkflowApprovalName",
+            "Money", "AssemblyName", "SecurityDutyDescription", "SegmentedEntryField", "Sha1HashCode",
+        };
+
+        /// <summary>
         /// Refuse to write an &lt;ExtendedDataType&gt; naming an EDT the provider does not know.
         /// The metadata writer accepts any string here, so a misspelled EDT serialized fine
         /// and the create/add-field returned success — the only symptom was a later build
@@ -3567,9 +3679,13 @@ namespace D365MetadataBridge.Services
         /// Deliberately fails OPEN when the provider itself throws (an Exists() that cannot
         /// answer is not evidence the EDT is missing, and blocking a valid write on a
         /// provider hiccup is a worse failure than the one this guards).
+        ///
+        /// A kernel EDT passes without asking: Exists() answers false for every one of them
+        /// (they have no AxEdt file), although shipped tables use them thousands of times (#1179).
         /// </summary>
         private void RequireExtendedDataTypeExists(string fieldName, string edtName, string what)
         {
+            if (KernelEdtNames.Contains(edtName)) return;
             bool known;
             try { known = _provider.Edts.Exists(edtName); }
             catch { return; }
@@ -3601,6 +3717,12 @@ namespace D365MetadataBridge.Services
                     break;
                 case "date":
                     axField = new AxTableFieldDate();
+                    break;
+                case "time":
+                case "timeofday":
+                    // 77 shipped fields on the kernel EDT TimeOfDay are AxTableFieldTime; without
+                    // this case "Time" fell to default and was looked up as an EDT name.
+                    axField = new AxTableFieldTime();
                     break;
                 case "utcdatetime":
                 case "datetime":
@@ -3797,6 +3919,13 @@ namespace D365MetadataBridge.Services
                     strEdt.StringSize = ss;
                     break;
                 case "referencetable": edt.ReferenceTable = value; break;
+                case "enumtype":
+                    // Only an enum EDT has an EnumType. Every shipped child of an enum EDT
+                    // states it (1,512 of 1,512, equal to the parent's), so without this an
+                    // enum EDT created through the bridge had no enum at all.
+                    if (edt is not AxEdtEnum enumEdt) return false;
+                    enumEdt.EnumType = value;
+                    break;
                 case "basetype": break; // handled at construction time
                 default:
                     Console.Error.WriteLine($"[WriteService] Unknown AxEdt property: {prop}");

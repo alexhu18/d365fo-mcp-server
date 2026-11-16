@@ -179,3 +179,157 @@ describe('COC004 — next must be unconditional', () => {
     expect(rules(code)).toEqual([]);
   });
 });
+
+describe('COC004 — protected blocks are not conditional', () => {
+  // Both verbatim from shipped AdvancedQualityManagement extensions, which compile.
+  // Counting every block deeper than the method body reported them as SYS10028.
+  it('accepts next inside try, with a finally (QMSCaseDetailBase_Extension.insert)', () => {
+    const code = coc(`    public void insert()
+    {
+        SysInstrumentationActivityContext createCaseContext;
+        QMSInstrumentationLogger logger;
+
+        boolean isCapaCase = QMSCAPAFeatureEnablementChecker::isCAPAEnabled() && this.QMSIsCAPA;
+
+        if (isCapaCase)
+        {
+            logger = QMSInstrumentationLogger::createLogger(classStr(QMSCaseDetailBase_Extension));
+
+            createCaseContext = logger.capaManagementActivities().capaCaseCreation();
+        }
+
+        try
+        {
+            next insert();
+
+            if (isCapaCase)
+            {
+                logger.logCAPACaseInformation(this);
+            }
+        }
+        finally
+        {
+            if (isCapaCase)
+            {
+                createCaseContext.dispose();
+            }
+        }
+    }`);
+
+    expect(rules(code)).toEqual([]);
+  });
+
+  it('accepts next inside using (QMSInventQualityOrderTable_Extension.insertFromForm)', () => {
+    const code = coc(`    public InventDimId insertFromForm(InventDim _inventDim)
+    {
+        using (var _ = QMSInventQualityOrderInsertFromFormContext::construct())
+        {
+            return next insertFromForm(_inventDim);
+        }
+    }`);
+
+    expect(rules(code)).toEqual([]);
+  });
+
+  it('accepts a bare block and a try opened on the same line', () => {
+    const code = coc(`    public void insert()
+    {
+        {
+            next insert();
+        }
+    }
+
+    public void update()
+    {
+        try { next update(); } finally { this.log(); }
+    }`);
+
+    expect(rules(code)).toEqual([]);
+  });
+
+  it('still flags next inside an if nested in a try', () => {
+    const code = coc(`    public void insert()
+    {
+        try
+        {
+            if (this.RecId)
+            {
+                next insert();
+            }
+        }
+        finally
+        {
+        }
+    }`);
+
+    expect(rules(code)).toHaveLength(1);
+  });
+
+  it('still flags next inside a catch, which runs only on an exception', () => {
+    const code = coc(`    public void insert()
+    {
+        try
+        {
+            this.prepare();
+        }
+        catch
+        {
+            next insert();
+        }
+    }`);
+
+    expect(rules(code)).toHaveLength(1);
+  });
+
+  it('still flags next inside an if or while whose condition spans lines', () => {
+    // The brace's own line and the line above it hold no keyword; only the header's
+    // first line does. Release audit 1.22: these passed after the protected-block change.
+    const code = coc(`    public void insert()
+    {
+        if (this.AccountNum
+            && this.CustGroup)
+        {
+            next insert();
+        }
+    }
+
+    public void update()
+    {
+        while (this.AccountNum
+            && this.CustGroup) {
+            next update();
+        }
+    }`);
+
+    expect(rules(code)).toHaveLength(2);
+  });
+
+  it('accepts next inside a using whose header spans lines', () => {
+    const code = coc(`    public void insert()
+    {
+        using (var context = QMSInventQualityOrderInsertFromFormContext::construct(
+            this.RecId))
+        {
+            next insert();
+        }
+    }`);
+
+    expect(rules(code)).toEqual([]);
+  });
+
+  it('still flags next inside an else block on its own line', () => {
+    const code = coc(`    public void insert()
+    {
+        if (this.RecId)
+        {
+            this.prepare();
+        }
+        else
+        {
+            next insert();
+        }
+    }`);
+
+    expect(rules(code)).toHaveLength(1);
+  });
+});

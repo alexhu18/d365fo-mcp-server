@@ -11,12 +11,14 @@
 
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import * as fs from 'fs/promises';
 import type { XppServerContext } from '../../types/context.js';
 import type { XppMetadataParser } from '../../metadata/xmlParser.js';
 import { tryBridgeMethodSource } from '../../bridge/bridgeAdapter.js';
 import { canonicalSymbolName } from '../../utils/symbolLookup.js';
 import { inheritedOwnerCandidates } from '../../utils/inheritanceChain.js';
 import { readIndexedMethodSource, obsoleteWarning } from '../../utils/indexedMethodSource.js';
+import { findD365FileOnDisk } from '../../utils/objectFileLookup.js';
 
 const GetMethodSourceArgsSchema = z.object({
   className: z.string().describe('Name of the class containing the method'),
@@ -24,7 +26,7 @@ const GetMethodSourceArgsSchema = z.object({
 });
 
 /** Object types that can own methods. */
-const OBJECT_TYPES = ['class', 'table', 'view', 'data-entity'] as const;
+const OBJECT_TYPES = ['class', 'table', 'view', 'data-entity', 'map'] as const;
 const OBJECT_TYPES_SQL = `(${OBJECT_TYPES.map(t => `'${t}'`).join(', ')})`;
 
 export async function getMethodSourceTool(request: CallToolRequest, context: XppServerContext) {
@@ -270,9 +272,22 @@ async function tryXmlMethodSource(
 
   if (!classRow?.file_path) return { status: 'unreachable' };
 
+  // The indexed path may be relative (post-extract dumps) or point at a build
+  // agent. If it is not readable as-is, rebuild it from the configured packages
+  // root before giving up — findD365FileOnDisk knows the Ax<Type> folder for
+  // every OBJECT_TYPES entry including map.
+  let filePath: string = classRow.file_path;
+  try {
+    await fs.access(filePath);
+  } catch {
+    const resolved = await findD365FileOnDisk(classRow.type, className, classRow.model);
+    if (!resolved) return { status: 'unreachable' };
+    filePath = resolved;
+  }
+
   try {
     const parseResult = await Promise.race([
-      parseByObjectType(parser, classRow.file_path, classRow.model, classRow.type),
+      parseByObjectType(parser, filePath, classRow.model, classRow.type),
       new Promise<{ success: false; error: string }>(resolve =>
         setTimeout(() => resolve({ success: false, error: 'timeout' }), 3000)
       ),
@@ -317,6 +332,7 @@ function parseByObjectType(
     case 'table':       return parser.parseTableFile(filePath, modelName);
     case 'view':
     case 'data-entity': return parser.parseViewFile(filePath, modelName);
+    case 'map':         return parser.parseMapFile(filePath);
     default:            return parser.parseClassFile(filePath, modelName);
   }
 }

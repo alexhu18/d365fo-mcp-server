@@ -3,7 +3,8 @@
  * Determines whether a D365 F&O model is custom or standard
  * 
  * Logic:
- * - Custom models are defined in CUSTOM_MODELS environment variable
+ * - Custom models are defined in CUSTOM_MODELS environment variable, which
+ *   follows its config file while the server runs (see getCustomModels)
  * - Supports wildcards: Custom*, *Test, *Extension*
  * - Models with EXTENSION_PREFIX are considered custom
  * - Auto-detected models from workspace are automatically registered as custom
@@ -12,6 +13,8 @@
 
 import { getInferredModelPrefix, toExtensionInfixCase } from './modelPrefixInference.js';
 import { normalizeModelToken } from './modelToken.js';
+import { readClassExtensionName } from './extensionNameFormat.js';
+import { reloadCustomModels } from './loadEnv.js';
 
 // Runtime registry for auto-detected custom models
 const autoDetectedCustomModels = new Set<string>();
@@ -40,9 +43,27 @@ function isAutoDetectedCustomModel(modelName: string): boolean {
 }
 
 /**
- * Get list of custom models from environment
+ * How often the configured list is checked against its files, at most. The
+ * classifier runs inside loops over whole models, so the check itself (two
+ * stats) is rationed. A hand edit of a config file takes far longer than this.
+ */
+const CUSTOM_MODELS_RECHECK_MS = 1000;
+let customModelsCheckedAt = 0;
+
+/**
+ * Get list of custom models from environment.
+ *
+ * The list follows the .env / JSON config file it came from while the server
+ * runs (reloadCustomModels), so a model added there is custom on the next tool
+ * call and a model removed there stops being custom. Models registered through
+ * registerCustomModel() are a separate source and are not affected.
  */
 export function getCustomModels(): string[] {
+  const now = Date.now();
+  if (now - customModelsCheckedAt >= CUSTOM_MODELS_RECHECK_MS || now < customModelsCheckedAt) {
+    customModelsCheckedAt = now;
+    reloadCustomModels();
+  }
   return process.env.CUSTOM_MODELS?.split(',').map(m => m.trim()).filter(Boolean) || [];
 }
 
@@ -72,6 +93,8 @@ function getConfiguredModelName(): string {
  * Empty string when not configured.
  */
 export function getObjectSuffix(): string {
+  // as-given: the name the caller chose is final, suffix included or not.
+  if (isAsGivenNamingMode()) return '';
   return process.env.EXTENSION_SUFFIX?.trim().replace(/_+$/, '') || '';
 }
 
@@ -85,7 +108,25 @@ export function getObjectSuffix(): string {
  * Studio default) — see getExtensionNamingStyle / getExtensionClassNamingStyle.
  */
 export function isNoPrefixMode(): boolean {
-  return process.env.EXTENSION_PREFIX_SOURCE?.trim().toLowerCase() === 'none';
+  const source = process.env.EXTENSION_PREFIX_SOURCE?.trim().toLowerCase();
+  return source === 'none' || isAsGivenSource(source);
+}
+
+function isAsGivenSource(source: string | undefined): boolean {
+  return source === 'as-given';
+}
+
+/**
+ * True when the server must not rename anything (naming.prefixSource=as-given,
+ * env EXTENSION_PREFIX_SOURCE=as-given) — issue #1134. It is `none` and more:
+ * no prefix, no suffix, AND no extension token. `none` still rewrites an
+ * extension's token to the model name, which is wrong for a team whose token is
+ * an abbreviation of it (`VendTable.ABC` in model `ContosoCore`). The convention
+ * then lives in the project's instruction file, and the server only refuses a
+ * name that cannot be a valid AOT name (see asGivenNameProblem in objectNaming).
+ */
+export function isAsGivenNamingMode(): boolean {
+  return isAsGivenSource(process.env.EXTENSION_PREFIX_SOURCE?.trim().toLowerCase());
 }
 
 /**
@@ -455,6 +496,10 @@ export function prefixLeadingClassName(base: string, infix: string): string {
  */
 export function extensionClassBaseOf(name: string, modelName?: string): string {
   if (!name.endsWith('_Extension')) return name;
+  // A configured class format states where the base sits; the most specific
+  // reading wins where formats overlap (see readClassExtensionName).
+  const formatted = readClassExtensionName(name)[0];
+  if (formatted) return formatted.base;
   const stem = name.slice(0, -'_Extension'.length);
   const prefix = resolveObjectPrefix(modelName ?? '');
   const infix = prefix ? deriveExtensionInfix(prefix, modelName) : '';
@@ -505,6 +550,8 @@ export function applyObjectPrefix(
   modelName?: string,
   options?: ApplyObjectPrefixOptions,
 ): string {
+  // as-given: nothing is renamed, extensions included (#1134).
+  if (isAsGivenNamingMode()) return objectName;
   // No prefix: a new object keeps its name. An extension still gets the model-name
   // token when the operator chose no prefix on purpose (naming.prefixSource=none) —
   // the branches below handle that, and leave regular objects untouched.

@@ -7,33 +7,32 @@ import * as fs from 'fs/promises';
 import { directXmlSetIndexValidTimeState, coerceNoYesFlag } from './directXmlWriters.js';
 import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import { XmlTemplateGenerator } from '../xml/xmlTemplateGenerator.js';
-import { findIgnoredEntityProperties, stagingTableNote } from '../xml/dataEntityXml.js';
+import { findIgnoredEntityProperties } from '../xml/dataEntityXml.js';
+import { provisionStagingTable } from './stagingTableProvisioning.js';
 import { fieldPropertiesFromSpecs, applyFieldPropertyPatches } from '../xml/tableFieldPropertyEdit.js';
 import * as path from 'path';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { getConfigManager, fallbackPackagePath } from '../../utils/configManager.js';
+import { getConfigManager } from '../../utils/configManager.js';
 import { describePackagesRootScan } from '../../utils/packagesRoot.js';
 import { upsertWrittenFileIntoIndex } from './inlineIndexUpsert.js';
 import { ProjectFileManager, ProjectFileFinder, registerFileInActiveProject } from '../../workspace/projectFile.js';
-import { verifyWrittenFile, renderWriteVerification, runInlineBpCheck, membershipOf, renderBatchEditHint } from './inlineWriteVerification.js';
+import { verifyWrittenFile, renderWriteVerification, runInlineBpCheck, membershipOf, bridgeMessageNote, renderBatchEditHint, verifyWriteIntent, createIntentFor } from './inlineWriteVerification.js';
 import { validateWrittenXpp } from './inlineXppValidation.js';
 import { createPhaseTimer } from '../../utils/phaseTimer.js';
 import { registerCustomModel } from '../../utils/modelClassifier.js';
-import { COC_BASE_SYMBOL_TYPES, inferExtendedBase, normalizeObjectName } from '../../utils/objectNaming.js';
-import { lookupSymbolsNocase } from '../../utils/symbolLookup.js';
-import { PackageResolver } from '../../utils/packageResolver.js';
+import { renameDisclosure, resolveCreateObjectName, applyRenameToContent } from './createObjectName.js';
+import { resolvePackageNameAsModel, resolveWriteTarget } from './resolveWriteTarget.js';
 import { crossModelWriteRefusal, standDownNotice } from '../../utils/crossModelWriteGuard.js';
-import { resolveAnchorModel } from './writeAnchorGuard.js';
+import { resolveAnchorModel, resolveModelDependency } from './writeAnchorGuard.js';
 import { xppMethodSourceForXml } from '../../utils/xppFormat.js';
-import { bridgeValidateAfterWrite, canBridgeCreate, bridgeCreateObject, bridgeCreateSmartTable, isBridgeFailure, describeBridgeFailure } from '../../bridge/index.js';
+import { bridgeValidateAfterWrite, canBridgeCreate, bridgeCreateObject, bridgeCreateSmartTable, isBridgeFailure, describeBridgeFailure, rejectedBridgeInput } from '../../bridge/index.js';
 import type { BridgeFailure } from '../../bridge/index.js';
 import * as debouncedRefresh from '../../bridge/debouncedRefresh.js';
 import { subscriberAccessLevelValue } from '../../utils/subscriberAccessLevel.js';
 import {
   checkObjectIdentity,
   renderIdentityRefusal,
-  rewriteRootObjectName,
 } from './objectIdentityGate.js';
 import { enforceGrounding } from '../../utils/provenanceStore.js';
 import { gateOnFormPatternErrors, isFormPatternEnforceEnabled } from '../analysis/validateFormPattern.js';
@@ -42,16 +41,22 @@ import { validateFormExtensionControlShape, buildFormExtensionShapeError } from 
 import { gateOnReferenceErrors } from './resolveReferences.js';
 import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import { resolveEdtBaseType, resolveEdtEnumType, heuristicEdtBaseType, isEnumName, bridgeEdtBaseType } from '../smart/generateSmartTable.js';
+import { withEdtTypeFromExtends, bridgeEdtBaseTypeName } from './edtBaseTypeFromExtends.js';
 import { recordCreatedArtifact } from '../../workspace/createdArtifactLedger.js';
 import { resolveOrCreateLabelRef, type AutoLabelTarget } from './createLabel.js';
 import { isRawLabelText } from '../../utils/labelReference.js';
 import { sayOncePerSession } from '../../utils/repeatedNotes.js';
 import { ensureFormMetadataNamespace, FORM_METADATA_NAMESPACE } from '../../utils/formMetadataNamespace.js';
-import { parseExtensionOfAttribute } from '../../metadata/xppDeclaration.js';
 import {
   reconcileTableCreateProperties,
   renderTableCreateHonestyReport,
 } from '../xml/createTablePropertyHonesty.js';
+import { relationOnDeleteFromSpecs, type TableBpDefaultsOptions } from '../xml/tableBpDefaults.js';
+import { fieldEdtNames, resolveEdtRelations } from '../xml/edtRelationResolver.js';
+import { applyMenuItemBpDefaults, renderMenuItemBpNote } from '../xml/menuItemBpDefaults.js';
+import { menuItemFormAllLocal } from '../xml/formDataSourceDomain.js';
+import { menuItemKindOf } from '../../utils/bpCreateDefaults.js';
+import type { XppServerContext } from '../../types/context.js';
 
 
 /**
@@ -588,19 +593,15 @@ export function sourceAsWritten(sourceCode: string | undefined, finalObjectName:
   }
 }
 
-/** Notes for a data-entity create: `properties` keys it did not read, and the staging table it did not create. */
-function dataEntityCreateNotes(objectType: string, properties: unknown, entityName: string): string {
+/** Note for a data-entity create: the `properties` keys it did not read. The staging table has its own (provisionStagingTable). */
+function dataEntityCreateNotes(objectType: string, properties: unknown): string {
   if (objectType !== 'data-entity') return '';
-  const props = properties as Record<string, any> | undefined;
-  const ignored = findIgnoredEntityProperties(props);
-  return (
-    (ignored.length
-      ? `\n⚠️ ${ignored.length} property key(s) were NOT written — the data-entity generator does not read: ` +
-        `${ignored.join(', ')}. Anything else can be set afterwards with modify (modify-property / ` +
-        `add-data-source / add-field).`
-      : '') +
-    stagingTableNote(entityName, props)
-  );
+  const ignored = findIgnoredEntityProperties(properties as Record<string, any> | undefined);
+  return ignored.length
+    ? `\n⚠️ ${ignored.length} property key(s) were NOT written — the data-entity generator does not read: ` +
+      `${ignored.join(', ')}. Anything else can be set afterwards with modify (modify-property / ` +
+      `add-data-source / add-field).`
+    : '';
 }
 
 /**
@@ -650,14 +651,16 @@ function bridgeSubscriberAccessLevel(key: string, value: unknown): unknown {
 async function reconcileCreatedTableProperties(
   filePath: string | undefined,
   properties: unknown,
+  db?: unknown,
 ): Promise<string> {
   if (!filePath) return '';
   try {
     const onDisk = await fs.readFile(filePath, 'utf-8');
-    // No properties still reconciles: a regular table gets Visual Studio's
-    // SubscriberAccessLevel, which no bridge create writes.
+    // No properties still reconciles: every table gets the OperationalDomain and
+    // SubscriberAccessLevel xppbp expects, which no bridge create writes.
     const props = properties && typeof properties === 'object' ? (properties as Record<string, unknown>) : undefined;
-    const reconciled = reconcileTableCreateProperties(onDisk, props);
+    // The bridge wrote this file, so its parent-pointing delete actions are its own (tableBpDefaults.ts).
+    const reconciled = reconcileTableCreateProperties(onDisk, props, await tableBpOptions(onDisk, props, db, true));
     // AllowEdit / IgnoreEDTRelation have no key in the bridge's create payload: applied to the XML on top of the reconcile.
     const fieldSpecs = props?.fields;
     const fieldPatches = Array.isArray(fieldSpecs)
@@ -683,6 +686,61 @@ async function reconcileCreatedTableProperties(
 }
 
 /**
+ * The structural BP-default options for a table create (tableBpDefaults.ts):
+ * the EDT relations of its fields, resolved from the index, and the caller's
+ * relations[].onDelete. `writerXml` says the document came from one of this
+ * server's writers rather than from the caller's xmlContent.
+ */
+async function tableBpOptions(
+  xml: string,
+  props: Record<string, unknown> | undefined,
+  db: unknown,
+  writerXml: boolean,
+): Promise<TableBpDefaultsOptions> {
+  return {
+    edtRelations: await resolveEdtRelations(fieldEdtNames(xml), db),
+    relationOnDelete: relationOnDeleteFromSpecs(props?.relations),
+    dropWriterDeleteActions: writerXml,
+  };
+}
+
+/** The symbol index's read handle, or undefined when there is none. */
+function readDbOf(context: Pick<XppServerContext, 'symbolIndex'> | Partial<Pick<XppServerContext, 'symbolIndex'>> | undefined): unknown {
+  try {
+    return context?.symbolIndex?.getReadDb?.();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * OperationalDomain and SubscriberAccessLevel on a menu item the bridge wrote
+ * (menuItemBpDefaults.ts). The bridge's SetAxMenuItemProperty() knows neither.
+ * Best-effort, like the table reconcile: a failure never fails the create.
+ */
+async function reconcileCreatedMenuItem(filePath: string | undefined, properties: unknown, db: unknown): Promise<string> {
+  if (!filePath) return '';
+  try {
+    const onDisk = await fs.readFile(filePath, 'utf-8');
+    const props = properties && typeof properties === 'object' ? (properties as Record<string, unknown>) : undefined;
+    const r = applyMenuItemBpDefaults(onDisk, props, { allDataSourcesLocal: await menuItemFormAllLocal(onDisk, db) });
+    if (r.xml !== onDisk) await writeFileAtomic(filePath, normalizeD365Xml(r.xml));
+    return renderMenuItemBpNote(r);
+  } catch (e) {
+    console.error(`[create_d365fo_file] menu item BP defaults skipped: ${e}`);
+    return '';
+  }
+}
+
+/** Keys the bridge cannot set on this object type and this tool writes itself after the create. */
+function writtenAfterBridgeCreate(objectType: string, key: string): boolean {
+  const k = key.toLowerCase();
+  if (objectType === 'table') return k === 'operationaldomain';
+  if (menuItemKindOf(objectType)) return k === 'operationaldomain' || k === 'subscriberaccesslevel';
+  return false;
+}
+
+/**
  * Create D365FO file handler function
  */
 /**
@@ -698,6 +756,8 @@ async function reconcileCreatedTableProperties(
 export interface CreateOutcome {
   finalObjectName?: string;
   filePath?: string;
+  /** The object was already on disk and overwrite was not set: nothing was written. */
+  alreadyExisted?: boolean;
 }
 
 export async function handleCreateD365File(
@@ -831,6 +891,22 @@ export async function handleCreateD365File(
       return { content: [{ type: 'text', text: errorMsg }], isError: true };
     }
 
+    // A package name passed as modelName means the package's one model. Resolved
+    // here, before the Microsoft-model check, the cross-model guard and the naming
+    // compare or use it: resolving it only with the write target (last) let the
+    // guard refuse "ContosoCore" against the workspace's "Contoso Core".
+    let packageAliasNote = '';
+    let aliasedPackage: string | undefined;
+    if (!args.packageName) {
+      const alias = await timer.time('package-name check', () => resolvePackageNameAsModel(actualModelName!));
+      if (alias.note) {
+        console.error(`[create_d365fo_file] modelName "${actualModelName}" is a package; using its model "${alias.modelName}"`);
+        aliasedPackage = actualModelName;
+        actualModelName = alias.modelName;
+        packageAliasNote = `\n${alias.note}`;
+      }
+    }
+
     // ⚠️ CRITICAL WARNING: If no project/solution path available anywhere
     if (!projectPathToUse && !solutionPathToUse) {
       console.error(
@@ -952,13 +1028,17 @@ export async function handleCreateD365File(
     // Resolved, not read synchronously: where the model comes only from the
     // background .rnrproj scan, the sync getter can still be null here — and a
     // null anchor makes the guard stand down.
+    const anchorModel = await resolveAnchorModel(getConfigManager());
     const crossModelCheck = {
       objectName: args.objectName,
       objectType: args.objectType,
       owningModel: actualModelName,
-      activeModel: await resolveAnchorModel(getConfigManager()),
+      // A workspace anchored by package (workspacePath) still owns the package's model.
+      owningPackage: aliasedPackage,
+      activeModel: anchorModel,
       toolSwitchedModel: getConfigManager().getToolProjectSwitch()?.forcedModel ?? null,
       action: 'create' as const,
+      dependency: await resolveModelDependency(actualModelName, anchorModel),
     };
     const crossModelCreateRefusal = crossModelWriteRefusal(crossModelCheck);
     if (crossModelCreateRefusal) {
@@ -970,33 +1050,19 @@ export async function handleCreateD365File(
     // Allowed, but possibly not into this model — see standDownNotice.
     const crossModelNotice = standDownNotice(crossModelCheck);
 
-    // Name normalisation lives in utils/objectNaming so that modify resolves the
-    // very same name from the very same arguments — the ninety lines that used to
-    // sit here inline were the reason it did not. See normalizeObjectName.
-    // The base an extension class names in [ExtensionOf] (or properties.baseClass)
-    // tells "SalesTable + Mcp + CreditHold" — a name that already carries the token —
-    // apart from a base that merely contains it. See ApplyObjectPrefixOptions.extendedBase.
-    const statedBaseClass = (args.properties as Record<string, unknown> | undefined)?.baseClass;
-    // With neither, the index stands in — the same inference prepare and
-    // validate_object_naming use, so the name they predict is the name written.
-    const extendedBase =
-      parseExtensionOfAttribute(args.sourceCode ?? args.xmlContent ?? '')?.baseObjectName ??
-      (typeof statedBaseClass === 'string' && statedBaseClass ? statedBaseClass : undefined) ??
-      inferExtendedBase(args.objectName, actualModelName, n => {
-        try {
-          const db = context?.symbolIndex?.getReadDb?.();
-          return !!db && lookupSymbolsNocase(db, n, { types: COC_BASE_SYMBOL_TYPES, limit: 1 }).length > 0;
-        } catch {
-          return false;
-        }
-      });
-    const finalObjectName = normalizeObjectName(
-      args.objectName,
-      args.objectType,
+    const naming = resolveCreateObjectName(
+      args,
       actualModelName,
+      context?.symbolIndex,
       (note: string) => console.error(`[create_d365fo_file] ${note}`),
-      { extendedBase },
     );
+    if (naming.kind === 'refused') {
+      return {
+        content: [{ type: 'text', text: `❌ Not created: ${naming.message}` }],
+        isError: true,
+      };
+    }
+    const finalObjectName = naming.finalObjectName;
     if (finalObjectName !== args.objectName) {
       console.error(`[create_d365fo_file] Applied naming: ${args.objectName} → ${finalObjectName}`);
     }
@@ -1008,10 +1074,7 @@ export async function handleCreateD365File(
     // path says "prefixed from …"; the bridge path — every extension, class and
     // table — said nothing, so the object came back under a name the caller never
     // chose and could only infer from the file path.
-    const renameNote = finalObjectName !== args.objectName
-      ? `\n🔖 Named \`${finalObjectName}\`, not \`${args.objectName}\` as passed — the model's naming ` +
-        `style decides this. The declaration inside the file matches; use this name in later calls.`
-      : '';
+    const renameNote = renameDisclosure(finalObjectName, args.objectName);
 
     // ── Raw label text → a label reference, before anything is written ───────
     // Measured over 1,515 real MCP calls: `labels` was called 268 times against
@@ -1090,96 +1153,20 @@ export async function handleCreateD365File(
       throw new Error(`Unsupported object type: ${args.objectType}`);
     }
 
-    // Construct full path - resolve package name
-    // Package name can differ from model name in any environment (not just UDE).
-    const configManager = getConfigManager();
-    const configPackagePath = configManager.getPackagePath();
-    const envType = await configManager.getDevEnvironmentType();
-
-    let basePath: string;
-    let resolvedPackageName: string;
-
-    // Resolve the custom write root (D365FO_CUSTOM_PACKAGES_PATH).
-    // Applies in both UDE and traditional mode — it always points to the repo
-    // working tree where custom model XML lives, regardless of dev env type.
-    const customWritePath = await configManager.getCustomPackagesPath();
-
-    if (args.packageName) {
-      // Explicit packageName always wins, regardless of environment type
-      resolvedPackageName = args.packageName;
-      // Custom write root beats the MS PLD for explicit packageName calls too.
-      basePath = args.packagePath || customWritePath || configPackagePath || fallbackPackagePath();
-    } else if (envType === 'ude') {
-      // UDE mode: auto-resolve package name via descriptor scan across both roots
-      const msPath = await configManager.getMicrosoftPackagesPath();
-      const roots = [customWritePath, msPath].filter(Boolean) as string[];
-
-      const resolver = new PackageResolver(roots);
-      const resolved = await timer.time('package resolution', () => resolver.resolve(actualModelName));
-
-      if (resolved) {
-        resolvedPackageName = resolved.packageName;
-        basePath = resolved.rootPath;
-      } else {
-        // Fallback: assume package == model (common case)
-        resolvedPackageName = actualModelName;
-        basePath = customWritePath || args.packagePath || configPackagePath || fallbackPackagePath();
-      }
-    } else {
-      // Traditional mode: try descriptor-based resolution first so a package
-      // whose name differs from the model name (e.g. package "ISVPackage",
-      // model "ISV Package") resolves correctly without an explicit packageName
-      // arg. Scan both the custom write root and D365FO_PACKAGE_PATH for the
-      // matching descriptor; fall back to assuming package == model otherwise.
-      const roots = [customWritePath, configPackagePath].filter(Boolean) as string[];
-      const resolver = new PackageResolver(roots);
-      const resolved = roots.length
-        ? await timer.time('package resolution', () => resolver.resolve(actualModelName))
-        : null;
-
-      if (resolved) {
-        resolvedPackageName = resolved.packageName;
-        basePath = resolved.rootPath;
-      } else {
-        // Fallback: assume package == model.
-        // Prefer the custom write root over D365FO_PACKAGE_PATH so custom model
-        // XML lands in the repo working tree rather than the MS PackagesLocalDirectory.
-        resolvedPackageName = actualModelName;
-        basePath =
-          args.packagePath ||
-          customWritePath ||
-          configPackagePath ||
-          fallbackPackagePath();
-      }
-    }
-
-    console.error(
-      `[create_d365fo_file] Environment: ${envType}, Package: ${resolvedPackageName}, Model: ${actualModelName}, BasePath: ${basePath}`,
-    );
-
-    const modelPath = path.join(
-      basePath,
-      resolvedPackageName,
-      actualModelName,
+    const target = await resolveWriteTarget({
+      modelName: actualModelName,
       objectFolder,
-    );
-    const fileName = `${finalObjectName}.xml`;
-    const fullPath = path.join(modelPath, fileName);
-
-    // Security: prevent path traversal. path.join() resolves ".." segments,
-    // so a crafted modelName/objectName could escape basePath entirely.
-    // Resolve both paths and assert the target stays within basePath.
-    const resolvedBase = path.resolve(basePath);
-    const resolvedTarget = path.resolve(fullPath);
-    if (!resolvedTarget.startsWith(resolvedBase + path.sep) && resolvedTarget !== resolvedBase) {
-      throw new Error(
-        `❌ Security error: resolved path "${resolvedTarget}" is outside base directory "${resolvedBase}".\n` +
-        `Check modelName, packageName, objectName, and packagePath for path traversal sequences.`
-      );
-    }
-
-    // Normalize path to Windows format (backslashes) for consistency
-    const normalizedFullPath = fullPath.replace(/\//g, '\\');
+      objectName: finalObjectName,
+      packageName: args.packageName,
+      packagePath: args.packagePath,
+      time: (name, fn) => timer.time(name, fn),
+      logPrefix: '[create_d365fo_file]',
+    });
+    const { basePath, modelPath, normalizedFullPath } = target;
+    // A package name passed as modelName resolves to the package's one model:
+    // every step from here (bridge, project, index) works on that model.
+    actualModelName = target.modelName;
+    const targetNote = packageAliasNote + target.notes.map(n => `\n${n}`).join('');
     if (outcome) outcome.filePath = normalizedFullPath;
 
     // Ensure directory exists (create if needed)
@@ -1240,6 +1227,7 @@ export async function handleCreateD365File(
 
     if (fileExisted) {
       if (!args.overwrite) {
+        if (outcome) outcome.alreadyExisted = true;
         // Surface what's already on disk so the caller doesn't have to read the
         // file in chunks just to discover its contents. Previously this branch
         // returned only "already exists", forcing repeated read_file calls.
@@ -1357,6 +1345,11 @@ export async function handleCreateD365File(
     // same ✅ as one the bridge performed.
     let bridgeFailure: BridgeFailure | null = null;
 
+    // Both writers below default an EDT to a string one; its parent decides instead.
+    if (args.objectType === 'edt') {
+      args.properties = await withEdtTypeFromExtends(args.properties, context?.bridge, context?.symbolIndex?.getReadDb?.());
+    }
+
     if (!args.xmlContent && !skipBridgeForEnum && context?.bridge && actualModelName && canBridgeCreate(args.objectType)) {
       try {
         // Settle any rebuild an earlier write in this session scheduled but did not
@@ -1376,6 +1369,8 @@ export async function handleCreateD365File(
         const scalarProperties: Record<string, string> | undefined = args.properties
           ? Object.fromEntries(
               Object.entries(args.properties as Record<string, unknown>)
+                // Written after the create instead, so the bridge does not report them as unapplied.
+                .filter(([k]) => !writtenAfterBridgeCreate(args.objectType, k))
                 .map(([k, v]): [string, unknown] => [k, bridgeSubscriberAccessLevel(k, v)])
                 .filter(([, v]) => v != null && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
                 .map(([k, v]) => [k, String(v)]),
@@ -1524,7 +1519,7 @@ export async function handleCreateD365File(
         // edtType:"Real", extends:"AmountCur" — the written XML came back i:type="AxEdtString".
         if (args.objectType === 'edt' && bridgeParams.properties && 'edtType' in bridgeParams.properties) {
           const { edtType, ...rest } = bridgeParams.properties;
-          bridgeParams.properties = { ...rest, BaseType: edtType };
+          bridgeParams.properties = { ...rest, BaseType: bridgeEdtBaseTypeName(edtType) as string };
         }
 
         // For plain 'table' creates, prefer the bridge's BP-smart path
@@ -1613,7 +1608,7 @@ export async function handleCreateD365File(
                       );
                       projectMsg = `\n✅ Added to project: ${path.basename(detectedPath)}`;
                     } else {
-                      projectMsg = `\n⚠️ Could not find .rnrproj for model '${actualModelName}' in ${solutionPathToUse}`;
+                      projectMsg = `\n⚠️ ${await ProjectFileFinder.describeNoProject(solutionPathToUse, actualModelName)}`;
                     }
                   } catch (projErr) {
                     projectMsg = `\n⚠️ Could not add to project: ${projErr}`;
@@ -1629,6 +1624,7 @@ export async function handleCreateD365File(
               const honestyReport = await reconcileCreatedTableProperties(
                 smartResult.filePath,
                 args.properties,
+                readDbOf(context),
               ) + await stampIndexValidTimeState(smartResult.filePath, args.properties);
 
               // Schedule (do not await) the provider rebuild that makes the new object
@@ -1686,9 +1682,11 @@ export async function handleCreateD365File(
                 content: [
                   {
                     type: 'text',
-                    text: `✅ Created ${args.objectType} '${finalObjectName}' via IMetadataProvider.Create() (Smart)${crossModelNotice}${renameNote}\n` +
-                      `📁 ${smartResult.filePath}${projectMsg}\n` +
-                      `🔧 API: ${smartResult.api ?? 'IMetaTableProvider.Create (Smart)'}${bpSummary}${honestyReport}${rawLabelWarning}${labelAutoNote}${verifyNote}${indexNote}${bpNote}` +
+                    // No `🔧 API:` line and no "via IMetadataProvider.Create()": the
+                    // same text on every table create, nothing the agent acts on.
+                    text: `✅ Created ${args.objectType} '${finalObjectName}'${crossModelNotice}${renameNote}${targetNote}\n` +
+                      `📁 ${smartResult.filePath}${projectMsg}` +
+                      `${bpSummary}${honestyReport}${rawLabelWarning}${labelAutoNote}${verifyNote}${indexNote}${bpNote}` +
                       validateWrittenXpp(sourceAsWritten(args.sourceCode, finalObjectName)),
                   },
                 ],
@@ -1745,7 +1743,7 @@ export async function handleCreateD365File(
                   );
                   projectMsg = `\n✅ Added to project: ${path.basename(detectedPath)}`;
                 } else {
-                  projectMsg = `\n⚠️ Could not find .rnrproj for model '${actualModelName}' in ${solutionPathToUse}`;
+                  projectMsg = `\n⚠️ ${await ProjectFileFinder.describeNoProject(solutionPathToUse, actualModelName)}`;
                 }
               } catch (projErr) {
                 projectMsg = `\n⚠️ Could not add to project: ${projErr}`;
@@ -1760,9 +1758,11 @@ export async function handleCreateD365File(
           // #35: C# CreateTable() runs the same SetAxTableProperty() switch as the
           // smart path and ignores its return value just as thoroughly.
           const honestyReport = args.objectType === 'table'
-            ? await reconcileCreatedTableProperties(bridgeResult.filePath, args.properties)
+            ? await reconcileCreatedTableProperties(bridgeResult.filePath, args.properties, readDbOf(context))
               + await stampIndexValidTimeState(bridgeResult.filePath, args.properties)
-            : '';
+            : menuItemKindOf(args.objectType)
+              ? await reconcileCreatedMenuItem(bridgeResult.filePath, args.properties, readDbOf(context))
+              : '';
 
           // Refresh only after the reconcile — see the smart-table path for what
           // scheduling it first cost.
@@ -1792,14 +1792,21 @@ export async function handleCreateD365File(
           const bpNote = await timer.time('inline BP check',
             () => runInlineBpCheck((args as any).bpCheck, args.objectType, finalObjectName, context));
           const xppRuleNote = validateWrittenXpp(sourceAsWritten(args.sourceCode, finalObjectName));
+          // The scalar properties the caller passed, against the file. A table has
+          // its own reconcile above, so createIntentFor returns nothing for one.
+          const readBackNote = await timer.time('read-back comparison',
+            () => verifyWriteIntent(bridgeResult.filePath, createIntentFor(args.objectType, args.properties)));
 
           return {
             content: [
               {
                 type: 'text',
-                text: `✅ Created ${args.objectType} '${finalObjectName}' via IMetadataProvider.Create()${crossModelNotice}${renameNote}\n` +
-                  `📁 ${bridgeResult.filePath}${projectMsg}\n` +
-                  `🔧 API: ${bridgeResult.message}${honestyReport}${rawLabelWarning}${labelAutoNote}${verifyNote}${indexNote}${bpNote}${xppRuleNote}${timer.render()}`,
+                // bridgeMessageNote keeps only what the bridge message adds (a
+                // `⚠️ NOT applied` suffix); its `✅ Created via … — file:` line
+                // restated this headline and the path below it.
+                text: `✅ Created ${args.objectType} '${finalObjectName}'${crossModelNotice}${renameNote}${targetNote}\n` +
+                  `📁 ${bridgeResult.filePath}${projectMsg}` +
+                  `${bridgeMessageNote(bridgeResult.message, bridgeResult.filePath)}${honestyReport}${rawLabelWarning}${labelAutoNote}${verifyNote}${indexNote}${bpNote}${xppRuleNote}${readBackNote}${timer.render()}`,
               },
             ],
           };
@@ -1809,6 +1816,20 @@ export async function handleCreateD365File(
       } catch (bridgeErr) {
         console.error(`[create_d365fo_file] Bridge create failed, falling back to XML: ${bridgeErr}`);
       }
+    }
+
+    // The bridge validated a value and rejected it: the template would write the
+    // same value unchecked, so stop here instead of falling back.
+    const rejectedInput = bridgeFailure ? rejectedBridgeInput(bridgeFailure) : null;
+    if (rejectedInput) {
+      return {
+        content: [{
+          type: 'text',
+          text: `❌ Nothing was written — the bridge rejected an input value for ${args.objectType} ` +
+            `"${finalObjectName}": ${rejectedInput}\nCorrect the value and create it again.`,
+        }],
+        isError: true,
+      };
     }
 
     // A view's <DataSource> must name the referenced QUERY'S ROOT DATASOURCE, not
@@ -1872,40 +1893,7 @@ export async function handleCreateD365File(
     // When xmlContent or sourceCode contains `class MyClass` but finalObjectName is `MyPrefixMyClass`,
     // the file would be named MyPrefixMyClass.xml but contain `class MyClass` — inconsistency!
     if (finalObjectName !== args.objectName && (args.xmlContent || args.sourceCode)) {
-      const orig = args.objectName;
-      const final = finalObjectName;
-      // Escape for use in RegExp (handles dots in extension names like "Foo.Extension")
-      const escapedOrig = orig.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-      // 1. `class OriginalName` / `public class OriginalName` etc.
-      const classPattern = new RegExp(
-        `\\b(public\\s+|private\\s+|protected\\s+|internal\\s+|final\\s+)?class\\s+${escapedOrig}\\b`,
-        'g',
-      );
-      let replaced = xmlContent.replace(classPattern, (match) => match.replace(orig, final));
-
-      // 2. classnum(OriginalName) — X++ intrinsic that refers to the class by name.
-      //    Callers often write classnum(OriginalName) in the source code before prefixing.
-      const classnumPattern = new RegExp(`\\bclassnum\\(\\s*${escapedOrig}\\s*\\)`, 'gi');
-      replaced = replaced.replace(classnumPattern, (m) => m.replace(new RegExp(escapedOrig, 'i'), final));
-
-      // 3. classStr(OriginalName) — used in [ExtensionOf(classStr(...))] and SysOperation attributes.
-      const classStrPattern = new RegExp(`\\bclassStr\\(\\s*${escapedOrig}\\s*\\)`, 'gi');
-      replaced = replaced.replace(classStrPattern, (m) => m.replace(new RegExp(escapedOrig, 'i'), final));
-
-      // 4. the metadata <Name> — the identity this block used to leave behind.
-      //    Rewriting the declaration alone produced a file whose name, whose X++
-      //    and whose <Name> disagreed, reported ✅, and killed the next build
-      //    ("must be named X instead of Y to be consistent with its file name").
-      replaced = rewriteRootObjectName(replaced, orig, final);
-
-      if (replaced !== xmlContent) {
-        console.error(
-          `[create_d365fo_file] ✅ Fixed name inconsistency: ` +
-          `replaced \`${orig}\` with \`${final}\` in XML content (<Name>, class decl, classnum, classStr)`,
-        );
-        xmlContent = replaced;
-      }
+      xmlContent = applyRenameToContent(xmlContent, args.objectName, finalObjectName);
     }
 
     // Sanitize AxReport XML structure — ensures required D365FO VS Designer elements
@@ -1976,9 +1964,22 @@ export async function handleCreateD365File(
     // used to come back as an identical ✅.
     let tableHonestyReport = '';
     if (args.objectType === 'table') {
-      const reconciled = reconcileTableCreateProperties(xmlContent, args.properties);
+      const props = args.properties as Record<string, unknown> | undefined;
+      const reconciled = reconcileTableCreateProperties(
+        xmlContent,
+        props,
+        // Caller xmlContent keeps its own delete actions: only the template's are ours.
+        await tableBpOptions(xmlContent, props, readDbOf(context), !args.xmlContent),
+      );
       xmlContent = reconciled.xml;
       tableHonestyReport = renderTableCreateHonestyReport(reconciled);
+    } else if (menuItemKindOf(args.objectType)) {
+      // Same report slot: the BP defaults a menu item got (menuItemBpDefaults.ts).
+      const r = applyMenuItemBpDefaults(xmlContent, args.properties as Record<string, unknown> | undefined, {
+        allDataSourcesLocal: await menuItemFormAllLocal(xmlContent, readDbOf(context)),
+      });
+      xmlContent = r.xml;
+      tableHonestyReport = renderMenuItemBpNote(r);
     }
 
     // Why this writer ran at all. Only set when a bridge create threw — an
@@ -1991,7 +1992,7 @@ export async function handleCreateD365File(
         `back with get_object_info before building on it.\n`
       : '';
 
-    // Form pattern gate: structural pattern violations (FP001-FP005, FP007)
+    // Form pattern gate: what the compiler rejects (FP001-FP005, FP007, FP011)
     // block the write when FORM_PATTERN_ENFORCE is enabled (default).
     // Recommendations are appended to the success message instead.
     let formPatternWarnings = '';
@@ -2155,9 +2156,8 @@ export async function handleCreateD365File(
           console.error(
             `[create_d365fo_file] No .rnrproj found in solution directory`
           );
-          projectMessage = `\n⚠️ Could not find .rnrproj file for model '${actualModelName}' in solution directory.\n` +
-            `Searched in: ${solutionPathToUse}\n` +
-            `Please specify projectPath parameter explicitly or add it to .mcp.json.\n`;
+          projectMessage =
+            `\n⚠️ ${await ProjectFileFinder.describeNoProject(solutionPathToUse, actualModelName)}\n`;
         } else {
           console.error(
             `[create_d365fo_file] Found project file: ${detectedPath}`
@@ -2219,18 +2219,22 @@ export async function handleCreateD365File(
       }
     }
 
-    // Only the step the AGENT can take, and only ONE of them.
+    // Only the step the AGENT can take, and only ONE of them. Kept although it is
+    // the same text on every create: unlike the confirmations trimmed above, each
+    // line was added against a measured round-trip pattern, and the tool
+    // descriptions it seems to restate were already there when that was measured.
     //
     // `bpCheck:true` makes the build run the best-practice checker too, so this
     // is one follow-up call rather than the build → run_bp_check →
     // verify_d365fo_project chain the logs actually show (39 run_bp_check and 35
     // verify_d365fo_project calls in 1,400, largely right after writes that had
-    // already verified themselves inline — see verifyNote/indexNote above).
+    // already verified themselves inline).
     //
-    // The old tail also carried a `⛔ TASK COMPLETE — do NOT call generate,
-    // generate, or d365fo_file(action="create") again` banner: 133 chars that
-    // named the same tool twice (a copy/paste defect) to say what the one clause
-    // appended to the batch-edit hint below says in 47.
+    // The batch-edit hint answers the dominant waste pattern (40 of 49 modifies
+    // were single-op although operations[] existed: a discovery gap, not a
+    // capability gap — see renderBatchEditHint). The old tail also carried a
+    // `⛔ TASK COMPLETE — do NOT call … again` banner; the last clause says the
+    // same in 47 chars.
     const nextSteps = (args.addToProject
       ? `Next: build_d365fo_project(bpCheck:true) — builds AND best-practice-checks in one call.\n`
       : `Next: add the file to your .rnrproj, then build_d365fo_project(bpCheck:true) — builds AND best-practice-checks in one call.\n`) +
@@ -2266,6 +2270,25 @@ export async function handleCreateD365File(
     // class, so the class-scoped rules (COC004, COC005) apply here — the cheap
     // moment to catch what xppbp does not and only a build would.
     const xppRuleNote = validateWrittenXpp(sourceAsWritten(args.sourceCode, finalObjectName));
+    // The scalar properties the caller passed, against the file (see the bridge
+    // path). Keys the data-entity note below already names are left to that note.
+    const readBackNote = await timer.time('read-back comparison', () =>
+      verifyWriteIntent(normalizedFullPath, createIntentFor(
+        args.objectType,
+        args.properties,
+        args.objectType === 'data-entity'
+          ? findIgnoredEntityProperties(args.properties as Record<string, any> | undefined)
+          : [],
+      )));
+    // An entity with data management enabled names a staging table: create it now,
+    // through this same handler, so the next build finds it (stagingTableProvisioning.ts).
+    const stagingNote = args.objectType === 'data-entity'
+      ? await timer.time('staging table', () => provisionStagingTable(
+          { entityName: finalObjectName, entityPath: normalizedFullPath, modelName: actualModelName!, args },
+          context,
+          handleCreateD365File,
+        ))
+      : '';
 
     // Return success message with file path
     return {
@@ -2279,7 +2302,7 @@ export async function handleCreateD365File(
           // the part kept — see createRenameDisclosure.test.ts for why it must be.
           text: `✅ Created ${args.objectType} ${finalObjectName}` +
             `${finalObjectName !== args.objectName ? ` (prefixed from "${args.objectName}")` : ''}` +
-            `${crossModelNotice}\n📁 ${normalizedFullPath}\n` +
+            `${crossModelNotice}${targetNote}\n📁 ${normalizedFullPath}\n` +
             bridgeValidation +
             namespaceNote +
             formPatternWarnings +
@@ -2288,14 +2311,16 @@ export async function handleCreateD365File(
             rawLabelBpWarning(args.properties, finalObjectName) +
             labelAutoNote +
             extensibleEnumOrderingWarning(args.objectType, args.properties, finalObjectName) +
-            dataEntityCreateNotes(args.objectType, args.properties, finalObjectName) +
+            dataEntityCreateNotes(args.objectType, args.properties) +
+            stagingNote +
             projectMessage +
             verifyNote +
             indexNote +
             bpNote +
             xppRuleNote +
+            readBackNote +
             timer.render() +
-            `\n${nextSteps}`,
+            `\n\n${nextSteps}`,
         },
       ],
     };

@@ -49,10 +49,13 @@ Which developer box this is and where its X++ packages live.
 | `environment.type` | setup | `D365FO_DEV_ENVIRONMENT_TYPE` | — | Classic AOSService VM ("traditional") or Unified Developer Experience / Power Platform Tools ("ude"). The wizard preselects the one it detects — UDE when XPP config files exist in %LOCALAPPDATA%\\Microsoft\\Dynamics365\\XPPConfig. Left unset, the server falls back to that same detection. Values: `traditional` — classic AOSService VM with PackagesLocalDirectory; `ude` — Unified Developer Experience / Power Platform Tools. |
 | `environment.packagePath` | setup | `D365FO_PACKAGE_PATH` | — | AOT packages folder (PackagesLocalDirectory) used as the read-only source for indexing. Machine-wide on a traditional VM; UDE resolves it from the XPP config instead. Left empty, the server scans the machine's drives for AosService\\PackagesLocalDirectory — which volume that is depends on the VM image (K:, C:, J:, …). |
 | `environment.scanDrives` | advanced | `D365FO_SCAN_DRIVES` | — | Comma-separated letters the packages-root scan probes when no packagePath is configured, e.g. "C,K". Empty probes C: to Z: — the letters that have ever held AosService first, the rest inside a 2 s budget. Set it on a machine with a disconnected mapped network drive: one stat on such a drive stalls for the SMB timeout, and the scan runs on the first tool call of a session. |
-| `environment.customModels` | setup | `CUSTOM_MODELS` | — | Your own (non-Microsoft) models, comma-separated. They are indexed with priority and treated as writable. Find them in VS → Dynamics 365 → Model Management → View models. UDE detects these automatically. |
+| `environment.customModels` | setup | `CUSTOM_MODELS` | — | Your own (non-Microsoft) models, comma-separated. They are indexed with priority and treated as writable. Find them in VS → Dynamics 365 → Model Management → View models. UDE detects these automatically. Re-read from the config file (or `.env`) while the server runs, so an edit applies without a restart. |
 | `environment.xppConfigName` | setup | `XPP_CONFIG_NAME` | — | Name of a config file in %LOCALAPPDATA%\\Microsoft\\Dynamics365\\XPPConfig. Pinning one keeps the server on a specific environment/version; leave empty to always use the newest config. |
 | `environment.customPackagesPath` | advanced | `D365FO_CUSTOM_PACKAGES_PATH` | — | Where custom model XML is written and tracked by git. Normally read from the XPP config — override only when your working tree lives somewhere else. |
 | `environment.microsoftPackagesPath` | advanced | `D365FO_MICROSOFT_PACKAGES_PATH` | — | Read-only Microsoft packages folder. Normally read from the XPP config. |
+| `environment.dataverseUrl` | setup | `D365FO_DATAVERSE_URL` | — | URL of the Dataverse environment your UDE belongs to, e.g. https://contoso-dev.crm.dynamics.com — not the Finance and Operations URL. run_systest_class sends tests to the cloud runtime through it, signing in as you in the browser. `pac org list` or the Power Platform admin center shows it. |
+| `environment.dataverseClientId` | advanced | `D365FO_DATAVERSE_CLIENT_ID` | `51f81489-12ee-4a9e-aaae-a2591f45987d` | Public client (app registration) used to sign in to Dataverse. Defaults to Microsoft's sample Dataverse client, the one Power Platform Tools signs in with; set your own when your tenant blocks it. It needs the http://localhost redirect URI. |
+| `environment.dataverseTenant` | advanced | `D365FO_DATAVERSE_TENANT` | `organizations` | Microsoft Entra tenant id or domain to sign in to. The default, "organizations", signs in to your home tenant; set the environment's tenant when you are a guest in it. |
 
 ### Workspace
 
@@ -75,10 +78,15 @@ How generated objects, extensions and fields are named.
 | Key | Asked | Env var | Default | Description |
 | --- | --- | --- | --- | --- |
 | `naming.prefix` | setup | `EXTENSION_PREFIX` | — | Your ISV/customer prefix. Prepended to every generated object, field and method name and enforced by the naming validator, so BP checks pass on the first build. Used as the **fallback**: when the active model's existing objects already show a prefix, that one wins — see [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). No prefix at all (a suffix convention)? Leave it empty and set `naming.prefixSource` to `none`; empty on its own still falls back to the model name. |
-| `naming.prefixSource` | advanced | `EXTENSION_PREFIX_SOURCE` | `model` | Whether the effective prefix is learned from the active model's own objects or pinned to the configured `naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns the shared stem, while the objects you write need the full one. `none` is for teams that use no prefix (e.g. a suffix convention with `naming.suffix`): new objects, fields and methods keep the name as given, and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). See [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). Values: `model` — the model's own objects decide, falling back to naming.prefix; `config` — always naming.prefix, inference off (pre-1.8.2 behaviour); `none` — no prefix at all — names as given; extensions embed the model name. |
+| `naming.prefixSource` | advanced | `EXTENSION_PREFIX_SOURCE` | `model` | Whether the effective prefix is learned from the active model's own objects or pinned to the configured `naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns the shared stem, while the objects you write need the full one. `none` is for teams that use no prefix (e.g. a suffix convention with `naming.suffix`): new objects, fields and methods keep the name as given, and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). `as-given` goes further: the server renames nothing, extensions included, and only refuses a name that cannot be an AOT name (no dot on an element extension, no `_Extension` on a class extension) — state the convention in the project's instruction file (AGENTS.md, CLAUDE.md, .github/copilot-instructions.md). See [Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from). Values: `model` — the model's own objects decide, falling back to naming.prefix; `config` — always naming.prefix, inference off (pre-1.8.2 behaviour); `none` — no prefix at all — names as given; extensions embed the model name; `as-given` — never rename — every name as given, extensions too; convention in your instruction file. |
 | `naming.suffix` | advanced | `EXTENSION_SUFFIX` | — | Optional suffix appended to new object names (MyTableZZ with suffix "ZZ"). Most projects use only a prefix — leave empty unless your convention requires one. |
 | `naming.extensionStyle` | advanced | `EXTENSION_NAMING_STYLE` | `prefix` | Whether extension classes/elements embed the prefix (per the Microsoft prefix guideline) or the model name (the Visual Studio default). Use model-name when your model name is long but your prefix is a short abbreviation. Values: `prefix` — CustTable.CrExtension — embeds the extension prefix; `model-name` — CustTable.ContosoRobotics — embeds the model name (VS default). |
 | `naming.extensionClassStyle` | advanced | `EXTENSION_CLASS_NAMING_STYLE` | `inherit` | Overrides naming.extensionStyle for CoC extension classes only, leaving element extensions alone. Some conventions spell the two differently — Visual Studio elements (CustTable.ContosoRobotics) with prefix-style classes (CustTableCtso_Extension) — which a single style cannot express: it renames one or the other. Leave on inherit unless your convention names classes differently from elements. Values: `inherit` — follow naming.extensionStyle — the default, behaviour unchanged; `prefix` — CustTableCtso_Extension — embeds the extension prefix, trailing; `model-name` — CustTable_ContosoRobotics_Extension — embeds the model name; `prefix-leading` — CtsoCustTable_Extension — embeds the extension prefix, leading (e.g. Avanade Development Guidelines). |
+| `naming.elementNameFormat` | advanced | `EXTENSION_ELEMENT_NAME_FORMAT` | — | A fixed name shape for every element extension (tables, forms, EDTs, enums, menus, menu items, security objects …), `{0}` = the extended object: `{0}.Contoso` names the InventTable extension `InventTable.Contoso`. Set, it replaces `naming.extensionStyle` for element extensions; create, prepare and validate_object_naming all apply it. Empty (the default) = the style decides, as before. See [Extension name formats](CUSTOM_EXTENSIONS.md#extension-name-formats). |
+| `naming.classNameFormat` | advanced | `EXTENSION_CLASS_NAME_FORMAT` | — | A fixed name shape for CoC extension classes, `{0}` = the extended object; `_Extension` is always appended: `Contoso_{0}Cls` names the SalesFormLetter extension `Contoso_SalesFormLetterCls_Extension`. Used for classes, and for tables and forms that have no format of their own. Which format applies depends on the TYPE of the extended object, which comes from the call (the `[ExtensionOf(tableStr(…))]` in sourceCode, or `properties.baseObjectType`) and is never guessed from a name. Set, it replaces `naming.extensionClassStyle`. Empty (the default) = the style decides, as before. |
+| `naming.classNameFormatTable` | advanced | `EXTENSION_CLASS_NAME_FORMAT_TABLE` | — | Like `naming.classNameFormat`, for extension classes of TABLES (`[ExtensionOf(tableStr(…))]`); `_Extension` is appended: `Contoso_{0}Dbt` → `Contoso_InventTableDbt_Extension`. Empty = `naming.classNameFormat`. |
+| `naming.classNameFormatForm` | advanced | `EXTENSION_CLASS_NAME_FORMAT_FORM` | — | Like `naming.classNameFormat`, for extension classes of FORMS (`[ExtensionOf(formStr(…))]`); `_Extension` is appended: `Contoso_{0}Frm` → `Contoso_InventTableFrm_Extension`. Empty = `naming.classNameFormat`. |
+| `naming.undefinedNameFormat` | advanced | `EXTENSION_NAME_FORMAT_UNDEFINED` | `ask` | Only read while an extension class name format is set. Decides the extension classes none of them defines — of form data sources and controls, views, data entities, maps …, and calls that do not state the extended object's type. `ask`: the tool does not invent a name; it answers "ask the user for the name and call again with an explicit name". `class-format`: `naming.classNameFormat` names them. An explicit full name (ending in `_Extension`) is accepted for these cases either way. Values: `ask` — the tool asks for the name — the user decides; `class-format` — naming.classNameFormat names them. |
 
 ### Metadata index
 
@@ -88,10 +96,12 @@ What gets extracted into the SQLite index and where it is stored.
 | --- | --- | --- | --- | --- |
 | `index.extractMode` | setup | `EXTRACT_MODE` | `all` | Scope of the metadata extraction. "all" gives full cross-reference search over the standard application but takes 1–2 hours and produces a multi-GB database; "custom" indexes only your own models and finishes in minutes. Values: `all` — standard + custom — full search, 1–2 h build; `custom` — custom models only — minutes; `standard` — Microsoft models only. |
 | `index.includeLabels` | setup | `INCLUDE_LABELS` | `true` | Builds the labels database so labels(action="search") and label reuse work. Disabling it speeds up the build and shrinks the index, at the cost of label lookup. |
-| `index.labelLanguages` | setup | `LABEL_LANGUAGES` | `en-US` | Comma-separated language codes, or `all` for every language shipped with the model. Each extra language multiplies the label table (~125 MB apiece) — indexing only the languages you actually ship keeps the database small. |
+| `index.labelLanguages` | setup | `LABEL_LANGUAGES` | `en-US` | Comma-separated language codes, or `all` for every language shipped with the model. Each extra language multiplies the label table (~125 MB apiece) — indexing only the languages you actually ship keeps the database small. `labels(action="create")` follows the same list: a translation for a language the label file does not have yet is written only when it is listed here (or passed in `languages`), and a new label file starts with every listed language. |
 | `index.dbPath` | advanced | `DB_PATH` | `./data/xpp-metadata.db` | SQLite file holding the indexed X++ metadata. Relative paths resolve from the config file directory. |
 | `index.labelsDbPath` | advanced | `LABELS_DB_PATH` | `./data/xpp-metadata-labels.db` | Second SQLite file for labels (dual-database architecture keeps label writes from locking metadata reads). Defaults to <dbPath>-labels.db. |
+| `index.xrefSqlitePath` | advanced | `D365FO_XREF_SQLITE_PATH` | — | A SQLite export of DYNAMICSXREFDB (tables Modules, Names, References; meta.schema 1) for a server without the C# bridge, e.g. a shared read-only server. find_references and the extension/event/API-usage lookups then answer from it instead of a name-based search; the bridge still takes precedence when it has the database. Opened read-only and immutable on first use: replace the file by rename, never in place (on Windows an open file cannot be renamed over: stop the server, replace the file, start it again). A missing or invalid file is logged and ignored. get_workspace_info shows its export date. |
 | `index.metadataPath` | advanced | `METADATA_PATH` | `./extracted-metadata` | Working folder for the XML dumped during extraction, before it is loaded into the database. |
+| `index.storeObjectSource` | advanced | `STORE_OBJECT_SOURCE` | `true` | Keeps a copy of every object's original XML in the extracted JSON and, gzipped, in the database (object_source), so a server without the AOT files (a shared or Azure deployment) can still read objects. A server that has the metadata folders on disk reads the files themselves and does not need the copy; turning it off saves about 2 GB of extracted JSON and 0.4 GB of database per full standard + custom index. Takes effect at the next index build; a full rebuild (extractMode "all") removes copies already stored. |
 | `index.bpCatalogPath` | advanced | `BP_CATALOG_PATH` | — | Per-instance JSON catalog of real BP-check monikers, extracted from this instance's own D365FO version (scripts/extract-bp-catalog.ps1). Falls back to the compiled-in snapshot when absent — this setting is only written once an instance has regenerated its own catalog. |
 | `index.labelSortOrder` | advanced | `LABEL_SORT_ORDER` | `alphabetical` | Alphabetical keeps .label.txt files sorted (smaller diffs, matches most teams); append adds new labels at the end of the file (preserves manual grouping). Values: `alphabetical` — insert in sorted position; `append` — add at the end of the file. |
 | `index.computeStats` | advanced | `COMPUTE_STATS` | `false` | Adds per-object usage counts used for ranking. Noticeably slows down large builds. |
@@ -117,7 +127,7 @@ Transport, timeouts and logging of the MCP server process.
 | `server.toolTimeoutMs` | advanced | `MCP_TOOL_TIMEOUT_MS` | `120000` | Upper bound for a single tool call before the server returns a timeout error. |
 | `server.toolTimeoutFastMs` | advanced | `MCP_TOOL_TIMEOUT_FAST_MS` | `30000` | Timeout for lookups that should always be quick (minimum 5000). |
 | `server.toolTimeoutHeavyMs` | advanced | `MCP_TOOL_TIMEOUT_HEAVY_MS` | `600000` | Timeout for builds, DB sync and test runs (minimum 60000). Raise it on slow VMs. |
-| `server.readPoolSize` | advanced | `READ_POOL_SIZE` | `3` | Parallel read connections to the index (clamped 1–8). More helps concurrent searches on fast disks. |
+| `server.readPoolSize` | advanced | `READ_POOL_SIZE` | `1` | Read connections to the index (clamped 1–8). One is right for the server: reads run one at a time, and the 128 MB page cache is split across the connections. |
 | `server.operationLockTimeoutMs` | advanced | `OPERATION_LOCK_TIMEOUT_MS` | `900000` | How long a build/sync waits for another one to finish before failing. |
 | `server.operationLockPollMs` | advanced | `OPERATION_LOCK_POLL_MS` | `250` | How often the waiting process re-checks the lock. |
 | `server.operationLockStaleMs` | advanced | `OPERATION_LOCK_STALE_MS` | `1200000` | A lock older than this is treated as left behind by a crashed process and broken. |
@@ -201,7 +211,10 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "customModels": "ContosoRobotics,ContosoBank",
     "xppConfigName": "",
     "customPackagesPath": "",
-    "microsoftPackagesPath": ""
+    "microsoftPackagesPath": "",
+    "dataverseUrl": "https://contoso-dev.crm.dynamics.com",
+    "dataverseClientId": "51f81489-12ee-4a9e-aaae-a2591f45987d",
+    "dataverseTenant": "organizations"
   },
   "workspace": {
     "modelName": "",
@@ -215,7 +228,12 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "prefixSource": "model",
     "suffix": "",
     "extensionStyle": "prefix",
-    "extensionClassStyle": "inherit"
+    "extensionClassStyle": "inherit",
+    "elementNameFormat": "{0}.Contoso",
+    "classNameFormat": "Contoso_{0}Cls",
+    "classNameFormatTable": "Contoso_{0}Dbt",
+    "classNameFormatForm": "Contoso_{0}Frm",
+    "undefinedNameFormat": "ask"
   },
   "index": {
     "extractMode": "all",
@@ -225,7 +243,9 @@ Downloading a pre-built index from blob storage instead of building it locally.
     ],
     "dbPath": "./data/xpp-metadata.db",
     "labelsDbPath": "./data/xpp-metadata-labels.db",
+    "xrefSqlitePath": "",
     "metadataPath": "./extracted-metadata",
+    "storeObjectSource": true,
     "bpCatalogPath": "",
     "labelSortOrder": "alphabetical",
     "computeStats": false,
@@ -245,7 +265,7 @@ Downloading a pre-built index from blob storage instead of building it locally.
     "toolTimeoutMs": 120000,
     "toolTimeoutFastMs": 30000,
     "toolTimeoutHeavyMs": 600000,
-    "readPoolSize": 3,
+    "readPoolSize": 1,
     "operationLockTimeoutMs": 900000,
     "operationLockPollMs": 250,
     "operationLockStaleMs": 1200000,

@@ -7,6 +7,12 @@ import type { XppServerContext } from '../../types/context.js';
 import { bridgeRefreshProvider } from '../../bridge/index.js';
 import { isFileUnderRoot } from '../../utils/pathContainment.js';
 import { lookupCreatedArtifact, forgetCreatedArtifact, type CreatedArtifact } from '../../workspace/createdArtifactLedger.js';
+import { removeCompilerMetadataFor } from './compilerMetadataPrune.js';
+
+/** The line an undo appends when it also removed the element's compiler-metadata copy. */
+function compilerCopyNote(removed: string | null): string {
+  return removed ? '\nAlso removed its compiler-metadata copy: ' + removed : '';
+}
 
 const execFileAsync = util.promisify(execFile);
 
@@ -89,7 +95,7 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
       // Not inside a git repository — e.g. the D365FO sandbox
       // K:\AosService\PackagesLocalDirectory. The git-based revert/delete cannot
       // help here. Fall back to the create-artifact ledger: undo may delete a file
-      // ONLY when d365fo_file(action="create") recorded creating it (genuinely new)
+      // ONLY when a create tool recorded creating it (genuinely new)
       // in THIS server session. Anything not in the ledger keeps the original
       // "not inside a git repository" error — the non-git path never deletes an
       // arbitrary or pre-existing file.
@@ -163,15 +169,34 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
       };
     }
 
+    // Untracked is not the same as created by the last write. A repo that commits
+    // only at PR time keeps objects from earlier sessions untracked for days, and
+    // an undo after a bad MODIFY of one deleted the whole object (git has nothing
+    // to restore, and no backup is taken inside a work tree). Delete only what this
+    // session created — the rule the non-git path below already applies.
+    if (!lookupCreatedArtifact(absolutePath)) {
+      return {
+        content: [{
+          type: 'text',
+          text: 'Refusing to delete ' + absolutePath + ': it is not tracked by git, and this session did not ' +
+            'create it, so there is no earlier version to revert to. Deleting it would remove the whole object, ' +
+            'not the last change. Undo the change with another modify, or remove the object deliberately with ' +
+            'd365fo_file(action="delete").',
+        }],
+        isError: true,
+      };
+    }
+
     fs.unlinkSync(absolutePath);
     // The create registered this file in a .rnrproj; deleting it without that
     // entry leaves a <Content Include> pointing at nothing, which nothing else in
     // the session removes and only VS reports. A model directory under source
     // control takes this path, not the ledger one below.
     const projectNote = await removeFromProjectAndForget(absolutePath);
+    const metaNote = compilerCopyNote(await removeCompilerMetadataFor(absolutePath));
     await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
     return {
-      content: [{ type: 'text', text: 'Successfully undid file creation (deleted untracked file): ' + absolutePath + projectNote + '\nStale index entries cleaned up.' }],
+      content: [{ type: 'text', text: 'Successfully undid file creation (deleted untracked file): ' + absolutePath + projectNote + metaNote + '\nStale index entries cleaned up.' }],
     };
   } catch (error: any) {
     return {
@@ -182,8 +207,8 @@ export const undoLastModificationTool = async (params: any, context: XppServerCo
 };
 
 /**
- * Non-git undo path. Safe by construction: it acts ONLY on a file that
- * d365fo_file(action="create") recorded creating (genuinely new) in this session.
+ * Non-git undo path. Safe by construction: it acts ONLY on a file that a
+ * create tool recorded creating (genuinely new) in this session.
  * Returns null when the path is not in the ledger, so the caller can fall back to
  * the original "not inside a git repository" error. Deletes the created file and
  * cleans its .rnrproj entry (when the create recorded a project) plus the index.
@@ -215,10 +240,11 @@ async function undoViaLedger(
 
   fs.unlinkSync(absolutePath);
   const projectNote = await removeFromProjectAndForget(absolutePath);
+  const metaNote = compilerCopyNote(await removeCompilerMetadataFor(absolutePath));
   await cleanupIndexAfterUndo(context, absolutePath, 'deleted');
 
   return {
-    content: [{ type: 'text', text: 'Successfully undid file creation (deleted session-created file outside git): ' + absolutePath + projectNote + '\nStale index entries cleaned up.' }],
+    content: [{ type: 'text', text: 'Successfully undid file creation (deleted session-created file outside git): ' + absolutePath + projectNote + metaNote + '\nStale index entries cleaned up.' }],
   };
 }
 
@@ -246,10 +272,13 @@ async function removeFromProjectAndForget(absolutePath: string): Promise<string>
  * Uses a dynamic import to avoid a static dependency cycle with createD365File.ts.
  */
 async function removeFromProjectSafe(entry: CreatedArtifact): Promise<void> {
-  if (!entry.projectPath || !entry.objectType || !entry.objectName) return;
+  if (!entry.projectPath) return;
+  if (!entry.projectInclude && (!entry.objectType || !entry.objectName)) return;
   try {
     const { ProjectFileManager } = await import('../../workspace/projectFile.js');
-    await new ProjectFileManager().removeFromProject(entry.projectPath, entry.objectType, entry.objectName);
+    const pfm = new ProjectFileManager();
+    if (entry.projectInclude) await pfm.removeIncludeFromProject(entry.projectPath, entry.projectInclude);
+    else await pfm.removeFromProject(entry.projectPath, entry.objectType!, entry.objectName!);
   } catch (e) {
     console.error(`[undo] Non-git project cleanup failed (non-fatal): ${e}`);
   }

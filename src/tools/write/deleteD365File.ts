@@ -53,9 +53,10 @@ import {
   axFolderForObjectType, resolveMembership, projectDisplayName,
 } from '../../workspace/projectMembership.js';
 import { forgetCreatedArtifact } from '../../workspace/createdArtifactLedger.js';
+import { removeCompilerMetadataFor } from '../sdlc/compilerMetadataPrune.js';
 import { crossModelWriteRefusal } from '../../utils/crossModelWriteGuard.js';
 import { enforceGrounding } from '../../utils/provenanceStore.js';
-import { resolveAnchorModel } from './writeAnchorGuard.js';
+import { resolveAnchorModel, resolveModelDependency } from './writeAnchorGuard.js';
 import { bridgeRefreshProvider } from '../../bridge/index.js';
 import {
   removeDiagnosticSuppressionsByPathPrefix, suppressionPathSegmentsForObjectType,
@@ -234,6 +235,7 @@ export async function handleDeleteD365File(
     toolSwitchedModel: configManager.getToolProjectSwitch()?.forcedModel ?? null,
     action: 'delete',
     existingExtensions: [],
+    dependency: await resolveModelDependency(owningModel, activeModel, filePath),
   });
   if (crossModelRefusal) return fail(crossModelRefusal);
 
@@ -310,6 +312,10 @@ export async function handleDeleteD365File(
   // The create may have recorded this path for the non-git undo; that entry now
   // points at nothing and would make undo_last_modification act on a ghost.
   forgetCreatedArtifact(filePath);
+  // Its compiler-metadata copy would otherwise keep the element in the package
+  // manifests until an incremental build of this server prunes it.
+  const removedMeta = await removeCompilerMetadataFor(filePath);
+  if (removedMeta) indexNote += `\n🧹 Removed its compiler-metadata copy: ${removedMeta}`;
   try {
     await bridgeRefreshProvider(context?.bridge);
   } catch { /* bridge not available — nothing loaded it anyway */ }

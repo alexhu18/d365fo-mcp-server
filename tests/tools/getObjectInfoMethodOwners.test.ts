@@ -32,7 +32,7 @@ const context = {} as any;
 const textOf = (result: any) => result.content.map((c: any) => c.text).join('\n');
 
 describe('get_object_info — options.method owner types', () => {
-  for (const objectType of ['class', 'table', 'view', 'data-entity']) {
+  for (const objectType of ['class', 'table', 'view', 'data-entity', 'map']) {
     it(`reads a method on a ${objectType}`, async () => {
       vi.mocked(getMethodTool).mockClear();
 
@@ -55,7 +55,7 @@ describe('get_object_info — options.method owner types', () => {
 
     expect(result.isError).toBe(true);
     const text = textOf(result);
-    expect(text).toContain('class, table, view, data-entity');
+    expect(text).toContain('class, table, view, data-entity, map');
     expect(text).toContain('"enum" stores no methods');
   });
 

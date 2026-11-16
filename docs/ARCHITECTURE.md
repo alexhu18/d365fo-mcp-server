@@ -42,7 +42,7 @@ Three complementary data sources, one rule: **bridge-first when live metadata ma
 | Available on | all platforms | all platforms | Windows VM only |
 | Symbol search | ✅ < 10 ms | — | ✅ live |
 | Method signatures / source | ✅ snapshot | ✅ on demand | ✅ live |
-| Cross-references (callers) | ~ FTS approximation | — | ✅ exact (`DYNAMICSXREFDB`) |
+| Cross-references (callers) | ~ FTS approximation, or exact from a SQLite export of `DYNAMICSXREFDB` (`D365FO_XREF_SQLITE_PATH`) | — | ✅ exact (`DYNAMICSXREFDB`) |
 | Labels (20M+ rows) | ✅ sole source | — | create/rename only |
 | Create / modify objects | validated XML writers for types the provider cannot express | — | ✅ 13 create types, 27 modify ops |
 
@@ -86,8 +86,8 @@ Generated code must *prove* itself before touching disk. All gates are fail-clos
 |------|------------------|-------------|--------|
 | Provenance | `prepare` (mode=change/create) issues a grounding token (30 min TTL, object-bound). In-memory by default; with `GROUNDING_SECRET` set on both instances the token is HMAC-signed and portable, so the hybrid write-only companion (and scaled-out App Service) can validate it — without the secret, write-only mode bypasses enforcement | write called without a valid token | `GROUNDING_ENFORCE` + `GROUNDING_SECRET` |
 | References | `validate_code(mode="references")` — every type, field, method (incl. arity), enum, label checked against the index | any identifier unresolved | `GROUNDING_ENFORCE` |
-| Best practices | `validate_code(mode="syntax")` — **55 rules**: 51 static (ATTR001–003, BP001–006, COC001–006, CS001, DOC001, EXT001, FN001/002, KW001, MAC001, OP001, RPT001/002/101–103, SEL001–010, SET001, TST001–003, TTS001–003, XML001/006–010) + 4 data-driven (XML002–005) mined from standard models (`property_stats`). FN001/FN002/KW001/ATTR001/SEL010 read the captured compiler tables (`src/knowledge/compilerFacts.ts`) rather than a hand-kept list | error-severity violations | — (advisory in output) |
-| Form patterns | `object_patterns (domain=form, action=validate)` — rules FP000–FP010 against the curated pattern catalog | structural violations (FP001–FP005, FP007) | `FORM_PATTERN_ENFORCE` |
+| Best practices | `validate_code(mode="syntax")` — **56 rules**: 52 static (ATTR001–003, BP001–006, COC001–006, CS001, DOC001, EXT001, FN001/002, KW001, MAC001, OP001, RPT001/002/101–103, SEL001–011, SET001, TST001–003, TTS001–003, XML001/006–010) + 4 data-driven (XML002–005) mined from standard models (`property_stats`). FN001/FN002/KW001/ATTR001/SEL010 read the captured compiler tables (`src/knowledge/compilerFacts.ts`) rather than a hand-kept list; the `reserved-words` knowledge topic is generated from the same table | error-severity violations | — (advisory in output) |
+| Form patterns | `object_patterns (domain=form, action=validate)` — rules FP000–FP011 against the platform pattern definitions (generated from the Patterns DLL) | what the compiler rejects (FP001–FP005, FP007, FP011) | `FORM_PATTERN_ENFORCE` |
 
 Supporting reliability mechanisms:
 
@@ -97,6 +97,7 @@ Supporting reliability mechanisms:
 | Agentic-loop detection | ≥3 identical calls in a 15-call window → corrective hint injected |
 | Index staleness detector | `get_workspace_info` warns when workspace files are newer than the index |
 | Structured xppc diagnostics | `build_d365fo_project` parses compiler output into actionable items with fix hints |
+| Extension name formats | optional `EXTENSION_*_NAME_FORMAT*` settings: one resolver (`resolveFormattedExtensionName`, `src/utils/objectNaming.ts`) names extensions for create, the modify lookup, `prepare`, `generate_object` and the cross-model suggestion, and `validate_object_naming` checks against the same formats. The base type comes from the call (`[ExtensionOf(<kind>Str)]`, a stated type), never from the index, so the write-only companion and the read-only server name alike |
 
 ### Form pattern engine
 
@@ -104,7 +105,7 @@ Supporting reliability mechanisms:
 flowchart LR
     CAT["Curated catalog\n36 patterns + 30 sub-patterns\nsrc/knowledge/formPatterns"] --> ADV[object_patterns\ndomain=form, action=analyze]
     CAT --> SPEC[object_patterns\ndomain=form, action=spec]
-    CAT --> VAL[object_patterns domain=form, action=validate\nFP000–FP010]
+    CAT --> VAL[object_patterns domain=form, action=validate\nFP000–FP011]
     MINE[("form_patterns table\nmined from real forms\nduring build-database")] --> ADV
     MINE -->|cross-check report| CAT
     ADV --> GEN["generate_object objectType=form\nclone reference form\n+ re-bind datasources"]
@@ -123,7 +124,7 @@ A .NET Framework 4.8 process (`D365MetadataBridge.exe`) spawned by the server, s
 It is not the *only* write path. Two cases fall through to purpose-built XML writers, and both are deliberate:
 
 - **Object types outside `BRIDGE_CREATE_TYPES`** (13 of the 39 create types route to the bridge). `security-privilege`/`duty`/`role` and `query`/`view` are excluded on purpose — the bridge's generic `properties: Dictionary<string,string>` channel cannot carry the structured collections they need (EntryPoints, Privileges, Duties, query data sources), so a bridge create would "succeed" and produce a functionally broken object. `securityPrivilegeXml.ts`, `queryViewXml.ts` and friends build these correctly instead.
-- **Modify operations with no backing C# op** — `add-delete-action`, `remove-delete-action`, `modify-property` on some types, `add-menu-item-to-menu`, `add-control`, `add-index`, `add-query-range`/`remove-query-range` and the data-entity-extension field writer fall back to the `directXml*` helpers in `src/tools/write/directXmlWriters.ts` (see also `dataEntityViewExtensionXml.ts`).
+- **Modify operations with no backing C# op** — `add-delete-action`, `remove-delete-action`, `modify-property` on some types, `add-menu-item-to-menu`, `add-control`, `add-index`, `add-query-range`/`remove-query-range` and the data-entity-extension field writer fall back to the `directXml*` helpers in `src/tools/write/directXmlWriters.ts` (see also `dataEntityViewExtensionXml.ts`; `add-menu-item-to-menu` on a `menu-extension`, or into a submenu of a `menu`, and `add-submenu` go there directly, through `src/tools/xml/menuExtensionXml.ts` and `menuXml.ts`; `move-control` and `wrap-controls` on a `form` through `src/tools/xml/formRestructure.ts`).
 
 The distinction matters for correctness, not for safety: **every write goes through the same grounding gates and the same path-containment check**, whichever writer commits it. The XML writers are structured builders with ambiguity guards (they refuse to guess when a target tag matches more than once), not blind string replacement.
 
@@ -143,7 +144,7 @@ Key implementation points:
 - **DiskProvider discovery** — write methods hide behind internal interfaces; the bridge casts to reach `SaveObject()`.
 - **ModelSaveInfo** — every write resolves the owning model from its descriptor, so files land in the right model.
 - **Auto-invalidation** — after each write: bridge metadata cache + SQLite index are refreshed, so the next read sees the change.
-- **Graceful degradation** — bridge missing (Azure/Linux) → read tools fall back to SQLite; `xrefAvailable: false` → xref tools fall back to FTS.
+- **Graceful degradation** — bridge missing (Azure/Linux) → read tools fall back to SQLite; `xrefAvailable: false` → xref tools read the SQLite export of `DYNAMICSXREFDB` named by `D365FO_XREF_SQLITE_PATH` when one is configured and valid (`src/xref/`: the bridge's four queries ported, bounded, opened read-only and immutable), else fall back to FTS. Not in `write-only` mode: the companion has no index to search, so `find_references` there answers from the cross-reference database only and points to the shared server's `find_references` otherwise.
 
 ### Bridge protocol & resilience
 
@@ -165,14 +166,14 @@ Dual-database design — symbol searches never scan label rows (**10–30× fast
 
 | Database | Content | Size | Key tables |
 |----------|---------|------|-----------|
-| `xpp-metadata.db` | symbols + analytics | ~2–3 GB | `symbols` (+FTS5), `form_datasources`, `form_patterns`, `table_relations`, `edt_metadata`, `security_*`, `menu_item_targets`, `property_stats` |
+| `xpp-metadata.db` | symbols + analytics | ~2–3 GB | `symbols` (+FTS5), `form_datasources`, `form_patterns`, `object_source`, `table_relations`, `edt_metadata`, `security_*`, `menu_item_targets`, `property_stats` |
 | `xpp-metadata-labels.db` | labels | ~0.5 GB (4 languages) – 8 GB (all 70) | `labels` (+FTS5 for en-US) |
 
 Each `symbols` row carries enhanced metadata beyond name/type/path: description, semantic tags, source snippet, complexity, used types, extends chain, usage statistics — richer context for generation. Statistical tables (`property_stats`, `form_patterns`) power the data-driven validators and advisors.
 
 `property_stats` is a corpus of **Microsoft-authored models only** — it answers "what does the standard platform do", so mining our own or a third-party ISV's objects would feed our own habits back to us as platform convention. The gate is `XppSymbolIndex.isMineableModel()`, fed by the extract manifest (the only source of truth on UDE, where `CUSTOM_MODELS` is empty by design) plus the name-based `isStandardModel()`. Counts are cumulative, so `build-database` also purges rows that fail today's gate; `npm run purge-property-stats [-- --dry-run]` does the same to an existing database without a rebuild.
 
-Read concurrency: WAL mode, read-connection pool with per-connection prepared-statement caches, 256 MB mmap.
+Reads: WAL mode, one read-only connection beside the writer (it reads the last committed snapshot while the writer has a transaction open) with a 128 MB page cache and its own prepared-statement cache, 1 GiB mmap. `READ_POOL_SIZE` opens more connections and splits the cache between them.
 
 ---
 
@@ -224,7 +225,9 @@ graph LR
 |------|-------------------|---------------|--------------|
 | Full | `full` (default) | all 22 | developer VM |
 | Read-only | `read-only` | 14 — everything except the eight `LOCAL_TOOLS` (build, BP, tests, SQL, trace, reindex, workspace, verify) | Azure App Service |
-| Write-only | `write-only` | up to 11 — the eight `LOCAL_TOOLS` + the three `ALWAYS_TOOLS` (`get_object_info`, `labels`, `d365fo_file`) | hybrid local companion |
+| Write-only | `write-only` | up to 12 — the eight `LOCAL_TOOLS` + the four `ALWAYS_TOOLS` (`get_object_info`, `labels`, `d365fo_file`, `find_references`) | hybrid local companion |
+
+In the hybrid deployment only the write-only companion runs the C# bridge, so only it reaches the developer's cross-reference database (`DYNAMICSXREFDB`); the read-only server answers `find_references` from its symbol index by name. The companion therefore publishes `find_references` too, answered from the bridge alone: it has no index, so wherever the shared server would search by name it says so and points there. Its cross-references are as current as the developer's last Visual Studio build with cross-references.
 
 A second, independent axis controls how many of those tools are worth advertising. `MCP_TOOL_PROFILE=core` publishes only the create-and-build loop (17 tools) instead of all 22, with `MCP_EXTRA_TOOLS` adding individual ones back; `isToolEnabled()` in `serverMode.ts` combines both axes and is the single predicate used by the ListTools filter, the runtime call gate and the startup banner. It exists because hosts stop sending the tool catalogue inline past a limit (VS Code: ~100 tools across all servers) and fall back to a search-based tool surface, which costs a discovery round trip per tool the model needs.
 

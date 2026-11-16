@@ -5,7 +5,7 @@ import os from 'os';
 import { createHash } from 'crypto';
 const m = vi.hoisted(() => ({
   files: new Map<string, string>(), children: [] as any[],
-  spawn: vi.fn(), restart: vi.fn(), metadata: vi.fn(), sync: vi.fn(), bp: vi.fn(), lockTail: Promise.resolve(),
+  spawn: vi.fn(), restart: vi.fn(), metadata: vi.fn(), sync: vi.fn(), bp: vi.fn(), scan: vi.fn(), lockTail: Promise.resolve(),
 }));
 vi.mock('fs/promises', () => ({
   readFile: vi.fn(async (p: string) => { if (m.files.has(p)) return m.files.get(p); throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }),
@@ -35,6 +35,12 @@ vi.mock('../../src/tools/xml/generateMetadata.js', () => ({ generateRuntimeMetad
 vi.mock('../../src/tools/sdlc/aosRuntime.js', () => ({ restartAosRuntime: m.restart }));
 vi.mock('../../src/tools/sdlc/dbSync.js', () => ({ dbSyncTool: m.sync }));
 vi.mock('../../src/tools/sdlc/runBpCheck.js', () => ({ runBpCheckTool: m.bp }));
+vi.mock('../../src/tools/sdlc/odataActionGuard.js', async () => ({
+  ...(await vi.importActual<any>('../../src/tools/sdlc/odataActionGuard.js')), scanODataActions: m.scan,
+}));
+vi.mock('../../src/tools/sdlc/schemaChangeGuard.js', () => ({ scanSchemaChanges: async () => ({ changed: [], errors: [] }), describeSchemaChanges: () => '' }));
+const noOdataFindings = { recompiled: [], missing: [], runtimeFile: null, errors: [] };
+const lostExistingAction = { ...noOdataFindings, missing: [{ entity: 'ProbeEntity', actions: ['ExistingAction'] }] };
 import { buildProjectTool } from '../../src/tools/sdlc/buildProject.js';
 const opts = { modelName: 'MyModel', restartAos: true, aosUrl: 'https://dev.example.test/', wait: false };
 const webConfig = path.join('C:\\Packages', '..', 'WebRoot', 'web.config');
@@ -56,6 +62,22 @@ describe('optional AOS restart build workflow', () => {
     m.sync.mockResolvedValue({ content: [{ type: 'text', text: 'Sync succeeded' }] });
     m.bp.mockResolvedValue({ content: [{ type: 'text', text: 'BP checked' }] });
     m.restart.mockResolvedValue({ status: 'ready', message: 'AOS ready' });
+    m.scan.mockResolvedValue(noOdataFindings);
+  });
+  it('blocks the restart that would take OData actions out of an incremental build', async () => {
+    // Nothing flagged before xppc, actions missing after it: the restart is what loses them.
+    m.scan.mockResolvedValueOnce(noOdataFindings).mockResolvedValueOnce(lostExistingAction);
+    await buildProjectTool(opts, {}); await finish();
+    expect(m.restart).not.toHaveBeenCalled();
+    const text = (await buildProjectTool({ modelName: 'MyModel', wait: false }, {})).content[0].text;
+    expect(text).toContain('AOS restart blocked: OData actions are missing from ODataExtends.runtime (ProbeEntity (ExistingAction))');
+    expect(text).toContain('fullBuild: true, restartAos: true');
+  });
+  it('still restarts after a full build that lacks actions — a restart cannot lose them then', async () => {
+    m.scan.mockResolvedValue(lostExistingAction);
+    await buildProjectTool({ ...opts, fullBuild: true }, {}); await finish();
+    expect(m.restart).toHaveBeenCalledTimes(1);
+    expect((await buildProjectTool({ modelName: 'MyModel', wait: false }, {})).content[0].text).toContain('A full build did not write them either');
   });
   it('executes original sync/BP and restart before completion with wait:false; collection never replays', async () => {
     await buildProjectTool({ ...opts, dbSync: ['MyTable'], bpCheck: true, projectPath: 'C:\\Proj.rnrproj' }, {});
@@ -152,6 +174,62 @@ describe('optional AOS restart build workflow', () => {
     m.files.set(webConfig, '<add key="Infrastructure.HostUrl" value="https://other.example.test/" />');
     await buildProjectTool(opts, {}); await finish();
     expect(m.restart).toHaveBeenCalledWith(opts.aosUrl);
+  });
+  it('runs the bpCheck and dbSync the build was started with, even when it is collected without them', async () => {
+    // A build that outlives its wait window (wait:false, or past waitTimeoutMs) is
+    // collected later, typically with the model name alone.
+    await buildProjectTool({ modelName: 'MyModel', wait: false, bpCheck: true, dbSync: true }, {}); await finish();
+    const response = await buildProjectTool({ modelName: 'MyModel', wait: false }, {});
+    expect(m.bp).toHaveBeenCalledTimes(1); expect(m.sync).toHaveBeenCalledTimes(1);
+    expect(response.content[0].text).toContain('BP checked');
+    expect(response.content[0].text).toContain('Sync succeeded');
+  });
+  it('keeps the dbSync scope the build was started with', async () => {
+    await buildProjectTool({ modelName: 'MyModel', wait: false, dbSync: ['MyTable'] }, {}); await finish();
+    await buildProjectTool({ modelName: 'MyModel', wait: false, dbSync: true }, {});
+    expect(m.sync).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(m.sync.mock.calls[0][0])).toContain('MyTable');
+  });
+  it('adds the tables a collecting call names to the scope the build was started with', async () => {
+    await buildProjectTool({ modelName: 'MyModel', wait: false, dbSync: ['TableA'] }, {}); await finish();
+    await buildProjectTool({ modelName: 'MyModel', wait: false, dbSync: ['TableB', 'TableA'] }, {});
+    expect(m.sync).toHaveBeenCalledTimes(1);
+    expect(m.sync.mock.calls[0][0].tables).toEqual(['TableA', 'TableB']);
+  });
+  it('still runs a bpCheck that only the collecting call asks for', async () => {
+    await buildProjectTool({ modelName: 'MyModel', wait: false }, {}); await finish();
+    const response = await buildProjectTool({ modelName: 'MyModel', wait: false, bpCheck: true }, {});
+    expect(m.bp).toHaveBeenCalledTimes(1); expect(m.sync).not.toHaveBeenCalled();
+    expect(response.content[0].text).toContain('BP checked');
+  });
+  describe('a second call waiting on the same build', () => {
+    // isProcessAlive must see the xppc PID alive for a call to attach and wait.
+    const spawnAlive = () => m.spawn.mockImplementation(() => { const child = { pid: process.pid, unref: vi.fn(), handlers: {} as any, on(event: string, fn: any) { this.handlers[event] = fn; } }; m.children.push(child); return child; });
+    it('gets the result the first waiter collected, at once, without a second bpCheck/dbSync', async () => {
+      spawnAlive();
+      const starter = buildProjectTool({ modelName: 'MyModel', bpCheck: true, dbSync: true }, {});
+      await vi.waitFor(() => expect(m.children.length).toBe(1));
+      // Default wait window (30 min): before the fix this call ran it out.
+      const attacher = buildProjectTool({ modelName: 'MyModel' }, {});
+      await new Promise(r => setTimeout(r, 100));
+      await finish();
+      const [first, second] = await Promise.all([starter, attacher]);
+      expect(m.sync).toHaveBeenCalledTimes(1); expect(m.bp).toHaveBeenCalledTimes(1);
+      const texts = [first.content[0].text, second.content[0].text];
+      expect(texts.filter(t => t.includes('Another call waiting on this build collected its result first'))).toHaveLength(1);
+      for (const text of texts) { expect(text).toContain('✅ Build succeeded'); expect(text).toContain('Sync succeeded'); }
+    }, 10_000);
+    it('says the build is no longer tracked when the result went to a call it cannot see', async () => {
+      spawnAlive();
+      await buildProjectTool({ modelName: 'MyModel', wait: false }, {});
+      const attacher = buildProjectTool({ modelName: 'MyModel' }, {});
+      await new Promise(r => setTimeout(r, 100));
+      // Another MCP server process collected it: the state is gone, nothing shared here.
+      m.files.delete(stateKey('MyModel'));
+      const text = (await attacher).content[0].text;
+      expect(text).toContain('The build of MyModel is no longer tracked');
+      expect(m.sync).not.toHaveBeenCalled(); expect(m.spawn).toHaveBeenCalledTimes(1);
+    }, 10_000);
   });
   it('keeps ordinary builds free of runtime actions', async () => {
     await buildProjectTool({ modelName: 'MyModel', wait: false }, {}); await finish();

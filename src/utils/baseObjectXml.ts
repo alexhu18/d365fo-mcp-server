@@ -12,7 +12,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { getConfigManager, fallbackPackagePath } from './configManager.js';
 import { resolveDbPathLocally } from './metadataResolver.js';
-import { findD365FileOnDisk } from './objectFileLookup.js';
+import { findAotFilesInAllPackages, findD365FileOnDisk } from './objectFileLookup.js';
+import { readIndexedXml, symbolTypesFor } from './indexedXmlLookup.js';
 
 /**
  * Locate the base form XML on disk, trying DB path → remapped path → filesystem scan.
@@ -82,7 +83,38 @@ export async function findBaseObjectXml(
 
   // 2. Filesystem scan using model from config
   const diskPath = await findD365FileOnDisk(objectType, objectName);
-  if (diskPath) return tryRead(diskPath);
+  if (diskPath) {
+    const content = await tryRead(diskPath);
+    if (content) return content;
+  }
+
+  // 2b. A type the index build never extracts has no symbols row, so steps 1 and 3
+  //     cannot find it, and step 2 looks in the configured model only — a STANDARD
+  //     object of that type would never be read. Look in every model of every
+  //     package root instead (~3,000 probes, ~200 ms on a full PackagesLocalDirectory).
+  const unindexedFolder = UNINDEXED_AOT_FOLDERS[objectType];
+  if (unindexedFolder) {
+    const fileName = `${objectName.toLowerCase()}.xml`;
+    const [found] = await findAotFilesInAllPackages(unindexedFolder, n => n.toLowerCase() === fileName);
+    if (found) {
+      const content = await tryRead(found);
+      if (content) return content;
+    }
+  }
+
+  // 3. The copy the index stored (database-only hosts), after every file probe so a
+  //    local edit since indexing wins. Never for a file this host knows is deleted.
+  try {
+    const found = await readIndexedXml(symbolIndex.getReadDb(), objectName, symbolTypesFor(objectType));
+    if (found) return found.xml;
+  } catch { /* ignore */ }
 
   return null;
 }
+
+/**
+ * Object types scripts/extract-metadata.ts does not extract, so the symbol index
+ * has no row for a shipped one: an AxMenu (OrganizationAdministration, …) is
+ * reachable only on disk.
+ */
+const UNINDEXED_AOT_FOLDERS: Record<string, string> = { menu: 'AxMenu' };

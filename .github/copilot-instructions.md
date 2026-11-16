@@ -22,7 +22,7 @@ Call `get_workspace_info()` before doing anything with D365FO objects.
 
 ## Terminal Prohibition
 
-PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integration. Never use `run_in_terminal` or generate scripts as a fallback when an MCP tool fails — STOP and report the error verbatim.
+PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integration. Never use `run_command_in_terminal` / `run_in_terminal` (or any other terminal tool) or generate scripts as a fallback when an MCP tool fails — STOP and report the error verbatim.
 
 ## Core Tool Mapping
 
@@ -32,7 +32,7 @@ PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integra
 | Plan a new object before creating it | `prepare(mode="create", goal, objectName, objectType)` — returns collision check, naming, EDT/label hints + `groundingToken` |
 | Create a D365FO object | `d365fo_file(action="create")` (never `create_file`) |
 | Edit an existing object | `d365fo_file(action="modify")` (applies immediately — confirm in chat first) |
-| Revert the last write | `d365fo_file(action="undo", filePath)` — git-tracked → checkout HEAD (discards ALL uncommitted changes to that file); untracked → deleted |
+| Revert the last write | `d365fo_file(action="undo", filePath)` — git-tracked → checkout HEAD (discards ALL uncommitted changes to that file); untracked → deleted only if created this session |
 | Search objects | `search` — multiple via `search(queries[])`, custom-only via `search(scope="extensions")` |
 | Read any object's metadata | `get_object_info(objectType, name, options?)` — objectType ∈ class/table/form/query/view/enum/edt/report/data-entity/menu-item/service/map/config-key/security-policy/macro. 2+ known names: `get_object_info(objects=[{objectType,objectName},…])` — ONE call, never a loop |
 | Method signature for CoC | `get_object_info(objectType="class", name, options={method, include:"signature"})` (already returned by `prepare(mode="change")`) |
@@ -42,6 +42,7 @@ PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integra
 | Validate form XML against its pattern | `object_patterns(domain="form", action="validate", xml \| formName \| filePath)` — structural errors block form writes (FORM_PATTERN_ENFORCE) |
 | Resolve label / EDT / class refs | `validate_code(mode="references", code)` |
 | Build / BP / Sync | `build_d365fo_project(bpCheck: true, dbSync: true)` — ONE call compiles, runs the best-practice check and syncs AxDB |
+| Deploy to a UDE environment (before running changed tests there) | `build_d365fo_project(deploy: true)` — compiles and deploys the model's package to the cloud runtime `run_systest_class` uses; add `dbSync: true` only after a table/view/data-entity/enum/EDT change (~20 min instead of ~3) |
 | Error diagnosis | `get_knowledge(kind="error", errorText)` |
 | Parameters for a `d365fo_file` operation / `generate_object` mode | `get_knowledge(kind="op-spec", topic="add-index" \| "table" \| "scaffold:form")` — those two tools keep their parameters OUT of the tool schema; look the contract up once for the operation you picked, then nest the values in `params` (`properties` for `action="create"`) |
 
@@ -58,7 +59,7 @@ PowerShell / any terminal command **WILL HANG** in VS 2022 / VS 2026 MCP integra
 
 ### Build automation
 
-4. Never run `build_d365fo_project()` automatically — only on explicit user request ("build", "compile", "check errors").
+4. Never run `build_d365fo_project()` automatically — only on explicit user request ("build", "compile", "check errors"). On UDE, a request to run a test whose code changed since the last deployment counts: tests run against deployed code, so build with `deploy: true` first. Say so before a full sync (`dbSync: true`).
 
 ### X++ correctness (BP-clean code)
 

@@ -16,7 +16,12 @@
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { READ_METHOD_OPTIONS } from '../../utils/methodBodyHint.js';
-import { XPP_INTRINSICS, COMPILER_VERSION } from '../../knowledge/compilerFacts.generated.js';
+import {
+  XPP_EXEMPTED_KEYWORDS,
+  XPP_INTRINSICS,
+  XPP_KEYWORDS,
+  COMPILER_VERSION,
+} from '../../knowledge/compilerFacts.generated.js';
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
@@ -94,6 +99,73 @@ function intrinsicCatalogRule(): string {
     `The complete catalog is ${Object.keys(XPP_INTRINSICS).length} intrinsics, read from the compiler `
     + `itself (xppc ${COMPILER_VERSION}) rather than from documentation, and grouped by ARITY because `
     + `that is what callers get wrong — validator FN001 exists for the one-argument ssrsReportStr. `
+    + groups.join(' · ')
+  );
+}
+
+/**
+ * The reserved-word catalog, built from the compiler's keyword set like the
+ * intrinsic catalog above. The groups only order the list for a reader; a word
+ * the map does not know (a recapture after a compiler update) still appears,
+ * under "other", so the topic cannot drop a word the parser rejects.
+ * `tests/knowledge/reservedWords.test.ts` asserts that every word is listed.
+ */
+const RESERVED_WORD_GROUPS: Record<string, string> = {
+  anytype: 'types', container: 'types', date: 'types', guid: 'types', int: 'types', int64: 'types',
+  real: 'types', str: 'types', utcdatetime: 'types', var: 'types', void: 'types',
+  abstract: 'declarations', async: 'declarations', byref: 'declarations', class: 'declarations',
+  client: 'declarations', const: 'declarations', delegate: 'declarations', display: 'declarations',
+  edit: 'declarations', eventhandler: 'declarations', extends: 'declarations', final: 'declarations',
+  implements: 'declarations', interface: 'declarations', internal: 'declarations',
+  namespace: 'declarations', private: 'declarations', protected: 'declarations',
+  public: 'declarations', readonly: 'declarations', server: 'declarations', static: 'declarations',
+  using: 'declarations',
+  break: 'control flow', breakpoint: 'control flow', case: 'control flow', catch: 'control flow',
+  continue: 'control flow', default: 'control flow', do: 'control flow', else: 'control flow',
+  finally: 'control flow', for: 'control flow', foreach: 'control flow', if: 'control flow',
+  retry: 'control flow', return: 'control flow', switch: 'control flow', throw: 'control flow',
+  try: 'control flow', while: 'control flow',
+  as: 'expressions', await: 'expressions', div: 'expressions', false: 'expressions',
+  is: 'expressions', like: 'expressions', mod: 'expressions', new: 'expressions', next: 'expressions',
+  null: 'expressions', print: 'expressions', super: 'expressions', true: 'expressions',
+  unchecked: 'expressions',
+  changecompany: 'database', delete_from: 'database', flush: 'database',
+  insert_recordset: 'database', select: 'database', setting: 'database', update_recordset: 'database',
+  avg: 'aggregates', count: 'aggregates', maxof: 'aggregates', minof: 'aggregates', sum: 'aggregates',
+  asc: 'select options', by: 'select options', crosscompany: 'select options', desc: 'select options',
+  exists: 'select options', firstfast: 'select options', firstonly: 'select options',
+  firstonly1: 'select options', firstonly10: 'select options', firstonly100: 'select options',
+  firstonly1000: 'select options', forceliterals: 'select options', forcenestedloop: 'select options',
+  forceplaceholders: 'select options', forceselectorder: 'select options', forupdate: 'select options',
+  from: 'select options', generateonly: 'select options', group: 'select options',
+  having: 'select options', hint: 'select options', index: 'select options', join: 'select options',
+  nofetch: 'select options', notexists: 'select options', optimisticlock: 'select options',
+  order: 'select options', outer: 'select options', pessimisticlock: 'select options',
+  repeatableread: 'select options', reverse: 'select options', validtimestate: 'select options',
+  where: 'select options',
+  ttsabort: 'transactions', ttsbegin: 'transactions', ttscommit: 'transactions',
+};
+const RESERVED_GROUP_ORDER = [
+  'types', 'control flow', 'declarations', 'expressions', 'database', 'aggregates',
+  'select options', 'transactions', 'other',
+];
+
+function reservedWordCatalogRule(): string {
+  const byGroup = new Map<string, string[]>();
+  for (const word of XPP_KEYWORDS) {
+    if (XPP_EXEMPTED_KEYWORDS.includes(word)) continue;
+    const group = RESERVED_WORD_GROUPS[word] ?? 'other';
+    const list = byGroup.get(group) ?? [];
+    list.push(word);
+    byGroup.set(group, list);
+  }
+  const groups = RESERVED_GROUP_ORDER
+    .filter(g => byGroup.has(g))
+    .map(g => `${g}: ${byGroup.get(g)!.sort().join(', ')}`);
+  const count = XPP_KEYWORDS.length - XPP_EXEMPTED_KEYWORDS.length;
+  return (
+    `The complete set is ${count} words, read from the parser itself (xppc ${COMPILER_VERSION}) rather `
+    + 'than from documentation. None of them can name a variable, a parameter or a loop variable. '
     + groups.join(' · ')
   );
 }
@@ -1042,7 +1114,7 @@ MyRentEquipmentId newId = numSeq.num();
       'Standard patterns: SimpleList, SimpleListDetails, DetailsMaster, DetailsTransaction, Dialog, DropDialog, ListPage, TableOfContents, Lookup, Workspace — each defines REQUIRED containers in a REQUIRED order',
       'NEW FORM workflow: object_patterns(domain="form", action="analyze", recommend={...}) → object_patterns(domain="form", action="spec", pattern) → generate_object(mode="scaffold", objectType="form", cloneFrom=referenceForm, tableMapping={...}) → object_patterns(domain="form", action="validate") → d365fo_file(action="create")',
       'CLONING an existing reference form (CustGroup for SimpleList, CustTable for DetailsMaster, SalesTable for DetailsTransaction, PaymTerm for SimpleListDetails, CustParameters for TableOfContents) is the PREFERRED strategy — patterns and sub-patterns are preserved',
-      'Container sub-patterns (Pattern element on Group/TabPage): FieldsFieldGroups (fields + max 1 level of groups, NO static text/images), CustomAndQuickFilters (QuickFilter required), ToolbarAndList, SidePanel — validate with object_patterns(domain="form", action="validate")',
+      'Container sub-patterns (Pattern element on Group/TabPage): FieldsFieldGroups (fields and field groups, NO static text/images), CustomAndQuickFilters (QuickFilter required), CustomFilters (ViewEditMode Edit), ToolbarList (1.2), FillText ("UX7 1.0": one StaticText or String, HeightMode SizeToAvailable). SidePanel is a Group Style, not a sub-pattern — validate with object_patterns(domain="form", action="validate")',
       'Structural pattern violations BLOCK d365fo_file(action="create") while FORM_PATTERN_ENFORCE=true (default): wrong control order, missing required container, disallowed child type, unknown pattern/version',
       'ELEMENT ORDER inside a control is enforced by the same flag: AOT XML is order-sensitive and the deserializer DROPS a misplaced element silently (a <Controls> written after <DataGroup> takes every control under it with it). Check first with validate_code(codeType="xml-form"); the canonical order per control i:type is mined from shipped metadata',
       'ALWAYS use form extensions — never modify standard forms (overlayering is blocked)',
@@ -2804,7 +2876,7 @@ else
       'Error handling: dual-write has a retry mechanism — failed records go to an error queue',
       'Live sync: changes in one system propagate to the other in near-real-time (~seconds)',
       'Virtual entities: NO data copy — F&O data accessed via OData at runtime in Dataverse; read-only by default',
-      'For custom entities: IsPublic=Yes + PublicEntityName/CollectionName. DataManagementEnabled is a DMF concern, NOT a dual-write prerequisite — turning it on without an existing DataManagementStagingTable fails the build',
+      'For custom entities: IsPublic=Yes + PublicEntityName/CollectionName. DataManagementEnabled is a DMF concern, NOT a dual-write prerequisite — turning it on needs the DataManagementStagingTable to exist, or the build fails (the data-entity create writes that table with the entity)',
       'Match on a stable business key, not RecId: give the entity an AxDataEntityViewKey over a real alternate key (unique index, AlternateKey=Yes, backed by ReplacementKey on the table)',
       'NEVER put complex business logic in dual-write transform — keep transforms simple (field mapping, default value)',
       'For custom pre/post processing: use business events + Power Automate instead of dual-write plug-ins',
@@ -3837,26 +3909,26 @@ finally
   {
     id: 'menu-navigation',
     title: 'Menus, Menu Items & Submenu Nesting',
-    keywords: ['menu', 'submenu', 'sub-menu', 'navigation', 'axmenu', 'axmenuelement', 'menu item', 'nesting', 'inquiries and reports'],
+    keywords: ['menu', 'submenu', 'sub-menu', 'navigation', 'axmenu', 'axmenuelement', 'menu item', 'nesting', 'inquiries and reports', 'menu extension', 'axmenuextension'],
     summary:
-      'An AxMenu is a flat <Elements> collection of AxMenuElement entries. A menu ITEM reference ' +
-      '(display/action/output) is an AxMenuElementMenuItem. A NESTED SUBMENU (another AxMenu shown ' +
-      'as a folder inside this one, e.g. "Inquiries and reports") is a DIFFERENT element type — ' +
-      'AxMenuElementSubMenu — with its own field name, not a menu-item reference.',
+      'An AxMenu\'s <Elements> holds AxMenuElement entries discriminated by i:type: a menu ITEM ' +
+      '(AxMenuElementMenuItem), an inline SUBMENU (AxMenuElementSubMenu — a folder such as "Inquiries ' +
+      'and reports", with its own Name, Label and nested <Elements>), a reference to ANOTHER menu object ' +
+      '(AxMenuElementMenuReference), a Tile or a Separator. A standard menu is changed through an ' +
+      'AxMenuExtension, never edited itself. Two operations write both: add-submenu and add-menu-item-to-menu.',
     rules: [
-      'Menu-item reference: <AxMenuElement i:type="AxMenuElementMenuItem"><Name>X</Name><MenuItemName>X</MenuItemName></AxMenuElement>',
-      'Submenu reference (nesting another AxMenu inside this one): <AxMenuElement i:type="AxMenuElementSubMenu"><Name>X</Name><SubMenu>X</SubMenu></AxMenuElement> — ' +
-        'the field is <SubMenu>, NOT <MenuName> and NOT <MenuItemName>. Verified against the real ' +
-        'Microsoft.Dynamics.AX.Metadata.dll type names: AxMenuElementMenuItem, AxMenuElementSubMenu, ' +
-        'AxMenuElementSeparator, AxMenuElementTile, AxMenuElementMenuReference (a different, legacy concept — not the one you want for a plain submenu).',
-      '❌ There is no tool operation to add a submenu automatically: add-menu-item-to-menu\'s menuItemToAddType only accepts "display"/"action"/"output" (menu ITEMS). To nest a submenu you must hand-author the <AxMenuElementSubMenu> element into the parent menu\'s XML (d365fo_file create/modify with overwrite) — this is a genuine, current tool gap, not a workaround to avoid.',
-      'A submenu is itself just a normal AxMenu object (create it with d365fo_file(action="create", objectType="menu")) — build its own items first, THEN add the AxMenuElementSubMenu reference to it from the parent menu.',
-      'This applies both to brand-new standalone menus AND to menu-extensions (AxMenuExtension) nesting into a standard menu (e.g. under "Inquiries and reports") — neither path has a dedicated add-submenu tool operation.',
-      'Always verify with build_d365fo_project after hand-authoring: a wrong element type name (e.g. the plausible-looking but nonexistent "AxMenuElementMenu"/"MenuName") is NOT caught by xppc itself — it only surfaces when the separate GenerateMetadata runtime-metadata step tries to deserialize the file ("cannot be deserialized as AxMenu ... no knowledge of any type that maps to this name").',
+      'Use the operations, never hand-written or overwritten XML: d365fo_file(action="modify", objectType="menu" (a menu of your own model) | "menu-extension" (a standard menu), operation="add-submenu", params={ submenuName, submenuLabel, parentMenuElement }) and operation="add-menu-item-to-menu", params={ menuItemToAdd, menuItemToAddType, parentMenuElement }. parentMenuElement is the PLAIN name of the submenu it goes under (nested ones too, e.g. "EInvoice" under Setup), omitted = top level.',
+      'A menu ITEM into a STANDARD menu: create a menu-extension ("<BaseMenu>.<Prefix>Extension"), then add-menu-item-to-menu on it. To group items in a new folder, add-submenu on the extension first, then add-menu-item-to-menu with parentMenuElement=<the new submenu>.',
+      'Menu item: <AxMenuElement xmlns="" i:type="AxMenuElementMenuItem"><Name>X</Name><MenuItemName>X</MenuItemName><MenuItemType>Action|Output</MenuItemType></AxMenuElement> — MenuItemType may be left out for Display.',
+      'Submenu: an INLINE folder, <AxMenuElement xmlns="" i:type="AxMenuElementSubMenu"><Name>X</Name><Label>@Model:Id</Label><Elements>…its items…</Elements></AxMenuElement>. Do not write a <SubMenu> field: none of 101 submenus in 44 shipped menu and extension files has one. A submenu is NOT a separate AxMenu object.',
+      'Another menu OBJECT inside a menu is an AxMenuElementMenuReference with <MenuName> — how every MainMenu.* extension hooks a module menu into the main menu.',
+      'In an AxMenuExtension each root entry is <AxMenuExtensionElement><Parent>submenu of the base menu</Parent><MenuElement i:type="…">…</MenuElement></AxMenuExtensionElement>; a submenu the extension adds itself holds its items nested in its own <Elements>, without <Parent>. The operations write both shapes.',
+      'Element names are unique in the whole menu (base menu and all its extensions), whatever the kind — items, submenus, tiles: a duplicate fails the build ("Multiple elements have the same name"), and a <Parent> names a submenu by its plain name. The same menu item placed twice gets a second Name (MenuItemName stays the item); the operations do that for you. A <Parent> naming no submenu fails the build.',
+      'Always verify with build_d365fo_project: a wrong element type name (e.g. the plausible-looking but nonexistent "AxMenuElementMenu") is NOT caught by xppc itself — it only surfaces when the separate GenerateMetadata runtime-metadata step tries to deserialize the file ("cannot be deserialized as AxMenu ... no knowledge of any type that maps to this name").',
     ],
     examples: [
       {
-        label: 'Parent menu with two items and one nested submenu',
+        label: 'A menu of your own model: one item and an inline submenu with its item',
         code: `<AxMenu xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V1">
   <Name>MyModule</Name>
   <Label>@MyModel:MyModule</Label>
@@ -3865,14 +3937,15 @@ finally
       <Name>MyEquipment</Name>
       <MenuItemName>MyEquipment</MenuItemName>
     </AxMenuElement>
-    <AxMenuElement xmlns="" i:type="AxMenuElementMenuItem">
-      <Name>MyAgreement</Name>
-      <MenuItemName>MyAgreement</MenuItemName>
-    </AxMenuElement>
-    <!-- Nested submenu: MySetup is itself a separate AxMenu object -->
     <AxMenuElement xmlns="" i:type="AxMenuElementSubMenu">
       <Name>MySetup</Name>
-      <SubMenu>MySetup</SubMenu>
+      <Label>@MyModel:Setup</Label>
+      <Elements>
+        <AxMenuElement xmlns="" i:type="AxMenuElementMenuItem">
+          <Name>MyParameters</Name>
+          <MenuItemName>MyParameters</MenuItemName>
+        </AxMenuElement>
+      </Elements>
     </AxMenuElement>
   </Elements>
 </AxMenu>`,
@@ -4885,6 +4958,41 @@ switch (status)
     related: ['operators-precedence', 'xpp-declarations', 'error-handling'],
   },
   {
+    id: 'reserved-words',
+    title: 'Reserved Words (the compiler\'s keyword set)',
+    keywords: ['reserved words', 'reserved word', 'reserved keywords', 'reserved keyword', 'reserved',
+               'keywords', 'kw001', 'invalid name', 'invalid token', 'identifier expected'],
+    summary:
+      'X++ reserves more words than the language reference lists, and the compiler rarely names the word when ' +
+      'one is used as a name. The set below is the parser\'s own; validate_code KW001 checks it.',
+    rules: [
+      reservedWordCatalogRule(),
+      'The compiler rejects a reserved word as a local or member variable of ANY type (int, a class, a table, an EDT, var), as every name of a declaration list (int a, count;), as a method parameter, as a for loop variable and as the variable of using/catch. The messages differ by position: "\'index\' is an invalid name for a parameter because it is an X++ keyword", "Invalid token \'count\'", "\'identifier\' expected" — most do not point at the name, so rename before building',
+      '`in` is reserved but EXEMPTED: int in; compiles. Prefixing a name with @ turns a keyword into an identifier (int @index; compiles), but a plain rename (lineIndex, itemCount, groupRecord) reads better',
+      'Method names are NOT restricted the same way: a method named count() compiles, and display, edit and abstract are modifiers in front of a method name',
+      '`boolean` is a type name but NOT a reserved word (boolean boolean; compiles); timeOfDay is not in the set either. int, int64, real, str, date, utcdatetime, guid, container and anytype ARE reserved',
+      'The Microsoft language reference and the compiler disagree. The reference still lists pause, window and tableLock, which the compiler no longer reserves (they are removed — see switch-loops), and it omits async, await, const, finally, foreach, generateonly, having, hint, namespace, readonly, unchecked, using, var, firstonly1, client, server, index and internal. Trust this set: it is captured from xppc by reflection and follows a recapture automatically',
+      'Several reserved words are reserved WITHOUT a feature behind them (having, foreach, async, await, namespace): they are still illegal as names even though no statement uses them',
+    ],
+    examples: [
+      {
+        label: 'Names that compile',
+        code: `void process(int _index)
+{
+    int     lineCount;
+    MyTable groupRecord;
+    int     @order = _index;    // the @ prefix makes a keyword an identifier
+
+    for (int i = 0; i < _index; i++)
+    {
+        lineCount++;
+    }
+}`,
+      },
+    ],
+    related: ['xpp-declarations', 'switch-loops'],
+  },
+  {
     id: 'attributes-authoring',
     title: 'Authoring & Reading Attributes (SysAttribute, literal-only args)',
     keywords: ['attribute', 'sysattribute', 'custom attribute', 'annotation', 'decorator', 'reflection',
@@ -5119,19 +5227,19 @@ str designRef  = ssrsReportStr(MyBonusReport, Report);`,
         label: 'Entry point that only accepts the record it understands',
         code: `public static void main(Args _args)
 {
-    MyOrderTable order;
+    MyOrderTable orderTable;
 
     if (!_args || _args.dataset() != tableNum(MyOrderTable))
     {
         throw error("@MyModel:OpenFromOrderListOnly");
     }
 
-    order = _args.record();
+    orderTable = _args.record();
 
     // The caller is a form only when a user opened it; a batch reaches here too.
     FormRun callerForm = _args.caller() as FormRun;
 
-    MyOrderProcessor::construct().process(order, _args.parm());
+    MyOrderProcessor::construct().process(orderTable, _args.parm());
 }`,
       },
     ],

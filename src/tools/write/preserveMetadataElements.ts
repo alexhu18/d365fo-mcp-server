@@ -34,6 +34,7 @@
 
 import { AX_TABLE_SERIALIZER_DEFAULTS } from '../xml/createTablePropertyHonesty.js';
 import { scanXmlLeaves } from '../../utils/xmlScan.js';
+import { SUBSCRIBER_PERMISSIONS, subscriberAccessLevelValue } from '../../utils/subscriberAccessLevel.js';
 
 /**
  * True when an element's value is the one the serializer omits, so its absence
@@ -77,7 +78,7 @@ const REMOVING_OPERATIONS = new Set([
   'remove-delete-action', 'remove-field-group', 'remove-control',
   'remove-entry-point', 'remove-enum-value', 'remove-query-range',
   'remove-table-mapping', 'remove-full-text-index', 'remove-diagnostic-suppression',
-  'remove-module-reference',
+  'remove-module-reference', 'remove-duty', 'remove-privilege',
   'replace-all-fields', 'rename-field', 'replace-code',
 ]);
 
@@ -186,13 +187,27 @@ export function claimedMarkerFor(
     case 'modify-property': {
       const name = str(args.propertyPath);
       const value = str(args.propertyValue) ?? (args.propertyValue != null ? String(args.propertyValue) : null);
-      if (!name || value === null) return null;
+      // An empty value removes the property: there is no value to find afterwards.
+      if (!name || value === null || value.trim() === '') return null;
       // Only top-level scalar properties: a dotted path addresses something this
       // check cannot see with a regex, and guessing is what got us here.
       if (name.includes('.') || name.includes('/')) return null;
+      // SubscriberAccessLevel is written as child elements, one per permission
+      // ("NoAccess" → six <X>Deny</X>), never as the text passed in.
+      if (name.toLowerCase() === 'subscriberaccesslevel') return subscriberAccessLevelMarker(value);
+      // An EDT's ReferenceField is the <RelatedField> of its table reference
+      // ("Table.Field" names the table too), never a <ReferenceField> element.
+      if (name.toLowerCase() === 'referencefield' && args.objectType === 'edt') {
+        const field = value.split('.').pop()!.trim();
+        return {
+          label: `ReferenceField=${value}`,
+          pattern: new RegExp(`<AxEdtTableReference>\\s*<RelatedField>\\s*${escapeRe(field)}\\s*</RelatedField>`),
+        };
+      }
       return {
         label: `${name}=${value}`,
-        pattern: new RegExp(`<${escapeRe(name)}>\\s*${escapeRe(value)}\\s*</${escapeRe(name)}>`, 'i'),
+        // Attributes allowed: a form's Design properties are written <Pattern xmlns="">…</Pattern>.
+        pattern: new RegExp(`<${escapeRe(name)}(?:\\s[^>]*)?>\\s*${escapeRe(value)}\\s*</${escapeRe(name)}>`, 'i'),
       };
     }
     case 'add-delete-action': {
@@ -223,6 +238,25 @@ export function claimedMarkerFor(
     default:
       return null;
   }
+}
+
+/**
+ * The claim for a SubscriberAccessLevel write: every permission the value sets,
+ * with its grant, inside the element (menu item children carry xmlns="").
+ * Null for an empty level: "None" removes the element, and absence is not
+ * something this marker can show.
+ */
+function subscriberAccessLevelMarker(value: string): { label: string; pattern: RegExp } | null {
+  const parsed = subscriberAccessLevelValue(value);
+  if (!parsed.ok) return null;
+  const set = SUBSCRIBER_PERMISSIONS.filter(p => parsed.level[p]);
+  if (set.length === 0) return null;
+  const body = '(?:(?!</SubscriberAccessLevel>)[\\s\\S])*?';
+  const looks = set.map(p => `(?=${body}<${p}(?:\\s[^>]*)?>\\s*${parsed.level[p]}\\s*</${p}>)`).join('');
+  return {
+    label: `SubscriberAccessLevel=${parsed.bridgeText}`,
+    pattern: new RegExp(`<SubscriberAccessLevel>${looks}`),
+  };
 }
 
 function escapeRe(v: string): string {

@@ -199,7 +199,8 @@ export const SETTINGS: Setting[] = [
     label: 'Custom model names',
     description:
       'Your own (non-Microsoft) models, comma-separated. They are indexed with priority and treated as writable. ' +
-      'Find them in VS → Dynamics 365 → Model Management → View models. UDE detects these automatically.',
+      'Find them in VS → Dynamics 365 → Model Management → View models. UDE detects these automatically. ' +
+      'Re-read from the config file (or `.env`) while the server runs, so an edit applies without a restart.',
     placeholder: 'ContosoRobotics,ContosoBank',
   },
   {
@@ -232,6 +233,47 @@ export const SETTINGS: Setting[] = [
     type: 'path',
     label: 'Microsoft X++ root (UDE FrameworkDirectory)',
     description: 'Read-only Microsoft packages folder. Normally read from the XPP config.',
+  },
+  {
+    path: 'environment.dataverseUrl',
+    env: 'D365FO_DATAVERSE_URL',
+    section: 'environment',
+    tier: 'basic',
+    type: 'string',
+    label: 'Dataverse environment URL (UDE)',
+    description:
+      'URL of the Dataverse environment your UDE belongs to, e.g. https://contoso-dev.crm.dynamics.com — not the ' +
+      'Finance and Operations URL. run_systest_class sends tests to the cloud runtime through it, signing in as you ' +
+      'in the browser. `pac org list` or the Power Platform admin center shows it.',
+    placeholder: 'https://contoso-dev.crm.dynamics.com',
+    validate: value => !value.trim() || /^https:\/\/[^/\s]+\/?$/i.test(value.trim())
+      ? undefined
+      : 'Enter the environment URL only, e.g. https://contoso-dev.crm.dynamics.com',
+  },
+  {
+    path: 'environment.dataverseClientId',
+    env: 'D365FO_DATAVERSE_CLIENT_ID',
+    section: 'environment',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Client id for Dataverse sign-in (UDE)',
+    description:
+      'Public client (app registration) used to sign in to Dataverse. Defaults to Microsoft\'s sample Dataverse client, ' +
+      'the one Power Platform Tools signs in with; set your own when your tenant blocks it. It needs the ' +
+      'http://localhost redirect URI.',
+    default: '51f81489-12ee-4a9e-aaae-a2591f45987d',
+  },
+  {
+    path: 'environment.dataverseTenant',
+    env: 'D365FO_DATAVERSE_TENANT',
+    section: 'environment',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Tenant for Dataverse sign-in (UDE)',
+    description:
+      'Microsoft Entra tenant id or domain to sign in to. The default, "organizations", signs in to your home tenant; ' +
+      'set the environment\'s tenant when you are a guest in it.',
+    default: 'organizations',
   },
 
   // ── workspace ────────────────────────────────────────────────────────────
@@ -352,13 +394,17 @@ export const SETTINGS: Setting[] = [
       '`naming.prefix`. Pin it when one model carries several feature prefixes that share a stem — inference learns ' +
       'the shared stem, while the objects you write need the full one. `none` is for teams that use no prefix ' +
       '(e.g. a suffix convention with `naming.suffix`): new objects, fields and methods keep the name as given, ' +
-      'and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). See ' +
+      'and extension elements/classes embed the model name (CustTable.MyModel, CustTable_MyModel_Extension). ' +
+      '`as-given` goes further: the server renames nothing, extensions included, and only refuses a name that ' +
+      'cannot be an AOT name (no dot on an element extension, no `_Extension` on a class extension) — state the ' +
+      'convention in the project\'s instruction file (AGENTS.md, CLAUDE.md, .github/copilot-instructions.md). See ' +
       '[Where the prefix comes from](CUSTOM_EXTENSIONS.md#where-the-prefix-comes-from).',
     default: 'model',
     choices: [
       { value: 'model', hint: 'the model\'s own objects decide, falling back to naming.prefix' },
       { value: 'config', hint: 'always naming.prefix, inference off (pre-1.8.2 behaviour)' },
       { value: 'none', hint: 'no prefix at all — names as given; extensions embed the model name' },
+      { value: 'as-given', hint: 'never rename — every name as given, extensions too; convention in your instruction file' },
     ],
   },
   {
@@ -408,6 +454,80 @@ export const SETTINGS: Setting[] = [
       { value: 'prefix-leading', hint: 'CtsoCustTable_Extension — embeds the extension prefix, leading (e.g. Avanade Development Guidelines)' },
     ],
   },
+  {
+    path: 'naming.elementNameFormat',
+    env: 'EXTENSION_ELEMENT_NAME_FORMAT',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Name format for element extensions',
+    description:
+      'A fixed name shape for every element extension (tables, forms, EDTs, enums, menus, menu items, security ' +
+      'objects …), `{0}` = the extended object: `{0}.Contoso` names the InventTable extension `InventTable.Contoso`. ' +
+      'Set, it replaces `naming.extensionStyle` for element extensions; create, prepare and validate_object_naming ' +
+      'all apply it. Empty (the default) = the style decides, as before. See ' +
+      '[Extension name formats](CUSTOM_EXTENSIONS.md#extension-name-formats).',
+    placeholder: '{0}.Contoso',
+  },
+  {
+    path: 'naming.classNameFormat',
+    env: 'EXTENSION_CLASS_NAME_FORMAT',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Name format for extension classes',
+    description:
+      'A fixed name shape for CoC extension classes, `{0}` = the extended object; `_Extension` is always appended: ' +
+      '`Contoso_{0}Cls` names the SalesFormLetter extension `Contoso_SalesFormLetterCls_Extension`. Used for classes, ' +
+      'and for tables and forms that have no format of their own. Which format applies depends on the TYPE of the ' +
+      'extended object, which comes from the call (the `[ExtensionOf(tableStr(…))]` in sourceCode, or ' +
+      '`properties.baseObjectType`) and is never guessed from a name. Set, it replaces `naming.extensionClassStyle`. ' +
+      'Empty (the default) = the style decides, as before.',
+    placeholder: 'Contoso_{0}Cls',
+  },
+  {
+    path: 'naming.classNameFormatTable',
+    env: 'EXTENSION_CLASS_NAME_FORMAT_TABLE',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Name format for extension classes of tables',
+    description:
+      'Like `naming.classNameFormat`, for extension classes of TABLES (`[ExtensionOf(tableStr(…))]`); `_Extension` ' +
+      'is appended: `Contoso_{0}Dbt` → `Contoso_InventTableDbt_Extension`. Empty = `naming.classNameFormat`.',
+    placeholder: 'Contoso_{0}Dbt',
+  },
+  {
+    path: 'naming.classNameFormatForm',
+    env: 'EXTENSION_CLASS_NAME_FORMAT_FORM',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'string',
+    label: 'Name format for extension classes of forms',
+    description:
+      'Like `naming.classNameFormat`, for extension classes of FORMS (`[ExtensionOf(formStr(…))]`); `_Extension` ' +
+      'is appended: `Contoso_{0}Frm` → `Contoso_InventTableFrm_Extension`. Empty = `naming.classNameFormat`.',
+    placeholder: 'Contoso_{0}Frm',
+  },
+  {
+    path: 'naming.undefinedNameFormat',
+    env: 'EXTENSION_NAME_FORMAT_UNDEFINED',
+    section: 'naming',
+    tier: 'advanced',
+    type: 'enum',
+    label: 'Extension classes no format defines',
+    description:
+      'Only read while an extension class name format is set. Decides the extension classes none of them defines — ' +
+      'of form data sources and controls, views, data entities, maps …, and calls that do not state the extended ' +
+      'object\'s type. `ask`: the tool does not invent a name; it answers "ask the user for the name and call again ' +
+      'with an explicit name". `class-format`: `naming.classNameFormat` names them. An explicit full name (ending in ' +
+      '`_Extension`) is accepted for these cases either way.',
+    default: 'ask',
+    choices: [
+      { value: 'ask', hint: 'the tool asks for the name — the user decides' },
+      { value: 'class-format', hint: 'naming.classNameFormat names them' },
+    ],
+  },
 
   // ── index ────────────────────────────────────────────────────────────────
   {
@@ -449,7 +569,9 @@ export const SETTINGS: Setting[] = [
     description:
       'Comma-separated language codes, or `all` for every language shipped with the model. Each extra language ' +
       'multiplies the label table (~125 MB apiece) — indexing only the languages you actually ship keeps the ' +
-      'database small.',
+      'database small. `labels(action="create")` follows the same list: a translation for a language the label ' +
+      'file does not have yet is written only when it is listed here (or passed in `languages`), and a new label ' +
+      'file starts with every listed language.',
     // src/metadata/labelParser.ts reads this default straight off the registry:
     // it used to carry its own 'en-US,cs,sk,de' literal, so an unconfigured
     // build silently indexed four languages while this table promised one.
@@ -479,6 +601,21 @@ export const SETTINGS: Setting[] = [
     default: './data/xpp-metadata-labels.db',
   },
   {
+    path: 'index.xrefSqlitePath',
+    env: 'D365FO_XREF_SQLITE_PATH',
+    section: 'index',
+    tier: 'advanced',
+    type: 'path',
+    label: 'Cross-reference SQLite file',
+    description:
+      'A SQLite export of DYNAMICSXREFDB (tables Modules, Names, References; meta.schema 1) for a server without ' +
+      'the C# bridge, e.g. a shared read-only server. find_references and the extension/event/API-usage lookups ' +
+      'then answer from it instead of a name-based search; the bridge still takes precedence when it has the ' +
+      'database. Opened read-only and immutable on first use: replace the file by rename, never in place (on Windows ' +
+      'an open file cannot be renamed over: stop the server, replace the file, start it again). ' +
+      'A missing or invalid file is logged and ignored. get_workspace_info shows its export date.',
+  },
+  {
     path: 'index.metadataPath',
     env: 'METADATA_PATH',
     section: 'index',
@@ -487,6 +624,21 @@ export const SETTINGS: Setting[] = [
     label: 'Extracted XML folder',
     description: 'Working folder for the XML dumped during extraction, before it is loaded into the database.',
     default: './extracted-metadata',
+  },
+  {
+    path: 'index.storeObjectSource',
+    env: 'STORE_OBJECT_SOURCE',
+    section: 'index',
+    tier: 'advanced',
+    type: 'boolean',
+    label: 'Store object XML in the index',
+    description:
+      'Keeps a copy of every object\'s original XML in the extracted JSON and, gzipped, in the database ' +
+      '(object_source), so a server without the AOT files (a shared or Azure deployment) can still read objects. ' +
+      'A server that has the metadata folders on disk reads the files themselves and does not need the copy; ' +
+      'turning it off saves about 2 GB of extracted JSON and 0.4 GB of database per full standard + custom index. ' +
+      'Takes effect at the next index build; a full rebuild (extractMode "all") removes copies already stored.',
+    default: true,
   },
   {
     path: 'index.bpCatalogPath',
@@ -707,8 +859,8 @@ export const SETTINGS: Setting[] = [
     tier: 'advanced',
     type: 'int',
     label: 'SQLite read connections',
-    description: 'Parallel read connections to the index (clamped 1–8). More helps concurrent searches on fast disks.',
-    default: 3,
+    description: 'Read connections to the index (clamped 1–8). One is right for the server: reads run one at a time, and the 128 MB page cache is split across the connections.',
+    default: 1,
   },
   {
     path: 'server.operationLockTimeoutMs',

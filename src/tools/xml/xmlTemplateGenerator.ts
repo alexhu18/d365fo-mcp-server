@@ -38,6 +38,13 @@
 
 import { escapeXml, decodeXmlEntitiesFromXppSource } from '../../utils/xmlEscape.js';
 import { extensionClassBaseOf } from '../../utils/modelClassifier.js';
+import { normalizeExtensionBaseType, readClassExtensionName } from '../../utils/extensionNameFormat.js';
+
+/** The [ExtensionOf] intrinsic for a one-argument base type. */
+const EXTENSION_OF_INTRINSIC: Record<string, string> = {
+  class: 'classStr', table: 'tableStr', form: 'formStr', view: 'viewStr', map: 'mapStr',
+  query: 'queryStr', 'data-entity': 'dataEntityViewStr',
+};
 import { readMethodCall } from '../../utils/methodBodyHint.js';
 import { ensureXppDocComment, ensureBlankLineBeforeClosingBrace } from '../../utils/xppDocGen.js';
 import { xppMethodSourceForXml, reindentXppSource } from '../../utils/xppFormat.js';
@@ -65,6 +72,38 @@ import { buildAxEdtExtensionXml } from './edtExtensionXml.js';
 import { buildAxDataEntityViewExtensionXml } from './dataEntityViewExtensionXml.js';
 import { buildAxMenuItemExtensionXml, type AxMenuItemExtensionRootElement } from './menuItemExtensionXml.js';
 import { buildAxServiceXml, buildAxServiceGroupXml } from './serviceXml.js';
+
+/**
+ * Index of the '(' that opens a method's parameter list in the text before its
+ * body: the one matching the LAST ')'.
+ *
+ * The last '(' is not it. It skips attribute parentheses above the signature
+ * (`[DataMemberAttribute('x')]`), which is why it was used, but a default
+ * argument that is a call — `date _d = dateNull()`, `str2Date('…', 123)` — puts
+ * a later '(' inside the list. The method was then named `dateNull`, and in the
+ * inner-class split a signature spread over several lines lost every line above
+ * that call. Quotes are skipped so a `')'` default does not count.
+ * Falls back to the last '(' when there is no ')'.
+ */
+export function parameterListOpenIndex(sigText: string): number {
+  const close = sigText.lastIndexOf(')');
+  if (close === -1) return sigText.lastIndexOf('(');
+  let depth = 0;
+  let quote = '';
+  for (let i = close; i >= 0; i--) {
+    const c = sigText[i];
+    if (quote) {
+      if (c === quote) quote = '';
+    } else if (c === "'" || c === '"') {
+      quote = c;
+    } else if (c === ')') {
+      depth++;
+    } else if (c === '(' && --depth === 0) {
+      return i;
+    }
+  }
+  return sigText.lastIndexOf('(');
+}
 
 /**
  * XML Templates for different D365FO object types
@@ -169,8 +208,8 @@ export class XmlTemplateGenerator {
 
       const methodSource = rest.substring(pos, bodyEnd + 1).trim();
 
-      // Extract method name: last identifier before '(' in the signature
-      const parenIdx = sigText.lastIndexOf('(');
+      // Extract method name: last identifier before the parameter list's '('
+      const parenIdx = parameterListOpenIndex(sigText);
       const nameMatch =
         parenIdx !== -1 ? sigText.substring(0, parenIdx).match(/(\w+)\s*$/) : null;
       const methodName = nameMatch ? nameMatch[1] : `method${methods.length + 1}`;
@@ -258,7 +297,7 @@ export class XmlTemplateGenerator {
       }
       if (bodyEnd === -1) break;
 
-      const parenIdx = sigText.lastIndexOf('(');
+      const parenIdx = parameterListOpenIndex(sigText);
       if (parenIdx !== -1) {
         // The block is a method (sigText contains a '(' — it's a parameter list).
         // Collect member-variable lines that appeared before the method signature.
@@ -273,7 +312,7 @@ export class XmlTemplateGenerator {
         }
 
         // Find where the actual method signature starts within sigText:
-        // walk backward from the last '(' to include attribute annotations ('[…]').
+        // walk backward from the parameter list's '(' to include attribute annotations ('[…]').
         const beforeLastParen = sigText.substring(0, parenIdx);
         const lastNewlineBeforeLastParen = beforeLastParen.lastIndexOf('\n');
         let methodStartInSig = lastNewlineBeforeLastParen !== -1
@@ -513,9 +552,14 @@ ${methodsXml}\t</SourceCode>
     // helper that reads all three class styles. The old `/_[^_]+_Extension$/` only
     // fit the model-name shape: CustTableCtso_Extension "extended" itself.
     const baseClass = properties?.baseClass || extensionClassBaseOf(extensionName, properties?.modelName);
+    // The intrinsic follows the base's type: stated (properties.baseObjectType), else
+    // the class format that named it (…_TABLE → tableStr), else classStr as before.
+    const baseType =
+      normalizeExtensionBaseType(properties?.baseObjectType) ?? readClassExtensionName(extensionName)[0]?.type;
+    const intrinsic = EXTENSION_OF_INTRINSIC[baseType ?? ''] ?? 'classStr';
 
     const defaultSource = sourceCode ||
-      `[ExtensionOf(classStr(${baseClass}))]\nfinal class ${extensionName}\n{\n    // ⚠️  ALWAYS call next <methodName>() — verify exact signature with:\n    //     ${readMethodCall('class', baseClass, '<methodName>')}\n    //\n    // Template for wrapping a method:\n    //   public ReturnType methodName(ParamType _param)\n    //   {\n    //       ReturnType result = next methodName(_param);\n    //       return result;\n    //   }\n}`;
+      `[ExtensionOf(${intrinsic}(${baseClass}))]\nfinal class ${extensionName}\n{\n    // ⚠️  ALWAYS call next <methodName>() — verify exact signature with:\n    //     ${readMethodCall('class', baseClass, '<methodName>')}\n    //\n    // Template for wrapping a method:\n    //   public ReturnType methodName(ParamType _param)\n    //   {\n    //       ReturnType result = next methodName(_param);\n    //       return result;\n    //   }\n}`;
 
     return XmlTemplateGenerator.generateAxClassXml(extensionName, defaultSource, { ...properties });
   }
@@ -2138,6 +2182,11 @@ ${defaultParamGroupXml}
     const extends_ = properties?.extends ? `\n\t<Extends>${properties.extends}</Extends>` : '';
     const stringSize = edtType === 'AxEdtString'
       ? `\n\t<StringSize>${properties?.stringSize ?? 30}</StringSize>` : '';
+    // An enum EDT names its enum after <TableReferences />, as shipped ones do
+    // (AgreementClassificationImmutable: Extends NoYesId, EnumType NoYes). Without
+    // it the EDT has no enum at all.
+    const enumType = edtType === 'AxEdtEnum' && properties?.enumType
+      ? `\n\t<EnumType>${properties.enumType}</EnumType>` : '';
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxEdt xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns=""
 \ti:type="${edtType}">
@@ -2145,7 +2194,7 @@ ${defaultParamGroupXml}
 \t<Label>${escapeXml(label)}</Label>${extends_}
 \t<ArrayElements />
 \t<Relations />
-\t<TableReferences />${stringSize}
+\t<TableReferences />${stringSize}${enumType}
 </AxEdt>`;
   }
 

@@ -25,14 +25,14 @@ import { assertWritePathAllowed } from '../../utils/pathContainment.js';
 import { writeFileAtomic } from '../../utils/atomicFileWrite.js';
 import {
   bridgeValidateAfterWrite, canBridgeModify,
-  bridgeAddMethod, bridgeRemoveMethod, bridgeAddField, bridgeSetProperty, bridgeReplaceCode,
+  bridgeAddField, bridgeSetProperty, bridgeReplaceCode,
   bridgeModifyField, bridgeRenameField, bridgeRemoveField, bridgeReplaceAllFields,
   bridgeAddIndex, bridgeRemoveIndex, bridgeAddRelation, bridgeRemoveRelation,
   bridgeAddFullTextIndex, bridgeRemoveFullTextIndex,
   bridgeAddTableMapping, bridgeRemoveTableMapping,
   bridgeAddFieldGroup, bridgeRemoveFieldGroup, bridgeAddFieldToFieldGroup,
   bridgeAddEnumValue, bridgeModifyEnumValue, bridgeRemoveEnumValue,
-  bridgeAddControl, bridgeAddDataSource,
+  bridgeAddDataSource,
   bridgeAddFieldModification, bridgeAddMenuItemToMenu,
   bridgeRefreshProvider,
 } from '../../bridge/index.js';
@@ -49,6 +49,8 @@ import { normalizeD365Xml } from '../../utils/d365XmlNormalizer.js';
 import {
   entityAddDataSource, entityAddFieldBindingError, entityAddField, modifyFieldOp, ENTITY_AND_FIELD_ZOD_PARAMS,
 } from './dataEntityOps.js';
+import { formStructureOp, FORM_STRUCTURE_ZOD_PARAMS } from './formStructureOps.js';
+import { bridgeAddFormControl, pickAddControlType } from './referenceGroupControl.js';
 import {
   upsertFormExtensionControlProperty, resolveControlPropertyTarget,
 } from '../../utils/formExtensionControlModifications.js';
@@ -63,7 +65,8 @@ import {
 } from '../analysis/validateFormPattern.js';
 import { validateEdtExtensionChange } from '../../utils/edtExtensionValidator.js';
 import { upsertWrittenFileIntoIndex } from './inlineIndexUpsert.js';
-import { verifyWrittenFile, renderWriteVerification, runInlineBpCheck, membershipOf, renderBatchEditHint, verifyFormElementOrder } from './inlineWriteVerification.js';
+import { applySecurityReferenceOperation, securityReferenceTypeRefusal } from './securityReferences.js';
+import { verifyWrittenFile, renderWriteVerification, runInlineBpCheck, membershipOf, bridgeMessageNote, renderBatchEditHint, verifyFormElementOrder, readBackAfterModify } from './inlineWriteVerification.js';
 import { lintXppSelect } from '../../utils/xppSelectLint.js';
 import { validateWrittenXpp } from './inlineXppValidation.js';
 import { createPhaseTimer } from '../../utils/phaseTimer.js';
@@ -72,6 +75,7 @@ import {
   findIgnoredParams, renderIgnoredParamsWarning, findMissingMutationParams,
   paramCorrectionCandidates, canonicalParamForAlias, D365FO_FILE_OP_SPECS,
 } from '../specs/d365foFileOpSpecs.js';
+import { isPublishedDefault } from '../specs/opSpecs.js';
 import { lookupSymbolNocase } from '../../utils/symbolLookup.js';
 import { isValidModuleReferenceName } from '../../metadata/modelDescriptor.js';
 import { decodeXmlEntitiesFromXppSource } from '../../utils/xmlEscape.js';
@@ -81,19 +85,24 @@ import {
 import {
   crossModelWriteRefusal, standDownNotice, baseObjectOf, type ExistingExtension,
 } from '../../utils/crossModelWriteGuard.js';
-import { resolveAnchorModel } from './writeAnchorGuard.js';
+import { resolveAnchorModel, resolveModelDependency } from './writeAnchorGuard.js';
 import { resolveOrCreateLabelRef, type AutoLabelTarget } from './createLabel.js';
 import { isRawLabelText } from '../../utils/labelReference.js';
+import { readFileEol, withEol } from '../../utils/eolUtils.js';
+import { methodScopedLines } from '../../utils/methodSourceSpans.js';
+import { nextEnumValue } from '../../utils/axEnumProperties.js';
 // The direct-XML writers moved to their own module; this file dispatches to them.
 import {
   directXmlReplaceCode,
-  directXmlModifyProperty,
+  directXmlModifyProperty, directXmlSetBpAccessProperty, directXmlSetEdtTableReference,directXmlSetRelationOnDelete,
   directXmlAddMenuItemToMenu,
+  directXmlAddMenuItemToMenuExtension,
+  directXmlAddSubmenu,
   viaXmlFallback,
   directXmlAddControl,
   coerceNoYesFlag,
   directXmlAddIndex,
-  directXmlSetIndexValidTimeState,
+  directXmlSetIndexValidTimeState, withRemovedFieldCleanup,
   directXmlClearEmptyProperty,
   directXmlAddQueryRange,
   directXmlRemoveQueryRange,
@@ -109,8 +118,9 @@ import {
   directXmlAddDiagnosticSuppression,
   directXmlAddModuleReference,
   directXmlRemoveModuleReference,
-  directXmlEnsureRelationProperties, directXmlModifyControlProperty, directXmlAddViewField, directXmlSetFormDataSourceInsertIfEmpty,
+  directXmlEnsureRelationProperties, directXmlModifyControlProperty, directXmlAddViewField, directXmlSetFormDataSourceInsertIfEmpty, directXmlModifyFormDataSourceProperty,
 } from './directXmlWriters.js';
+import { addMethodWithXmlFallback, removeMethodWithXmlFallback } from './methodXmlFallback.js';
 import { addReportParameter, refreshReportDataset } from './reportDesignXml.js';
 
 
@@ -356,37 +366,42 @@ export function preflightReplaceCode(
   content: string,
   oldCode: string,
   newCode: string,
+  methodName?: string,
 ): ReplaceCodeVerdict | null {
   const normOld = oldCode.replace(/\r\n/g, '\n');
   const normNew = newCode.replace(/\r\n/g, '\n');
   if (normOld.length === 0) return null;
 
-  const hits = occurrenceLines(content, normOld);
+  // Both the match count and the already-applied check look where the bridge acts: newCode
+  // in ANOTHER method is not this edit being done, and must not turn it into a no-op.
+  const inScope = (needle: string) => methodScopedLines(content, needle, methodName) ?? occurrenceLines(content, needle);
+  const hits = inScope(normOld);
+  const newHits = normNew.length > 0 ? inScope(normNew) : [];
 
   if (hits.length === 0) {
     // Not an error here — the bridge may still reach source this file-level view
     // cannot (form control overrides). But if the intended result is already
     // present, say THAT instead of letting "oldCode not found" imply the opposite.
-    if (normNew.length > 0 && content.includes(normNew)) {
+    if (newHits.length > 0) {
       return {
         kind: 'noop',
         message:
           `Nothing to do — the file already contains newCode ` +
-          `(line ${occurrenceLines(content, normNew)[0]}), and oldCode is not present. ` +
+          `(line ${newHits[0]}), and oldCode is not present. ` +
           `This edit has already been applied; do not retry it.`,
       };
     }
     return null;
   }
 
-  if (normNew.includes(normOld) && content.includes(normNew)) {
+  if (normNew.includes(normOld) && newHits.length > 0) {
     return {
       kind: 'noop',
       message:
         `Nothing to do — this edit is already applied, and repeating it would nest the text.\n` +
         `   oldCode  : ${JSON.stringify(normOld)}\n` +
         `   newCode  : ${JSON.stringify(normNew)}\n` +
-        `newCode is already in the file at line ${occurrenceLines(content, normNew)[0]}, and oldCode is a ` +
+        `newCode is already in the file at line ${newHits[0]}, and oldCode is a ` +
         `substring of it — so the ${hits.length} "match(es)" found ARE the newCode occurrence(s). ` +
         `Applying it would produce ${JSON.stringify(normNew.replace(normOld, normNew))}.\n` +
         `If you meant a different edit, pass a full-line oldCode with enough surrounding text to be unambiguous.`,
@@ -399,8 +414,8 @@ export function preflightReplaceCode(
       message:
         `⛔ replace-code refused — oldCode matches ${hits.length} times (lines ${hits.join(', ')}).\n` +
         `The bridge replaces EVERY occurrence, so this would edit all ${hits.length} of them. ` +
-        `Extend oldCode with surrounding lines until it identifies exactly one site, or scope the call ` +
-        `with methodName="<method>".`,
+        `Extend oldCode with surrounding lines until it identifies exactly one site` +
+        (methodName ? ` inside ${methodName}.` : `, or scope the call with methodName="<method>".`),
     };
   }
 
@@ -505,7 +520,7 @@ export const ModifyD365FileArgsSchema = z.object({
     'menu-item-display', 'menu-item-action', 'menu-item-output',
     'menu-item-display-extension', 'menu-item-action-extension', 'menu-item-output-extension',
     'menu', 'menu-extension',
-    'security-privilege', 'security-duty', 'security-role',
+    'security-privilege', 'security-duty', 'security-role', 'security-duty-extension', 'security-role-extension',
     'ignore-diagnostic-list',
     'model-descriptor',
   ]).describe('Type of D365FO object'),
@@ -527,11 +542,11 @@ export const ModifyD365FileArgsSchema = z.object({
     'add-data-source',
     'modify-property',
     'add-control', 'remove-control',
-    'add-entry-point', 'remove-entry-point',
+    'add-entry-point', 'remove-entry-point', 'add-duty', 'remove-duty', 'add-privilege', 'remove-privilege',
     'remove-diagnostic-suppression', 'add-diagnostic-suppression',
     'add-module-reference', 'remove-module-reference',
     'add-enum-value', 'modify-enum-value', 'remove-enum-value',
-    'add-display-method', 'add-table-method', 'add-menu-item-to-menu',
+    'add-display-method', 'add-table-method', 'add-menu-item-to-menu', 'add-submenu', 'move-control', 'wrap-controls',
     'add-query-range', 'remove-query-range',
     'report-design',
   ]).describe(
@@ -597,6 +612,12 @@ export const ModifyD365FileArgsSchema = z.object({
     'Type of menu item to add: display (form), action (class), output (report). ' +
     'Used with add-menu-item-to-menu. Defaults to display.'
   ),
+  parentMenuElement: z.string().optional().describe(
+    'Submenu the item or submenu goes under (plain name, e.g. "Inquiries"). Used with add-menu-item-to-menu ' +
+    'and add-submenu; omit it for the top level.'
+  ),
+  submenuName: z.string().optional().describe('Name of the submenu to add. Used with add-submenu.'),
+  submenuLabel: z.string().optional().describe('Label id of the new submenu (e.g. "@MyModel:Rentals"). Used with add-submenu.'),
 
   // For add-control (form-extension only)
   controlName: z.string().optional().describe(
@@ -621,9 +642,9 @@ export const ModifyD365FileArgsSchema = z.object({
   ),
   controlType: z.string().optional().describe(
     'Form control type (default: String). Determines i:type and <Type> in the XML. ' +
-    'Supported values: String, Integer, Real, CheckBox, ComboBox, Date, DateTime, Int64, Group, Button, CommandButton, MenuFunctionButton. ' +
+    'Supported values: String, Integer, Real, CheckBox, ComboBox, Date, DateTime, Int64, Group, Button, CommandButton, MenuFunctionButton, ReferenceGroup. ' +
     'Use CheckBox for NoYes/boolean fields. Use ComboBox for enum fields. ' +
-    'If omitted the tool auto-picks based on the EDT base type if controlDataField is provided.'
+    'If omitted the tool auto-picks based on the EDT base type if controlDataField is provided, and ReferenceGroup for a surrogate foreign key.'
   ),
   controlLabel: z.string().optional().describe(
     'Caption of the new control (add-control); Label, Text or Caption by type.'
@@ -687,8 +708,9 @@ export const ModifyD365FileArgsSchema = z.object({
   fieldLabel: z.string().optional().describe('Field label'),
   fieldHelpText: z.string().optional().describe('Field help text (modify-field).'),
   fieldEnumType: z.string().optional().describe('Enum name for an enum-typed field. On add-field this replaces fieldType entirely — it writes AxTableFieldEnum + EnumType and needs no EDT. Also settable later with modify-field.'),
+  fieldEnumValues: z.array(z.unknown()).optional().describe('add-field: values of the enum created when fieldEnumType does not exist (names or {name,label}).'),
   fieldStringSize: z.string().optional().describe('String size to set on the field (modify-field, for string-typed fields).'),
-  ...ENTITY_AND_FIELD_ZOD_PARAMS,
+  ...ENTITY_AND_FIELD_ZOD_PARAMS, ...FORM_STRUCTURE_ZOD_PARAMS,
   fields: z.array(z.object({
     name: z.string(),
     edt: z.string().optional(),
@@ -746,6 +768,7 @@ export const ModifyD365FileArgsSchema = z.object({
   relationCardinality: z.string().optional().describe('Cardinality on local side: ZeroMore | ZeroOne | ExactlyOne (default: ZeroMore).'),
   relatedTableCardinality: z.string().optional().describe('Cardinality on related side: ZeroMore | ZeroOne | ExactlyOne (default: ExactlyOne).'),
   relationshipType: z.string().optional().describe('Relationship type: Association | Composition | Aggregation | Link | Specialization (default: Association).'),
+  relationOnDelete: z.string().optional().describe('OnDelete for add-relation: None | Restricted | Cascade | CascadeRestricted. On a relation that already exists (table or table-extension) it sets only OnDelete.'),
 
   // For add-delete-action / remove-delete-action (table)
   deleteActionTable: z.string().optional().describe(
@@ -806,6 +829,10 @@ export const ModifyD365FileArgsSchema = z.object({
     'add-entry-point: permissions the <Grant> carries. "view"/"read" grant Read; "maintain" grants ' +
     'Correct+Create+Delete+Read+Update (plus Invoke on a ServiceOperation). Defaults to "view".'
   ),
+
+  // For add-/remove-duty and add-/remove-privilege (security role, duty, their extensions).
+  dutyName: z.string().optional().describe('add-duty / remove-duty: REQUIRED — the duty to reference, by AOT name.'),
+  privilegeName: z.string().optional().describe('add-privilege / remove-privilege: REQUIRED — the privilege to reference, by AOT name.'),
 
   // For remove-diagnostic-suppression (ignore-diagnostic-list).
   diagnosticPath: z.string().optional().describe(
@@ -928,7 +955,8 @@ export const ModifyD365FileArgsSchema = z.object({
   propertyPath: z.string().optional().describe(
     'Property name to set. ' +
     'For tables (AxTable): TableGroup, TitleField1, TitleField2, TableType (TempDB/RegularTable/InMemory), ' +
-    'CacheLookup, ClusteredIndex, PrimaryIndex, SaveDataPerCompany, Label, HelpText, Extends, SystemTable. ' +
+    'CacheLookup, ClusteredIndex, PrimaryIndex, SaveDataPerCompany, Label, HelpText, Extends, SystemTable, ' +
+    'OperationalDomain, SubscriberAccessLevel (also on menu items; values in the modify-property op-spec). ' +
     'For table-extensions (AxTableExtension): properties are stored inside <PropertyModifications> as ' +
     '<AxPropertyModification> entries. Supported: Label, HelpText, TableGroup, CacheLookup, TitleField1, TitleField2, ' +
     'ClusteredIndex, PrimaryIndex, SaveDataPerCompany, TableType, SystemTable, ' +
@@ -1233,12 +1261,22 @@ export interface ModifyOutcome {
    */
   createExtensionFirst?: { objectType: string; objectName: string };
   /**
+   * Set by the dispatcher once it has created that extension. An atomic batch restores
+   * a file to its bytes before the batch's first write to it, which for a file this
+   * call created is the empty extension, not "nothing": the rollback has to say so.
+   */
+  createdExtension?: { objectType: string; objectName: string; filePath: string };
+  /**
    * The bridge declined this operation and wrote nothing (an element of that
    * name is already there). The call did not fail, so it is not counted as a
    * failure — but it must not be counted as applied either, which is what
    * "3/3 operation(s) applied" did for three writes that never landed.
    */
   skipped?: boolean;
+  /** Set by an atomic operations[] batch: capture the target's bytes before the write. */
+  captureOriginal?: boolean;
+  /** The target's raw bytes before this operation (null: unreadable), when captureOriginal. */
+  originalBytes?: Buffer | null;
 }
 
 export async function modifyD365FileTool(
@@ -1280,7 +1318,7 @@ async function runModify(
     // told it was dropped. Measured on the NORMALISED keys, so a key that has
     // just been corrected is not also reported as ignored.
     const rawArgs = normalized.args;
-    const providedKeys = Object.keys(rawArgs).filter(k => rawArgs[k] !== undefined);
+    const providedKeys = Object.keys(rawArgs).filter(k => rawArgs[k] !== undefined && !isPublishedDefault(k, rawArgs[k]));
     const ignoredParams = findIgnoredParams(String(args.operation), providedKeys);
     const ignoredParamsWarning = renderIgnoredParamsWarning(String(args.operation), ignoredParams);
 
@@ -1305,8 +1343,8 @@ async function runModify(
 
     // Decode XML entities in X++ payloads. An AI that copied entity-encoded code (an
     // SSRS <Text> block, or escaped doc comments like "/// &lt;summary&gt;") sends
-    // &lt;/&gt;/&amp;/&quot;/&apos;; the serializer would otherwise write them literally
-    // into the source. No-op for clean X++ — literal <, >, && and " are not entities.
+    // &lt;/&gt;/&amp;/&quot;/&apos;. Real X++ round-trips unchanged: a doc comment's
+    // P&amp;L and markup in string literals stay as written (see utils/xmlEscape.ts).
     if (args.sourceCode) args.sourceCode = decodeXmlEntitiesFromXppSource(args.sourceCode);
     if ((args as any).methodCode) (args as any).methodCode = decodeXmlEntitiesFromXppSource((args as any).methodCode);
     if (args.newCode) args.newCode = decodeXmlEntitiesFromXppSource(args.newCode);
@@ -1338,6 +1376,9 @@ async function runModify(
         };
       }
     }
+
+    const securityRefusal = securityReferenceTypeRefusal(String(args.operation), args.objectType);
+    if (securityRefusal) return { content: [{ type: 'text', text: securityRefusal }], isError: true };
 
     // Grounding enforcement: modifying an extension changes the behaviour of an
     // existing base object — when GROUNDING_ENFORCE=true the model must prove
@@ -1713,7 +1754,8 @@ async function runModify(
           `To extend a standard object, create an extension instead:\n` +
           `  • Table: d365fo_file(action="create", objectType="table-extension", objectName="${objectName}.${configuredModel || 'YourModel'}Extension")\n` +
           `  • Class: d365fo_file(action="create", objectType="class-extension", objectName="${objectName}_Extension")\n` +
-          `  • Form:  d365fo_file(action="create", objectType="form-extension", objectName="${objectName}.${configuredModel || 'YourModel'}Extension")`
+          `  • Form:  d365fo_file(action="create", objectType="form-extension", objectName="${objectName}.${configuredModel || 'YourModel'}Extension")\n` +
+          `  • Role / duty: objectType="security-role-extension" / "security-duty-extension", same objectName form`
         );
       }
     }
@@ -1758,6 +1800,7 @@ async function runModify(
       activeModel,
       toolSwitchedModel: getConfigManager().getToolProjectSwitch()?.forcedModel ?? null,
       action: 'modify' as const,
+      dependency: await resolveModelDependency(owningModel, activeModel, filePath),
       existingExtensions: findExtensionsInModel(
         symbolIndex,
         baseObjectOf(objectName, objectType),
@@ -1915,7 +1958,10 @@ async function runModify(
      */
     const preImage: string | null = await timer.time('pre-write image',
       async () => readForMatching(actualFilePath).catch(() => null));
+    if (outcome?.captureOriginal && outcome.originalBytes === undefined) outcome.originalBytes = await fs.readFile(actualFilePath).catch(() => null);
     let _bridgeRetried = false;
+    const addMethodOrXml = (methodName: string, source: string) =>
+      addMethodWithXmlFallback(context.bridge, objectType, objectName, actualFilePath, methodName, source);
     // Retry loop: on the first null result with all required params present,
     // refresh the bridge provider (picks up objects created this session) and
     // re-run the operation once. Max 1 auto-refresh retry (_bridgeRetried guard).
@@ -1936,7 +1982,8 @@ async function runModify(
 
           if (bodies.length > 1) {
             const added: string[] = [];
-            let lastResult: { success: boolean; message: string } | null = null;
+            let lastResult: { success: boolean; message: string; viaXmlFallback?: boolean } | null = null;
+            let failed = false;
             for (const body of bodies) {
               const mName = extractMethodNameFromSource(body);
               if (!mName) {
@@ -1955,26 +2002,33 @@ async function runModify(
                   `Ensure each method has a complete signature (e.g. "public void foo()").`,
                 );
               }
-              lastResult = await bridgeAddMethod(context.bridge, objectType, objectName, mName, body);
+              lastResult = await addMethodOrXml(mName, body);
               if (!lastResult) {
                 throw new Error(
                   `Bridge add-method failed for '${mName}' (${added.length} of ${bodies.length} method(s) added successfully: ${added.join(', ') || 'none'}).`,
                 );
               }
+              // Stop at the first refusal and hand it to the shared failure path
+              // with its own message — summarising it as "Added N methods" made a
+              // failed write read as a list of successes.
+              if (!lastResult.success) {
+                failed = true;
+                bridgeResult = {
+                  ...lastResult,
+                  message: `${lastResult.message} ('${mName}'; ${added.length} of ${bodies.length} method(s) added before it: ${added.join(', ') || 'none'})`,
+                };
+                break;
+              }
               added.push(mName);
             }
             // Summarize as a single result for the downstream success message.
-            bridgeResult = lastResult
-              ? { ...lastResult, message: `Added ${added.length} methods: ${added.join(', ')}` }
-              : null;
+            if (!failed) {
+              bridgeResult = lastResult
+                ? { ...lastResult, message: `Added ${added.length} methods: ${added.join(', ')}` }
+                : null;
+            }
           } else if (args.methodName) {
-            bridgeResult = await bridgeAddMethod(
-              context.bridge,
-              objectType,
-              objectName,
-              args.methodName,
-              methodSource,
-            );
+            bridgeResult = await addMethodOrXml(args.methodName, methodSource);
           }
         }
         break;
@@ -1993,13 +2047,7 @@ async function runModify(
             `\`${(args as any).displayMethodReturnEdt}\` (stub — fill in the computation).`;
         }
         if (methodName && methodSource) {
-          bridgeResult = await bridgeAddMethod(
-            context.bridge,
-            objectType,
-            objectName,
-            methodName,
-            methodSource,
-          );
+          bridgeResult = await addMethodOrXml(methodName, methodSource);
         }
         break;
       }
@@ -2028,23 +2076,14 @@ async function runModify(
           methodName = (args as any).tableMethodType as string;
         }
         if (methodName && methodSource) {
-          bridgeResult = await bridgeAddMethod(
-            context.bridge,
-            objectType,
-            objectName,
-            methodName,
-            methodSource,
-          );
+          bridgeResult = await addMethodOrXml(methodName, methodSource);
         }
         break;
       }
       case 'remove-method': {
         if (args.methodName) {
-          bridgeResult = await bridgeRemoveMethod(
-            context.bridge,
-            objectType,
-            objectName,
-            args.methodName,
+          bridgeResult = await removeMethodWithXmlFallback(
+            context.bridge, objectType, objectName, actualFilePath, args.methodName,
           );
         }
         break;
@@ -2263,10 +2302,10 @@ async function runModify(
             if (enumSet && !enumSet.success) {
               // Undo the half-written field. Two calls are not atomic, and what
               // they can leave behind — an AxTableFieldEnum with no enum — is a
-              // field the caller did not ask for. Worse, the bridge's AddField
-              // does not check for an existing field, so an agent that reads
-              // "failed" and simply repeats the call ends up with the field
-              // twice. Rolling back restores the pre-call state, which is the
+              // field the caller did not ask for. (AddField now skips a field that
+              // exists, so a repeat no longer adds it twice, and the skip guard
+              // above keeps this rollback off an existing field.) Rolling back
+              // restores the pre-call state, which is the
               // only state a failed operation may leave.
               const undone = await bridgeRemoveField(context.bridge, objectName, args.fieldName);
               bridgeResult = {
@@ -2322,7 +2361,7 @@ async function runModify(
         break;
       }
       case 'modify-field': {
-        if (args.fieldName) bridgeResult = await modifyFieldOp(context.bridge, objectName, actualFilePath, args as any);
+        if (args.fieldName) bridgeResult = await modifyFieldOp(context.bridge, objectName, actualFilePath, args as any, symbolIndex);
         break;
       }
       case 'rename-field': {
@@ -2338,11 +2377,11 @@ async function runModify(
       }
       case 'remove-field': {
         if (args.fieldName) {
-          bridgeResult = await bridgeRemoveField(
+          bridgeResult = await withRemovedFieldCleanup(await bridgeRemoveField(
             context.bridge,
             objectName,
             args.fieldName,
-          );
+          ), actualFilePath, args.fieldName);
         }
         break;
       }
@@ -2410,8 +2449,8 @@ async function runModify(
             if (xmlFallbackResult) bridgeResult = viaXmlFallback(xmlFallbackResult);
           }
           // Valid-time-state key/mode live outside what the bridge's AddIndex knows —
-          // stamp them into the on-disk XML once the index exists (either path).
-          if (bridgeResult?.success) {
+          // stamp them into the on-disk XML once the index exists (either path, not a skip).
+          if (bridgeResult?.success && !bridgeResult.skipped) {
             const vtsResult = await directXmlSetIndexValidTimeState(
               actualFilePath,
               (args as any).indexName,
@@ -2485,6 +2524,8 @@ async function runModify(
         break;
       }
       case 'add-relation': {
+        const onDel = (args as any).relationOnDelete && (args as any).relationName ? await directXmlSetRelationOnDelete(actualFilePath, objectName, (args as any).relationName, (args as any).relationOnDelete) : null;
+        if (onDel) { if (!onDel.success) return { content: [{ type: 'text', text: onDel.message }], isError: true }; bridgeResult = viaXmlFallback(onDel); break; }
         if ((args as any).relationName && (args as any).relatedTable) {
           // relationConstraints is documented as [{ fieldName, relatedFieldName }], but the
           // bridge/C# WriteRelationConstraint deserializes the JSON keys { field, relatedField }.
@@ -2521,7 +2562,7 @@ async function runModify(
           // The on-disk writer stays as the fallback for an OLD bridge binary, which
           // ignores the new params without complaint; it no-ops when the properties are
           // already present, so the bridge path costs one file read.
-          if (bridgeResult?.success && !(bridgeResult as any).propertiesWritten) {
+          if (bridgeResult?.success && !bridgeResult.skipped && !(bridgeResult as any).propertiesWritten) {
             const relProps = await directXmlEnsureRelationProperties(
               actualFilePath,
               (args as any).relationName,
@@ -2536,6 +2577,8 @@ async function runModify(
               };
             }
           }
+          const newOnDel = bridgeResult?.success && (args as any).relationOnDelete ? await directXmlSetRelationOnDelete(actualFilePath, objectName, (args as any).relationName, (args as any).relationOnDelete) : null;
+          if (newOnDel && bridgeResult) bridgeResult = { ...bridgeResult, success: newOnDel.success, message: `${bridgeResult.message}\n${newOnDel.message}` };
         }
         break;
       }
@@ -2640,6 +2683,15 @@ async function runModify(
       }
       case 'modify-property': {
         if (args.propertyPath && args.propertyValue !== undefined) {
+          // OperationalDomain / SubscriberAccessLevel on a table or menu item: XML only, never the bridge.
+          const bpWrite = await directXmlSetBpAccessProperty(actualFilePath, objectType, objectName, args.propertyPath, args.propertyValue);
+          if (bpWrite) { if (!bpWrite.success) return { content: [{ type: 'text', text: bpWrite.message }], isError: true }; bridgeResult = viaXmlFallback(bpWrite); break; }
+          // ReferenceField on an EDT: a child of <TableReferences>, XML only as well.
+          const edtRef = await directXmlSetEdtTableReference(actualFilePath, objectType, objectName, args.propertyPath, args.propertyValue);
+          if (edtRef) { if (!edtRef.success) return { content: [{ type: 'text', text: edtRef.message }], isError: true }; bridgeResult = viaXmlFallback(edtRef); break; }
+          // dataSourceName: a property of a data source the form itself defines (JoinSource, LinkType, …).
+          const dsName = (args as { dataSourceName?: string }).dataSourceName;
+          if (dsName) { bridgeResult = viaXmlFallback(await directXmlModifyFormDataSourceProperty(actualFilePath, objectType, objectName, dsName, args.propertyPath, String(args.propertyValue))); break; }
           const own = await directXmlModifyControlProperty(actualFilePath, objectType, objectName, args.propertyPath, String(args.propertyValue), (args as { controlName?: string }).controlName);
           if (own) { bridgeResult = viaXmlFallback(own); break; } // a control this file defines (own form, or one an extension adds)
           // ── Form extension targeting a BASE-FORM control ─────────────────────
@@ -2773,11 +2825,13 @@ async function runModify(
           const beforeContent = await readForMatching(actualFilePath);
           if (beforeContent !== null) {
             replaceCodeBefore = beforeContent;
-            const verdict = preflightReplaceCode(beforeContent, args.oldCode!, args.newCode!);
+            const verdict = preflightReplaceCode(beforeContent, args.oldCode!, args.newCode!, args.methodName);
             if (verdict?.kind === 'refuse') throw new Error(verdict.message);
             if (verdict?.kind === 'noop') {
               // An already-correct file is a success; "oldCode not found" would
-              // read as "the file is still wrong" and invite a retry.
+              // read as "the file is still wrong" and invite a retry. Nothing was
+              // written, so a batch must count it as skipped, not applied.
+              if (outcome) outcome.skipped = true;
               return {
                 content: [{
                   type: 'text',
@@ -2789,14 +2843,15 @@ async function runModify(
             }
           }
 
-          // Try bridge first
+          // Try bridge first, in the file's own line endings: it matches with Contains.
+          const eol = await readFileEol(actualFilePath);
           bridgeResult = await bridgeReplaceCode(
             context.bridge,
             objectType,
             objectName,
             args.methodName,
-            args.oldCode!,
-            args.newCode!,
+            withEol(args.oldCode!, eol),
+            withEol(args.newCode!, eol),
           );
 
           // Fallback: if bridge returns null (unsupported type or not connected)
@@ -2807,6 +2862,7 @@ async function runModify(
             const xmlFallbackResult = await directXmlReplaceCode(
               actualFilePath, args.oldCode!, args.newCode!,
               describeBridgeFallbackReason(context.bridge, objectType, 'replace-code', bridgeResult),
+              args.methodName,
             );
             if (xmlFallbackResult) {
               bridgeResult = viaXmlFallback(xmlFallbackResult);
@@ -2829,7 +2885,7 @@ async function runModify(
             context.bridge,
             objectName,
             (args as any).enumValueName,
-            (args as any).enumValueInt ?? 0,
+            (args as any).enumValueInt ?? (objectType === 'enum' ? nextEnumValue(await readForMatching(actualFilePath)) : 0),
             (args as any).enumValueLabel,
             (args as any).enumValueCountryRegionCodes,
           );
@@ -2863,14 +2919,13 @@ async function runModify(
       }
       case 'add-control': {
         if ((args as any).controlName && (args as any).parentControl) {
-          const resolvedControlType =
+          // A surrogate foreign key gets the designer's reference group (referenceGroupControl.ts).
+          const { controlType: resolvedControlType, note: controlTypeNote } = await pickAddControlType(
+            args as any, objectType, objectName, actualFilePath, symbolIndex,
             (args as any).controlType
-            ?? resolveControlTypeForField(
-                 (args as any).controlDataSource,
-                 (args as any).controlDataField,
-                 symbolIndex?.getReadDb?.(),
-               )
-            ?? 'String';
+              ?? resolveControlTypeForField((args as any).controlDataSource, (args as any).controlDataField, symbolIndex?.getReadDb?.())
+              ?? 'String');
+          addControlNote += controlTypeNote;
           // The bridge's AddControl resolves its target via _provider.Forms, which
           // never contains a form EXTENSION (keyed "Base.Suffix" in FormExtensions).
           // Calling it would always fail with 'Form "<ext>" not found' and log a
@@ -2880,16 +2935,8 @@ async function runModify(
 
           if (!isFormExtension) {
             // The bridge appends; addBaseFormControl moves the control to previousSibling/positionType.
-            bridgeResult = await addBaseFormControl(actualFilePath, args as any, () => bridgeAddControl(
-              context.bridge,
-              objectName,
-              (args as any).controlName,
-              (args as any).parentControl,
-              resolvedControlType,
-              (args as any).controlDataSource,
-              (args as any).controlDataField,
-              (args as any).controlLabel,
-            ));
+            bridgeResult = await addBaseFormControl(actualFilePath, args as any, () => bridgeAddFormControl(
+              context.bridge, actualFilePath, objectName, args as any, resolvedControlType));
           }
 
           if (isFormExtension && (!bridgeResult || !bridgeResult.success)) {
@@ -2948,6 +2995,13 @@ async function runModify(
             objectType: (args as any).entryPointObjectType,
           }));
         }
+        break;
+      }
+      case 'add-duty': case 'remove-duty': case 'add-privilege': case 'remove-privilege': {
+        // Security objects have no bridge write path at all (see the writer).
+        bridgeResult = viaXmlFallback(await applySecurityReferenceOperation(actualFilePath, operation, args, {
+          objectType, symbolIndex, baseNames: baseObjectNameCandidates(objectName, modelName),
+        }));
         break;
       }
       case 'remove-diagnostic-suppression': {
@@ -3141,7 +3195,13 @@ async function runModify(
         break;
       }
       case 'add-menu-item-to-menu': {
-        if ((args as any).menuItemToAdd) {
+        // No bridge path for a menu extension, and the AxMenu fallback below writes the wrong shape into one.
+        if ((args as any).menuItemToAdd && objectType === 'menu-extension') {
+          bridgeResult = viaXmlFallback(await directXmlAddMenuItemToMenuExtension(actualFilePath, args as any, symbolIndex));
+        } else if ((args as any).menuItemToAdd && (args as any).parentMenuElement) {
+          // The C# op has no parent: an item into a submenu of a menu is XML only.
+          bridgeResult = viaXmlFallback(await directXmlAddMenuItemToMenu(actualFilePath, (args as any).menuItemToAdd, (args as any).menuItemToAddType ?? 'display', (args as any).parentMenuElement));
+        } else if ((args as any).menuItemToAdd) {
           bridgeResult = await bridgeAddMenuItemToMenu(
             context.bridge,
             objectName,
@@ -3161,6 +3221,12 @@ async function runModify(
             }
           }
         }
+        break;
+      }
+      case 'move-control': case 'wrap-controls': bridgeResult = await formStructureOp(operation, objectType, actualFilePath, args as any); break;
+      case 'add-submenu': {
+        // No C# op adds a submenu: XML only, on a menu and a menu extension alike.
+        if ((args as any).submenuName) bridgeResult = viaXmlFallback(await directXmlAddSubmenu(actualFilePath, args as any, symbolIndex));
         break;
       }
       default:
@@ -3400,7 +3466,7 @@ async function runModify(
 
     // The offline rule set on the same text. The object's <Declaration> supplies
     // the class header a method snippet lacks; without it, fewer rules apply.
-    const xppRuleNote = writtenXpp ? validateWrittenXpp(writtenXpp, afterContent) : '';
+    const xppRuleNote = writtenXpp ? validateWrittenXpp(writtenXpp, afterContent, operation === 'replace-code' ? args.oldCode : undefined) : '';
 
     const changedLinesNote = replaceCodeBefore !== null && afterContent !== null
       ? renderChangedLines(replaceCodeBefore, afterContent)
@@ -3548,35 +3614,36 @@ async function runModify(
     // silence. Only checkable after the operation has applied (#989).
     const formOrderNote = await timer.time('form element order',
       () => verifyFormElementOrder(actualFilePath, objectType));
+    // Is what this operation asked for in the file? No bridge round trip, every object type (#1161).
+    const readBackNote = wasSkipped ? '' : await timer.time('read-back comparison', () => readBackAfterModify(actualFilePath, operation, objectType,
+      args as unknown as Record<string, unknown>, preservationNote, s => countTopLevelMethodBodies(s) > 1 ? splitTopLevelMethodBodies(s).map(extractMethodNameFromSource) : null));
 
     return {
       content: [
         {
           type: 'text',
           text:
-            // A skip is not an application. Saying "✅ … applied via
-            // IMetadataProvider.Update()" over a write the provider declined is
-            // how three dropped data sources read as three successes; the 🔧 API
-            // line below carries the bridge's own reason.
+            // A skip is not an application. Saying "✅ … applied" over a write the
+            // provider declined is how three dropped data sources read as three
+            // successes; a skip keeps the bridge's own message, which carries the
+            // reason.
+            //
+            // An applied write says only what varies with the call, plus the one
+            // fixed tail below. Gone: "— applied via IMetadataProvider.Update()"
+            // (or "via this server's XML writer") and a `🔧 API: ✅ <thing> added
+            // via <Api>` line restating the headline.
             (bridgeResult.skipped
-              ? `⏭️ ${operation} on ${objectType} "${objectName}" — SKIPPED, nothing was written${crossModelNotice}${autoCorrectNote}\n\n`
-              : `✅ ${operation} on ${objectType} "${objectName}" — applied via ${bridgeResult.viaXmlFallback
-                  ? "this server's XML writer (no bridge path for this operation)"
-                  : 'IMetadataProvider.Update()'}${crossModelNotice}${autoCorrectNote}\n\n`) +
-            `**File:** ${actualFilePath}${addControlNote}${generationNote}${bridgeValidation}${projectMessage}\n` +
-            `🔧 API: ${bridgeResult.message}${preservationNote}${changedLinesNote}${xppLintNote}${xppRuleNote}${addFieldBpNote}${fieldGroupRenderNote}${dataSourceTableNote}${backupNote}${verifyNote}${indexNote}${bpNote}${formOrderNote}${timer.render()}` +
+              ? `⏭️ ${operation} on ${objectType} "${objectName}" — SKIPPED, nothing was written${crossModelNotice}${autoCorrectNote}\n`
+              : `✅ ${operation} on ${objectType} "${objectName}"${crossModelNotice}${autoCorrectNote}\n`) +
+            `**File:** ${actualFilePath}${addControlNote}${generationNote}${bridgeValidation}${projectMessage}` +
+            (bridgeResult.skipped ? `\n${bridgeResult.message}` : bridgeMessageNote(bridgeResult.message, actualFilePath)) +
+            `${preservationNote}${changedLinesNote}${xppLintNote}${xppRuleNote}${addFieldBpNote}${fieldGroupRenderNote}${dataSourceTableNote}${backupNote}${verifyNote}${indexNote}${bpNote}${formOrderNote}${readBackNote}${timer.render()}` +
             // "Review changes in Visual Studio" is not something the caller can act
             // on, and it rode along on every write.
             (ignoredParamsWarning ? `\n\n${ignoredParamsWarning}` : '') +
-            // One tool that builds AND runs the best-practice check. The old line
-            // named build_d365fo_project alone, and the sampled sessions then spent
-            // 35 verify_d365fo_project and 39 run_bp_check calls, largely right
-            // after writes that had already verified themselves.
-            //
-            // Suppressed inside a batch, along with the batch-edit hint:
-            // runModifyBatch emits one of each for the whole call, and telling an
-            // operation that is already batched to batch itself reads as a defect.
-            (inBatch
+            // Fixed, but measured: see the create tail in createD365File.ts. Not in a
+            // batch (runModifyBatch emits one for the call) or after a skip.
+            (inBatch || bridgeResult.skipped
               ? ''
               : `\n\nNext: build_d365fo_project(bpCheck:true) — builds and runs the best-practice check in one call.` +
                 renderBatchEditHint(objectType, objectName)),
@@ -3713,6 +3780,9 @@ async function missingExtensionVerdict(
   let baseFound: string | null = null;
   for (const candidate of baseObjectNameCandidates(objectName, modelName)) {
     baseFound = await resolveD365FileByName(symbolIndex, baseType, candidate, undefined, packagePath);
+    // The name lookup reads security types in the configured model only, and the
+    // base of a role extension is usually Microsoft's: ask the index as well.
+    if (!baseFound && baseType.startsWith('security-')) baseFound = await findBaseObjectXml(baseType, candidate, symbolIndex);
     if (baseFound) break;
   }
   // Nothing to extend — fall through to the ordinary "file not found" answer,

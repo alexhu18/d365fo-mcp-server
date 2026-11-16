@@ -202,6 +202,28 @@ const CHARS_PER_TOKEN = 4;
 // as git can see — an agent read that as "undo deletes any file it is pointed at"
 // and would not use undo at all. Paid for in the same description ("returns the
 // contract for the one you picked" → "returns its contract"), so the ceiling holds.
+//
+// validate_object_naming published `baseObjectType` (the extended object's type,
+// which picks the extension class name format) and paid for it inside its own
+// schema: objectType's "Type of the D365FO object" restated its enum, and the tool,
+// baseObjectName and modelPrefix descriptions said the same in fewer words.
+// Measured payload after: 45_076 (was 45_096). The ceiling holds.
+//
+// build_d365fo_project published `deploy` (UDE: deploy the built package to the
+// cloud runtime tests run in) and the UDE meaning of `dbSync` with it, ~220 chars.
+// Paid for in the same schema — `wait` restated the tool description's "Blocks
+// until done — call ONCE", `waitTimeoutMs` said its part in fewer words — and by
+// leaving out `openWorldHint: false` on the two tools that do reach the cloud
+// (true is the spec default). Measured payload after: 45_083. The ceiling holds.
+//
+// d365fo_file's operation enum gained add-duty, remove-duty, add-privilege and
+// remove-privilege (+60). Paid for in `properties`, whose description listed example
+// properties the op-spec it points to returns, and said "creation" under a [create]
+// tag (-68). Measured payload after: 45_070, with `deploy` above. The ceiling holds.
+//
+// get_object_info's objectType enum gained menu and menu-extension. Paid for in its
+// description, which spelled out the six *-extension types its own enum already
+// lists. Measured payload after: 45_020 (was 45_072). The ceiling holds.
 const TOTAL_BUDGET = 45_100;
 // axdb_sql is published only once SQL is configured, so TOTAL_BUDGET above —
 // the payload every default install sends — does not carry it. A configured

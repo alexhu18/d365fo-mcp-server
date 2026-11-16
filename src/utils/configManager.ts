@@ -10,7 +10,7 @@ import { findDescriptorPath } from '../metadata/modelDescriptor.js';
 import * as os from 'os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { autoDetectD365Project, detectD365Project, scanAllD365Projects, extractModelNameFromProject, detectGitBranch, isMicrosoftDemoModel, distinctCustomModels, type D365ProjectInfo } from './workspaceDetector.js';
-import { registerCustomModel, getCustomModels } from './modelClassifier.js';
+import { registerCustomModel } from './modelClassifier.js';
 import { XppConfigProvider, type XppEnvironmentConfig } from './xppConfigProvider.js';
 import { FALLBACK_PACKAGES_ROOT, findPackagesRoot, warmPackagesRoots } from './packagesRoot.js';
 import { debugLog } from './logger.js';
@@ -102,7 +102,10 @@ class ConfigManager {
   private projectScanRunning = false;
   private xppConfigProvider: XppConfigProvider | null = null;
   private xppConfig: XppEnvironmentConfig | null = null;
-  private xppConfigLoaded: boolean = false;
+  // The one load of the XPP config. Every caller awaits this promise, so a call
+  // that arrives while the load is still running waits for it instead of reading
+  // xppConfig while it is still null.
+  private xppConfigLoad: Promise<void> | null = null;
   // Set while a TOOL call (get_workspace_info projectName/projectPath) has moved the
   // active project off the model this workspace itself resolved to. `anchorModel` is
   // that original model and it survives further switches — see getWriteAnchorModel().
@@ -912,10 +915,10 @@ class ConfigManager {
     // loop. Resolves immediately once warm, which it is after the first call.
     await warmPackagesRoots();
 
-    // Register the explicitly-configured custom models exactly once. The target
+    // Register the explicitly-configured target model exactly once. The target
     // model resolved from configuration (D365FO_MODEL_NAME env var or a modelName
-    // key in .mcp.json) is custom by definition, as are any CUSTOM_MODELS entries.
-    // Registering them here makes isCustomModel() deterministic regardless of call
+    // key in .mcp.json) is custom by definition.
+    // Registering it here makes isCustomModel() deterministic regardless of call
     // ordering — without it, a long model name whose ISV prefix is only an
     // abbreviation (e.g. prefix "CR" for "ContosoRobotics") is misclassified as a
     // Microsoft standard model until some later operation happens to register it.
@@ -927,13 +930,10 @@ class ConfigManager {
         registerCustomModel(configuredModel);
       }
 
-      // CUSTOM_MODELS literals (wildcard patterns are matched directly by
-      // isCustomModel, so they don't need to be registered as exact names).
-      for (const entry of getCustomModels()) {
-        if (!entry.includes('*')) {
-          registerCustomModel(entry);
-        }
-      }
+      // CUSTOM_MODELS entries are deliberately NOT registered. isCustomModel()
+      // matches the live list itself (literals and wildcards, case-insensitive),
+      // and the registry is add-only: a literal copied into it here would stay
+      // custom after the user took it off the list (see reloadCustomModels).
     }
   }
 
@@ -1756,13 +1756,21 @@ class ConfigManager {
     return this.xppConfig?.xrefDbName || null;
   }
 
-  private async ensureXppConfig(): Promise<void> {
-    if (this.xppConfigLoaded) return;
-    this.xppConfigLoaded = true;
+  private ensureXppConfig(): Promise<void> {
+    return (this.xppConfigLoad ??= this.loadXppConfig());
+  }
 
+  private async loadXppConfig(): Promise<void> {
     this.xppConfigProvider = new XppConfigProvider();
     const configName = process.env.XPP_CONFIG_NAME || undefined;
-    this.xppConfig = await this.xppConfigProvider.getActiveConfig(configName);
+    try {
+      this.xppConfig = await this.xppConfigProvider.getActiveConfig(configName);
+    } catch (err) {
+      // Every later caller awaits this same promise, so a rejection must not
+      // escape it: treat an unreadable config like a missing one.
+      console.error(`[ConfigManager] Could not read the XPP config: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
 
     if (this.xppConfig) {
       console.error(`[ConfigManager] XPP config loaded: ${this.xppConfig.configName} v${this.xppConfig.version}`);

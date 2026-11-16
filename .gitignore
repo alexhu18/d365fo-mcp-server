@@ -120,3 +120,8 @@ tests/axdb-sql-host/bin/
 tests/axdb-sql-host/obj/
 tests/trace-host/bin/
 tests/trace-host/obj/
+
+# Visual Studio workspace caches (including nested projects)
+.vs/
+bridge/BinaryModelExtractor/bin/
+bridge/BinaryModelExtractor/obj/

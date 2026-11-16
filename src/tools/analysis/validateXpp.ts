@@ -44,6 +44,7 @@
  *   SEL008  order by / group by after the where of the same segment
  *   SEL009  the in operator with an inline container literal
  *   SEL010  a select expression on an aliased buffer; validTimeState given an expression
+ *   SEL011  update()/delete() on a buffer no select fetched for update
  *   ATTR001 an attribute argument that is not a compile-time literal
  *   ATTR002 [SysObsolete] without message, isError AND date (xppbp moniker)
  *   EXT001  an extension-method class whose class or methods are not static
@@ -874,7 +875,15 @@ function checkBuiltinArity(code: string): ValidationViolation[] {
  *
  * Brace depths are counted on the masked copy, so a '{' inside a literal or a doc
  * comment cannot shift the method boundaries.
+ *
+ * Only a block whose header branches or loops makes `next` conditional. A `try`,
+ * `finally` or `using` block runs its body unconditionally, and the compiler accepts
+ * `next` there: counting every block deeper than the method body reported 66 shipped
+ * CoC methods that compile (QMSCaseDetailBase_Extension.insert, try/finally) as
+ * SYS10028 errors. `catch` stays conditional — its body runs only on an exception.
  */
+const COC_CONDITIONAL_BLOCK = /\b(if|else|while|for|do|switch|case|default|catch)\b/;
+
 function checkCocNextUnconditional(code: string): ValidationViolation[] {
   const violations: ValidationViolation[] = [];
   if (!/\[ExtensionOf\s*\(/i.test(code)) return violations;
@@ -885,6 +894,12 @@ function checkCocNextUnconditional(code: string): ValidationViolation[] {
     /^\s*(?:(?:public|protected|private|internal|static|final|display|edit|server|client)\s+)*[A-Za-z_]\w*\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*$/;
 
   let depth = 0;
+  // One entry per block open inside the current method body: does its header branch?
+  const blocks: boolean[] = [];
+  // Text since the last '{', '}' or ';' — the header of the next block, which can span
+  // lines: in `if (a\n && b)\n{` the line above the brace holds no `if`, and taking only
+  // that line made the block unconditional and its `next` pass.
+  let pendingHeader = '';
   let classBodyDepth: number | null = null;
   // The method currently being walked, if any.
   let method: { name: string; bodyDepth: number; nexts: Array<{ line: number; excerpt: string; conditional: boolean }>; earlyReturn: number | null } | null = null;
@@ -953,9 +968,9 @@ function checkCocNextUnconditional(code: string): ValidationViolation[] {
         method.nexts.push({
           line: i + 1,
           excerpt: lines[i].trim(),
-          // Deeper than the method body means it sits inside if/while/switch/try;
-          // the same-line form "if (ret) ret = next foo();" never opens a block.
-          conditional: depthAtLineStart > method.bodyDepth || /\b(if|while|for|switch|case)\b/.test(clean),
+          // Inside an open if/while/switch/catch block, or the same-line form
+          // "if (ret) ret = next foo();", which never opens a block.
+          conditional: blocks.includes(true) || /\b(if|while|for|switch|case)\b/.test(clean),
         });
       } else if (
         method.earlyReturn === null &&
@@ -971,13 +986,31 @@ function checkCocNextUnconditional(code: string): ValidationViolation[] {
       }
     }
 
-    for (const ch of clean) {
-      if (ch === '{') depth++;
-      else if (ch === '}') {
+    let segmentStart = 0;
+    for (let c = 0; c < clean.length; c++) {
+      const ch = clean[c];
+      if (ch === '{') {
+        depth++;
+        if (method && depth > method.bodyDepth) {
+          blocks.push(COC_CONDITIONAL_BLOCK.test(`${pendingHeader} ${clean.slice(segmentStart, c)}`));
+        }
+        segmentStart = c + 1;
+        pendingHeader = '';
+      } else if (ch === '}') {
+        if (method && depth > method.bodyDepth) blocks.pop();
         depth--;
-        if (method && depth < method.bodyDepth) closeMethod();
+        if (method && depth < method.bodyDepth) {
+          closeMethod();
+          blocks.length = 0;
+        }
+        segmentStart = c + 1;
+        pendingHeader = '';
+      } else if (ch === ';') {
+        segmentStart = c + 1;
+        pendingHeader = '';
       }
     }
+    pendingHeader += ` ${clean.slice(segmentStart)}`;
   }
   closeMethod();
 
@@ -2398,26 +2431,98 @@ function checkExtensionMethodClassShape(code: string): ValidationViolation[] {
  * `await` and `namespace` are reserved without being implemented, so a variable
  * called `having` fails with a syntax error that names the following token instead.
  * `in` is reserved but exempted and stays legal.
+ *
+ * The type may be any EDT, table or class, not only a primitive: `TransDate from;`,
+ * `CustTable outer;` and a parameter `(TransDate _d, AmountMST sum)` fail the same
+ * way, and those are the common shapes (an EDT-typed date range is where `from`
+ * shows up). A line whose first word is itself reserved (`return count;`,
+ * `else sum = 0;`, `group by x;`) is a statement, not a declaration, and is skipped
+ * — except the primitive type names that are reserved words themselves.
+ *
+ * `asc` and `desc` are never reported: an `order by` list (`, ModifyDate desc`,
+ * `SortingRank asc,` on a line of its own) has the same shape as a declaration or a
+ * parameter, and it was the only shape that fired on shipped code. With them
+ * excluded, a sweep of 95,753 shipped and ISV AxClass/AxTable/AxForm files
+ * (1,075,169 source blocks) gives no KW001 at all.
+ *
+ * Every name of a declaration list is checked, not only the first: `int a, count;`
+ * fails with "'identifier' expected". So is a sized-string parameter
+ * (`str 20 select`). A `for`, `using` or `catch` header matches the parameter
+ * pattern, and the fix calls it a loop variable or a variable instead.
  */
+const RESERVED_TYPE_NAMES = /^(str|int|int64|real|date|utcdatetime|guid|container|anytype|var)$/i;
+
+function isDeclarationType(type: string): boolean {
+  return RESERVED_TYPE_NAMES.test(type) || !isReservedKeyword(type);
+}
+
+function isReservedName(name: string): boolean {
+  return isReservedKeyword(name) && !/^(asc|desc)$/i.test(name);
+}
+
+function isReservedDeclaration(type: string, name: string): boolean {
+  return isReservedName(name) && isDeclarationType(type);
+}
+
+/**
+ * The names after the first in a declaration list, with their offsets. `tail`
+ * starts at the `,` or `=` after the first name; the statement ends at the next
+ * `;` and is not one if a brace comes first. Commas inside (), [] and {} belong
+ * to an initializer, not to the list.
+ */
+function laterDeclaredNames(masked: string, tail: number): { name: string; index: number }[] {
+  const end = masked.indexOf(';', tail);
+  if (end < 0 || /[{}]/.test(masked.slice(tail, end))) return [];
+  const names: { name: string; index: number }[] = [];
+  let depth = 0;
+  for (let i = tail; i < end; i++) {
+    const ch = masked[i];
+    if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) {
+      const n = /^\s*([A-Za-z_]\w*)\s*(?:=|,|$)/.exec(masked.slice(i + 1, end));
+      if (n) names.push({ name: n[1], index: i + 1 + n[0].indexOf(n[1]) });
+    }
+  }
+  return names;
+}
+
 function checkReservedIdentifiers(code: string): ValidationViolation[] {
   const masked = maskStringsAndComments(code);
   const lines = code.split('\n');
   const violations: ValidationViolation[] = [];
   const declRe =
-    /^\s*(?:(?:public|protected|private|internal|static|final|const|readonly)\s+)*(str\s+\d+|str|int64|int|real|boolean|date|utcdatetime|timeOfDay|guid|container|anytype)\s+([A-Za-z_]\w*)\s*[;,=]/gim;
-  let m: RegExpExecArray | null;
-  while ((m = declRe.exec(masked)) !== null) {
-    if (!isReservedKeyword(m[2])) continue;
-    const lineNo = lineNumber(masked, m.index);
+    /^\s*(?:(?:public|protected|private|internal|static|final|const|readonly)\s+)*([A-Za-z_][\w.]*)(?:\s+\d+)?\s+([A-Za-z_]\w*)\s*[;,=]/gim;
+  const paramRe = /[(,]\s*([A-Za-z_][\w.]*)(?:\s+\d+)?\s+([A-Za-z_]\w*)\s*(?=[,)=])/g;
+  const report = (index: number, name: string, what: string) => {
+    const lineNo = lineNumber(masked, index);
     violations.push({
       rule: 'KW001',
       severity: 'error',
       line: lineNo,
-      excerpt: lines[lineNo - 1]?.trim() ?? m[0].trim(),
-      fix: `"${m[2]}" is a reserved word in X++ (the parser's own keyword set) and cannot name a ` +
-        'variable. Rename it — the compiler reports the failure on the token that follows, not on ' +
+      excerpt: lines[lineNo - 1]?.trim() ?? name,
+      fix: `"${name}" is a reserved word in X++ (the parser's own keyword set) and cannot name a ` +
+        `${what}. Rename it — the compiler reports the failure on the token that follows, not on ` +
         'the name, so the message will not point here.',
     });
+  };
+  let m: RegExpExecArray | null;
+  while ((m = declRe.exec(masked)) !== null) {
+    if (!isDeclarationType(m[1]) || /^(asc|desc)$/i.test(m[2])) continue;
+    if (isReservedName(m[2])) report(m.index, m[2], 'variable');
+    if (m[0].endsWith(';')) continue;
+    for (const later of laterDeclaredNames(masked, m.index + m[0].length - 1)) {
+      if (isReservedName(later.name)) report(later.index, later.name, 'variable');
+    }
+  }
+  while ((m = paramRe.exec(masked)) !== null) {
+    if (!isReservedDeclaration(m[1], m[2])) continue;
+    const header = m[0].startsWith('(')
+      ? /(\w+)\s*$/.exec(masked.slice(Math.max(0, m.index - 20), m.index))?.[1].toLowerCase()
+      : undefined;
+    const what = header === 'for' ? 'loop variable'
+      : header === 'using' || header === 'catch' ? 'variable' : 'parameter';
+    report(m.index, m[2], what);
   }
   return violations;
 }
@@ -2559,8 +2664,123 @@ function checkMixedBooleanOperators(code: string): ValidationViolation[] {
   return violations;
 }
 
+/** Words that can sit where `Type` sits in `Type buf;` without declaring anything. */
+const NOT_A_DECLARING_TYPE = new Set([
+  'select', 'join', 'from', 'next', 'return', 'exists', 'notexists', 'outer', 'firstonly',
+  'firstonly10', 'firstonly100', 'firstonly1000', 'firstfast', 'forupdate', 'nofetch',
+  'reverse', 'crosscompany', 'forceplaceholders', 'forceliterals', 'forceselectorder',
+  'forcenestedloop', 'repeatableread', 'validtimestate', 'pessimisticlock', 'optimisticlock',
+  'generateonly', 'desc', 'asc', 'by', 'new', 'case', 'else', 'delete_from', 'update_recordset',
+]);
+
+const LOCK_HINT = /\b(?:forupdate|pessimisticlock|optimisticlock)\b/i;
+
+/** What may stand between `select`/`join` and the buffer it binds. */
+const SELECT_HINT = /^(?:firstonly\d*|firstfast|forupdate|nofetch|reverse|crosscompany|forceplaceholders|forceliterals|forceselectorder|forcenestedloop|repeatableread|validtimestate|pessimisticlock|optimisticlock|generateonly|exists|notexists|outer)$/i;
+
+/**
+ * The buffers one select statement binds — `select [hints] buf`, `select [hints]
+ * f1, f2 from buf`, and the same after each `join`. Field names in the field list
+ * and `x.Field == buf.RecId` in the where clause are not bindings; matching the
+ * name anywhere in the statement made `select Location from dirPartyLocation`
+ * look like a select of a `location` buffer.
+ */
+function selectBoundBuffers(statement: string): string[] {
+  const buffers: string[] = [];
+  for (const kw of statement.matchAll(/\b(?:select|join)\b/gi)) {
+    const clause = statement
+      .slice((kw.index ?? 0) + kw[0].length)
+      .split(/\b(?:where|join|order|group|index)\b/i)[0];
+    const from = /\bfrom\s+([A-Za-z_]\w*)/i.exec(clause);
+    if (from) { buffers.push(from[1]); continue; }
+    const tokens = clause.replace(/\([^)]*\)/g, ' ').replace(/:\s*\w+/g, ' ').match(/[A-Za-z_]\w*/g) ?? [];
+    const first = tokens.find(t => !SELECT_HINT.test(t));
+    if (first) buffers.push(first);
+  }
+  return buffers;
+}
+
+/**
+ * SEL011 — `buf.update()` / `buf.delete()` on a buffer that was never selected
+ * for update.
+ *
+ * It passes the compiler and the reference check, and throws at runtime: "Cannot
+ * edit a record in <table>. The operation cannot be completed, since the record
+ * was not selected for update." (#1164)
+ *
+ * Deliberately narrow, because the buffer can get its update permission in ways
+ * a text scan cannot follow. It fires only when the buffer IS selected in this
+ * method and EVERY such select before the call lacks forupdate /
+ * pessimisticlock / optimisticlock, and it stays quiet when:
+ *   - the buffer calls selectForUpdate() anywhere,
+ *   - it is assigned or inserted after its last select (`buf = T::find(id, true)`),
+ *   - its declared type looks like a temporary table, or it calls setTmp(),
+ *   - the call is on `this`.
+ * The scope is "since the buffer was last declared", which keeps a select of the
+ * same name in another method from counting.
+ */
+function checkUpdateWithoutForUpdate(code: string): ValidationViolation[] {
+  const masked = maskStringsAndComments(code);
+  const violations: ValidationViolation[] = [];
+  const callRe = /\b([A-Za-z_]\w*)\s*\.\s*(update|delete)\s*\(\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(masked)) !== null) {
+    const buf = m[1];
+    if (/^(?:this|super|element)$/i.test(buf)) continue;
+    const b = buf.toLowerCase();
+    const before = masked.slice(0, m.index);
+
+    // Scope: from the buffer's last declaration (local, parameter or member).
+    const declRe = new RegExp(String.raw`\b([A-Za-z_]\w*)\s+${buf}\s*([;,=)])(\s*[A-Za-z_]\w*\s*;)?`, 'gi');
+    let scopeStart = -1;
+    let declaredType = '';
+    let copiedFromBuffer = false;
+    for (const d of before.matchAll(declRe)) {
+      if (NOT_A_DECLARING_TYPE.has(d[1].toLowerCase())) continue;
+      scopeStart = d.index ?? 0;
+      declaredType = d[1];
+      // `T tmpref = stampJournalTable;` — a copy of another buffer, which may
+      // well be a temporary-table instance, and those need no forupdate.
+      copiedFromBuffer = d[2] === '=' && Boolean(d[3]);
+    }
+    if (scopeStart < 0 || copiedFromBuffer) continue; // origin unknown
+    if (/tmp|temp/i.test(declaredType)) continue;
+    const scope = masked.slice(scopeStart, m.index);
+    if (new RegExp(String.raw`\b${buf}\s*\.\s*(?:selectForUpdate|setTmp)\s*\(`, 'i').test(masked)) continue;
+
+    // Every select statement in scope that binds this buffer.
+    let lastSelectEnd = -1;
+    let anySelect = false;
+    let anyLocked = false;
+    for (const s of scope.matchAll(/\bselect\b[^;{]*/gi)) {
+      if (!selectBoundBuffers(s[0]).some(x => x.toLowerCase() === b)) continue;
+      anySelect = true;
+      if (LOCK_HINT.test(s[0])) anyLocked = true;
+      lastSelectEnd = (s.index ?? 0) + s[0].length;
+    }
+    if (!anySelect || anyLocked) continue;
+
+    // Re-filled after the select: assigned, or inserted (an inserted buffer may be updated).
+    const after = scope.slice(lastSelectEnd);
+    if (new RegExp(String.raw`\b${buf}\s*=(?!=)|\b${buf}\s*\.\s*(?:insert|data)\s*\(`, 'i').test(after)) continue;
+
+    violations.push({
+      rule: 'SEL011',
+      severity: 'warning',
+      line: lineNumber(code, m.index),
+      excerpt: `${buf}.${m[2]}()`,
+      fix:
+        `${buf} is selected without forupdate, so ${buf}.${m[2]}() throws at runtime ("the record was not ` +
+        `selected for update"). Add forupdate to the select that fetches it (select forupdate ${buf} where …), ` +
+        `or call ${buf}.selectForUpdate(true) before the select.`,
+    });
+  }
+  return violations;
+}
+
 const XPP_RULES = [
   checkTodayDeprecated,
+  checkUpdateWithoutForUpdate,
   checkDocCommentXml,
   checkSetBasedWithoutWhere,
   checkMixedBooleanOperators,

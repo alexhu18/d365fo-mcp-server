@@ -29,6 +29,18 @@ vi.mock('../../src/utils/metadataResolver', async (orig) => {
   return { ...actual, buildObjectTypeMismatchMessage: vi.fn(() => '') };
 });
 
+// The XML fallback now probes the indexed path and, when it is not readable,
+// re-resolves it via findD365FileOnDisk against the packages root. In here the
+// indexed paths are synthetic ('/Classes/TestClass.xml') — resolve them back
+// to themselves so the parser mock keeps receiving the path the test set up.
+vi.mock('../../src/utils/objectFileLookup', async (orig) => {
+  const actual = await orig<typeof import('../../src/utils/objectFileLookup')>();
+  return {
+    ...actual,
+    findD365FileOnDisk: vi.fn(async (_type: string, name: string) => `/Classes/${name}.xml`),
+  };
+});
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const req = (name: string, args: Record<string, unknown> = {}): CallToolRequest => ({

@@ -95,6 +95,10 @@ export const CAPTION_LABELS = {
   lineDetails: '@SYS23823',
   setup: '@SYS2186',
   summary: '@SYS15560',
+  // The related-links section caption shipped workspaces use most.
+  relatedLinks: '@SYS72248',
+  // "List": the default workspace list section when the caller names none.
+  list: '@SYS6188',
 } as const;
 
 /**
@@ -551,7 +555,19 @@ ${tabFieldControls}\t\t\t\t\t\t\t\t</Controls>
         `\t\t\t\t\t\t\t\t\t\t<ShowLabel>No</ShowLabel>\n` +
         `\t\t\t\t\t\t\t\t\t\t<Style>TitleField</Style>\n` +
         `\t\t\t\t\t\t\t\t\t</AxFormControl>\n`
-      : '';
+      // The platform's DetailsMaster 1.4 requires the HeaderTitle String even when
+      // no title field is known yet: emit it unbound rather than drop it, or the
+      // form does not compile. Bind its DataField once the table has a TitleField1.
+      : `\t\t\t\t\t\t\t\t\t<AxFormControl xmlns=""\n` +
+        `\t\t\t\t\t\t\t\t\t\t\ti:type="AxFormStringControl">\n` +
+        `\t\t\t\t\t\t\t\t\t\t<Name>TitleField</Name>\n` +
+        `\t\t\t\t\t\t\t\t\t\t<Skip>Yes</Skip>\n` +
+        `\t\t\t\t\t\t\t\t\t\t<Type>String</Type>\n` +
+        `\t\t\t\t\t\t\t\t\t\t<WidthMode>SizeToAvailable</WidthMode>\n` +
+        `\t\t\t\t\t\t\t\t\t\t<FormControlExtension\n\t\t\t\t\t\t\t\t\t\t\ti:nil="true" />\n` +
+        `\t\t\t\t\t\t\t\t\t\t<ShowLabel>No</ShowLabel>\n` +
+        `\t\t\t\t\t\t\t\t\t\t<Style>TitleField</Style>\n` +
+        `\t\t\t\t\t\t\t\t\t</AxFormControl>\n`;
 
     return `<?xml version="1.0" encoding="utf-8"?>
 <AxForm xmlns:i="http://www.w3.org/2001/XMLSchema-instance" xmlns="Microsoft.Dynamics.AX.Metadata.V6">
@@ -889,7 +905,10 @@ ${gridPanelFieldControls}\t\t\t\t\t\t\t\t</Controls>
     const linesDsFields = dsFieldList(linesFields);
 
     // DetailsTransaction v1.4 carries the title in a DetailTitleContainer header
-    // (HeaderInfo) bound to the record's identifying field.
+    // (HeaderInfo) bound to the record's identifying field. The pattern requires its
+    // HeaderTitle String even when no field is known yet (the platform's
+    // PatternAnalyzer rejects the form without it), so it is then written unbound,
+    // as DetailsMaster does with its TitleField.
     const titleField = gridFields[0];
 
     return `<?xml version="1.0" encoding="utf-8"?>
@@ -1032,7 +1051,7 @@ ${navListColumns}\t\t\t\t\t\t</Controls>
 \t\t\t\t\t\t\t\t<FormControlExtension
 \t\t\t\t\t\t\t\t\ti:nil="true" />
 \t\t\t\t\t\t\t\t<Controls>
-${titleField ? `\t\t\t\t\t\t\t\t\t<AxFormControl xmlns=""
+\t\t\t\t\t\t\t\t\t<AxFormControl xmlns=""
 \t\t\t\t\t\t\t\t\t\t\ti:type="AxFormStringControl">
 \t\t\t\t\t\t\t\t\t\t<Name>HeaderTitle</Name>
 \t\t\t\t\t\t\t\t\t\t<Skip>Yes</Skip>
@@ -1040,11 +1059,12 @@ ${titleField ? `\t\t\t\t\t\t\t\t\t<AxFormControl xmlns=""
 \t\t\t\t\t\t\t\t\t\t<WidthMode>SizeToAvailable</WidthMode>
 \t\t\t\t\t\t\t\t\t\t<FormControlExtension
 \t\t\t\t\t\t\t\t\t\t\ti:nil="true" />
-\t\t\t\t\t\t\t\t\t\t<DataField>${titleField}</DataField>
+${titleField ? `\t\t\t\t\t\t\t\t\t\t<DataField>${titleField}</DataField>
 \t\t\t\t\t\t\t\t\t\t<DataSource>${dsName}</DataSource>
-\t\t\t\t\t\t\t\t\t\t<ShowLabel>No</ShowLabel>
+` : ''}\t\t\t\t\t\t\t\t\t\t<ShowLabel>No</ShowLabel>
 \t\t\t\t\t\t\t\t\t\t<Style>TitleField</Style>
-\t\t\t\t\t\t\t\t\t</AxFormControl>\n` : ''}\t\t\t\t\t\t\t\t</Controls>
+\t\t\t\t\t\t\t\t\t</AxFormControl>
+\t\t\t\t\t\t\t\t</Controls>
 \t\t\t\t\t\t\t\t<ArrangeMethod>HorizontalLeft</ArrangeMethod>
 \t\t\t\t\t\t\t\t<FrameType>None</FrameType>
 \t\t\t\t\t\t\t\t<Style>DetailTitleContainer</Style>
@@ -1387,9 +1407,13 @@ ${gridPanelColumns}\t\t\t\t\t\t\t\t</Controls>
       `\t\t\t\t\t<Pattern>FieldsFieldGroups</Pattern>\n` +
       `\t\t\t\t\t<PatternVersion>1.1</PatternVersion>\n` +
       `\t\t\t\t\t<Type>TabPage</Type>\n` +
-      `\t\t\t\t\t<Caption>${s.caption}</Caption>\n` +
       `\t\t\t\t\t<FormControlExtension\n\t\t\t\t\t\ti:nil="true" />\n` +
       `\t\t\t\t\t<Controls />\n` +
+      // FieldsFieldGroups requires ColumnsMode Fill (a TabPage defaults to Fixed).
+      // Caption is a TabPage property and must follow <Controls>, or the
+      // deserializer drops it.
+      `\t\t\t\t\t<ColumnsMode>Fill</ColumnsMode>\n` +
+      `\t\t\t\t\t<Caption>${s.caption}</Caption>\n` +
       `\t\t\t\t</AxFormControl>\n`
     ).join('');
 
@@ -1778,8 +1802,8 @@ public class ${formName} extends FormRun
 \t\t\t<Fields />
 \t\t\t<ReferencedDataSources />
 \t\t\t<AllowCreate>No</AllowCreate>
-\t\t\t<AllowEdit>No</AllowEdit>
 \t\t\t<AllowDelete>No</AllowDelete>
+\t\t\t<AllowEdit>No</AllowEdit>
 \t\t\t<InsertIfEmpty>No</InsertIfEmpty>
 \t\t\t<DataSourceLinks />
 \t\t\t<DerivedDataSources />
@@ -1906,12 +1930,17 @@ ${fieldControls}\t\t\t\t</Controls>
   //              ListSection(s) (TabPage) → CustomFilterGroup + Grid per section
   // ---------------------------------------------------------------------------
   static buildWorkspace(opt: FormTemplateOptions): string {
-    const { formName, dsName = formName, dsTable = dsName, caption, sections = [] } = opt;
+    const { formName, dsName = formName, dsTable = dsName, caption } = opt;
     const captionXml = caption
       ? `\t\t<Caption xmlns="">${caption}</Caption>\n`
       : '';
 
-    // Generate extra panorama list sections from the `sections` option
+    // The panorama list sections, from the `sections` option. WorkspaceOperational
+    // 1.1 requires at least one (its SectionTabbedList part has no 0..1 count):
+    // without one the platform's PatternAnalyzer pairs RelatedLinksSection with that
+    // part and reports SectionRelatedLinks missing, and a pipeline build rejects the
+    // form. So a caller that names none gets one list over the primary data source.
+    const sections = opt.sections?.length ? opt.sections : [{ name: 'List', caption: CAPTION_LABELS.list }];
     const listSections = sections.map((sec, idx) =>
       `\t\t\t\t\t<AxFormControl xmlns=""\n` +
       `\t\t\t\t\t\t\ti:type="AxFormTabPageControl">\n` +
@@ -1961,9 +1990,9 @@ ${fieldControls}\t\t\t\t</Controls>
       `\t\t\t\t\t\t\t\t<Style>Tabular</Style>\n` +
       `\t\t\t\t\t\t\t</AxFormControl>\n` +
       `\t\t\t\t\t\t</Controls>\n` +
-      `\t\t\t\t\t\t<FastTabExpanded>Yes</FastTabExpanded>\n` +
-      `\t\t\t\t\t\t<FrameType>None</FrameType>\n` +
+      // Caption before FastTabExpanded, or the deserializer drops it; a tab page has no FrameType.
       `\t\t\t\t\t\t<Caption>${sec.caption}</Caption>\n` +
+      `\t\t\t\t\t\t<FastTabExpanded>Yes</FastTabExpanded>\n` +
       `\t\t\t\t\t</AxFormControl>\n`
     ).join('');
 
@@ -1994,8 +2023,8 @@ public class ${formName} extends FormRun
 \t\t\t<Fields />
 \t\t\t<ReferencedDataSources />
 \t\t\t<AllowCreate>No</AllowCreate>
-\t\t\t<AllowEdit>No</AllowEdit>
 \t\t\t<AllowDelete>No</AllowDelete>
+\t\t\t<AllowEdit>No</AllowEdit>
 \t\t\t<InsertIfEmpty>No</InsertIfEmpty>
 \t\t\t<DataSourceLinks />
 \t\t\t<DerivedDataSources />
@@ -2092,7 +2121,19 @@ ${captionXml}\t\t<Pattern xmlns="">WorkspaceOperational</Pattern>
 \t\t\t\t\t\t<Caption>${CAPTION_LABELS.summary}</Caption>
 \t\t\t\t\t\t<FastTabExpanded>Yes</FastTabExpanded>
 \t\t\t\t\t</AxFormControl>
-${listSections}\t\t\t\t</Controls>
+${listSections}\t\t\t\t\t<AxFormControl xmlns=""
+\t\t\t\t\t\t\ti:type="AxFormTabPageControl">
+\t\t\t\t\t\t<Name>RelatedLinksSection</Name>
+\t\t\t\t\t\t<Type>TabPage</Type>
+\t\t\t\t\t\t<FormControlExtension
+\t\t\t\t\t\t\ti:nil="true" />
+\t\t\t\t\t\t<Controls>
+\t\t\t\t\t\t\t<!-- Add link MenuFunctionButtons (Style Link) or LinksGroup groups here -->
+\t\t\t\t\t\t</Controls>
+\t\t\t\t\t\t<Caption>${CAPTION_LABELS.relatedLinks}</Caption>
+\t\t\t\t\t\t<FastTabExpanded>Yes</FastTabExpanded>
+\t\t\t\t\t</AxFormControl>
+\t\t\t\t</Controls>
 \t\t\t\t<AlignChild>No</AlignChild>
 \t\t\t\t<ShowTabs>Yes</ShowTabs>
 \t\t\t\t<Style>FastTabs</Style>

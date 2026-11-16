@@ -35,6 +35,11 @@ import { resetRecentPrepares } from './prepare/prepare.js';
 import { testCoverageNote } from './prepare/testFirst.js';
 import * as debouncedRefresh from '../bridge/debouncedRefresh.js';
 import { truncateOnBlockBoundary } from '../utils/payloadBudget.js';
+import {
+  provisionFieldTypes, renderProvisionNotes, slotFromAddField, slotsFromFieldSpecs,
+  type FieldTypeSlot, type ProvisionResult,
+} from './write/fieldTypeProvisioning.js';
+import { writeFile } from 'fs/promises';
 
 export const D365_FILE_ACTIONS = ['generate', 'create', 'project', 'modify', 'delete', 'undo'] as const;
 export type D365FileAction = (typeof D365_FILE_ACTIONS)[number];
@@ -86,6 +91,39 @@ const MAX_OPERATION_CHARS = 4_000;
  * the create's own answer has to survive intact, isError included, with the
  * reason the edits were skipped appended to it.
  */
+/**
+ * Create the EDTs and enums the fields of this write need, before it runs: the
+ * fields of a table create, and every add-field on a table or table extension
+ * (single, or in operations[]). See write/fieldTypeProvisioning.ts. autoCorrect=false
+ * writes the fields as passed.
+ */
+async function provisionFieldTypesFor(
+  args: Record<string, unknown>,
+  operations: unknown,
+  context: XppServerContext,
+): Promise<ProvisionResult> {
+  if (args.autoCorrect === false) return { notes: [] };
+  if (args.objectType !== 'table' && args.objectType !== 'table-extension') return { notes: [] };
+  const slots: FieldTypeSlot[] = slotsFromFieldSpecs((args.properties as Record<string, unknown> | undefined)?.fields);
+  const ops = Array.isArray(operations) ? operations : typeof args.operation === 'string' ? [args] : [];
+  for (const op of ops) {
+    const slot = op && typeof op === 'object' ? slotFromAddField(op as Record<string, unknown>) : undefined;
+    if (slot) slots.push(slot);
+  }
+  return provisionFieldTypes(slots, args, context);
+}
+
+/** The refusal when a type the fields need could not be created. */
+function provisionError(p: ProvisionResult): any {
+  return {
+    content: [{
+      type: 'text',
+      text: `❌ ${p.error}\nThe fields were NOT written.${renderProvisionNotes(p)}`,
+    }],
+    isError: true,
+  };
+}
+
 function appendToResult(result: any, note: string): any {
   const content = result?.content;
   const first = Array.isArray(content) ? content[0] : undefined;
@@ -189,6 +227,7 @@ async function modifyWithExtensionAutoCreate(
   }
 
   const finalName = createOutcome.finalObjectName ?? pending.objectName;
+  outcome.createdExtension = { objectType: pending.objectType, objectName: finalName, filePath: createOutcome.filePath };
   const retry = await modifyD365FileTool(
     subRequest('modify_d365fo_file', {
       ...args,
@@ -251,7 +290,14 @@ async function runModifyBatch(
   // heading of action="modify" under a create reads as a different call.
   calledAs: 'modify' | 'create' = 'modify',
 ): Promise<any> {
-  const { operations, ...shared } = rest as { operations: unknown[] } & Record<string, unknown>;
+  // `atomic` is a batch option, not an operation parameter: taken out here so it is
+  // neither spread into every entry nor reported as an ignored parameter there.
+  const { operations, atomic: atomicArg, ...shared } = rest as { operations: unknown[] } & Record<string, unknown>;
+  const atomic = atomicArg === true || atomicArg === 'true';
+  /** First pre-batch image of each file an atomic batch touched, for the rollback. */
+  const originals = new Map<string, Buffer>();
+  /** Extensions this batch created before modifying them: a rollback empties them, it does not remove them. */
+  const createdExtensions: NonNullable<ModifyOutcome['createdExtension']>[] = [];
 
   if (operations.length === 0) {
     return {
@@ -349,9 +395,13 @@ async function runModifyBatch(
       break;
     }
 
-    const outcome: ModifyOutcome = {};
+    const outcome: ModifyOutcome = atomic ? { captureOriginal: true } : {};
     const result = await modifyWithExtensionAutoCreate(entryArgs, context, outcome);
     const ok = !result?.isError;
+    if (atomic && outcome.filePath && outcome.originalBytes && !originals.has(outcome.filePath)) {
+      originals.set(outcome.filePath, outcome.originalBytes);
+    }
+    if (outcome.createdExtension) createdExtensions.push(outcome.createdExtension);
     results.push({
       label: `#${i + 1} ${opName}`,
       ok,
@@ -383,9 +433,35 @@ async function runModifyBatch(
   const failed = results.filter(r => !r.ok).length;
   const notAttempted = operations.length - results.length;
 
+  // atomic: a failure restores every file the batch changed to its bytes from before
+  // the call, so the object is left as it was instead of half-applied (one project's
+  // sessions had 11 batches stop that way, e.g. "4/13 operation(s) applied").
+  const rolledBack: string[] = [];
+  const rollbackErrors: string[] = [];
+  if (atomic && failed > 0) {
+    for (const [file, bytes] of originals) {
+      try {
+        await writeFile(file, bytes);
+        rolledBack.push(file);
+      } catch (e: any) {
+        rollbackErrors.push(`${file}: ${e?.message ?? e}`);
+      }
+    }
+    if (rolledBack.length > 0 && context.bridge) {
+      void debouncedRefresh.refresh(context.bridge);
+      await debouncedRefresh.flush();
+    }
+    for (const file of rolledBack) {
+      await upsertWrittenFileIntoIndex(file, context);
+      written.delete(file);
+    }
+  }
+
   const head =
     `${failed === 0 ? (declined ? '⏭️' : '✅') : '⚠️'} d365fo_file(action="${calledAs}") — ` +
-    `${succeeded}/${operations.length} operation(s) applied` +
+    (rolledBack.length > 0
+      ? `0/${operations.length} operation(s) applied (${succeeded} rolled back)`
+      : `${succeeded}/${operations.length} operation(s) applied`) +
     (declined ? `, ${declined} skipped (nothing written — see below)` : '') +
     (failed ? `, failed at #${stoppedAt + 1}` : '') +
     (notAttempted ? `, ${notAttempted} not attempted` : '');
@@ -402,11 +478,26 @@ async function runModifyBatch(
     })
     .join('');
 
-  const tail = failed
-    ? `\n\n> Operations run in order and stop at the first failure, because a later one usually ` +
-      `depends on an earlier one. The ${succeeded} operation(s) above it ARE applied — fix the failing ` +
-      `entry and re-send only the remaining ones.`
-    : '';
+  const tail = !failed
+    ? ''
+    : rolledBack.length > 0 || rollbackErrors.length > 0
+      ? `\n\n> atomic: the batch stopped at #${stoppedAt + 1} and restored ${rolledBack.length} file(s) to how ` +
+        `they were before its first operation, so none of its operations remain. Fix the failing entry and ` +
+        `re-send the whole batch.` +
+        (rollbackErrors.length > 0
+          ? `\n> ⚠️ Could not restore: ${rollbackErrors.join('; ')} — that file keeps the operations above.`
+          : '') +
+        createdExtensions
+          .map(c =>
+            `\n> ⚠️ ${c.objectType} "${c.objectName}" did not exist before this call. The batch created it ` +
+            `before its first operation, and the rollback leaves it as created: EMPTY, on disk and registered ` +
+            `in the project (${c.filePath}). Re-send the batch against "${c.objectName}", or remove it with ` +
+            `d365fo_file(action="delete", objectType="${c.objectType}", objectName="${c.objectName}").`)
+          .join('')
+      : `\n\n> Operations run in order and stop at the first failure, because a later one usually ` +
+        `depends on an earlier one. The ${succeeded} operation(s) above it ARE applied — fix the failing ` +
+        `entry and re-send only the remaining ones.` +
+        (succeeded > 0 && !atomic ? ' Pass atomic: true to have a failed batch restore its file(s) instead.' : '');
 
   // The per-file work, once, for the whole call — the per-operation copies are
   // suppressed inside modifyD365FileTool (see the `inBatch` block there).
@@ -430,17 +521,20 @@ async function runModifyBatch(
         ),
       ),
     );
-    trailerLines.push(
-      (written.size > 1 ? `\n${target.objectName ?? target.filePath}:` : '') + verifyNote + indexNote,
-    );
+    // Both notes are '' for a clean write, so a file only gets a line when
+    // something about it needs the agent's attention.
+    const note = verifyNote + indexNote;
+    if (note) {
+      trailerLines.push((written.size > 1 ? `\n${target.objectName ?? target.filePath}:` : '') + note);
+    }
   }
-  // No batch-edit hint here: this call already IS the batch, and telling a caller
-  // that just sent operations[] to send operations[] is the same defect the
-  // per-operation suppression exists to avoid.
-  const trailer = trailerLines.length
-    ? `\n${trailerLines.join('')}` +
-      `\n\nNext: build_d365fo_project(bpCheck:true) — builds and runs the best-practice check in one call.`
-    : '';
+  // No batch-edit hint here: this call already IS the batch. The Next line stays
+  // (once per batch): it is what turned build → run_bp_check → verify into one
+  // call (see the modify tail in modifyD365File.ts).
+  const trailer = (trailerLines.length ? `\n${trailerLines.join('')}` : '') +
+    (written.size > 0
+      ? `\n\nNext: build_d365fo_project(bpCheck:true) — builds and runs the best-practice check in one call.`
+      : '');
 
   return {
     content: [{ type: 'text', text: head + body + tail + trailer }],
@@ -496,8 +590,13 @@ export async function d365foFileTool(request: CallToolRequest, context: XppServe
     // Stamped BEFORE the create so the refresh check below can tell "the bridge
     // rebuilt the provider as part of this create" from "the last rebuild was
     // some earlier call's".
+    const types = await provisionFieldTypesFor(createArgs, operations, context);
+    if (types.error) return provisionError(types);
     const createStartedAt = Date.now();
-    const created = await handleCreateD365File(subRequest('create_d365fo_file', createArgs), context, outcome);
+    const created = appendToResult(
+      await handleCreateD365File(subRequest('create_d365fo_file', createArgs), context, outcome),
+      renderProvisionNotes(types),
+    );
 
     if (!Array.isArray(operations) || operations.length === 0) return created;
     // Never run edits against an object that was not created.
@@ -555,16 +654,18 @@ export async function d365foFileTool(request: CallToolRequest, context: XppServe
     };
   }
   if (action === 'modify') {
+    const types = await provisionFieldTypesFor(rest, rest.operations, context);
+    if (types.error) return provisionError(types);
     const modified = Array.isArray(rest.operations)
       ? await runModifyBatch(rest, context)
       : await modifyWithExtensionAutoCreate(rest, context, {});
-    return withTestCoverageNote(modified, rest, context);
+    return withTestCoverageNote(appendToResult(modified, renderProvisionNotes(types)), rest, context);
   }
   if (action === 'delete') {
     return handleDeleteD365File(subRequest('delete_d365fo_file', rest), context);
   }
-  // generate: handler takes the request only (no context).
-  return handleGenerateD365Xml(subRequest('generate_d365fo_xml', rest));
+  // generate: the symbol index lets it infer an extension's base, as create does.
+  return handleGenerateD365Xml(subRequest('generate_d365fo_xml', rest), context);
 }
 
 // Tool registration (name, description, inputSchema) lives in

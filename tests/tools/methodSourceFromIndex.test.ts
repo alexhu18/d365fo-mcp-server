@@ -25,6 +25,15 @@ vi.mock('../../src/utils/metadataResolver', async (orig) => {
   return { ...actual, buildObjectTypeMismatchMessage: vi.fn(() => '') };
 });
 
+// The XML fallback re-resolves an unreadable indexed path against the packages
+// root. The path below is synthetic, so without this the lookup reads the real
+// disk: on a dev VM it finds the shipped CustTable.xml and the tests pass by
+// accident, on CI it finds nothing and the parsed-file cases never parse.
+vi.mock('../../src/utils/objectFileLookup', async (orig) => {
+  const actual = await orig<typeof import('../../src/utils/objectFileLookup')>();
+  return { ...actual, findD365FileOnDisk: vi.fn(async (_type: string, name: string) => `K:/Packages/${name}.xml`) };
+});
+
 const req = (name: string, args: Record<string, unknown> = {}): CallToolRequest => ({
   method: 'tools/call',
   params: { name, arguments: args },

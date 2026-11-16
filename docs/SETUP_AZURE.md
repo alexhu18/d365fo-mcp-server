@@ -208,6 +208,14 @@ Create a variable group named **`xpp-mcp-server-config`** in Azure DevOps Librar
 | `AZURE_SUBSCRIPTION` | No | Name of your Azure DevOps service connection |
 | `AZURE_APP_SERVICE_NAME` | No | `xpp-mcp-server` |
 
+### Object source in the database
+
+Every object's original XML is stored (gzipped, table `object_source`; extensions excluded) so a host with only the database can read it. Measured on one full standard install (about 187,000 objects): 1.8 GiB of XML, **about 330 MiB gzipped** in the database, led by reports (120 MiB, embedded RDL), classes (95 MiB), tables (37 MiB) and forms (36 MiB); gzip adds about 90 s of CPU to a full build. The extractor attaches the XML to each JSON as `raw`, so blob JSON grows by roughly the escaped XML size (about +1.8 GiB for a full standard extract), which costs storage and download time.
+
+Existing blob JSON has no `raw`; objects from it have no stored copy until re-extracted. Run the **platform pipeline with extraction** (not `skipExtraction`) first for the standard models, then the **custom pipeline with extraction**, then the upgrade pipeline if you use it — the upgrade pipeline and custom `skipExtraction` runs rebuild from blob JSON and only get stored copies if that JSON carries `raw`. `form_datasources` (which forms use a table) needs no re-extraction.
+
+Upgrading from 1.22.0: its forms-only `form_source` table is no longer read, so forms lose their stored copy until the database is rebuilt this way. Run the pipelines before the App Service restarts on the new version.
+
 ### Uploading standard packages
 
 The platform pipeline needs the raw `PackagesLocalDirectory` as a zip in the `packages` container. On your D365FO VM, compress `K:\AosService\PackagesLocalDirectory`, upload it as `PackagesLocalDirectory.zip` (via **Azure Storage Explorer**), and re-upload only after a version upgrade or hotfix rollup.

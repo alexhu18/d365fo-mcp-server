@@ -7,10 +7,13 @@ import Database, { type Statement } from '../database/sqlite.js';
 import { Worker } from 'node:worker_threads';
 import * as fs from 'fs';
 import * as path from 'path';
+import { gzipSync } from 'node:zlib';
 import type { XppSymbol } from './types.js';
 import { renderMethodSignature } from './xppDeclaration.js';
+import { storeObjectSourceEnabled } from './objectSourceSetting.js';
 import { isStandardModel } from '../utils/modelClassifier.js';
 import { labelIdSpellings, parseLabelReference } from '../utils/labelReference.js';
+import { normalizeLabelText } from '../utils/labelText.js';
 import { c, log } from '../utils/terminalUi.js';
 
 /**
@@ -23,6 +26,31 @@ const isCI = (): boolean => {
 
 /** How many distinct queries keep a memoized "did you mean" candidate pool. */
 const SUGGESTION_CACHE_ENTRIES = 32;
+
+/**
+ * Case-insensitive order with the exact spelling as tie-break, so two calls on
+ * the same rows always agree. Plain code-unit comparison, not localeCompare:
+ * the order must not depend on the process locale.
+ */
+function compareIgnoreCase(a: string, b: string): number {
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  if (x !== y) return x < y ? -1 : 1;
+  return a === b ? 0 : a < b ? -1 : 1;
+}
+
+/**
+ * The pattern suggestMissingMethods compares a class against: the indexed
+ * pattern type, or one read from a Helper / Service / Controller name suffix.
+ * `undefined` when the class has neither, i.e. there are no similar classes.
+ */
+export function suggestionPatternType(className: string, patternType?: string): string | undefined {
+  if (patternType && patternType !== 'Unknown') return patternType;
+  if (className.endsWith('Helper')) return 'Helper';
+  if (className.endsWith('Service')) return 'Service';
+  if (className.endsWith('Controller')) return 'Controller';
+  return undefined;
+}
 
 /**
  * A multi-word query, split into the substrings a symbol name must ALL contain.
@@ -66,6 +94,50 @@ export interface ExtensionMetadataRecord {
 }
 
 /**
+ * How many read-only connections the index opens when READ_POOL_SIZE is not set.
+ *
+ * One. The SQLite driver is synchronous and every tool runs on the main thread,
+ * so there is never more than one read in flight: a second and third connection
+ * add no concurrency, only a second and third page cache, statement cache and
+ * FTS state for the same work, each warmed a third as often.
+ *
+ * It stays a connection of its own rather than the writer, because a separate
+ * connection reads the last committed snapshot while the writer has a
+ * transaction open.
+ */
+export const DEFAULT_READ_POOL_SIZE = 1;
+
+/**
+ * Page-cache budget for the read connections together, in KiB (128 MB).
+ *
+ * The symbols file is larger than the 1 GiB mmap window, so a scan outside the
+ * window lives on this cache. Three connections at 32 MB each ran the same
+ * scan in 630 to 910 ms where one connection with 256 MB took 100 to 130 ms.
+ * 128 MB on one connection is slightly more than the old three pools together
+ * (96 MB), and the six labels connections that went with them are gone.
+ */
+export const READ_CACHE_BUDGET_KIB = 128_000;
+
+/** The per-connection page cache before this budget existed. Never go below it. */
+const MIN_READ_CACHE_KIB = 32_000;
+
+/** READ_POOL_SIZE, clamped to 1-8. Unset, empty or not a number means the default. */
+export function readPoolSizeFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = parseInt(env.READ_POOL_SIZE || '', 10);
+  const wanted = Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_READ_POOL_SIZE;
+  return Math.min(8, Math.max(1, wanted));
+}
+
+/**
+ * The budget split across the pool, so asking for more connections does not
+ * multiply the memory. Floored at the old 32 MB so an override is never worse
+ * off per connection than it was.
+ */
+export function readCacheKibPerConnection(poolSize: number): number {
+  return Math.max(MIN_READ_CACHE_KIB, Math.floor(READ_CACHE_BUDGET_KIB / Math.max(1, poolSize)));
+}
+
+/**
  * Construction-time switches for the deferred file_path index builds.
  *
  * The defaults describe the long-running server: build in the background, treat
@@ -93,6 +165,12 @@ export interface XppSymbolIndexOptions {
   deferFilePathIndexes?: boolean;
   /** Byte size at which a DB is "large" enough to hand its index build to a worker. */
   largeDbThresholdBytes?: number;
+  /**
+   * Store objects' original XML in object_source (default: the index.storeObjectSource
+   * setting, i.e. STORE_OBJECT_SOURCE, which defaults to true). When false,
+   * writeObjectSource() stores nothing, in the build and in update_symbol_index alike.
+   */
+  storeObjectSource?: boolean;
 }
 
 /**
@@ -121,6 +199,21 @@ export interface IndexProgress {
  * tens while its classes and tables run to thousands.
  */
 export const REGULAR_NAME_SAMPLE = 60;
+
+/** How many evenly spaced runs the regular band is read in — see readModelObjectNames. */
+export const REGULAR_SAMPLE_PROBES = 8;
+
+/**
+ * The object types whose original XML object_source keeps: the top-level types the full
+ * build indexes. Extensions are left out — their rows hang off the base object, so no
+ * reader resolves them by name and a stored copy could never be read or cleaned up.
+ */
+export const STORED_SOURCE_TYPES: ReadonlySet<string> = new Set([
+  'class', 'table', 'form', 'query', 'view', 'enum', 'edt', 'report', 'map', 'macro',
+  'security-privilege', 'security-duty', 'security-role', 'security-policy',
+  'menu-item-display', 'menu-item-action', 'menu-item-output',
+  'service', 'service-group', 'configuration-key', 'license-code',
+]);
 
 /** The little of a database handle this read needs, so a CLI can pass its own. */
 export interface ModelNameReadDb {
@@ -162,8 +255,8 @@ export interface ModelNameReadDb {
  * outright, regular objects are many and carry the leading token, and
  * inferPrefixFromObjectNames needs BOTH — a single window ordered any way at all
  * would let the larger band crowd the other one out entirely. Each band is capped
- * at half the budget, gives back what it does not use, and is ordered (type, name)
- * so the same model always yields the same sample — a silent, self-reinforcing
+ * at half the budget, gives back what it does not use, and is read in a fixed
+ * order so the same model always yields the same sample — a silent, self-reinforcing
  * failure otherwise, since this server writes names with the inferred prefix and
  * those names become evidence for the next inference.
  *
@@ -175,29 +268,32 @@ export interface ModelNameReadDb {
  * first call of every session. They cannot be dropped altogether — the underscore
  * form ("ConSK_" vs "ConSK") appears in no extension name, so only a regular
  * object can decide it.
+ *
+ * The regular band is SPREAD across the model rather than read from its start
+ * (#1164). Sixty names in (type, name) order are the model's first sixty classes
+ * alphabetically, and a minority prefix that sorts early fills all of them: in a
+ * 3,800-object model where 69 names start "xyz3PL", digits sort before letters,
+ * the sample held 53 of them, and inference answered "xyz3PL" over the "xyz" the
+ * other 3,700 carry. So the band is read as REGULAR_SAMPLE_PROBES short runs,
+ * each starting at an evenly spaced rowid inside the model. The full build
+ * inserts a model type by type and file by file, so evenly spaced rowids land at
+ * evenly spaced points through every type's alphabet. Still deterministic, and
+ * each run is a seek on idx_symbols_model (model, rowid) that stops at its limit
+ * — measured on the production DB at 0.5–1.2 s cold for the largest Microsoft
+ * models and ~2 ms warm, against a full pass over the model for any "every Nth
+ * row" query (57 s cold on Foundation).
  */
 export function readModelObjectNames(db: ModelNameReadDb, model: string, limit = 400): string[] {
   if (!model) return [];
   if (limit <= 0) return [];
 
-  const band = (extensions: boolean, cap: number): string[] => {
+  const extensionBand = (cap: number): string[] => {
     if (cap <= 0) return [];
     const rows = db
       .prepare(
-        // Unary + on parent_name, for the same reason as searchCustomExtensions'
-        // `+type IN (…)`: written plainly, `parent_name IS NULL` makes the planner
-        // choose idx_symbols_parent_name, whose ANALYZE stats claim ~13 rows per
-        // value. NULL is not one value — it is every top-level object of every
-        // model, 180,664 of the 1,188,748 rows on the production DB, against 274
-        // for the one model being asked about. Measured on that DB: 483 s cold and
-        // 632 ms warm on the parent_name plan, against 17 ms on the model plan —
-        // the difference between a first call that looks like a hung server and
-        // one that answers. EXPLAIN QUERY PLAN must keep reporting
-        // `SEARCH symbols USING INDEX idx_symbols_model`.
         `SELECT name FROM symbols
            WHERE model = ?
-             AND type ${extensions ? 'LIKE' : 'NOT LIKE'} '%-extension'
-             ${extensions ? '' : 'AND +parent_name IS NULL'}
+             AND type LIKE '%-extension'
              AND type NOT IN ('method', 'field')
            ORDER BY type, name
            LIMIT ?`
@@ -206,12 +302,73 @@ export function readModelObjectNames(db: ModelNameReadDb, model: string, limit =
     return rows.map(r => r.name);
   };
 
+  const regularBand = (cap: number): string[] => {
+    if (cap <= 0) return [];
+    const names = new Set<string>();
+    try {
+      spreadRegularNames(cap, names);
+    } catch { /* no idx_symbols_model on this DB — the ordered read below still answers */ }
+    // A model with fewer regular objects than the cap, or runs that overlapped:
+    // top up in (type, name) order, which on such a model is all of it.
+    if (names.size < cap) {
+      const rows = db.prepare(
+        `SELECT name FROM symbols
+           WHERE model = ?
+             AND type NOT LIKE '%-extension'
+             AND +parent_name IS NULL
+             AND type NOT IN ('method', 'field')
+           ORDER BY type, name
+           LIMIT ?`,
+      ).all(model, cap) as Array<{ name: string }>;
+      for (const r of rows) if (names.size < cap) names.add(r.name);
+    }
+    return [...names];
+  };
+
+  const spreadRegularNames = (cap: number, names: Set<string>): void => {
+    const edge = (direction: 'ASC' | 'DESC'): number | undefined =>
+      (db.prepare(
+        `SELECT id FROM symbols INDEXED BY idx_symbols_model
+           WHERE model = ? ORDER BY id ${direction} LIMIT 1`,
+      ).all(model) as Array<{ id: number }>)[0]?.id;
+    const lo = edge('ASC');
+    const hi = edge('DESC');
+    if (lo === undefined || hi === undefined) return;
+
+    // Unary + on parent_name, for the same reason as searchCustomExtensions'
+    // `+type IN (…)`: written plainly, `parent_name IS NULL` makes the planner
+    // choose idx_symbols_parent_name, whose ANALYZE stats claim ~13 rows per
+    // value. NULL is not one value — it is every top-level object of every
+    // model, 180,664 of the 1,188,748 rows on the production DB, against 274
+    // for the one model being asked about. Measured on that DB: 483 s cold and
+    // 632 ms warm on the parent_name plan, against 17 ms on the model plan —
+    // the difference between a first call that looks like a hung server and
+    // one that answers. The index is forced here regardless, because the rowid
+    // seek is the whole point of the query; the guard stays for whoever copies it.
+    const run = db.prepare(
+      `SELECT name FROM symbols INDEXED BY idx_symbols_model
+         WHERE model = ? AND id >= ?
+           AND type NOT LIKE '%-extension'
+           AND +parent_name IS NULL
+           AND type NOT IN ('method', 'field')
+         ORDER BY id
+         LIMIT ?`,
+    );
+    const perRun = Math.ceil(cap / REGULAR_SAMPLE_PROBES);
+    for (let i = 0; i < REGULAR_SAMPLE_PROBES && names.size < cap; i++) {
+      const anchor = lo + Math.floor((i * (hi - lo + 1)) / REGULAR_SAMPLE_PROBES);
+      for (const r of run.all(model, anchor, perRun) as Array<{ name: string }>) {
+        if (names.size < cap) names.add(r.name);
+      }
+    }
+  };
+
   // Extensions first so their (smaller) band can hand its leftover budget to the
   // regular one; the reverse would let a large model spend the whole budget on
   // regular objects before the infix evidence is ever read.
   const half = Math.max(1, Math.ceil(limit / 2));
-  const extensionNames = band(true, half);
-  const regularNames = band(false, Math.min(REGULAR_NAME_SAMPLE, limit - extensionNames.length));
+  const extensionNames = extensionBand(half);
+  const regularNames = regularBand(Math.min(REGULAR_NAME_SAMPLE, limit - extensionNames.length));
   return [...extensionNames, ...regularNames];
 }
 
@@ -230,11 +387,11 @@ export class XppSymbolIndex {
   // answer is constant per model within a run. Cleared by setNonMicrosoftModels().
   private mineableModelCache: Map<string, boolean> = new Map();
 
-  // Read-only connection pool: WAL mode allows N readers + 1 writer without
-  // blocking each other. Pool size: READ_POOL_SIZE env var (default 3, clamped 1-8).
+  // Read-only connections to the symbols database. One by default — see
+  // DEFAULT_READ_POOL_SIZE. READ_POOL_SIZE overrides the count (clamped 1-8).
   // Not used for :memory: databases (each connection would be a separate empty DB).
+  // There is no labels counterpart: every label query runs on labelsDb.
   private readPool: Database[] = [];
-  private labelsReadPool: Database[] = [];
   private readPoolRR = 0;
   // Symbol-count scans are expensive (full index scan of 1M+ rows, 30-60 s
   // cold) — memoize the result and compute it off-thread (see getSymbolCounts).
@@ -257,6 +414,7 @@ export class XppSymbolIndex {
   // same answer whether it runs from the constructor or from a build script later.
   private backgroundIndexBuilds: boolean;
   private deferFilePathIndexes: boolean;
+  private readonly storeObjectSource: boolean;
   private largeDbThresholdBytes: number;
   // Index-build workers still running. closeReadPool() cannot drain these (it only
   // owns the read pool), so track them to warn about the EXCLUSIVE-lock race and to
@@ -276,6 +434,7 @@ export class XppSymbolIndex {
     this.backgroundIndexBuilds = options.backgroundIndexBuilds !== false;
     this.deferFilePathIndexes = options.deferFilePathIndexes === true;
     this.largeDbThresholdBytes = options.largeDbThresholdBytes ?? 200 * 1024 * 1024;
+    this.storeObjectSource = options.storeObjectSource ?? storeObjectSourceEnabled();
     // Ensure database directory exists
     const dbDir = path.dirname(dbPath);
     if (!fs.existsSync(dbDir)) {
@@ -331,36 +490,27 @@ export class XppSymbolIndex {
 
     // Skip pool for :memory: — each new connection would be a separate empty DB.
     if (dbPath !== ':memory:') {
-      const poolSize = Math.min(8, Math.max(1,
-        parseInt(process.env.READ_POOL_SIZE || '3', 10) || 3
-      ));
+      const poolSize = readPoolSizeFromEnv();
+      const cacheKib = readCacheKibPerConnection(poolSize);
       for (let i = 0; i < poolSize; i++) {
         const rConn = new Database(dbPath, { readonly: true });
         rConn.pragma('busy_timeout = 5000');
-        rConn.pragma('cache_size = -32000'); // 32 MB page cache per connection
+        rConn.pragma(`cache_size = -${cacheKib}`);
         rConn.pragma('temp_store = MEMORY');
         rConn.pragma('mmap_size = 1073741824');
         this.readPool.push(rConn);
-
-        if (labelPath !== ':memory:') {
-          const rLabels = new Database(labelPath, { readonly: true });
-          rLabels.pragma('busy_timeout = 5000');
-          rLabels.pragma('cache_size = -16000'); // 16 MB per labels connection
-          rLabels.pragma('temp_store = MEMORY');
-          rLabels.pragma('mmap_size = 536870912');
-          this.labelsReadPool.push(rLabels);
-        }
       }
     }
   }
 
   /**
-   * Returns the next read-only connection from the pool (round-robin).
-   * Falls back to the main writer connection when the pool is empty
-   * (e.g. :memory: databases used in write-only mode).
+   * Returns the read-only connection (round-robin when READ_POOL_SIZE asked for
+   * more than one). Falls back to the main writer connection when the pool is
+   * empty (e.g. :memory: databases used in write-only mode).
    *
-   * Tool handlers should use this instead of accessing `db` directly
-   * to benefit from read-pool parallelism and per-connection stmt caching.
+   * Tool handlers should use this instead of accessing `db` directly: a separate
+   * connection reads the last committed snapshot while the writer has a
+   * transaction open, and keeps its own page cache and prepared statements.
    */
   getReadDb(): Database {
     if (this.readPool.length === 0) return this.db;
@@ -397,10 +547,6 @@ export class XppSymbolIndex {
       try { conn.close(); } catch { /* ignore */ }
     }
     this.readPool = [];
-    for (const conn of this.labelsReadPool) {
-      try { conn.close(); } catch { /* ignore */ }
-    }
-    this.labelsReadPool = [];
     this.readPoolRR = 0;
   }
 
@@ -590,14 +736,12 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
       CREATE INDEX IF NOT EXISTS idx_symbols_type ON symbols(type);
       CREATE INDEX IF NOT EXISTS idx_symbols_model ON symbols(model);
-      CREATE INDEX IF NOT EXISTS idx_symbols_pattern_type ON symbols(pattern_type);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_unique
         ON symbols(name, type, COALESCE(parent_name, ''), model);
       
       -- Composite indexes for common query patterns (major speed boost)
       CREATE INDEX IF NOT EXISTS idx_type_parent ON symbols(type, parent_name) WHERE parent_name IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_type_name ON symbols(type, name);
-      CREATE INDEX IF NOT EXISTS idx_parent_type ON symbols(parent_name, type) WHERE parent_name IS NOT NULL;
       CREATE INDEX IF NOT EXISTS idx_name_type ON symbols(name, type);
       -- Covering index for field/method lookups by parent (avoids table access)
       CREATE INDEX IF NOT EXISTS idx_parent_type_name ON symbols(parent_name, type, name) WHERE parent_name IS NOT NULL;
@@ -774,6 +918,21 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_form_patterns_model ON form_patterns(model);
     `);
 
+    // Object Source — every object's original XML, gzipped, so a host that has only this
+    // database (no AOT files, no extracted JSON) can still read its definition. Keyed by
+    // symbols.type because names repeat across types. It replaces the forms-only
+    // form_source, which this version neither writes nor reads.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS object_source (
+        object_type TEXT NOT NULL,
+        name TEXT NOT NULL,
+        model TEXT NOT NULL COLLATE NOCASE,
+        xml_gz BLOB NOT NULL,
+        indexed_at TEXT NOT NULL,
+        PRIMARY KEY (object_type, name, model)
+      );
+    `);
+
     // EDT Metadata - for EDT suggestion and validation
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS edt_metadata (
@@ -880,6 +1039,20 @@ export class XppSymbolIndex {
       );
     `);
 
+    // The mtime each file had when it was last indexed incrementally. last_indexed_at
+    // is one global value that every write bumps, so it cannot say which files of a
+    // model changed since THEY were read; update_symbol_index(model) compares each
+    // file's mtime with its own row instead. Rows exist only for files an incremental
+    // pass indexed, so a model's first pass re-reads every file once.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS indexed_files (
+        file_path TEXT PRIMARY KEY COLLATE NOCASE,
+        mtime_ms REAL NOT NULL,
+        model TEXT NOT NULL COLLATE NOCASE
+      );
+      CREATE INDEX IF NOT EXISTS idx_indexed_files_model ON indexed_files(model);
+    `);
+
     // Property stats: distribution of metadata property values across STANDARD models,
     // used for data-driven BP rules in validate_xpp instead of hardcoded tables.
     // Presence is encoded via special values '(present)' / '(absent)'.
@@ -960,6 +1133,17 @@ export class XppSymbolIndex {
       CREATE INDEX IF NOT EXISTS idx_mm_table ON map_mappings(mapping_table);
       CREATE INDEX IF NOT EXISTS idx_mm_model ON map_mappings(model);
     `);
+    // Migrate old indexes once: retain the latest duplicate binding.
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_mm_binding'").get()) {
+      this.db.transaction(() => {
+        this.db.exec(`
+          DELETE FROM map_mappings WHERE id NOT IN (
+            SELECT MAX(id) FROM map_mappings GROUP BY map_name, mapping_table, model
+          );
+          CREATE UNIQUE INDEX idx_mm_binding ON map_mappings(map_name, mapping_table, model);
+        `);
+      })();
+    }
 
     // Security policies (row-level / OLS)
     // Indexed by primary table so get_security_coverage_for_object can report
@@ -1084,6 +1268,28 @@ export class XppSymbolIndex {
   }
 
   /**
+   * Indexes on `symbols` that earlier versions created and no query uses.
+   * Measured with dbstat on a 3.3 GB index (1.2 M symbols) they were 284 MB,
+   * 8.6 % of the file, and three more B-trees to maintain on every insert:
+   *
+   *  • `idx_symbols_file_path` (223 MB) — BINARY collation. Every comparison of
+   *    file_path is COLLATE NOCASE and uses idx_symbols_file_path_nocase; an
+   *    index of another collation cannot serve those.
+   *  • `idx_parent_type` (49 MB) — (parent_name, type), a strict prefix of
+   *    idx_parent_type_name (parent_name, type, name) under the same partial
+   *    predicate, so anything it could answer the longer one answers too.
+   *  • `idx_symbols_pattern_type` (12 MB) — nothing filters or orders on
+   *    symbols.pattern_type (code_patterns has its own index).
+   *
+   * No longer created, and dropped by ensureDeferredIndexes() where they exist.
+   */
+  static readonly RETIRED_SYMBOL_INDEXES: readonly string[] = [
+    'idx_symbols_file_path',
+    'idx_parent_type',
+    'idx_symbols_pattern_type',
+  ];
+
+  /**
    * The indexes built AFTER the schema exists rather than with it.
    *
    * Deliberately not part of the CREATE INDEX block above, and all for one
@@ -1097,7 +1303,7 @@ export class XppSymbolIndex {
    *
    * What is deferred, and why each earns its bytes:
    *
-   *  • `symbols.file_path` / `labels.file_path` (+ their NOCASE twins) are the
+   *  • `symbols.file_path COLLATE NOCASE` / `labels.file_path_id` are the
    *    lookup key of removeSymbolsByFile()/removeLabelsByFile(), which every
    *    update_symbol_index, undo_last_modification and resync runs first.
    *    Unindexed, each of those scans the entire table — measured on the 2 GB
@@ -1114,6 +1320,19 @@ export class XppSymbolIndex {
    *    walks in the order asked for and stops at the limit, and with parent_name
    *    carried as the fourth column nothing touches the table at all: 152 ms to
    *    0.2 ms on a 480k-row fixture, with the temp B-tree gone from the plan.
+   *
+   *  • `idx_symbols_implements` holds only the rows that implement an interface
+   *    (about one class in six). find_references' name-based fallback asks
+   *    "which classes implement X" with `LIKE '%X%'`, which no index can seek, so
+   *    without this it reads every class row whenever fewer matches exist than the
+   *    limit — and for a class, which nobody implements, that is every time:
+   *    0.6 to 0.9 s warm and several seconds cold on a 1.2 M-symbol index. With it
+   *    the same LIKE walks the small partial index instead. The query names the
+   *    index (INDEXED BY) and falls back to its old form while it is absent.
+   *
+   * It also DROPS the indexes in RETIRED_SYMBOL_INDEXES from a database that
+   * still carries them, on the same terms: inline when small, on the worker when
+   * large, because DROP INDEX walks every page of the index it frees.
    *
    * Public because build scripts defer it (see XppSymbolIndexOptions) and run it
    * themselves after their bulk load, with the worker dispatch turned off.
@@ -1134,14 +1353,17 @@ export class XppSymbolIndex {
     };
 
     const labelsPath = this.labelsDbPath;
-    const work: Array<{ db: Database; dbFile: string; sql: string; name: string }> = [];
-    if (missing(this.db, 'idx_symbols_file_path')) {
-      work.push({
-        db: this.db,
-        dbFile: this.dbPath,
-        name: 'idx_symbols_file_path',
-        sql: 'CREATE INDEX IF NOT EXISTS idx_symbols_file_path ON symbols(file_path);',
-      });
+    const work: Array<{ db: Database; dbFile: string; sql: string; name: string; drop?: boolean }> = [];
+    for (const name of XppSymbolIndex.RETIRED_SYMBOL_INDEXES) {
+      if (!missing(this.db, name)) {
+        work.push({
+          db: this.db,
+          dbFile: this.dbPath,
+          name,
+          sql: `DROP INDEX IF EXISTS ${name};`,
+          drop: true,
+        });
+      }
     }
     if (missing(this.db, 'idx_model_type_name')) {
       work.push({
@@ -1154,6 +1376,16 @@ export class XppSymbolIndex {
         sql: 'CREATE INDEX IF NOT EXISTS idx_model_type_name ON symbols(model, type, name, parent_name);',
       });
     }
+    if (missing(this.db, 'idx_symbols_implements')) {
+      work.push({
+        db: this.db,
+        dbFile: this.dbPath,
+        name: 'idx_symbols_implements',
+        // Partial: only the rows that implement something are in it. The value is
+        // stored as NULL, never '', when a class implements nothing (addSymbol).
+        sql: 'CREATE INDEX IF NOT EXISTS idx_symbols_implements ON symbols(implements_interfaces) WHERE implements_interfaces IS NOT NULL;',
+      });
+    }
     if (missing(this.labelsDb, 'idx_labels_file_path_id')) {
       work.push({
         db: this.labelsDb,
@@ -1162,11 +1394,10 @@ export class XppSymbolIndex {
         sql: 'CREATE INDEX IF NOT EXISTS idx_labels_file_path_id ON labels(file_path_id);',
       });
     }
-    // NOCASE twins. removeSymbolsByFile/removeLabelsByFile compare COLLATE NOCASE
-    // (Windows paths differ only in case between the indexer and a tool argument),
-    // and SQLite will only use an index whose collation matches the comparison —
-    // without these the case-insensitive delete falls back to the full-table scan
-    // the BINARY indexes above exist to avoid.
+    // NOCASE, and only NOCASE. Every comparison of symbols.file_path is COLLATE
+    // NOCASE (Windows paths differ only in case between the indexer and a tool
+    // argument), and SQLite will only use an index whose collation matches the
+    // comparison — so a BINARY index on the same column serves no query at all.
     if (missing(this.db, 'idx_symbols_file_path_nocase')) {
       work.push({
         db: this.db,
@@ -1187,7 +1418,7 @@ export class XppSymbolIndex {
       // checked here rather than assumed — off WAL the only safe build is inline.
       const inWal = (item.db.pragma('journal_mode', { simple: true }) as string) === 'wal';
       if (isLarge(item.dbFile) && this.backgroundIndexBuilds && inWal) {
-        this.buildIndexInWorker(item.dbFile, item.sql, item.name);
+        this.buildIndexInWorker(item.dbFile, item.sql, item.name, item.drop === true);
       } else {
         item.db.exec(item.sql);
       }
@@ -1205,7 +1436,7 @@ export class XppSymbolIndex {
    * Best-effort: a failure leaves the index absent, which is exactly the state
    * the server ran in before, so it is logged and never thrown.
    */
-  private buildIndexInWorker(dbPath: string, sql: string, indexName: string): void {
+  private buildIndexInWorker(dbPath: string, sql: string, indexName: string, drop = false): void {
     try {
       const worker = new Worker(new URL('./buildIndexWorker.js', import.meta.url), {
         workerData: { dbPath, sql, indexName },
@@ -1215,9 +1446,9 @@ export class XppSymbolIndex {
       worker.unref();
       worker.once('message', (msg: { ok: boolean; elapsedMs?: number; error?: string }) => {
         if (msg.ok) {
-          console.error(`[SymbolIndex] Built ${indexName} in background (${msg.elapsedMs}ms)`);
+          console.error(`[SymbolIndex] ${drop ? 'Dropped' : 'Built'} ${indexName} in background (${msg.elapsedMs}ms)`);
         } else {
-          console.error(`[SymbolIndex] Background build of ${indexName} failed: ${msg.error}`);
+          console.error(`[SymbolIndex] Background ${drop ? 'drop' : 'build'} of ${indexName} failed: ${msg.error}`);
         }
         this.pendingIndexWorkers.delete(worker);
         void worker.terminate();
@@ -1584,10 +1815,35 @@ export class XppSymbolIndex {
     ).all(...forms) as Array<{ name: string }>;
     const objectNames = rows.map(r => r.name);
 
+    // Removed objects also own rows no symbols row points at: the stored source, and for
+    // a form its datasources and patterns. Keyed by type, so a table file named like a
+    // form cannot wipe the form's rows.
+    const ownerRows = this.db.prepare(
+      `SELECT DISTINCT type, name, model FROM symbols WHERE file_path COLLATE NOCASE IN (${placeholders}) AND parent_name IS NULL`
+    ).all(...forms) as Array<{ type: string; name: string; model: string }>;
+
     // The FTS trigger (symbols_fts AFTER DELETE) handles FTS cleanup automatically
-    const result = this.db.prepare(`DELETE FROM symbols WHERE file_path COLLATE NOCASE IN (${placeholders})`).run(...forms);
+    const removeAll = this.db.transaction(() => {
+      const result = this.db.prepare(`DELETE FROM symbols WHERE file_path COLLATE NOCASE IN (${placeholders})`).run(...forms);
+      const deleteSource = this.db.prepare('DELETE FROM object_source WHERE object_type = ? AND name = ? AND model = ?');
+      for (const o of ownerRows) {
+        if (o.type === 'form') this.deleteFormSideRows(o.name, o.model);
+        else deleteSource.run(o.type, o.name, o.model);
+      }
+      return result;
+    });
+    const result = removeAll();
     this.invalidateSymbolCounts();
     return { deletedCount: result.changes, objectNames };
+  }
+
+  /** The tables keyed by a form's name and model, its stored source included (see writeFormSymbols). */
+  private deleteFormSideRows(formName: string, model: string): void {
+    // NOCASE on model: the reader matches it that way, and the build's model directory
+    // and the model parsed from a path can differ in case.
+    this.db.prepare('DELETE FROM form_datasources WHERE form_name = ? AND model = ? COLLATE NOCASE').run(formName, model);
+    this.db.prepare('DELETE FROM form_patterns WHERE form_name = ? AND model = ? COLLATE NOCASE').run(formName, model);
+    this.db.prepare(`DELETE FROM object_source WHERE object_type = 'form' AND name = ? AND model = ?`).run(formName, model);
   }
 
   /**
@@ -2626,6 +2882,7 @@ export class XppSymbolIndex {
           relatedMethods: classData.relatedMethods ? JSON.stringify(classData.relatedMethods) : undefined,
           apiPatterns: classData.apiPatterns ? JSON.stringify(classData.apiPatterns) : undefined,
         });
+        this.writeObjectSource('class', classData.name, model, classData.raw);
 
         // Add method symbols with enhanced metadata
         if (classData.methods && Array.isArray(classData.methods)) {
@@ -2678,6 +2935,7 @@ export class XppSymbolIndex {
           filePath: sourceFilePath,
           model,
         });
+        this.writeObjectSource('table', tableData.name, model, tableData.raw);
 
         // Mine property distribution for data-driven BP rules (standard models only)
         this.recordTablePropertyStats(tableData, model);
@@ -2747,6 +3005,20 @@ export class XppSymbolIndex {
             }
           }
         }
+        // Index table→map bindings into map_mappings. Most bindings are declared
+        // on the table's side (1,913 shipped, against 147 in maps' own XML, which
+        // indexMaps stores), so without this most maps listed no tables.
+        if (tableData.mapMappings && Array.isArray(tableData.mapMappings)) {
+          const stmt = this.db.prepare(`
+            INSERT INTO map_mappings (map_name, mapping_table, field_connections, model)
+            VALUES (?, ?, ?, ?) ON CONFLICT(map_name, mapping_table, model) DO UPDATE SET field_connections = excluded.field_connections
+          `);
+          for (const mapping of tableData.mapMappings) {
+            if (mapping.map) {
+              stmt.run(mapping.map, tableData.name, mapping.fieldConnections || 0, model);
+            }
+          }
+        }
       } catch (error) {
         log.warn(`Skipped table ${file}: ${error instanceof Error ? error.message : error}`);
       }
@@ -2772,6 +3044,7 @@ export class XppSymbolIndex {
           filePath: sourceFilePath,
           model,
         });
+        this.writeObjectSource('enum', enumName, model, enumData.raw);
       
       } catch (error) {
         log.warn(`Skipped enum ${file}: ${error instanceof Error ? error.message : error}`);
@@ -2813,6 +3086,7 @@ export class XppSymbolIndex {
           filePath: sourceFilePath,
           model,
         });
+        this.writeObjectSource('edt', edtName, model, edtData.raw);
 
         // Add extended EDT metadata to new table — always insert when any property is present
         if (edtData.extends || edtData.enumType || edtData.referenceTable ||
@@ -2863,6 +3137,7 @@ export class XppSymbolIndex {
           filePath: sourceFilePath,
           model,
         });
+        this.writeObjectSource('report', reportName, model, reportData.raw);
       } catch (error) {
         log.warn(`Skipped report ${file}: ${error instanceof Error ? error.message : error}`);
       }
@@ -2882,80 +3157,136 @@ export class XppSymbolIndex {
         const sourceFilePath = formData.sourcePath || filePath;
         const formName = formData.name || path.basename(file, '.json');
 
-        this.addSymbol({
-          name: formName,
-          type: 'form',
-          filePath: sourceFilePath,
+        // `raw` (the original XML) is missing from JSON extracted by older versions;
+        // those forms get no object_source row.
+        this.writeFormSymbols(
+          { ...formData, name: formName },
           model,
-          description: formData.caption || formData.label,
-        });
-
-        // Index mined pattern nodes (Design + sub-patterned containers) and
-        // record pattern distribution stats for the advisor/cross-check.
-        if (formData.patternNodes && Array.isArray(formData.patternNodes)) {
-          const patternStmt = this.db.prepare(`
-            INSERT OR REPLACE INTO form_patterns (
-              form_name, model, node_path, control_name, control_type,
-              pattern, pattern_version, child_sequence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          `);
-          for (const node of formData.patternNodes) {
-            if (!node?.pattern || !node?.nodePath) continue;
-            patternStmt.run(
-              formName,
-              model,
-              node.nodePath,
-              node.controlName ?? '',
-              node.controlType ?? '',
-              node.pattern,
-              node.patternVersion ?? null,
-              JSON.stringify(node.childSequence ?? []),
-            );
-            // form_patterns rows above are per-model FACTS and are stored for every model;
-            // property_stats is a corpus of "what the standard platform does", so the same
-            // gate as recordTablePropertyStats() applies here. Without it our own forms and
-            // ISV forms skew the mined pattern distribution that generateSmartForm's
-            // defaultFormPattern() picks from — on every environment, not just UDE.
-            if (node.nodePath === 'Design' && this.isMineableModel(model)) {
-              this.recordPropertyStat('AxFormDesign', 'Pattern', node.pattern, model);
-              this.recordPropertyStat(
-                'AxFormDesign',
-                `PatternVersion:${node.pattern}`,
-                node.patternVersion ?? '(absent)',
-                model,
-              );
-            }
-          }
-        }
-
-        // Index form datasources to new table
-        if (formData.dataSources && Array.isArray(formData.dataSources)) {
-          const stmt = this.db.prepare(`
-            INSERT OR REPLACE INTO form_datasources (
-              form_name, datasource_name, table_name, 
-              allow_edit, allow_create, allow_delete, model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-          `);
-
-          for (const ds of formData.dataSources) {
-            if (ds.name && ds.table) {
-              stmt.run(
-                formName,
-                ds.name,
-                ds.table,
-                ds.allowEdit ? 1 : 0,
-                ds.allowCreate ? 1 : 0,
-                ds.allowDelete ? 1 : 0,
-                model
-              );
-            }
-          }
-        }
-      
+          sourceFilePath,
+          typeof formData.raw === 'string' ? formData.raw : undefined,
+          { recordStats: true },
+        );
       } catch (error) {
         log.warn(`Skipped form ${file}: ${error instanceof Error ? error.message : error}`);
       }
     }
+  }
+
+  /**
+   * Everything the index keeps for one form: its `form` symbol, mined pattern nodes,
+   * datasources and, when `xml` is given, the gzipped source. The full build and
+   * update_symbol_index both call this, so the two cannot drift.
+   *
+   * One transaction, starting with a delete by (form_name, model): form_datasources has
+   * no unique key (its INSERT OR REPLACE is a plain INSERT), so a re-index whose
+   * removeSymbolsByFile missed the old row (a path spelling it cannot map) would
+   * otherwise list the datasources twice.
+   *
+   * `recordStats` only from the build: property_stats is flushed per model there.
+   */
+  writeFormSymbols(
+    formData: any,
+    model: string,
+    filePath: string,
+    xml?: string,
+    opts: { recordStats?: boolean } = {},
+  ): void {
+    const formName: string = formData.name;
+
+    const write = this.db.transaction(() => {
+      this.deleteFormSideRows(formName, model);
+
+      this.addSymbol({
+        name: formName,
+        type: 'form',
+        filePath,
+        model,
+        description: formData.caption || formData.label,
+      });
+
+      // Index mined pattern nodes (Design + sub-patterned containers) and
+      // record pattern distribution stats for the advisor/cross-check.
+      if (formData.patternNodes && Array.isArray(formData.patternNodes)) {
+        const patternStmt = this.db.prepare(`
+          INSERT OR REPLACE INTO form_patterns (
+            form_name, model, node_path, control_name, control_type,
+            pattern, pattern_version, child_sequence
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const node of formData.patternNodes) {
+          if (!node?.pattern || !node?.nodePath) continue;
+          patternStmt.run(
+            formName,
+            model,
+            node.nodePath,
+            node.controlName ?? '',
+            node.controlType ?? '',
+            node.pattern,
+            node.patternVersion ?? null,
+            JSON.stringify(node.childSequence ?? []),
+          );
+          // form_patterns rows above are per-model FACTS and are stored for every model;
+          // property_stats is a corpus of "what the standard platform does", so the same
+          // gate as recordTablePropertyStats() applies here. Without it our own forms and
+          // ISV forms skew the mined pattern distribution that generateSmartForm's
+          // defaultFormPattern() picks from — on every environment, not just UDE.
+          if (opts.recordStats && node.nodePath === 'Design' && this.isMineableModel(model)) {
+            this.recordPropertyStat('AxFormDesign', 'Pattern', node.pattern, model);
+            this.recordPropertyStat(
+              'AxFormDesign',
+              `PatternVersion:${node.pattern}`,
+              node.patternVersion ?? '(absent)',
+              model,
+            );
+          }
+        }
+      }
+
+      // Index form datasources
+      if (formData.dataSources && Array.isArray(formData.dataSources)) {
+        const stmt = this.db.prepare(`
+          INSERT OR REPLACE INTO form_datasources (
+            form_name, datasource_name, table_name,
+            allow_edit, allow_create, allow_delete, model
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        for (const ds of formData.dataSources) {
+          if (ds.name && ds.table) {
+            stmt.run(
+              formName,
+              ds.name,
+              ds.table,
+              ds.allowEdit ? 1 : 0,
+              ds.allowCreate ? 1 : 0,
+              ds.allowDelete ? 1 : 0,
+              model
+            );
+          }
+        }
+      }
+
+      this.writeObjectSource('form', formName, model, xml);
+    });
+    write();
+  }
+
+  /**
+   * Store an object's original XML (object_source). A no-op without XML (JSON from older
+   * extracts), for a type outside STORED_SOURCE_TYPES, and when index.storeObjectSource is
+   * off, so the build and update_symbol_index store the same set.
+   */
+  writeObjectSource(objectType: string, name: string, model: string, xml: unknown): void {
+    if (!this.storeObjectSource) return;
+    if (typeof xml !== 'string' || xml.length === 0 || !STORED_SOURCE_TYPES.has(objectType)) return;
+    let stmt = this.stmtCache.get('writeObjectSource');
+    if (!stmt) {
+      stmt = this.db.prepare(
+        'INSERT OR REPLACE INTO object_source (object_type, name, model, xml_gz, indexed_at) VALUES (?, ?, ?, ?, ?)'
+      );
+      this.stmtCache.set('writeObjectSource', stmt);
+    }
+    stmt.run(objectType, name, model, gzipSync(Buffer.from(xml, 'utf-8')), new Date().toISOString());
   }
 
   private indexQueries(queriesPath: string, model: string): void {
@@ -2978,6 +3309,7 @@ export class XppSymbolIndex {
           model,
           description: queryData.title || queryData.label,
         });
+        this.writeObjectSource('query', queryName, model, queryData.raw);
       
       } catch (error) {
         log.warn(`Skipped query ${file}: ${error instanceof Error ? error.message : error}`);
@@ -3006,6 +3338,7 @@ export class XppSymbolIndex {
           model,
           description: viewData.label || viewData.type,
         });
+        this.writeObjectSource('view', viewName, model, viewData.raw);
 
         // Add field symbols (same pattern as tables)
         if (viewData.fields && Array.isArray(viewData.fields)) {
@@ -3074,6 +3407,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: entryPoints.length > 0 ? `${entryPoints.length} entry point(s)` : undefined,
         });
+        this.writeObjectSource('security-privilege', name, model, data.raw);
 
         for (const ep of entryPoints) {
           // Skip malformed entry points — missing name causes a bind error in node:sqlite
@@ -3122,6 +3456,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: privileges.length > 0 ? `${privileges.length} privilege(s)` : undefined,
         });
+        this.writeObjectSource('security-duty', name, model, data.raw);
 
         for (const priv of privileges) {
           insertPriv.run(name, priv, model);
@@ -3155,6 +3490,7 @@ export class XppSymbolIndex {
           description: data.description || data.label || undefined,
           signature: duties.length > 0 ? `${duties.length} duty(ies)` : undefined,
         });
+        this.writeObjectSource('security-role', name, model, data.raw);
 
         for (const duty of duties) {
           insertDuty.run(name, duty, model);
@@ -3189,6 +3525,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: data.targetObject || data.object || undefined,
         });
+        this.writeObjectSource(symbolType, name, model, data.raw);
 
         insertTarget.run(
           name,
@@ -3230,6 +3567,7 @@ export class XppSymbolIndex {
           signature: data.serviceClass || undefined,
           description: data.externalName || undefined,
         });
+        this.writeObjectSource('service', name, model, data.raw);
 
         if (Array.isArray(data.operations)) {
           for (const op of data.operations) {
@@ -3264,6 +3602,7 @@ export class XppSymbolIndex {
           model,
           description: data.description || undefined,
         });
+        this.writeObjectSource('service-group', name, model, data.raw);
 
         if (Array.isArray(data.services)) {
           for (const svc of data.services) {
@@ -3281,7 +3620,7 @@ export class XppSymbolIndex {
     const files = fs.readdirSync(dirPath).filter(f => f.endsWith('.json'));
     const insertMapping = this.db.prepare(`
       INSERT INTO map_mappings (map_name, mapping_table, field_connections, model)
-      VALUES (?, ?, ?, ?)
+      VALUES (?, ?, ?, ?) ON CONFLICT(map_name, mapping_table, model) DO UPDATE SET field_connections = excluded.field_connections
     `);
     for (const file of files) {
       try {
@@ -3295,6 +3634,25 @@ export class XppSymbolIndex {
           model,
           extendsClass: data.extends || undefined,
         });
+        this.writeObjectSource('map', name, model, data.raw);
+        // Map methods are indexed like class methods (type 'method', parent =
+        // the map) so search and the index-fallback method reader see them.
+        if (Array.isArray(data.methods)) {
+          for (const method of data.methods) {
+            if (!method?.name) continue;
+            this.addSymbol({
+              name: method.name,
+              type: 'method',
+              parentName: name,
+              signature: renderMethodSignature(method),
+              filePath: data.sourcePath || filePath,
+              model,
+              description: method.documentation,
+              sourceSnippet: method.sourceSnippet,
+              source: method.source,
+            });
+          }
+        }
         if (Array.isArray(data.mappings)) {
           for (const m of data.mappings) {
             if (!m?.table) continue;
@@ -3323,6 +3681,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: data.parentKey || undefined,
         });
+        this.writeObjectSource('configuration-key', name, model, data.raw);
       } catch (error) {
         log.warn(`Skipped configuration-key ${file}: ${error instanceof Error ? error.message : error}`);
       }
@@ -3346,6 +3705,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: sig,
         });
+        this.writeObjectSource('license-code', name, model, data.raw);
       } catch (error) {
         log.warn(`Skipped license-code ${file}: ${error instanceof Error ? error.message : error}`);
       }
@@ -3372,6 +3732,7 @@ export class XppSymbolIndex {
           description: data.label || undefined,
           signature: data.primaryTable || undefined,
         });
+        this.writeObjectSource('security-policy', name, model, data.raw);
         insertPolicy.run(
           name,
           data.primaryTable || null,
@@ -3404,6 +3765,7 @@ export class XppSymbolIndex {
           filePath: data.sourcePath || filePath,
           model,
         });
+        this.writeObjectSource('macro', name, model, data.raw);
         if (Array.isArray(data.defines)) {
           for (const d of data.defines) {
             if (!d?.name) continue;
@@ -3521,6 +3883,60 @@ export class XppSymbolIndex {
       ).run(new Date().toISOString());
     } catch {
       // Bookkeeping is best-effort
+    }
+  }
+
+  /** Remember the mtime a file had when it was indexed — see the indexed_files table. */
+  recordIndexedFile(filePath: string, mtimeMs: number, model: string): void {
+    try {
+      this.db.prepare(
+        `INSERT OR REPLACE INTO indexed_files (file_path, mtime_ms, model) VALUES (?, ?, ?)`,
+      ).run(filePath, mtimeMs, model);
+    } catch {
+      // Bookkeeping is best-effort: a missing row only costs a re-read next pass
+    }
+  }
+
+  forgetIndexedFile(filePath: string): void {
+    try {
+      this.db.prepare(`DELETE FROM indexed_files WHERE file_path = ?`).run(filePath);
+    } catch { /* best-effort, as above */ }
+  }
+
+  /** Lower-cased path → mtime recorded for every file of the model. */
+  getIndexedFileMtimes(model: string): Map<string, number> {
+    const rows = this.getReadDb().prepare(
+      `SELECT file_path, mtime_ms FROM indexed_files WHERE model = ?`,
+    ).all(model) as Array<{ file_path: string; mtime_ms: number }>;
+    return new Map(rows.map(r => [r.file_path.toLowerCase(), r.mtime_ms]));
+  }
+
+  /** Every distinct file path the symbols table holds for a model. */
+  getModelFilePaths(model: string): string[] {
+    const rows = this.getReadDb().prepare(
+      `SELECT DISTINCT file_path FROM symbols WHERE model = ? COLLATE NOCASE`,
+    ).all(model) as Array<{ file_path: string }>;
+    return rows.map(r => r.file_path);
+  }
+
+  /** Every path indexed_files records for a model, as stored. */
+  getIndexedFilePaths(model: string): string[] {
+    const rows = this.getReadDb().prepare(
+      `SELECT file_path FROM indexed_files WHERE model = ?`,
+    ).all(model) as Array<{ file_path: string }>;
+    return rows.map(r => r.file_path);
+  }
+
+  /**
+   * Every .label.txt path the labels DB holds rows for. Labels are not symbols, so
+   * getModelFilePaths never sees them; one row per file (~800 on a full build).
+   */
+  getAllLabelFilePaths(): string[] {
+    try {
+      const rows = this.labelsDb.prepare(`SELECT file_path FROM label_files`).all() as Array<{ file_path: string }>;
+      return rows.map(r => r.file_path);
+    } catch {
+      return [];
     }
   }
 
@@ -3759,27 +4175,30 @@ export class XppSymbolIndex {
   }
 
   /**
-   * Search custom extensions by prefix.
+   * search(scope="extensions"): every symbol in a custom/ISV model whose name contains `query`.
    *
-   * Restricts results to symbol types whose names carry the `*_Extension` /
-   * `*.<model>Extension` convention (class-extension, table-extension, etc.)
-   * so that unrelated symbols sharing a substring don't leak into extension UI.
+   * The scope is "custom models", as the tool and `scope` descriptions say. It used to also
+   * require an extension-shaped name or parent (`*_Extension`, `Base.SuffixExtension`), so new
+   * custom classes, tables and helpers never appeared and `type:"class"` could not bring them
+   * back (#1212). Callers who want extensions only pass `type:["class-extension", ...]`.
+   * Extension-shaped rows still sort first, so an unfiltered query keeps its old top results.
+   *
+   * `prefix` is the object prefix (`ISV_`, `Contoso`), as documented. It matches when the
+   * object, or the object a member belongs to, starts with it. Extension names carry the
+   * prefix in the middle (`CustTableContoso_Extension`, `CustTable.ContosoExtension`), so for
+   * an extension-shaped name it may appear anywhere. A model name starting with `prefix` still
+   * matches the whole model, so calls written against the old model-name behaviour keep working.
    *
    * `model IN (custom models)` is what makes this affordable, and it has to be the
    * FIRST predicate. A leading-wildcard `name LIKE '%q%'` is unindexable, so with the
    * whole corpus in scope every call scanned all 584 K symbols — measured at 122.8 s on
    * the production DB. Against idx_symbols_model the same scan covers only the ~25
-   * custom models. The filter is also a correctness fix: the results were already
-   * captioned "matches in custom extensions" while Microsoft rows could satisfy the
-   * name convention and appear there.
+   * custom models.
    *
-   * `types` narrows to symbol kinds (the `type` argument of search(scope="extensions"),
-   * which used to be dropped before it reached here). A method or field is matched on
-   * its PARENT carrying the extension convention — its own name never does.
+   * `types` narrows to symbol kinds (the `type` argument of search(scope="extensions")).
    */
   searchCustomExtensions(query: string, prefix?: string, limit: number = 20, types?: string[]): XppSymbol[] {
-    const customModels = this.getCustomModels()
-      .filter(m => !prefix || m.toLowerCase().startsWith(prefix.toLowerCase()));
+    const customModels = this.getCustomModels();
     if (customModels.length === 0) return [];
 
     // '_' is a single-character LIKE wildcard, so the unescaped '%_Extension' this
@@ -3788,27 +4207,42 @@ export class XppSymbolIndex {
     const escapeLikePattern = (value: string): string =>
       value.replace(/\\/g, '\\\\').replace(/[%_]/g, '\\$&');
 
-    const modelPlaceholders = customModels.map(() => '?').join(',');
-    let sql = `
-      SELECT *
-      FROM symbols
-      WHERE model IN (${modelPlaceholders})
-        AND name LIKE ? ESCAPE '\\'
-        AND (
+    // An extension-shaped name: a *-extension type, `X_Extension` or `Base.SuffixExtension`.
+    const extensionName = (col: string) =>
+      `(${col} LIKE '%\\_Extension' ESCAPE '\\' OR ${col} LIKE '%.%Extension')`;
+    const extensionShaped = `(
           type IN (
             'class-extension','table-extension','form-extension','enum-extension',
             'edt-extension','view-extension','query-extension','data-entity-extension',
             'map-extension','menu-extension','security-role-extension','security-duty-extension',
             'menu-item-display-extension','menu-item-action-extension','menu-item-output-extension'
           )
-          OR name LIKE '%\\_Extension' ESCAPE '\\'
-          OR name LIKE '%.%Extension'
-          OR parent_name LIKE '%\\_Extension' ESCAPE '\\'
-          OR parent_name LIKE '%.%Extension'
-        )
-    `;
+          OR ${extensionName('name')}
+          OR ${extensionName('parent_name')}
+        )`;
 
+    const modelPlaceholders = customModels.map(() => '?').join(',');
+    let sql = `
+      SELECT *
+      FROM symbols
+      WHERE model IN (${modelPlaceholders})
+        AND name LIKE ? ESCAPE '\\'
+    `;
     const params: any[] = [...customModels, `%${escapeLikePattern(query)}%`];
+
+    if (prefix) {
+      const starts = `${escapeLikePattern(prefix)}%`;
+      const anywhere = `%${escapeLikePattern(prefix)}%`;
+      sql += `
+        AND (
+          model LIKE ? ESCAPE '\\'
+          OR name LIKE ? ESCAPE '\\'
+          OR parent_name LIKE ? ESCAPE '\\'
+          OR (name LIKE ? ESCAPE '\\' AND ${extensionName('name')})
+          OR (parent_name LIKE ? ESCAPE '\\' AND ${extensionName('parent_name')})
+        )`;
+      params.push(starts, starts, starts, anywhere, anywhere);
+    }
 
     if (types && types.length > 0) {
       // Unary + strips the term of its index affinity. Written plainly, `type IN ('method')`
@@ -3820,8 +4254,12 @@ export class XppSymbolIndex {
       params.push(...types);
     }
 
-    sql += ` ORDER BY name LIMIT ?`;
-    params.push(limit);
+    // An exact name first, then extension-shaped rows (the old result set), then names that
+    // start with the query, so the first page is not filled by names that merely contain it.
+    // COALESCE: an object has no parent_name, so the OR comes out NULL rather than 0 for it,
+    // and NULL sorts last under DESC, below every member that merely contains the query.
+    sql += ` ORDER BY (name = ? COLLATE NOCASE) DESC, COALESCE(${extensionShaped}, 0) DESC, (name LIKE ? ESCAPE '\\') DESC, name, parent_name LIMIT ?`;
+    params.push(query, `${escapeLikePattern(query)}%`, limit);
 
     const rows = this.getReadDb().prepare(sql).all(...params) as any[];
     return rows.map(row => this.rowToSymbol(row));
@@ -4227,14 +4665,14 @@ export class XppSymbolIndex {
     const existingMethods = this.getClassMethods(className);
     const existingMethodNames = new Set(existingMethods.map(m => m.name));
     
-    // Detect pattern type
-    let patternType = classSymbol.patternType || 'Unknown';
-    if (!patternType || patternType === 'Unknown') {
-      if (className.endsWith('Helper')) patternType = 'Helper';
-      else if (className.endsWith('Service')) patternType = 'Service';
-      else if (className.endsWith('Controller')) patternType = 'Controller';
-    }
-    
+    // Detect pattern type. Without one there is no group of similar classes to
+    // compare against. The query below would then look for `parent_name LIKE
+    // '%Unknown'`: a scan of every method row (about a million on a production-size
+    // index) whose only hits are classes that happen to be NAMED "…Unknown", so
+    // the suggestions it produced came from unrelated classes.
+    const patternType = suggestionPatternType(className, classSymbol.patternType);
+    if (!patternType) return [];
+
     // Find similar classes with same pattern
     const sql = `
       SELECT DISTINCT parent_name
@@ -4291,6 +4729,7 @@ export class XppSymbolIndex {
     this.db.exec('DELETE FROM table_relations');
     this.db.exec('DELETE FROM form_datasources');
     this.db.exec('DELETE FROM form_patterns');
+    this.db.exec('DELETE FROM object_source');
     this.db.exec('DELETE FROM edt_metadata');
     this.db.exec('DELETE FROM security_privilege_entries');
     this.db.exec('DELETE FROM security_duty_privileges');
@@ -4332,6 +4771,7 @@ export class XppSymbolIndex {
       this.db.prepare(`DELETE FROM table_relations WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM form_datasources WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM form_patterns WHERE model IN (${placeholders})`).run(...modelNames);
+      this.db.prepare(`DELETE FROM object_source WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM edt_metadata WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM security_privilege_entries WHERE model IN (${placeholders})`).run(...modelNames);
       this.db.prepare(`DELETE FROM security_duty_privileges WHERE model IN (${placeholders})`).run(...modelNames);
@@ -4876,6 +5316,123 @@ export class XppSymbolIndex {
   }
 
   /**
+   * Labels whose text equals `text` after normalizeLabelText on both sides —
+   * the exact lookup behind labels(action="search", exact=true).
+   *
+   * Candidates come from labels_fts: every whitespace-separated chunk of the text
+   * that has a letter or digit becomes a quoted phrase on the `text` column, so
+   * FTS operators (`NOT`, `OR`) and punctuation are plain input, never syntax.
+   * unicode61 folds case and diacritics, so the candidates are a superset of the
+   * exact matches; the equality itself is decided here in JS. A text with no
+   * letter or digit gives FTS nothing to match, so it scans the language instead,
+   * through idx_labels_language_lower, pre-filtered to texts without an ASCII
+   * letter or digit (an equal text cannot have one).
+   *
+   * Candidates are compared shortest first and at most `candidateCap` of them. A
+   * cut-off set is reported as `truncated` with the length reached — a longer
+   * exact match (extra whitespace) would not have been compared, so the caller
+   * must not read the answer as "none exists".
+   *
+   * The language check is across the whole index, not the model/labelFileId
+   * narrowing, so "not indexed" means the language itself is missing.
+   *
+   * Matches come back in a fixed order: custom models first (isCustomModel), then
+   * label file id, label id and model, each case-insensitive with the stored
+   * spelling as the tie-break. With no custom model configured that is simply
+   * label file id, then label id. Translations are fetched for the first
+   * `maxMatches` in that order — the ones a caller lists.
+   */
+  findLabelsByExactText(
+    text: string,
+    opts: { language?: string; model?: string; labelFileId?: string; candidateCap?: number; maxMatches?: number } = {},
+  ): {
+    matches: Array<{
+      labelId: string;
+      labelFileId: string;
+      model: string;
+      language: string;
+      text: string;
+      /** isCustomModel(model) — CUSTOM_MODELS, EXTENSION_PREFIX, D365FO_MODEL_NAME, auto-detected. */
+      custom: boolean;
+      /** The label's other indexed languages; only on the first `maxMatches` matches. */
+      translations?: Array<{ language: string; text: string }>;
+    }>;
+    candidates: number;
+    truncated: boolean;
+    /** Text length of the longest candidate compared — only meaningful when truncated. */
+    comparedUpToLength: number;
+    languageIndexed: boolean;
+  } {
+    const { language = 'en-US', model, labelFileId, candidateCap = 50_000, maxMatches = 20 } = opts;
+    const wanted = normalizeLabelText(text);
+    const phrases = text.normalize('NFC').trim().split(/\s+/)
+      .filter(chunk => /[\p{L}\p{N}]/u.test(chunk))
+      .map(chunk => `text : "${chunk.replace(/"/g, '""')}"`);
+
+    let sql = phrases.length > 0
+      ? `SELECT l.label_id AS labelId, l.label_file_id AS labelFileId, l.model, l.language, l.text
+         FROM labels_fts f
+         JOIN labels l ON l.id = f.rowid
+         WHERE labels_fts MATCH ?
+           AND LOWER(l.language) = ?`
+      : `SELECT l.label_id AS labelId, l.label_file_id AS labelFileId, l.model, l.language, l.text
+         FROM labels l
+         WHERE LOWER(l.language) = ?
+           AND l.text NOT GLOB '*[A-Za-z0-9]*'`;
+    const params: any[] = phrases.length > 0 ? [phrases.join(' AND '), language.toLowerCase()] : [language.toLowerCase()];
+    if (model)       { sql += `\n           AND l.model = ?`;         params.push(model); }
+    if (labelFileId) { sql += `\n           AND l.label_file_id = ?`; params.push(labelFileId); }
+    sql += `\n         ORDER BY length(l.text), l.model, l.label_file_id, l.label_id\n         LIMIT ?`;
+    params.push(candidateCap + 1);
+
+    const rows = this.labelsDb.prepare(sql).all(...params) as Array<{
+      labelId: string; labelFileId: string; model: string; language: string; text: string;
+    }>;
+    const truncated = rows.length > candidateCap;
+    const compared = truncated ? rows.slice(0, candidateCap) : rows;
+    // Custom models first, so a caller that lists only the first N never loses its
+    // own copy of a text behind dozens of standard ones ("Buchungen" is 46 labels in
+    // the standard models alone). isStandardModel answers per model and reads the
+    // environment on every call, so it is asked once per model here.
+    const customByModel = new Map<string, boolean>();
+    const isCustom = (m: string) => {
+      let custom = customByModel.get(m);
+      if (custom === undefined) customByModel.set(m, custom = !isStandardModel(m));
+      return custom;
+    };
+    const matches: ReturnType<XppSymbolIndex['findLabelsByExactText']>['matches'] = compared
+      .filter(r => normalizeLabelText(r.text) === wanted)
+      .map(r => ({ ...r, custom: isCustom(r.model) }))
+      .sort((a, b) =>
+        Number(b.custom) - Number(a.custom) ||
+        compareIgnoreCase(a.labelFileId, b.labelFileId) ||
+        compareIgnoreCase(a.labelId, b.labelId) ||
+        compareIgnoreCase(a.model, b.model));
+
+    if (matches.length > 0) {
+      const others = this.labelsDb.prepare(`
+        SELECT language, text FROM labels
+        WHERE label_id = ? AND label_file_id = ? AND model = ? AND LOWER(language) <> ?
+        ORDER BY language`);
+      for (const m of matches.slice(0, maxMatches)) {
+        m.translations = others.all(m.labelId, m.labelFileId, m.model, m.language.toLowerCase()) as any[];
+      }
+    }
+
+    const languageIndexed = matches.length > 0 || rows.length > 0 ||
+      this.labelsDb.prepare('SELECT 1 FROM labels WHERE LOWER(language) = ? LIMIT 1').get(language.toLowerCase()) !== undefined;
+
+    return {
+      matches,
+      candidates: compared.length,
+      truncated,
+      // Code points, as SQLite's length() counted them for the ORDER BY.
+      comparedUpToLength: compared.length > 0 ? Array.from(String(compared[compared.length - 1].text ?? '')).length : 0,
+      languageIndexed,
+    };
+  }
+
+  /**
    * Get a single label by ID (returns all languages).
    *
    * The ID may be spelled any way the rest of the server emits it: a reference
@@ -4963,6 +5520,30 @@ export class XppSymbolIndex {
     const nocaseParams: string[] = [labelFileId];
     if (model) { nocaseWhere.unshift('model = ?'); nocaseParams.unshift(model); }
     return run(`WHERE ${nocaseWhere.join(' AND ')}`, nocaseParams);
+  }
+
+  /**
+   * True when at least one label row carries exactly this label file id. A seek on
+   * idx_labels_file_id that stops at the first row — the cheap half of "does this
+   * label file exist?". Exact case only: the index is BINARY.
+   */
+  hasLabelFileId(labelFileId: string): boolean {
+    return this.labelsDb
+      .prepare('SELECT 1 FROM labels WHERE label_file_id = ? LIMIT 1')
+      .get(labelFileId) !== undefined;
+  }
+
+  /**
+   * The bare list of label file ids, one row each. For a caller that only needs to
+   * know which ids exist (for example a case-insensitive membership test) this
+   * replaces getLabelFileIds(), which also groups by model and concatenates the
+   * languages of every label row.
+   */
+  getDistinctLabelFileIds(): string[] {
+    const rows = this.labelsDb
+      .prepare('SELECT DISTINCT label_file_id AS labelFileId FROM labels')
+      .all() as Array<{ labelFileId: string }>;
+    return rows.map(r => r.labelFileId);
   }
 
   /**

@@ -88,6 +88,8 @@ export interface XppTableInfo {
   indexes: XppIndexInfo[];
   relations: XppRelationInfo[];
   methods: XppMethodInfo[];
+  /** Table→map bindings this table declares (mappings live in the TABLE's XML). */
+  mapMappings?: { map: string; fieldConnections: number }[];
 }
 
 export interface XppFieldInfo {
@@ -152,6 +154,20 @@ export interface XppViewInfo {
   fields: XppViewFieldInfo[];
   relations: XppViewRelationInfo[];
   methods: XppMethodInfo[];
+  /** Data entity only. */
+  publicEntityName?: string;
+  publicCollectionName?: string;
+  dataManagementEnabled?: boolean;
+  entityCategory?: string;
+  /** ViewMetadata data sources, depth-first; `parent` is unset on the root. */
+  dataSources?: XppViewDataSourceInfo[];
+}
+
+export interface XppViewDataSourceInfo {
+  name: string;
+  table: string;
+  joinMode?: string;
+  parent?: string;
 }
 
 export interface XppSymbol {

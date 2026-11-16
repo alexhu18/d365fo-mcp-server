@@ -103,7 +103,11 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'Enum name for an enum-typed field. On add-field this is all an enum field needs — ' +
       'it writes AxTableFieldEnum + EnumType, no EDT.',
   },
-  fieldStringSize: { type: 'string', description: 'String size to set on a string-typed field.' },
+  fieldStringSize: { type: 'string', description: 'String size to set on a string-typed field (on add-field: of the EDT created for it).' },
+  fieldEnumValues: {
+    type: 'array of string | {name,label?}',
+    description: 'add-field: the values of the enum created when fieldEnumType does not exist yet. Each gets a label.',
+  },
   autoCorrect: {
     type: 'boolean (default true)',
     description:
@@ -118,6 +122,10 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
   fieldIgnoreEdtRelation: {
     type: 'boolean',
     description: 'modify-field: true writes <IgnoreEDTRelation>Yes</IgnoreEDTRelation> (EDT with a relation).',
+  },
+  computedFieldMethod: {
+    type: 'string',
+    description: 'modify-field on a data-entity: static method name; the mapped field becomes a computed field using it.',
   },
   dataField: {
     type: 'string',
@@ -148,7 +156,9 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'ClusteredIndex, PrimaryIndex, SaveDataPerCompany, Label, HelpText, Extends, SystemTable.\n' +
       '    table-extension (stored as <AxPropertyModification>): the table names above plus ' +
       'ModifiedDateTime, CreatedDateTime, ModifiedBy, CreatedBy (Yes/No), CountryRegionCodes ("CZ,SK").\n' +
-      '    edt: Extends, StringSize, Label, HelpText, ReferenceTable, ReferenceField.\n' +
+      '    edt: Extends, StringSize, Label, HelpText, ReferenceTable, ReferenceField (the related field ' +
+      'of the EDT\'s table reference: "AccountNum" once ReferenceTable is set, or "CustTable.AccountNum" ' +
+      'to set table and field in one call).\n' +
       '    class: Extends, Abstract, Final, Label.\n' +
       '    form: any single text element (Caption, Pattern) via XML fallback.\n' +
       '    Example: propertyPath="TableGroup" propertyValue="Group".',
@@ -180,8 +190,9 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string',
     description:
       'String (default), Integer, Real, CheckBox (NoYes/boolean), ComboBox (enums), Date, DateTime, ' +
-      'Int64, Group, Button, CommandButton, MenuFunctionButton. Auto-picked from the EDT base type ' +
-      'when controlDataField is provided.',
+      'Int64, Group, Button, CommandButton, MenuFunctionButton, ReferenceGroup (controlDataField becomes its ' +
+      'ReferenceField). Auto-picked from the EDT base type when controlDataField is provided, and ' +
+      'ReferenceGroup for a surrogate foreign key, as the form designer does. Any other type is refused.',
   },
   controlLabel: { type: 'string', description: 'Optional label for the new control.' },
   positionType: {
@@ -254,6 +265,11 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string',
     description:
       'Association | Composition | Aggregation | Link | Specialization | NotSpecified (default: Association).',
+  },
+  relationOnDelete: {
+    type: 'string',
+    description:
+      'None | Restricted | Cascade | CascadeRestricted. On a relation that already exists it sets only OnDelete.',
   },
   // field groups
   fieldGroupName: { type: 'string', description: 'Field group name.' },
@@ -426,6 +442,19 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
       'Correct+Create+Delete+Read+Update (plus Invoke on a ServiceOperation). DEFAULTS to "view", so a maintain privilege must say so explicitly. ' +
       'Nothing else is accepted — "full"/"edit" used to be taken and silently degraded to Read-only.',
   },
+  // security role/duty references
+  dutyName: {
+    type: 'string',
+    description:
+      'add-duty / remove-duty: REQUIRED — AOT name of the AxSecurityDuty to reference. ONE name; send ' +
+      'several as operations[] entries. Matched case-insensitively.',
+  },
+  privilegeName: {
+    type: 'string',
+    description:
+      'add-privilege / remove-privilege: REQUIRED — AOT name of the AxSecurityPrivilege to reference. ONE ' +
+      'name; send several as operations[] entries. Matched case-insensitively.',
+  },
   // BP-check suppressions
   diagnosticPath: {
     type: 'string',
@@ -507,6 +536,19 @@ export const D365FO_FILE_PARAM_SPECS: Record<string, { type: string; description
     type: 'string (display | action | output)',
     description: 'Menu item kind: display (form), action (class), output (report). Default: display.',
   },
+  parentMenuElement: {
+    type: 'string',
+    description: 'Submenu the item or submenu goes under, plain name (e.g. "Inquiries", nested ones too). Omit for the top level.',
+  },
+  submenuName: { type: 'string', description: 'Name of the submenu to add (e.g. "ContosoRentals").' },
+  submenuLabel: { type: 'string', description: 'Label id of the new submenu (e.g. "@ContosoRental:Rentals").' },
+  controlNames: { type: 'string[]', description: 'Existing controls to wrap, all children of one parent (e.g. ["ClaimId","Description"]).' },
+  containerName: { type: 'string', description: 'Name of the new container control (unique on the form).' },
+  containerType: { type: 'string', description: 'Group (default), TabPage or Tab.' },
+  containerPattern: { type: 'string', description: 'Pattern of the new container (e.g. "FieldsFieldGroups", "ToolbarList").' },
+  containerPatternVersion: { type: 'string', description: 'PatternVersion; default = newest version the pattern catalogue knows.' },
+  containerCaption: { type: 'string', description: 'Caption label id of the new container (e.g. "@MyModel:General").' },
+  containerStyle: { type: 'string', description: 'Style of the new container (e.g. "FastTabs" on a Tab).' },
 };
 
 export interface D365FileOpSpec {
@@ -583,7 +625,8 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
     optional: ['methodModifiers', 'methodReturnType', 'methodParameters'],
     note:
       'Adds OR updates in place when the method name exists (position preserved). methodName is derived ' +
-      'from the source signature when omitted. sourceCode may carry several methods at once.',
+      'from the source signature when omitted. sourceCode may carry several methods at once. ' +
+      'Forms: methodName="DataSource.method", "DataSource.Field.method" or "Control.method" adds that override.',
   },
   'remove-method': { required: ['methodName'], optional: [] },
   'replace-code': {
@@ -595,9 +638,12 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   },
   'add-field': {
     required: ['fieldName'],
-    optional: ['fieldType', 'fieldBaseType', 'fieldEnumType', 'fieldMandatory', 'fieldLabel', 'dataField', 'dataSource', 'fieldGroupName', 'autoCorrect'],
+    optional: ['fieldType', 'fieldBaseType', 'fieldEnumType', 'fieldEnumValues', 'fieldStringSize', 'fieldMandatory', 'fieldLabel', 'dataField', 'dataSource', 'fieldGroupName', 'autoCorrect'],
     mutationOneOf: ['fieldType', 'fieldEnumType', 'dataField', 'dataSource', 'fieldBaseType'],
     note:
+      'Table/table-extension: a fieldType EDT or fieldEnumType enum that does not exist is created first ' +
+      '(fieldBaseType, fieldStringSize, fieldLabel and fieldEnumValues shape it), and fieldBaseType alone gets ' +
+      'an EDT named after the field (reused when one of that name and base type exists). ' +
       'Enum field: pass fieldEnumType="<enum name>" and NO fieldType — an enum-typed table field ' +
       'is an AxTableFieldEnum with an EnumType and needs no EDT. (fieldType is the EDT name here, ' +
       'never an XML element name like "AxTableFieldEnum" — that one is read as fieldEnumType when the ' +
@@ -616,9 +662,13 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   },
   'modify-field': {
     required: ['fieldName'],
-    optional: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation'],
-    mutationOneOf: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation'],
+    optional: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation', 'computedFieldMethod', 'sourceCode'],
+    mutationOneOf: ['fieldType', 'fieldMandatory', 'fieldLabel', 'fieldHelpText', 'fieldEnumType', 'fieldStringSize', 'fieldAllowEdit', 'fieldIgnoreEdtRelation', 'computedFieldMethod'],
     note:
+      'DATA-ENTITY: computedFieldMethod turns the entity\'s own mapped field into a computed (unmapped) ' +
+      'field of the source field\'s type and EDT (fieldType overrides the EDT), in one write with its ' +
+      'static method: sourceCode when given, else an existing method of that name, else a generated ' +
+      'SysComputedColumn::returnField over the field it was mapped to. A key field is refused. ' +
       'fieldType (an EDT name) works on an ENUM field too — it re-types the field to that EDT; fieldLabel ' +
       'takes a label id or raw text. fieldAllowEdit=false writes <AllowEdit>No</AllowEdit> (staging key ' +
       'fields, BPErrorTablePrimaryKeyEditable); fieldIgnoreEdtRelation=true writes ' +
@@ -671,7 +721,13 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   'remove-table-mapping': { required: ['mapName'], optional: [] },
   'add-relation': {
     required: ['relationName', 'relatedTable'],
-    optional: ['relationConstraints', 'relationCardinality', 'relatedTableCardinality', 'relationshipType'],
+    optional: ['relationConstraints', 'relationCardinality', 'relatedTableCardinality', 'relationshipType', 'relationOnDelete'],
+    note:
+      'relationOnDelete (None | Restricted | Cascade | CascadeRestricted) writes <OnDelete> on the relation, ' +
+      'the fix for BPCheckMissingDeleteActions. When the table or table-extension ALREADY has a relation ' +
+      'named relationName, only its OnDelete is set (relatedTable not needed, nothing else changes), in the ' +
+      'element order shipped metadata uses (after Cardinality, before RelatedTable). An existing value is ' +
+      'replaced.',
   },
   'remove-relation': { required: ['relationName'], optional: [] },
   'add-delete-action': {
@@ -779,7 +835,11 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       + 'extension-defined parent by its order among the children of the parent, under a base-form parent as '
       + '<PositionType>AfterItem</PositionType> + <PreviousSibling>. On a control the file ALREADY defines, '
       + 'add-control with previousSibling or positionType MOVES it there (same parent only; to change parent, '
-      + 'remove-control then add-control) — the way to put a field next to another after creating it.',
+      + 'move-control) — the way to put a field next to another after creating it. '
+      + 'Without controlType, a surrogate foreign key (an Int64 field whose EDT derives from RefRecId, related '
+      + 'to RecId of a table that has a replacement key, e.g. SalesTable.WorkerSalesTaker) gets a reference group '
+      + 'bound by ReferenceField, the control the form designer adds; pass controlType="Int64" for a plain one. '
+      + 'Set a reference group\'s ReplacementFieldGroup afterwards with modify-property.',
   },
   'remove-control': {
     required: ['controlName'],
@@ -823,6 +883,48 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       + 'a form. Removing the last one collapses <EntryPoints> to <EntryPoints />. '
       + 'A privilege left with no entry points and no data-entity permissions grants nothing — delete '
       + 'it with d365fo_file(action="delete") and drop its BP suppression entry.',
+  },
+  'add-duty': {
+    required: ['dutyName'],
+    optional: [],
+    note:
+      'objectType="security-role" or "security-role-extension". Appends one <AxSecurityDutyReference> to ' +
+      '<Duties>. To a STANDARD role, add through a security-role-extension ("<BaseRole>.<Prefix>Extension"). ' +
+      'Idempotent, case-insensitively: a duty already listed is SKIPPED and reported. Checked against the ' +
+      'symbol index: a name that exists only as a privilege is REFUSED (use add-privilege); an unknown name ' +
+      'is WARNED about and still written, because it may come later in the same batch or not be indexed ' +
+      'yet. On an extension, a duty the base role already references is warned about and still written.',
+  },
+  'remove-duty': {
+    required: ['dutyName'],
+    optional: [],
+    note:
+      'objectType="security-role" or "security-role-extension". Removes one <AxSecurityDutyReference>. A ' +
+      'name that is not listed comes back with the list that is there; a name listed twice is REFUSED ' +
+      'rather than guessed. Removing the last one collapses the list to <Duties />. An extension lists ' +
+      'only what it adds: a duty of the base role cannot be removed through it.',
+  },
+  'add-privilege': {
+    required: ['privilegeName'],
+    optional: [],
+    note:
+      'objectType="security-role", "security-duty", "security-role-extension" or "security-duty-extension". ' +
+      'Appends one <AxSecurityPrivilegeReference> to <Privileges>. To a STANDARD role or duty, add through ' +
+      'its extension ("<Base>.<Prefix>Extension"). Idempotent, case-insensitively: a privilege already ' +
+      'listed is SKIPPED and reported. Checked against the symbol index: a name that exists only as a duty ' +
+      'is REFUSED (a role takes it through add-duty); an unknown name is WARNED about and still written, ' +
+      'because it may come later in the same batch or not be indexed yet. On an extension, a privilege the ' +
+      'base object already references is warned about and still written.',
+  },
+  'remove-privilege': {
+    required: ['privilegeName'],
+    optional: [],
+    note:
+      'objectType="security-role", "security-duty", "security-role-extension" or "security-duty-extension". ' +
+      'Removes one <AxSecurityPrivilegeReference>. A name that is not listed comes back with the list that ' +
+      'is there; a name listed twice is REFUSED rather than guessed. Removing the last one collapses the ' +
+      'list to <Privileges />. An extension lists only what it adds: a privilege of the base object cannot ' +
+      'be removed through it.',
   },
   'remove-diagnostic-suppression': {
     required: ['diagnosticPath'],
@@ -901,12 +1003,62 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
   'remove-enum-value': { required: ['enumValueName'], optional: [] },
   'add-menu-item-to-menu': {
     required: ['menuItemToAdd'],
-    optional: ['menuItemToAddType'],
+    optional: ['menuItemToAddType', 'parentMenuElement'],
+    note:
+      'objectType="menu" or "menu-extension". An item for a STANDARD menu goes into a menu-extension ' +
+      '("<BaseMenu>.<Prefix>Extension"): parentMenuElement names the submenu of the base menu it goes ' +
+      'under (e.g. "Inquiries", also a nested one by its plain name), omitted = top level. It is checked ' +
+      'against the base menu and the submenus this and the other indexed extensions of it add; an ' +
+      'unknown one is refused with the list. A submenu this extension adds takes the item inside it. ' +
+      'Appended at the end of its parent; the same item under the same parent again is skipped. ' +
+      'Element names are unique in the whole menu: an item whose name another element has is named <item>N. ' +
+      'On objectType="menu" (a menu of your own model) parentMenuElement is a submenu of that menu.',
+  },
+  'add-submenu': {
+    required: ['submenuName'],
+    optional: ['submenuLabel', 'parentMenuElement'],
+    note:
+      'objectType="menu" (a menu of your own model: an inline submenu) or "menu-extension" (a standard ' +
+      'menu). parentMenuElement = the submenu it goes under, plain name, omitted = top level; checked like ' +
+      'add-menu-item-to-menu\'s. The name must be new in the whole menu, items included (a <Parent> names submenus by plain ' +
+      'name): one that exists elsewhere is refused, the same one under the same parent again is skipped. ' +
+      'Then fill it with add-menu-item-to-menu, parentMenuElement=<submenuName>.',
+  },
+  'move-control': {
+    required: ['controlName'],
+    optional: ['parentControl', 'previousSibling', 'positionType'],
+    note:
+      'objectType="form" (a form of your own model). Moves an existing control, with everything under it, ' +
+      'to parentControl (a Group/Tab/TabPage/Grid/… that has <Controls>; omitted or "Design" = the design ' +
+      'itself) — after previousSibling, or positionType "Begin"/"End" (default End). The control\'s XML is ' +
+      'kept byte for byte, only re-indented. A move into the control\'s own subtree, or into a control ' +
+      'with no <Controls>, or a non-TabPage into a Tab, is refused; a control already there is skipped. To convert a form to a pattern: ' +
+      'wrap-controls builds the containers, move-control fills them, modify-property sets the design\'s ' +
+      'Pattern and PatternVersion (both, in one operations[] call).',
+  },
+  'wrap-controls': {
+    required: ['controlNames', 'containerName'],
+    optional: ['containerType', 'containerPattern', 'containerPatternVersion', 'containerCaption', 'containerStyle'],
+    note:
+      'objectType="form". Puts existing controls (controlNames, all children of ONE parent) into a NEW ' +
+      'container where the first of them was, in their current order. containerType Group (default), ' +
+      'TabPage or Tab (a Tab holds TabPages only). containerPattern (e.g. FieldsFieldGroups, ToolbarList) ' +
+      'gets containerPatternVersion, default the newest the pattern catalogue knows. containerCaption (label ' +
+      'id), containerStyle (e.g. FastTabs on a Tab). Written in shipped element order (Pattern before ' +
+      '<Controls>, Caption and Style after it); a property the type never carries (Caption on a Tab) is ' +
+      'refused. FastTabs: wrap each group in a TabPage, then the pages in a Tab with containerStyle=FastTabs.',
   },
   'modify-property': {
     required: ['propertyPath', 'propertyValue'],
-    optional: ['controlName'],
+    optional: ['controlName', 'dataSourceName'],
     note:
+      'dataSourceName targets a DATA SOURCE the form or form extension defines: propertyPath is ' +
+      'JoinSource (must name another data source of the form), LinkType (InnerJoin | OuterJoin | ' +
+      'ExistJoin | NotExistJoin | Delayed | Active | Passive), a Yes/No property (AllowCreate, ' +
+      'AllowDelete, AllowEdit, AllowCheck, AutoNotify, AutoQuery, AutoSearch, CrossCompanyAutoQuery, ' +
+      'DelayActive, OnlyFetchActive, InsertAtEnd, InsertIfEmpty), Index, MaxAccessRight or ' +
+      'StartPosition. Replaced in place, or inserted in the element order measured on Microsoft ' +
+      'standard forms; an empty value removes it. Other data source properties are refused. ' +
       'controlName (or a dotted propertyPath, "MyButton.NeedsRecord") targets a form CONTROL. On ' +
       'objectType="form", and for a control a form extension ADDS, the property is written on that ' +
       'control (e.g. MenuItemName, MenuItemType, MultiSelect, NeedsRecord, Visible, Label) in the ' +
@@ -925,7 +1077,15 @@ export const D365FO_FILE_OP_SPECS: Record<string, D365FileOpSpec> = {
       'path — ConfigurationKey, PrimaryCompanyContext (e.g. "DataAreaId"), CountryRegionCodes, ' +
       'SingularLabel, IsObsolete, AllowArchival, AutoCreateDataverse, EnableSetBasedSqlOperations and ' +
       'ValidTimeStateEnabled. Modules, OperationalDomain and SubscriberAccessLevel are refused. ' +
-      'Yes/No properties take true/false/Yes/No.',
+      'Yes/No properties take true/false/Yes/No. ' +
+      'table, menu-item-action, menu-item-display, menu-item-output: OperationalDomain (Company | Shared | ' +
+      'Local) and SubscriberAccessLevel ("NoAccess" = all six permissions Deny, "Read" = Read Allow, ' +
+      '"All" = all six Allow, "None" removes it, or an explicit "Read=Allow,Create=Deny") are written on ' +
+      'the XML, never by the bridge: in canonical element order (tables after Label, menu items ' +
+      'alphabetically after Name), children in serializer order, xmlns="" on menu item children. An ' +
+      'existing element is replaced. The reply says when the value differs from what xppbp expects: ' +
+      'TempDB/InMemory/Staging tables Local + NoAccess, SaveDataPerCompany=No Shared + Read, other tables ' +
+      'Company + Read. Action menu item on a class NoAccess, Display on a class any right Allow. No hint for a menu item on a form or report: xppbp decides from its data sources (all Local, i.e. TempDB, gives Local + NoAccess, otherwise Read).',
   },
 };
 
@@ -944,13 +1104,21 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
   table:
     'label, tableGroup, tableType, titleField1/2, cacheLookup?, primaryIndex?, ' +
     'allowRowVersionChangeTracking? (dual-write), subscriberAccessLevel? ("Read=Allow,Create=Deny" | ' +
-    '{read:"Allow"} | "None"; default Read=Allow, none on TempDB/InMemory), created/modifiedBy/DateTime?, ' +
-    'fields[{name,type?|edt?|fieldType?,enumType?,label?,mandatory?,allowEdit?,ignoreEdtRelation?}] — enum fields need ' +
+    '{read:"Allow"} | "No Access" | "None"; default what xppbp expects: No Access on TempDB/InMemory/Staging, ' +
+    'Read=Allow otherwise), operationalDomain? (Company|Shared|Local; default Local on TempDB/InMemory/Staging, ' +
+    'else Company, or Shared with saveDataPerCompany:false), created/modifiedBy/DateTime?, ' +
+    'fields[{name,type?|edt?|fieldType?,enumType?,enumValues?,label?,mandatory?,allowEdit?,ignoreEdtRelation?}] — enum fields need ' +
+    'A missing EDT/enum, or one for a primitive-only field, is created first (see add-field). ' +
     'enumType ONLY (it makes the field an AxTableFieldEnum by itself; fieldType is optional), ' +
     'allowEdit:false writes AllowEdit=No (staging key fields), ignoreEdtRelation:true writes IgnoreEDTRelation=Yes ' +
     '(EDT with a relation), validTimeStateFieldType? (Date|UtcDateTime — then ADD the ValidFrom/ValidTo ' +
     'fields yourself and give the key index validTimeStateKey:true), ' +
-    'indexes?[{name,fields[],allowDuplicates?,alternateKey?,validTimeStateKey?,validTimeStateMode?("Gap"|"NoGap")}]',
+    'indexes?[{name,fields[],allowDuplicates?,alternateKey?,validTimeStateKey?,validTimeStateMode?("Gap"|"NoGap")}], ' +
+    'relations?[{name,relatedTable,constraints[{field,relatedField}],onDelete?(Restricted|Cascade|CascadeRestricted|None; ' +
+    'default Restricted)}]. BP defaults written after the create, listed in the reply: PrimaryIndex and ' +
+    'alternate-key fields AllowEdit=No + Mandatory=Yes, a field in no group joins AutoReport, a field whose EDT ' +
+    'has a relation gets that table relation (unless ignoreEdtRelation), every relation gets OnDelete, ' +
+    'Cardinality, RelatedTableCardinality and RelationshipType',
   enum:
     'label, useEnumValue, configurationKey, isExtensible, enumValues[{name,value?,label?,helpText?}] — ' +
     'every member keeps its number: the value you pass (or its position when you pass none) is written as ' +
@@ -962,6 +1130,11 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
     'CHOOSE isExtensible DELIBERATELY: it also bars `<`/`>`/`<=`/`>=` on the enum ("Cannot use extensible ' +
     'enumerated type in non-equality comparison"), so any enum whose values get RANKED in X++ — a tier, a ' +
     'severity, a no-downgrade check — must be isExtensible:false',
+  'class-extension':
+    'baseClass? (the extended object; default: the [ExtensionOf] in sourceCode), baseObjectType? (class|table|form|' +
+    'view|map|form-datasource|… — default: the [ExtensionOf] kind). The type picks the configured extension class ' +
+    'name format (EXTENSION_CLASS_NAME_FORMAT*); without one, or for a type no format covers, the reply asks for ' +
+    'the full name — pass it as objectName (ending in _Extension). No format configured: both are optional as before',
   'enum-extension': 'enumValues[{name,label?,value?,countryRegionCodes?}]',
   'table-extension':
     'fields[{name,edt?,enumType?,label?,mandatory?,fieldType?}] — enum fields need ' +
@@ -974,19 +1147,24 @@ export const D365FO_FILE_CREATE_PROPERTY_SPECS: Record<string, string> = {
     'label, targetObject, objectType (MenuItemDisplay|MenuItemAction|MenuItemOutput|ServiceOperation), ' +
     'accessLevel (view|read = Read only, maintain = Correct+Create+Delete+Read+Update, plus Invoke on a ServiceOperation — nothing else is accepted; "full"/"edit" ' +
     'used to degrade silently to Read-only), dataEntity (grants perms)',
-  'security-duty': 'label, privileges[]',
-  'security-role': 'label, duties[], privileges[]',
-  'menu-item-display': 'label, object, objectType',
-  'menu-item-action': 'label, object, objectType',
-  'menu-item-output': 'label, object, objectType',
+  'security-duty': 'label, privileges[] (change the list later with add-privilege / remove-privilege)',
+  'security-role': 'label, duties[], privileges[] (change the lists later with add-duty / add-privilege and their remove- operations)',
+  'menu-item-display': 'label, object, objectType, operationalDomain? (default Shared), subscriberAccessLevel? ' +
+    '(default Read=Allow on a form, every permission allowed with objectType Class). A form whose data sources ' +
+    'are all Local (TempDB) tables gets Local and "No Access" instead, as xppbp expects',
+  'menu-item-action': 'label, object, objectType, operationalDomain? (default Local), subscriberAccessLevel? ' +
+    '(default "No Access", which xppbp requires on an Action item with objectType Class)',
+  'menu-item-output': 'label, object, objectType, operationalDomain? (default Shared), subscriberAccessLevel? ' +
+    '(default Read=Allow)',
   'data-entity':
     'primaryTable + fields[{name,dataField?}] — BOTH REQUIRED (without them the entity has no query ' +
     'and returns no data, which builds clean; the create is refused instead), primaryKey?, ' +
     'primaryKeyFields?[], isPublic?, entityCategory? ' +
     '(Master|Configuration|Transaction|Reference|Document|Parameters — note the plural), ' +
     'dynamicFields?, allowRowVersionChangeTracking? (dual-write: set on the source ' +
-    'TABLES too), dataManagementEnabled? (writes the staging-table REFERENCE only — the staging table is NOT ' +
-    'created, so create it yourself or the full build fails; the reply says so), ' +
+    'TABLES too), dataManagementEnabled? (also creates the staging table <entity>Staging in the same model: DMF fields, ' +
+    'one field per public entity field, index StagingIdx, relation DataEntity. The reply names any field it ' +
+    'left out. An existing table is kept. autoCorrect=false skips it), ' +
     'isReadOnly?, tags?, configurationKey?, primaryCompanyContext? (e.g. "DataAreaId"), ' +
     'surrogateKey? (true: key EntityKey = a SourceKey field bound to RecId — instead of ' +
     'primaryKeyFields). Any other key is not read and is listed in the reply as NOT written. ' +
